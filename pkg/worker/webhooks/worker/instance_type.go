@@ -1,0 +1,238 @@
+package worker
+
+import (
+	"context"
+	"strings"
+
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrladmission "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/nodefeature"
+	"gpustack.ai/gpustack/pkg/systemname"
+	"gpustack.ai/gpustack/pkg/utils/strconvx"
+	"gpustack.ai/gpustack/pkg/webhook"
+	"gpustack.ai/gpustack/pkg/worker/settings"
+)
+
+// QueueEntranceLabelKey, on an InstanceType, records the name of the namespaced LocalQueue that
+// fronts its backing ClusterQueue (a workload's "kueue.x-k8s.io/queue-name" value). The Pod
+// webhook reverse-looks-up the InstanceType by this label to read the observed per-card VRAM
+// (Status.Detail.Memory), never trusting the user-writable LocalQueue. The Default webhook stamps
+// it with nodefeature.FormatLocalQueueName(<InstanceType name>).
+const QueueEntranceLabelKey = "schedule." + systemname.LabelPrefix + "queue-entrance"
+
+// InstanceTypeWebhook defaults and validates a v1alpha1.InstanceType.
+//
+// The defaulting webhook stamps only the schedule discriminator + entrance labels; the observed
+// hardware descriptor is computed by the reconciler into Status.Detail, not enriched onto the spec
+// at admission. The validating webhook requires the admin-writable inputs on create and freezes the
+// spec on update.
+//
+// nolint: lll
+// +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="instancetypes",scope="Cluster"
+// +k8s:webhook-gen:validating:operations=["CREATE","UPDATE"],failurePolicy="Fail",sideEffects="None",matchPolicy="Equivalent",timeoutSeconds=10
+// +k8s:webhook-gen:mutating:group="worker.gpustack.ai",version="v1alpha1",resource="instancetypes",scope="Cluster"
+// +k8s:webhook-gen:mutating:operations=["CREATE","UPDATE"],failurePolicy="Fail",sideEffects="None",matchPolicy="Equivalent",timeoutSeconds=10
+type InstanceTypeWebhook struct {
+	Client    ctrlcli.Client
+	APIReader ctrlcli.Reader
+}
+
+func (r *InstanceTypeWebhook) SetupWebhook(_ context.Context, opts webhook.SetupOptions) (runtime.Object, error) {
+	r.Client = opts.Manager.GetClient()
+	r.APIReader = opts.Manager.GetAPIReader()
+
+	return &workercore.InstanceType{}, nil
+}
+
+var (
+	_ ctrladmission.Validator[runtime.Object] = (*InstanceTypeWebhook)(nil)
+	_ ctrladmission.Defaulter[runtime.Object] = (*InstanceTypeWebhook)(nil)
+	_ webhook.ReceiveDeletionUpdate           = (*InstanceTypeWebhook)(nil)
+)
+
+// ReceiveDeletionUpdate keeps this webhook validating updates to an InstanceType that is being
+// deleted. validateInstanceTypeSpecImmutable is a masked equality on the two specs and reads nothing
+// else, so the spec stays frozen while the reconciler drains the type's ClusterQueue rather than only
+// while the type is live.
+//
+// One marker releases the mutating half as well, and here that refuses nothing: Default returns nil
+// on every path, and its registration is failurePolicy Fail on CREATE, so every stored InstanceType
+// has already been through it and re-deriving its labels is idempotent.
+func (r *InstanceTypeWebhook) ReceiveDeletionUpdate() {}
+
+func (r *InstanceTypeWebhook) ValidateCreate(_ context.Context, obj runtime.Object) (ctrladmission.Warnings, error) {
+	it := obj.(*workercore.InstanceType)
+
+	if errs := validateInstanceTypeSpec(it); len(errs) > 0 {
+		return nil, kerrors.NewInvalid(workercore.Kind("InstanceType"), it.Name, errs)
+	}
+	return nil, nil
+}
+
+func (r *InstanceTypeWebhook) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (ctrladmission.Warnings, error) {
+	itOld, it := oldObj.(*workercore.InstanceType), newObj.(*workercore.InstanceType)
+
+	// Only immutability is enforced on update: the spec is frozen except displayName and
+	// inactive, so every input validateInstanceTypeSpec checks on create is already frozen to
+	// its stored value. Re-running those create-time checks here would add no protection and
+	// would wedge a legacy object whose stored value predates a tightened rule (e.g. a CPU-only
+	// type stored with unit CPU other than 1), blocking even a displayName/inactive edit or the
+	// operator's own inactive backfill.
+	if errs := validateInstanceTypeSpecImmutable(itOld, it); len(errs) > 0 {
+		return nil, kerrors.NewInvalid(workercore.Kind("InstanceType"), itOld.Name, errs)
+	}
+	return nil, nil
+}
+
+func (r *InstanceTypeWebhook) ValidateDelete(_ context.Context, _ runtime.Object) (ctrladmission.Warnings, error) {
+	return nil, nil
+}
+
+// Default stamps the InstanceType's metadata labels so it is selectable from day one. From the
+// spec identity it derives the (acceleratable, group) feature key and, with kubernetes.io/os|arch,
+// stamps the schedule discriminators the pool's Devices and ResourceFlavors carry (pruning a stale
+// feature key left by a group/acceleratable change), plus the entrance label
+// (nodefeature.FormatLocalQueueName(name)) the Pod webhook reverse-looks-up. It writes no hardware
+// descriptor: the observed descriptor lives in Status.Detail, computed by the reconciler as
+// hardware changes, not snapshotted onto the spec here.
+func (r *InstanceTypeWebhook) Default(ctx context.Context, obj runtime.Object) error {
+	it := obj.(*workercore.InstanceType)
+
+	// Default the CPU group to the generic sentinel so a pool collapses without the admin
+	// setting it; a real CPU group only matters when awareness is on.
+	if it.Spec.GeneralGroup == "" {
+		it.Spec.GeneralGroup = nodefeature.GeneralGroupGeneric
+	}
+	// An accelerated type needs an accelerator group to have a pool to schedule onto; leave it
+	// for the validating webhook to reject rather than stamping degenerate labels.
+	if it.Spec.Acceleratable && it.Spec.AcceleratorGroup == "" {
+		return nil
+	}
+
+	// The pool's schedule labels from the spec identity and the awareness setting. Read the
+	// setting here (the worker process carries the local settings indexer); validation stays
+	// setting-independent.
+	cpuAware := settings.InstanceTypeAwareCPUManufacturer.ShouldValueBool(ctx)
+	sched := nodefeature.PoolScheduleLabels(
+		it.Spec.Acceleratable, cpuAware,
+		it.Spec.GeneralGroup, it.Spec.AcceleratorGroup,
+		it.Spec.OS, it.Spec.Arch,
+	)
+
+	// Stamp the schedule labels on the InstanceType so it is selectable by the same
+	// discriminators its Devices and ResourceFlavors carry. Drop a stale feature key left by a
+	// group/acceleratable change — its key varies, while the os/arch and the acceleratable
+	// boolean have fixed keys and are simply overwritten.
+	if it.Labels == nil {
+		it.Labels = make(map[string]string, len(sched)+1)
+	}
+	for k := range it.Labels {
+		if _, want := sched[k]; want {
+			continue
+		}
+		if strings.HasPrefix(k, nodefeature.GeneralFeatureLabelPrefix) ||
+			strings.HasPrefix(k, nodefeature.AcceleratableFeatureLabelPrefix) {
+			delete(it.Labels, k)
+		}
+	}
+	for k, v := range sched {
+		it.Labels[k] = v
+	}
+	// Advertise the fronting LocalQueue name so the Pod webhook reverse-looks-up this
+	// InstanceType for the observed per-card VRAM (Status.Detail.Memory).
+	it.Labels[QueueEntranceLabelKey] = nodefeature.FormatLocalQueueName(it.Name)
+
+	return nil
+}
+
+// validateInstanceTypeSpec collects the required-input errors: an accelerator group when
+// accelerated, os/arch non-empty, plus the unit-spec well-formedness checks. It reads no
+// editable setting — validation is independent of instance-type-aware-cpu-manufacturer; the
+// mutating webhook defaults an empty GeneralGroup to "generic", so GeneralGroup is never
+// required here.
+func validateInstanceTypeSpec(it *workercore.InstanceType) field.ErrorList {
+	var errs field.ErrorList
+	if it.Spec.Acceleratable && it.Spec.AcceleratorGroup == "" {
+		errs = append(errs, field.Required(field.NewPath("spec", "acceleratorGroup"),
+			"must be specified when acceleratable is true"))
+	}
+	if it.Spec.OS == "" {
+		errs = append(errs, field.Required(field.NewPath("spec", "os"), "must be specified"))
+	}
+	if it.Spec.Arch == "" {
+		errs = append(errs, field.Required(field.NewPath("spec", "arch"), "must be specified"))
+	}
+	return append(errs, validateInstanceTypeUnitSpec(it)...)
+}
+
+// validateInstanceTypeUnitSpec enforces the unit spec: all three fields must be set and
+// well-formed — unitRAM and localStorage a positive integer with a case-sensitive "Gi" suffix.
+// The unitCPU rule branches on acceleratable: an acceleratable type accepts any unitless
+// positive integer, while a non-acceleratable (CPU-only) type accepts only exactly 1 core,
+// matching how a CPU-only request is sized (the requested CPU count is the unit count).
+func validateInstanceTypeUnitSpec(it *workercore.InstanceType) field.ErrorList {
+	cpu, ram, localStg := it.Spec.UnitResources.CPU, it.Spec.UnitResources.RAM, it.Spec.LocalStorage
+
+	var errs field.ErrorList
+	if it.Spec.Acceleratable {
+		if extractPositiveNumberFromString(cpu) == "" {
+			errs = append(errs, field.Invalid(field.NewPath("spec", "unitResources", "cpu"),
+				cpu, "must be a positive integer with no unit suffix"))
+		}
+	} else if n, err := strconvx.ParseInt[int32](cpu, 10, 32); err != nil || n != 1 {
+		errs = append(errs, field.Invalid(field.NewPath("spec", "unitResources", "cpu"),
+			cpu, "must be 1 when acceleratable is false"))
+	}
+	if extractPositiveNumberFromQuantity(ram, "Gi") == "" {
+		errs = append(errs, field.Invalid(field.NewPath("spec", "unitResources", "ram"),
+			ram, "must be a positive integer with a case-sensitive \"Gi\" suffix"))
+	}
+	if extractPositiveNumberFromQuantity(localStg, "Gi") == "" {
+		errs = append(errs, field.Invalid(field.NewPath("spec", "localStorage"),
+			localStg, "must be a positive integer with a case-sensitive \"Gi\" suffix"))
+	}
+	return errs
+}
+
+// extractPositiveNumberFromString returns v unchanged when it is a positive integer
+// carrying no unit suffix, and "" otherwise (including empty input).
+func extractPositiveNumberFromString(v string) string {
+	n, err := strconvx.ParseInt[int32](v, 10, 32)
+	if err == nil && n > 0 {
+		return v
+	}
+	return ""
+}
+
+// extractPositiveNumberFromQuantity strips the given suffix and returns the bare
+// positive integer, or "" when the suffix is absent or the remainder is not a positive
+// integer (including empty input).
+func extractPositiveNumberFromQuantity(v, suffix string) string {
+	b, ok := strings.CutSuffix(v, suffix)
+	if ok {
+		return extractPositiveNumberFromString(b)
+	}
+	return ""
+}
+
+// validateInstanceTypeSpecImmutable rejects any change to the spec after creation other than the
+// admin-editable fields: DisplayName (rename), Description (free-form annotation) and Inactive
+// (take in/out of service). The spec is fully comparable, so it masks those fields on both sides
+// and compares the rest with a single equality check — a newly added spec field is then frozen
+// automatically.
+func validateInstanceTypeSpecImmutable(itOld, it *workercore.InstanceType) field.ErrorList {
+	oldSpec, newSpec := itOld.Spec, it.Spec
+	oldSpec.DisplayName, newSpec.DisplayName = "", ""
+	oldSpec.Description, newSpec.Description = "", ""
+	oldSpec.Inactive, newSpec.Inactive = false, false
+	if oldSpec != newSpec {
+		return field.ErrorList{field.Forbidden(field.NewPath("spec"),
+			"is immutable except displayName, description and inactive")}
+	}
+	return nil
+}

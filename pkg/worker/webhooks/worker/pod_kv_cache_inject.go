@@ -1,0 +1,915 @@
+package worker
+
+import (
+	"fmt"
+	"path"
+	"slices"
+	"strings"
+
+	core "k8s.io/api/core/v1"
+
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/deviceplugin"
+	"gpustack.ai/gpustack/pkg/systemname"
+	"gpustack.ai/gpustack/pkg/utils/json"
+	workerctrl "gpustack.ai/gpustack/pkg/worker/controllers/worker"
+	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
+)
+
+const (
+	// KVCacheInjectedAnnotationKey records what this webhook did, as JSON so a jsonpath query can
+	// select one field. It is written by the webhook and never read from a submitted object: a
+	// user-supplied value would be a forged record of a decision the user did not make.
+	KVCacheInjectedAnnotationKey = "kvcache." + systemname.LabelPrefix + "injected"
+
+	// observabilityMetricsEnv and observabilityBandwidthEnv are turned on when the container has not
+	// spoken about them. They are the one pair that still YIELDS rather than being overwritten, and
+	// the reason is that they change no result: they toggle reporting, so a user-set value is neither
+	// a second answer to a question this webhook answers nor something worth refusing a Pod over.
+	observabilityMetricsEnv   = "MC_TE_METRIC"
+	observabilityBandwidthEnv = "MC_STORE_CLIENT_METRIC_BANDWIDTH"
+)
+
+// ownedArgs are the flags this webhook writes. A container already carrying one has a KV cache
+// configured by someone else, and merging would produce "two --kv-transfer-config, which one wins",
+// which is undiagnosable from outside.
+var ownedArgs = []string{"--kv-transfer-config", "--hicache-storage-backend"}
+
+// ownedEnv is the variable this webhook writes that SELECTS the mechanism, as opposed to the ones
+// that carry values inside it. The value variables do not refuse -- they are OVERWRITTEN, because
+// injection is opt-in and the opt-out is explicit.
+//
+// SGLANG_HICACHE_MOONCAKE_CONFIG_PATH is absent HERE and refused ELSEWHERE, and the move is measured
+// rather than stylistic. This webhook does not write it, so it collides with nothing and cannot be
+// judged by a scan filtered on what the render writes. What it does is take a different branch of
+// the engine's configuration-source selector, leaving every injected variable present and unread --
+// see inject.ConfigSourceKeys, which carries the measurement.
+var ownedEnv = []string{"MOONCAKE_CONFIG_PATH"}
+
+// injectionRecord is the stamp: what this webhook decided, on the object it decided about.
+//
+// It is JSON so a jsonpath query can select one field, and it exists because the decisions below leave
+// no other trace. A Pod given a tenant and one given none look alike from outside, and the cost of the
+// difference - two reuse domains sharing an eviction pool - moves no metric at all.
+type injectionRecord struct {
+	// Binding is the KVCachePoolBinding this Pod NAMED and this webhook resolved, in the Pod's own
+	// namespace. It provisioned the domain and the capacity; it authorized nothing, and the API
+	// contract says so explicitly - a workload that knows another domain's name reaches it, Binding
+	// or no Binding (see docs/modules/kv-cache/pool.md#limitations and #168).
+	//
+	// It is NOT necessarily the Binding the writes are ACCOUNTED to. An engine build that ignores the
+	// injected tenant writes under the master's own "default" name, so usage lands on whichever
+	// Binding registered that domain. Reading this field as the accounting object can therefore send
+	// an operator to the wrong status.
+	Binding string `json:"binding"`
+
+	// Engine is what was configured.
+	Engine string `json:"engine"`
+
+	// Vehicle is "file" or "environment". A Pod on the environment vehicle whose cache is cold is a
+	// Pod to check for a config path of its own, which is the one silent outcome this design accepts.
+	Vehicle string `json:"vehicle"`
+
+	// Domain is the reuse identity the Binding declared.
+	Domain string `json:"domain,omitempty"`
+
+	// TenantInjected is whether this webhook wrote a tenant identity into the container, and it
+	// records an ACTION rather than an outcome. That distinction is the whole design of this field.
+	//
+	// Whether the tenant takes effect depends on the engine BUILD, which admission cannot see: it
+	// never inspects the image. An older build may be handed a value it never reads.
+	// Over-claiming in that direction is the failure
+	// this field exists to avoid, so it says what we did - which is certain - and never what
+	// resulted, which is not.
+	//
+	// Reading it, TRUE: a tenant was supplied by this webhook. A build that honors it isolates, and
+	// one too old to read the variable silently does not. On the client side the failure is loud
+	// instead - a Mooncake too old to accept the argument raises rather than dropping it, so the Pod
+	// stops rather than losing isolation quietly.
+	//
+	// Reading it, FALSE: the renderer received no domain and wrote no tenant.
+	TenantInjected bool `json:"tenantInjected"`
+
+	// LaunchProgram is the executable left after transparent launchers are removed. It is empty only
+	// where there was no program to read on the command line and the author declared that the launch
+	// forwards appended arguments anyway: an image ENTRYPOINT, or a command line carried inside one
+	// token. A launch that resolves to no program at all is refused rather than stamped.
+	LaunchProgram string `json:"launchProgram"`
+
+	// LaunchArgsForwarded records whether the author declaration admitted a launch this webhook
+	// could not identify as an engine entry point.
+	LaunchArgsForwarded bool `json:"launchArgsForwarded"`
+}
+
+// injectPod applies a rendered Result to one container of the Pod, and stamps what it did.
+//
+// It is the only function here that mutates, and it mutates last: every refusal has already run, so a
+// Pod reaching this point is either fully injected or untouched. A half-injected Pod - the volume added
+// and the env missing, say - would start and behave in a way no field explains.
+func (r *PodKVCacheWebhook) injectPod(pod *core.Pod, res *resolution, out *inject.Result) error {
+	ctr, err := targetContainer(pod)
+	if err != nil {
+		return err
+	}
+	if err = checkOwnedKeys(pod, ctr, res.Input.Engine, out); err != nil {
+		return err
+	}
+	if err = checkConfigSourceKeys(ctr, res.Input.Engine); err != nil {
+		return err
+	}
+	launch, err := checkLaunchArgs(ctr, res.Input.Engine, pod.Annotations)
+	if err != nil {
+		return err
+	}
+
+	for i := range out.Env {
+		// AN INJECTION OVERRULES A VARIABLE THE WORKLOAD DECLARED FOR ITSELF. Injection is opt-in and
+		// the opt-out is explicit -- the label set to "false", or left off -- so a Pod that asked for
+		// it and then declared one of these variables has two answers for one setting, and this one
+		// is the one derived from the Binding it named.
+		//
+		// IT IS WRITTEN IN PLACE RATHER THAN APPENDED, although appending would also win: the kubelet
+		// folds a container's env list into a map in declaration order, so the last entry of a
+		// repeated name is the one the process sees. In place keeps the Pod readable -- one entry per
+		// name, showing the value that will apply -- and does not rely on a property a reader of the
+		// Pod cannot see.
+		found := false
+		for j := range ctr.Env {
+			if ctr.Env[j].Name == out.Env[i].Name {
+				ctr.Env[j] = out.Env[i]
+				found = true
+			}
+		}
+		if !found {
+			ctr.Env = append(ctr.Env, out.Env[i])
+		}
+	}
+	for _, name := range []string{observabilityMetricsEnv, observabilityBandwidthEnv} {
+		if !deviceplugin.ContainerEnvDeclared(ctr, name) {
+			ctr.Env = append(ctr.Env, core.EnvVar{Name: name, Value: "1"})
+		}
+	}
+	// The renderer's defaults yield to the container on the same terms as the two above: a
+	// declaration of the same name, or an argument naming the same flag, is the workload's own
+	// answer. The container's arguments are read BEFORE the rendered ones are appended, so only
+	// what the workload wrote can drop a default.
+	for _, e := range out.DefaultedEnv {
+		if !deviceplugin.ContainerEnvDeclared(ctr, e.Name) {
+			ctr.Env = append(ctr.Env, e)
+		}
+	}
+	var defaultedArgs []string
+	for _, group := range out.DefaultedArgs {
+		if _, found := containerFlag(ctr, res.Input.Engine, group[0]); found {
+			continue
+		}
+		defaultedArgs = append(defaultedArgs, group...)
+	}
+
+	ctr.Args = append(ctr.Args, out.Args...)
+	ctr.Args = append(ctr.Args, defaultedArgs...)
+	ctr.VolumeMounts = append(ctr.VolumeMounts, out.VolumeMounts...)
+	pod.Spec.Volumes = append(pod.Spec.Volumes, out.Volumes...)
+
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	for k, v := range out.PodAnnotations {
+		pod.Annotations[k] = v
+	}
+
+	vehicle := "environment"
+	if len(out.Volumes) > 0 {
+		vehicle = "file"
+	}
+	record, err := json.Marshal(injectionRecord{
+		Binding:             pod.Annotations[KVCacheBindingAnnotationKey],
+		Engine:              string(res.Input.Engine),
+		Vehicle:             vehicle,
+		Domain:              res.Isolation.Domain,
+		TenantInjected:      out.TenantInjected,
+		LaunchProgram:       launch.program,
+		LaunchArgsForwarded: launch.argsForwarded,
+	})
+	if err != nil {
+		// UNREACHABLE, and left in rather than dropped because dropping it would mean ignoring an
+		// error return. injectionRecord contains only strings and booleans, and encoding/json fails only on
+		// values it cannot represent - channels, functions, cyclic references, NaN and infinities -
+		// none of which this struct can hold. The branch is therefore not covered by any test, and
+		// writing one would mean adding a field that can fail to a record that has no use for it.
+		// Do not panic here either: this runs on an admission path, where a panic takes the webhook
+		// down for every Pod rather than failing one.
+		return fmt.Errorf("marshal the injection record: %w", err)
+	}
+	pod.Annotations[KVCacheInjectedAnnotationKey] = string(record)
+
+	return nil
+}
+
+// targetContainer picks the container to inject into, and refuses rather than guessing.
+//
+// With one container it is that one. With several the caller must name it, because picking the first
+// is exactly how an injection lands in a sidecar while the workload runs in the main container - the
+// symptom is "artifacts present, feature absent", which is undiagnosable from outside the Pod.
+//
+// Init containers are never candidates and naming one is refused. An init container finishes before the
+// workload starts, so configuring it caches nothing.
+func targetContainer(pod *core.Pod) (*core.Container, error) {
+	named := pod.Annotations[KVCacheContainerAnnotationKey]
+
+	if named == "" {
+		switch len(pod.Spec.Containers) {
+		case 1:
+			return &pod.Spec.Containers[0], nil
+		case 0:
+			return nil, fmt.Errorf("the Pod has no containers to inject into")
+		default:
+			return nil, fmt.Errorf("the Pod has %d containers (%s), so annotation %q must name the "+
+				"one running the engine; this webhook never picks the first",
+				len(pod.Spec.Containers), strings.Join(containerNames(pod.Spec.Containers), ", "),
+				KVCacheContainerAnnotationKey)
+		}
+	}
+
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == named {
+			return &pod.Spec.Containers[i], nil
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == named {
+			return nil, fmt.Errorf("annotation %q names %q, which is an init container: it finishes "+
+				"before the workload starts, so configuring it would cache nothing. Name one of: %s",
+				KVCacheContainerAnnotationKey, named,
+				strings.Join(containerNames(pod.Spec.Containers), ", "))
+		}
+	}
+	return nil, fmt.Errorf("annotation %q names %q, which is not a container of this Pod. Name one "+
+		"of: %s", KVCacheContainerAnnotationKey, named,
+		strings.Join(containerNames(pod.Spec.Containers), ", "))
+}
+
+// checkConfigSourceKeys refuses a container that already selects a configuration SOURCE this webhook
+// does not write.
+//
+// It is separate from checkOwnedKeys because the two refuse different things. An owned key is a
+// second source for a setting this webhook renders, and the scan there is filtered by what THIS
+// render writes -- nothing collides with a key the render was never going to add. A key here
+// collides with nothing: the webhook writes no such key, and that is exactly why it is dangerous.
+// The engine reads its store configuration through mutually exclusive branches, so the key takes one
+// and the branch every injected variable lives in is never executed. The Pod then carries a full set
+// of variables nothing reads, and the injection record says it succeeded.
+//
+// The keys are per engine, from the package that measured them, because a key is only a branch
+// selector for the engine that reads it.
+func checkConfigSourceKeys(ctr *core.Container, engine inject.Engine) error {
+	env, args := inject.ConfigSourceKeys(engine)
+
+	for _, name := range env {
+		if deviceplugin.ContainerEnvDeclared(ctr, name) {
+			return fmt.Errorf("container %q sets %s, which points engine %q at a configuration file "+
+				"of its own; this webhook configures the store through the environment, and that "+
+				"branch is then never read -- every injected variable would be present and unused",
+				ctr.Name, name, engine)
+		}
+	}
+	for _, flag := range args {
+		if spelled, found := containerFlag(ctr, engine, flag); found {
+			return fmt.Errorf("container %q passes %s, which outranks the environment engine %q "+
+				"would otherwise read its store configuration from, so the injected variables would "+
+				"be present and unused", ctr.Name, spelled, engine)
+		}
+	}
+
+	return nil
+}
+
+// checkOwnedKeys refuses a container that already carries a key selecting a KV cache mechanism, or a
+// volume or mount occupying a name or path this webhook owns.
+//
+// It refuses rather than merging because every one of these produces an ambiguity nothing reports: two
+// connector flags on one command line, or two mounts at one path. Taking over is an explicit opt-out -
+// set the inject label to "false", or leave it off.
+func checkOwnedKeys(pod *core.Pod, ctr *core.Container, engine inject.Engine, out *inject.Result) error {
+	// Only what THIS render will write can collide. The owned lists span every engine, so scanning
+	// them unfiltered refused Pods over keys the render was never going to add: an SGLang container
+	// setting MOONCAKE_CONFIG_PATH - SGLang selects its file with SGLANG_HICACHE_MOONCAKE_CONFIG_PATH,
+	// so that variable means nothing to it - or a vLLM one passing SGLang's
+	// --hicache-storage-backend. Neither is a second source for one setting, which is the whole
+	// premise of refusing here.
+	for _, name := range ownedEnv {
+		if !slices.ContainsFunc(out.Env, func(e core.EnvVar) bool { return e.Name == name }) {
+			continue
+		}
+		if deviceplugin.ContainerEnvDeclared(ctr, name) {
+			return fmt.Errorf("container %q already sets %s, so it already has a KV cache configured; "+
+				"this webhook refuses to merge rather than leave two sources for one setting",
+				ctr.Name, name)
+		}
+	}
+	for _, flag := range ownedArgs {
+		if !slices.Contains(out.Args, flag) {
+			continue
+		}
+		if spelled, found := containerFlag(ctr, engine, flag); found {
+			return fmt.Errorf("container %q already passes %s, so it already has a KV cache "+
+				"configured; two of them on one command line is undiagnosable", ctr.Name, spelled)
+		}
+	}
+	// The dtype flag is refused for another reason than the two above: it says nothing about a
+	// cache configured elsewhere, it names an element type, and the Binding's is the one every
+	// engine on its domain must write.
+	if slices.Contains(out.Args, inject.KVCacheDtypeArg) {
+		if spelled, found := containerFlag(ctr, engine, inject.KVCacheDtypeArg); found {
+			return fmt.Errorf("container %q already passes %s, but the KV cache dtype comes from "+
+				"the KVCachePoolBinding: the store key does not carry it, so engines writing two "+
+				"dtypes into one domain read each other's blocks wrong; remove it, and name a "+
+				"Binding declaring the dtype you want", ctr.Name, spelled)
+		}
+	}
+
+	// The Pod's own volume list is checked as well as the container's mounts. A volume of this name
+	// can exist on the Pod without the target container mounting it, and appending a second one of
+	// the same name is refused by the API server with an error that names neither this webhook nor
+	// the manifest line that collided.
+	for i := range out.Volumes {
+		for j := range pod.Spec.Volumes {
+			if pod.Spec.Volumes[j].Name == out.Volumes[i].Name {
+				return fmt.Errorf("the Pod already declares a volume named %q, which this webhook owns",
+					out.Volumes[i].Name)
+			}
+		}
+	}
+
+	for i := range out.VolumeMounts {
+		for j := range ctr.VolumeMounts {
+			switch {
+			case ctr.VolumeMounts[j].Name == out.VolumeMounts[i].Name:
+				return fmt.Errorf("container %q already mounts a volume named %q, which this webhook "+
+					"owns", ctr.Name, out.VolumeMounts[i].Name)
+			case ctr.VolumeMounts[j].MountPath == out.VolumeMounts[i].MountPath:
+				return fmt.Errorf("container %q already mounts something at %q, which this webhook "+
+					"owns", ctr.Name, out.VolumeMounts[i].MountPath)
+			}
+		}
+	}
+	return nil
+}
+
+// checkLaunchArgs refuses a container that declares neither command nor args.
+//
+// Appending to an empty args does not append: Kubernetes reads args alone as the whole command line and
+// discards the image's CMD entirely, so the engine would lose its own launch arguments. This webhook
+// cannot see the image and cannot restore them.
+//
+// WHY A COMMAND WITH NO ARGS IS NOT THE SAME CASE, written here because review has raised it three
+// times and a reply on a thread does not survive the thread being resolved. The claim each time is
+// that `command` set with `args` absent still runs the image's CMD, so appending to args silently
+// replaces it. Kubernetes resolves the four combinations like this:
+//
+//	command unset, args unset  -> image ENTRYPOINT + image CMD
+//	command unset, args set    -> image ENTRYPOINT + args        (CMD dropped)
+//	command SET,   args unset  -> command alone                  (ENTRYPOINT and CMD BOTH dropped)
+//	command set,   args set    -> command + args
+//
+// So on the third row there is no CMD left to replace: setting command already discarded it, before
+// this webhook appends anything. The container's author dropped it, not the injection. That row is
+// also why the refusal below fires on neither-declared rather than on args-empty - a container with
+// only a command is complete, and appending to its args is the ordinary case this webhook is for.
+//
+// A COMMAND THAT IS ONLY A LAUNCHER is the exception on that third row, and it is refused. `tini --`
+// with args empty resolves to an empty argv: the container names no program at all, so the arguments
+// appended here become the command the launcher execs and the connector flag is run as a program.
+// Refusing costs no launch that would have worked - a launcher with nothing to launch already fails
+// on its own - while admitting it turns a container that cannot start into one that starts and runs
+// the wrong thing. It is narrower than "args is empty": `tini --` WITH a command in args resolves to
+// that command and is the ordinary appendable case above.
+type launchCheck struct {
+	program       string
+	argsForwarded bool
+}
+
+func checkLaunchArgs(ctr *core.Container, engine inject.Engine, annotations map[string]string) (launchCheck, error) {
+	if len(ctr.Command) == 0 && len(ctr.Args) == 0 {
+		return launchCheck{}, fmt.Errorf("container %q declares neither command nor args, so it runs the image's own "+
+			"ENTRYPOINT and CMD. Both engines need a flag on the command line, and setting args while "+
+			"command is unset makes Kubernetes discard the image's CMD. Set command to the engine executable "+
+			"and copy the image's launch arguments into args; this overrides the image ENTRYPOINT too, so "+
+			"the command must start the engine directly",
+			ctr.Name)
+	}
+	declaresForwarding, err := declaresLaunchArgsForwarding(annotations)
+	if err != nil {
+		return launchCheck{}, err
+	}
+	if len(ctr.Command) == 0 {
+		if declaresForwarding {
+			return launchCheck{argsForwarded: true}, nil
+		}
+		return launchCheck{}, fmt.Errorf("container %q has args but no command, so its image ENTRYPOINT is "+
+			"not visible to this webhook. Set command to the engine executable and leave its arguments in "+
+			"args, or set annotation %q to %q only if the image ENTRYPOINT forwards appended arguments to "+
+			"the engine", ctr.Name, KVCacheLaunchArgsForwardedAnnotationKey, "true")
+	}
+
+	argv, insideOneString := shellLaunchArgv(slices.Concat(ctr.Command, ctr.Args))
+	if err := checkShellWrapper(ctr, argv, insideOneString, declaresForwarding); err != nil {
+		return launchCheck{}, err
+	}
+	if insideOneString {
+		return launchCheck{argsForwarded: declaresForwarding}, nil
+	}
+	if len(argv) == 0 {
+		return launchCheck{}, fmt.Errorf("container %q runs the launcher %q with no program after "+
+			"it, so its command line starts no engine and whatever this webhook appends to args "+
+			"would be taken by that launcher as the command to run - the connector flag itself "+
+			"would be executed as a program. Put the engine executable and its arguments after the "+
+			"launcher, or in command and args directly", ctr.Name, path.Base(ctr.Command[0]))
+	}
+
+	program := path.Base(argv[0])
+	if resolvedEngine, recognised := launchEngine(argv); recognised {
+		if !launchMatchesEngine(resolvedEngine, engine) {
+			return launchCheck{}, fmt.Errorf("container %q resolves to the %q engine, but the selected cache "+
+				"runtime is %q. The injected configuration must match the engine that starts; correct the "+
+				"engine or manufacturer annotation, or launch that engine directly", ctr.Name, resolvedEngine, engine)
+		}
+		return launchCheck{program: program}, nil
+	}
+	if declaresForwarding {
+		return launchCheck{program: program, argsForwarded: true}, nil
+	}
+	return launchCheck{}, fmt.Errorf("container %q resolves to %q, which this webhook cannot identify "+
+		"as a supported engine launch. Launch the engine directly - put its executable in command and "+
+		"its arguments in args - or set annotation %q to %q only if this launcher forwards appended "+
+		"arguments to the engine", ctr.Name, program, KVCacheLaunchArgsForwardedAnnotationKey, "true")
+}
+
+func declaresLaunchArgsForwarding(annotations map[string]string) (bool, error) {
+	value, declared := annotations[KVCacheLaunchArgsForwardedAnnotationKey]
+	if !declared {
+		return false, nil
+	}
+	if value != "true" {
+		return false, fmt.Errorf("annotation %q must be %q when declared: it is an author statement "+
+			"that the launch forwards appended arguments to the engine", KVCacheLaunchArgsForwardedAnnotationKey, "true")
+	}
+	return true, nil
+}
+
+func launchEngine(argv []string) (inject.Engine, bool) {
+	switch path.Base(argv[0]) {
+	case "vllm":
+		return inject.EngineVLLM, true
+	case "python3":
+		if len(argv) >= 3 && argv[1] == "-m" && argv[2] == "sglang.launch_server" {
+			return inject.EngineSGLang, true
+		}
+		return "", false
+	default:
+		return "", false
+	}
+}
+
+func launchMatchesEngine(resolvedEngine, declaredEngine inject.Engine) bool {
+	if resolvedEngine == inject.EngineVLLM {
+		return declaredEngine == inject.EngineVLLM || declaredEngine == inject.EngineVLLMAscend
+	}
+	return resolvedEngine == declaredEngine
+}
+
+// shellNames are the interpreters for which "-c" means "the next argument is the whole script".
+var shellNames = []string{"sh", "bash", "dash", "ash", "zsh", "ksh"}
+
+// checkShellWrapper refuses a container whose launch cannot be SHOWN to carry an appended argument
+// through to the engine. It fails closed: "cannot tell" is a refusal with a message, not an
+// admission.
+//
+// Three shapes are refused, and the message says which, because the reader's next move differs:
+//
+//	a shell's -c            the appended flag becomes $0 and $1 and never reaches the engine
+//	a command in one token  `env -S "sh -c ..."` - there is nothing on the command line to test
+//	a script as the program  whether it forwards "$@" is inside the image, not on the command line
+//
+// The third covers both spellings of the same launch. `./run.sh` and `sh /app/run.sh` hand the same
+// unreadable file the same appended flag, so refusing one and admitting the other would only teach
+// the spelling that gets through.
+//
+// The launcher enumeration below is not complete. A launcher this parser has never heard of resolves
+// to itself, and the engine check then refuses it unless its author declares that it forwards appended
+// arguments. That turns an omitted launcher into a visible refusal rather than a silent admission.
+//
+// After `sh -c <script>`, everything further is a POSITIONAL PARAMETER: the flag becomes $0 and its
+// value $1, and the shell never passes either to what it runs. Measured, not assumed -
+// `sh -c 'echo "$0 [$*]"' --kv-config VAL` prints `--kv-config [VAL]`. The Pod then starts, the stamp
+// says it was injected, the projected file is mounted, and the connector is simply never enabled: a
+// silent outcome whose visible symptom is a cache that does not hit.
+//
+// The test is on the CONCATENATED argv, and that is the whole correctness of it. Kubernetes runs
+// command followed by args, so these two spellings produce identical processes:
+//
+//	command: ["/bin/sh", "-c"]  args: ["<script>"]
+//	command: ["/bin/sh"]        args: ["-c", "<script>"]
+//
+// A check written against `command` alone catches the first and misses the second. Neither field is
+// the object that decides the behavior; their concatenation is.
+//
+// Both conditions are needed, and the first is what keeps the refusal narrow. `-c` is an ordinary
+// option for ordinary programs - `command: ["myapp", "-c", "config.yaml"]` is common and has no
+// problem here. Requiring argv[0] to be a shell narrows the refusal to the case where the behavior
+// is guaranteed by POSIX rather than inferred from an absence of counter-examples.
+func checkShellWrapper(ctr *core.Container, argv []string, insideOneString, declaresForwarding bool) error {
+	if insideOneString {
+		if declaresForwarding {
+			return nil
+		}
+		return fmt.Errorf("container %q hides its command line inside a single argument, so this "+
+			"webhook cannot tell what would run or whether appending to args would reach it. "+
+			"Launch the engine directly - put its executable in command and its arguments in args - "+
+			"or add the connector flag inside that argument yourself", ctr.Name)
+	}
+	if len(argv) == 0 {
+		return nil
+	}
+	program := path.Base(argv[0])
+	if !slices.Contains(shellNames, program) {
+		// A launcher can be an arbitrary script, and its transparency lives in its body rather than
+		// on the command line. No enumeration of launchers closes that: this is not a launcher the
+		// parser has not heard of, it is one whose behavior admission cannot read at all.
+		return scriptByPath(ctr.Name, program, declaresForwarding)
+	}
+	// A shell stops reading options at its first operand, and so does this scan: in
+	// `sh /app/run.sh -c config` the -c belongs to the SCRIPT rather than to the shell, so it is not
+	// the shape this refusal is about. Where the scan stops is where the shell's command file is,
+	// and that file gets the same test a directly executed script gets.
+	for i := 1; i < len(argv); i++ {
+		arg := argv[i]
+		switch {
+		case arg == "--":
+			// Options ended without -c; whatever follows is the command file.
+			if i+1 < len(argv) {
+				return scriptByPath(ctr.Name, path.Base(argv[i+1]), declaresForwarding)
+			}
+
+			return nil
+		case len(arg) < 2 || (arg[0] != '-' && arg[0] != '+'):
+			// The command file itself. "-" alone is an operand too, not an option bundle.
+			return scriptByPath(ctr.Name, path.Base(arg), declaresForwarding)
+		case isShellCommandFlag(arg):
+			// Fall through to the refusal. Checked BEFORE the operand rules below, because a bundle can
+			// be both - `-co` is command mode whose -o still takes an operand.
+		case slices.Contains(shellOperandLong, arg):
+			// A long option whose operand is the next token, which is a startup FILE rather than the
+			// command file: `bash --rcfile /tmp/x -c '<script>'` still reads -c. Skipping it is what
+			// keeps the scan going; stopping there would admit that launch.
+			i++
+			continue
+		case arg[len(arg)-1] == 'o' || arg[len(arg)-1] == 'O':
+			// -o and bash's -O take an option NAME as their operand, and so do bundles ending in them
+			// (-euo pipefail). That operand is never the command file, so the scan must skip it rather
+			// than stop there.
+			i++
+			continue
+		default:
+			continue
+		}
+		return fmt.Errorf("container %q runs %q through a shell's %q, and anything this webhook "+
+			"appends to args would become the shell's positional parameters ($0, $1) rather than "+
+			"reaching the engine. The Pod would start, record itself as injected, and never enable "+
+			"the connector. Launch the engine directly - put its executable in command and its "+
+			"arguments in args - or add the connector flag to the script yourself",
+			ctr.Name, program, arg)
+	}
+	return nil
+}
+
+// scriptByPath refuses a launch whose program is a shell script, and admits anything else.
+//
+// Whether an appended argument reaches the engine depends on whether the script forwards "$@", and
+// that is the contents of a file inside the image rather than a token on the command line. So this
+// refuses rather than guesses, which is the whole point of failing closed: it turns "cannot tell"
+// from a silent admission into a message. The cost is a script that DOES forward "$@" and is now
+// refused, and the remedy the message names is the same one the shell case gives.
+//
+// The caller reaches it from both spellings, because the uncertainty is identical: `./run.sh` runs
+// the script directly, `sh /app/run.sh` hands the same file to an interpreter, and the appended flag
+// becomes that script's $1 either way.
+//
+// A .sh suffix is a convention rather than a guarantee, so a program that merely ends in .sh would
+// be refused. A suffix-less script passes this helper, then the launch check refuses its unrecognized
+// program unless its author declares forwarding. Reading the file is not available at admission, and
+// the suffix is the only script-specific signal on the command line.
+func scriptByPath(ctrName, program string, declaresForwarding bool) error {
+	if !strings.HasSuffix(program, ".sh") {
+		return nil
+	}
+	if declaresForwarding {
+		return nil
+	}
+
+	return fmt.Errorf("container %q runs the script %q, and whether anything this webhook "+
+		"appends to args reaches the engine depends on whether that script forwards its "+
+		"arguments - which admission cannot read, because it is inside the image. Launch "+
+		"the engine directly - put its executable in command and its arguments in args - "+
+		"or add the connector flag inside the script yourself", ctrName, program)
+}
+
+// launcherGrammar is the only part of a launcher's option syntax that matters here: which of its
+// options take the FOLLOWING token as their operand. Everything else is a flag or the command.
+type launcherGrammar struct {
+	// operandShort holds the option letters whose operand is a separate token, spelled as they
+	// appear after a single dash.
+	operandShort string
+	// operandLong holds the long options that accept a separated operand. The --opt=value form
+	// needs no entry, since the value travels inside the token.
+	operandLong []string
+	// opaqueShort holds the option letters whose operand is a whole COMMAND LINE rather than a
+	// value, spelled as they appear after a single dash. env(1)'s -S is the only one among the
+	// launchers below: it splits its operand into a program and its arguments.
+	//
+	// These are kept apart from operandShort because stepping over such an option leaves nothing
+	// to test - the program is inside the token that was skipped. Meeting one therefore ends
+	// resolution with "cannot tell" rather than with a program, whatever follows it.
+	opaqueShort string
+	// opaqueLong holds the long spellings of the same options. Unlike operandLong this covers the
+	// --opt=value form too, since the command line is inside the token either way.
+	opaqueLong []string
+	// positionalOperands is how many operands of the launcher's OWN sit between its options and the
+	// command, as `timeout DURATION COMMAND` has one. Zero means the first non-option token is the
+	// command, which is the shape of every other entry here.
+	//
+	// A launcher with a positional operand used to be unresolvable for that exact reason. It is
+	// resolvable once the count is known, and `gosu USER` / `chroot DIR` are each a count of one -
+	// but they are NOT listed below: their gap is an open review thread awaiting a human decision on
+	// whether to parse them or to narrow the documented promise, and quietly closing it here would
+	// answer that question by editing rather than by deciding.
+	positionalOperands int
+}
+
+// shellLaunchers exec whatever follows their own arguments, so a shell behind one still ends up as
+// the process that reads -c. Their grammar is options-then-command, which is what makes them
+// resolvable; a launcher taking a positional operand first is not (see shellLaunchArgv).
+//
+// This map, its per-launcher option letters, and shellOperandLong below are three enumerations, and
+// none of them is closed: which programs are launchers, which of their options consume a token, and
+// which of a shell's do. An entry missing here resolves to its launcher, and the engine check refuses
+// that program unless its author declares that it forwards appended arguments.
+//
+// Each entry is copied from that program's own option list rather than generalised, because a wrong
+// entry hides the shell in EITHER direction: assume too few operands and `env -C /tmp sh -c ...`
+// reports /tmp as the program, assume too many and `env -i sh -c ...` reports -c.
+var shellLaunchers = map[string]launcherGrammar{
+	// GNU coreutils env(1): -u NAME, -C DIR, -S STRING, -a ARG, and the long forms of all four, which
+	// getopt_long also accepts separated. Its three --*-signal options take an OPTIONAL operand
+	// (`[=SIG]`), so their separated form consumes nothing and they are correctly absent here.
+	//
+	// -S is the odd one out and sits in the opaque fields: its operand is a command line rather
+	// than a value, so it is not something to step over.
+	"env": {
+		operandShort: "uCa",
+		operandLong:  []string{"--unset", "--chdir", "--argv0"},
+		opaqueShort:  "S",
+		opaqueLong:   []string{"--split-string"},
+	},
+	// tini(1) parses with plain getopt, so only -p SIGNAL and -e EXIT_CODE reach past themselves.
+	"tini": {operandShort: "pe"},
+	// dumb-init(1): -r/--rewrite takes a signal remapping.
+	"dumb-init": {operandShort: "r", operandLong: []string{"--rewrite"}},
+	// Multi-call binaries. Their first operand names the applet to run, so `busybox sh -c ...` runs a
+	// shell this check has to see. That operand looks positional like gosu's user or chroot's
+	// directory, but it IS the program rather than an argument to one, which is exactly what makes
+	// these resolvable and those two not. Neither consumes a following token for any option.
+	"busybox": {},
+	"toybox":  {},
+	// timeout(1) runs `timeout [OPTION] DURATION COMMAND [ARG]...`, so one operand of its own sits
+	// between its options and the command. Without the count, `timeout 30 sh -c 'vllm ...'` resolved
+	// to `timeout` - not a shell - and was ADMITTED while the appended flag became the shell's $0.
+	// It is a common wrapper in container command lines, and unlike gosu/chroot it was not on the
+	// documented list of shapes this parser knowingly lets through.
+	"timeout": {
+		operandShort:       "sk",
+		operandLong:        []string{"--signal", "--kill-after"},
+		positionalOperands: 1,
+	},
+}
+
+// shellOperandLong lists the shell long options whose operand is the NEXT token. Among the shells
+// named above, bash's --rcfile and its synonym --init-file are the whole set; every other long
+// option those shells take is a flag. bash parses these itself rather than with getopt_long and does
+// not accept an --opt=value form, so there is no inline spelling to strip - and were one written
+// anyway, it falls through as an unrecognized flag and the scan still reaches the -c behind it.
+var shellOperandLong = []string{"--rcfile", "--init-file"}
+
+// shellLaunchArgv resolves transparent launcher prefixes, so the check below sees the program that
+// actually runs rather than the first word on the command line.
+//
+// This exists because testing argv[0] has now been walked around three times: -c moved from command
+// into args, a -c that belonged to the script rather than the shell, and `env sh -c`. The third one
+// is not a fourth special case to add - it says the first word is simply not always the program. So
+// the prefix is RESOLVED rather than enumerated against.
+//
+// SCOPE, stated because the gap is real. One shape is not resolved: a launcher whose own first
+// positional operand is an argument rather than the program, as in `gosu USER sh -c` or
+// `chroot DIR sh -c`. Nothing here distinguishes that operand from a command. It remains as argv[0]
+// and is refused by the engine check unless its author declares forwarding. A multi-call binary's
+// applet name is not this case; see busybox below.
+//
+// insideOneString reports that the launcher was handed a command line inside a single token this
+// parser cannot look into, which is `env -S "sh -c ..."` and its spellings. The resolved argv is nil
+// in that case, which is indistinguishable from "nothing to run" without this second return, and
+// those two deserve different answers: nothing to run is refused for declaring no program, a command
+// hidden in a string is refused for being unreadable - and only the second one an author may take
+// responsibility for with the forwarding declaration. Which token is opaque comes from the
+// launcher's own grammar rather than from where the argv happened to end - `env -S "sh -c ..."
+// trailing` resolved to `trailing` and was admitted while the hidden shell ran.
+func shellLaunchArgv(argv []string) (resolved []string, insideOneString bool) {
+	for len(argv) > 0 {
+		grammar, ok := shellLaunchers[path.Base(argv[0])]
+		if !ok {
+			return argv, false
+		}
+
+		var opaque bool
+		argv, opaque = stripLauncherOperands(argv[1:], grammar)
+		if opaque {
+			return nil, true
+		}
+	}
+
+	return argv, false
+}
+
+// stripLauncherOperands drops one launcher's own arguments - NAME=value assignments, its flags, and
+// the operands its options consume - and returns the argv starting at the command it will exec.
+//
+// opaque reports that the launcher was told to run a command line carried INSIDE one of its tokens,
+// which is `env -S "sh -c ..."` and nothing else among the launchers here. There is then no program
+// on the argv to test, so it is returned rather than folded into an empty argv: the caller refuses
+// both, under different messages and with only this one open to an author's forwarding declaration.
+//
+// AN EMPTY RESULT IS NOT "CANNOT TELL", and folding the two together here would lose the difference
+// the caller refuses on. Empty says the container declares no program; opaque says the program is
+// inside a token this parser cannot read. The reader's next move differs, so the messages differ.
+//
+// Empty is also not the commonest shape, which is worth stating because the two read alike. The
+// runner image families this operator synthesizes ship `tini --` as their entrypoint - 56 of 60 -
+// and they carry a real command in ARGS. Kubernetes concatenates command and args before this runs,
+// so those resolve to that command rather than to nothing, and stay the appendable case they are.
+// An argv that resolves empty is a container whose whole declaration is the launcher.
+//
+// An operand-taking option left without its operand - `env -u` as the last token - is empty for the
+// same reason: env will fail on its own terms, and there is no command line there for a shell to
+// hide in. It is refused as the empty case rather than as the hidden one, which is what this second
+// return value is for. Folding it in with -S used to refuse it under a message describing a command
+// line it does not have.
+//
+// AN EMPTY OPAQUE OPERAND IS NOT OPAQUE EITHER, and it is the option's VALUE rather than the option
+// that decides here - the one place in this parser where that is so. An empty string splits into no
+// words at all, so the launcher runs whatever follows it, and resolution has to continue instead of
+// stopping at a command line that is not there. Measured on GNU coreutils 9.11 and BSD env alike:
+// `env -S "" echo hi` prints hi, `env --split-string= echo hi` prints hi, and `env -S ""` with
+// nothing after it launches nothing at all - it prints the environment and exits 0.
+//
+// Skipping it rather than reporting opaque decides three shapes, and only the first is the one that
+// was reported: `env -S ""` resolves to nothing and is refused for declaring no program, which the
+// forwarding declaration no longer lets through; `env -S "" vllm serve` resolves to vllm and is
+// admitted, where reporting opaque was a false refusal of a launch that runs; and `env -S "" sh -c`
+// reaches the shell refusal, which names what actually eats the appended flag.
+func stripLauncherOperands(argv []string, grammar launcherGrammar) (resolved []string, opaque bool) {
+	// Operands of the launcher's own that sit before the command, consumed as they are met. A
+	// launcher declaring none behaves exactly as before: the first non-option token is the command.
+	positional := grammar.positionalOperands
+	for len(argv) > 0 {
+		arg := argv[0]
+		takesNext := false
+		switch {
+		case arg == "--":
+			return argv[1:], false
+		case strings.HasPrefix(arg, "--"):
+			name, value, inline := strings.Cut(arg, "=")
+			if slices.Contains(grammar.opaqueLong, name) {
+				if inline && value == "" {
+					argv = argv[1:]
+
+					continue
+				}
+				if !inline && len(argv) > 1 && argv[1] == "" {
+					argv = argv[2:]
+
+					continue
+				}
+				return nil, inline || len(argv) > 1
+			}
+			takesNext = !inline && slices.Contains(grammar.operandLong, name)
+		case arg != "" && arg[0] == '-':
+			// A lone "-" carries no letters, so it reaches past nothing; env(1) reads it as -i.
+			separated, isOpaque := bundleOperand(arg[1:], grammar)
+			if isOpaque {
+				if separated && len(argv) > 1 && argv[1] == "" {
+					argv = argv[2:]
+
+					continue
+				}
+				// An opaque option is only opaque once it HAS its operand. Attached - `-Ssh -c vllm`
+				// or `--split-string=...` - carries the command line inside this very token;
+				// separated carries it in the next one, if there is one. With the operand missing
+				// there is no command line at all, so this is the empty case rather than the hidden
+				// one, exactly as for an operand-taking option that ran out.
+				return nil, !separated || len(argv) > 1
+			}
+			takesNext = separated
+		case strings.Contains(arg, "="):
+			// A NAME=value assignment, which env(1) accepts before the command.
+		case positional > 0:
+			// An operand belonging to the launcher, not the command: timeout's DURATION. Consumed
+			// before the default arm so the token after it is still tested as a program.
+			positional--
+		default:
+			return argv, false
+		}
+		if takesNext {
+			if len(argv) < 2 {
+				// The operand is missing, so there is no command here and no token it could be
+				// inside. Empty and admitted, as above.
+				return nil, false
+			}
+			argv = argv[2:]
+
+			continue
+		}
+		argv = argv[1:]
+	}
+
+	return argv, false
+}
+
+// bundleOperand classifies a short-option bundle: whether it reaches past itself for an operand, and
+// whether that operand is a command line this parser cannot look inside.
+//
+// The FIRST operand-taking letter decides, because it consumes whatever remains of the bundle when
+// there is any - `-uNAME` unsets NAME - so only a bundle ENDING in such a letter takes the token that
+// follows. That is the same rule the shell scan applies to -o, and getting it wrong either way hides
+// a shell.
+//
+// takesNext is reported for an opaque letter too, and the caller needs it rather than just the flag:
+// `-Ssh -c vllm` carries the command line inside its own token, `-S 'sh -c vllm'` in the next one,
+// and `-S` with nothing after it carries none at all - which is a different answer from both.
+func bundleOperand(bundle string, grammar launcherGrammar) (takesNext, opaque bool) {
+	for i, letter := range bundle {
+		last := i == len(bundle)-1
+		switch {
+		case strings.ContainsRune(grammar.opaqueShort, letter):
+			return last, true
+		case strings.ContainsRune(grammar.operandShort, letter):
+			return last, false
+		}
+	}
+
+	return false, false
+}
+
+// isShellCommandFlag reports whether a shell option bundle contains "c", covering -c as well as the
+// combined forms a wrapper may use, such as -lc or -euc. A long option is never one of these.
+func isShellCommandFlag(arg string) bool {
+	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || len(arg) < 2 {
+		return false
+	}
+	return strings.ContainsRune(arg[1:], 'c')
+}
+
+// hasFlag reports whether a flag appears in an argument list, including in its --flag=value form.
+// containerFlag reports whether the container passes flag in any spelling the engine's own parser
+// reads as it, and describes the entry that does. Command is scanned as well as args, because a user
+// may put the flag in either.
+//
+// vLLM-Ascend is a plugin that vLLM's own parser launches, so it reads vLLM's spellings.
+func containerFlag(ctr *core.Container, engine inject.Engine, flag string) (string, bool) {
+	parser := string(engine)
+	switch engine {
+	case inject.EngineVLLM, inject.EngineVLLMAscend:
+		parser = workercore.ModelDeploymentEngineVLLM
+	case inject.EngineSGLang:
+		parser = workercore.ModelDeploymentEngineSGLang
+	}
+
+	for _, arg := range slices.Concat(ctr.Args, ctr.Command) {
+		if _, found := workerctrl.ModelDeploymentResolveArg(parser, arg, []string{flag}); !found {
+			continue
+		}
+		if name := workerctrl.ModelDeploymentArgName(arg); name != flag {
+			return fmt.Sprintf("%s, which engine %q reads as %s", name, engine, flag), true
+		}
+		return flag, true
+	}
+
+	return "", false
+}
+
+// containerNames lists container names for a refusal a reader can act on.
+func containerNames(ctrs []core.Container) []string {
+	names := make([]string, 0, len(ctrs))
+	for i := range ctrs {
+		names = append(names, ctrs[i].Name)
+	}
+	return names
+}

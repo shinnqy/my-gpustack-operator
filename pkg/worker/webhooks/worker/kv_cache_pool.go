@@ -1,0 +1,210 @@
+package worker
+
+import (
+	"context"
+	"fmt"
+	"slices"
+
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrladmission "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
+	"gpustack.ai/gpustack/pkg/webhook"
+	"gpustack.ai/gpustack/pkg/worker/kvcache/mooncake"
+)
+
+// KVCachePoolWebhook validates a v1alpha1.KVCachePool.
+//
+// It is validating only, for the reason KVCacheBackendWebhook is: every default and every enum this
+// API has is a CRD schema rule, and structural schema validation runs before the validating chain,
+// so a value outside one never reaches this handler.
+//
+// What is left is what a schema cannot express: a count whose refusal needs a reason, a read of the
+// backend this pool names, and immutability.
+//
+// nolint: lll
+// +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="kvcachepools",scope="Cluster"
+// +k8s:webhook-gen:validating:operations=["CREATE","UPDATE"],failurePolicy="Fail",sideEffects="None",matchPolicy="Equivalent",timeoutSeconds=10
+type KVCachePoolWebhook struct {
+	Client    ctrlcli.Client
+	APIReader ctrlcli.Reader
+}
+
+func (r *KVCachePoolWebhook) SetupWebhook(_ context.Context, opts webhook.SetupOptions) (runtime.Object, error) {
+	r.Client = opts.Manager.GetClient()
+	r.APIReader = opts.Manager.GetAPIReader()
+
+	return &workercore.KVCachePool{}, nil
+}
+
+var (
+	_ ctrladmission.Validator[runtime.Object] = (*KVCachePoolWebhook)(nil)
+	_ webhook.ReceiveDeletionUpdate           = (*KVCachePoolWebhook)(nil)
+)
+
+// ReceiveDeletionUpdate keeps this webhook validating updates to a pool that is being deleted. Its
+// finalizer holds while any Binding remains, so spec.backends stays frozen for the whole span in
+// which the pool still names the master its tenant quotas live on.
+//
+// Every rule ValidateUpdate reaches is answered from the two objects it is handed, which is what
+// makes opting out of the guard safe: nothing it reads can have gone away. The backend is read from
+// ValidateCreate alone, and ValidateUpdate's own comment gives that reason.
+func (r *KVCachePoolWebhook) ReceiveDeletionUpdate() {}
+
+func (r *KVCachePoolWebhook) ValidateCreate(
+	ctx context.Context, obj runtime.Object,
+) (ctrladmission.Warnings, error) {
+	kvcp := obj.(*workercore.KVCachePool)
+
+	errs := validateKVCachePoolSpec(kvcp)
+	// The backend is read only when the object's own shape already names exactly one. Reading it
+	// otherwise would answer "not found" for the empty name and bury the count rule that is the
+	// actual fault.
+	var warnings ctrladmission.Warnings
+	if len(errs) == 0 {
+		warnings, errs = r.validateKVCachePoolBackend(ctx, kvcp)
+	}
+	if len(errs) > 0 {
+		return nil, kerrors.NewInvalid(workercore.Kind("KVCachePool"), kvcp.Name, errs)
+	}
+
+	return warnings, nil
+}
+
+func (r *KVCachePoolWebhook) ValidateUpdate(
+	_ context.Context, oldObj, newObj runtime.Object,
+) (ctrladmission.Warnings, error) {
+	oldKvcp, newKvcp := oldObj.(*workercore.KVCachePool), newObj.(*workercore.KVCachePool)
+
+	// The backend is NOT re-read here, and that is deliberate. spec.backends is immutable, so an
+	// update cannot have changed which backend is named or whether this pool is entitled to it — but
+	// the backend itself may since have been deleted or edited, and a rule that re-asked would make
+	// an admitted pool stop being updatable because of a change to a different object. The
+	// reconciler removing this pool's finalizer is such an update, so refusing it would strand the
+	// pool undeletable for as long as its backend stayed gone.
+	//
+	// F5's precondition is not weakened by that: the reconciler treats the master's own 409 as
+	// authoritative and surfaces a Condition, which is level-based and therefore the enforcement
+	// that actually holds. Admission is the early refusal, not the guarantee.
+	errs := validateKVCachePoolSpec(newKvcp)
+	errs = append(errs, validateKVCachePoolImmutable(oldKvcp, newKvcp)...)
+	if len(errs) > 0 {
+		return nil, kerrors.NewInvalid(workercore.Kind("KVCachePool"), newKvcp.Name, errs)
+	}
+
+	return nil, nil
+}
+
+func (r *KVCachePoolWebhook) ValidateDelete(
+	_ context.Context, _ runtime.Object,
+) (ctrladmission.Warnings, error) {
+	// Deletion is refused by the reconciler's finalizer while status.usedBy is non-empty, not here:
+	// this handler sees only the object, while the decision needs the Bindings that hold it.
+	return nil, nil
+}
+
+// validateKVCachePoolSpec holds every rule answerable from the object alone.
+func validateKVCachePoolSpec(kvcp *workercore.KVCachePool) field.ErrorList {
+	specPath := field.NewPath("spec")
+
+	var errs field.ErrorList
+
+	// A count the schema could have refused, refused here so the message can carry the reason. The
+	// shape is a list because a pool over several backends is the obvious next question, and the
+	// answer to it is a quota model rather than a wider bound.
+	if len(kvcp.Spec.Backends) != 1 {
+		errs = append(errs, field.Invalid(specPath.Child("backends"), kvcp.Spec.Backends,
+			fmt.Sprintf("exactly 1 backend is supported, and %d were given: quota is enforced by one "+
+				"master's per-tenant ledger, and no master can account for bytes held in another",
+				len(kvcp.Spec.Backends))))
+	}
+	for i, name := range kvcp.Spec.Backends {
+		if name == "" {
+			errs = append(errs, field.Required(specPath.Child("backends").Index(i),
+				"a backend is named by the name of a KVCacheBackend"))
+		}
+	}
+
+	// A resource.Quantity is a STRING in the schema, so no numeric bound in a marker can reach it.
+	// The rules are the policy file's own, from the one validator that renders it: a ceiling this
+	// pool declares bounds every ceiling written under it, so the two cannot hold separate opinions
+	// about which numbers are usable.
+	errs = append(errs, mooncake.ValidateQuotaPolicyQuota(
+		kvcp.Spec.Quota.Total, specPath.Child("quota", "total"),
+	)...)
+
+	return errs
+}
+
+// validateKVCachePoolBackend refuses a pool whose backend cannot serve it, and warns on one that
+// serves it without a tenant ledger.
+//
+// A backend that is not there yet is a reference to fix, and stays a refusal. A managed backend
+// declared without multi-tenancy is a single-tenant topology rather than a fault: every request
+// falls into the default tenant and no per-tenant quota can be written, which is what the warning
+// says — and the Binding webhook is what keeps such a master to exactly one reuse domain, so the
+// collision this operator once refused the pool over has no second domain to happen against.
+func (r *KVCachePoolWebhook) validateKVCachePoolBackend(
+	ctx context.Context, kvcp *workercore.KVCachePool,
+) (ctrladmission.Warnings, field.ErrorList) {
+	backendPath := field.NewPath("spec", "backends").Index(0)
+
+	kvcb := &workercore.KVCacheBackend{}
+	key := ctrlcli.ObjectKey{Name: kvcp.Spec.Backends[0]}
+	if err := r.Client.Get(ctx, key, kvcb); err != nil {
+		if !kerrors.IsNotFound(err) {
+			return nil, field.ErrorList{field.InternalError(backendPath,
+				fmt.Errorf("get kv cache backend: %w", err))}
+		}
+		// The cache may simply not hold it yet — a pool created in the same breath as its backend is
+		// the ordinary case — so a miss is re-asked of the API server before it becomes a refusal.
+		//
+		// Only a NotFound from that read is the refusal. A timeout, an RBAC denial or a 5xx says
+		// nothing about whether the backend exists, and this webhook runs with failurePolicy Fail:
+		// reporting one of them as "backend not found" makes a cluster outage read as a typo in the
+		// object being submitted, which is the one place an author would not look.
+		if err = r.APIReader.Get(ctx, key, kvcb, ctrlclix.WithoutQuorum); err != nil {
+			if !kerrors.IsNotFound(err) {
+				return nil, field.ErrorList{field.InternalError(backendPath,
+					fmt.Errorf("get kv cache backend: %w", err))}
+			}
+			return nil, field.ErrorList{field.NotFound(backendPath, key.Name)}
+		}
+	}
+
+	// Only a managed backend's ledger is known at admission: this operator renders the flag onto
+	// the leader's own command line. An external one runs somebody else's master, and how that
+	// process was started is answered where it can be — by the reconciler reading the master's own
+	// 409, and by the Pod webhook refusing injection until the pool reports it.
+	managed := kvcb.Spec.Connection.Managed
+	if managed == nil || managed.Leader.MultiTenancyEnabled() {
+		return nil, nil
+	}
+
+	return ctrladmission.Warnings{fmt.Sprintf(
+		"backend %q runs without multi-tenancy: it holds no tenant ledger, so no per-tenant quota "+
+			"is in force — every write falls into the default tenant, bounded only by the store's "+
+			"global capacity — and the master serves exactly one reuse domain",
+		key.Name,
+	)}, nil
+}
+
+// validateKVCachePoolImmutable freezes the reference a pool's whole identity rests on.
+//
+// Re-pointing a pool would leave every tenant quota it wrote on the old master's ledger, with
+// nothing left here that names that master and could delete them — and each domain's warm cache
+// would be stranded with them, while the pool reported itself Ready against a backend holding
+// nothing.
+func validateKVCachePoolImmutable(oldKvcp, newKvcp *workercore.KVCachePool) field.ErrorList {
+	if slices.Equal(oldKvcp.Spec.Backends, newKvcp.Spec.Backends) {
+		return nil
+	}
+
+	return field.ErrorList{field.Forbidden(field.NewPath("spec", "backends"),
+		"backends is immutable: moving a pool to another backend strands every tenant quota it "+
+			"wrote on the old master's ledger, with nothing left to delete them with")}
+}
