@@ -33,7 +33,7 @@ def generated_files(root):
 def generate(work):
     # go-to-protobuf 用物理目录末尾的模块路径确定输出位置。
     work.mkdir(parents=True)
-    for name in ("api", "cmd", "gen", "hack", "pkg", "staging"):
+    for name in ("api", "binding", "cmd", "gen", "hack", "pkg", "staging"):
         shutil.copytree(ROOT / name, work / name)
     for name in ("go.mod", "go.sum"):
         shutil.copyfile(ROOT / name, work / name)

@@ -1,10 +1,10 @@
-// Package quantityx provides helpers around k8s.io/apimachinery/pkg/api/resource.Quantity
-// that the upstream API does not expose.
+// quantityx 为 Kubernetes resource.Quantity 提供上游类型未直接暴露的计算和格式化操作。
 package quantityx
 
 import (
 	"math"
 	"math/big"
+	"strconv"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -18,9 +18,7 @@ const (
 	Ei = 1 << 60
 )
 
-// Multiply multiplies quantity by multiplier and returns the result as a new
-// quantity; the input is not modified. If multiplier is 1, quantity is returned
-// unchanged.
+// Multiply 返回与倍数相乘后的新数量，保留输入值。倍数为 1 时直接返回原值。
 func Multiply(quantity resource.Quantity, multiplier int64) resource.Quantity {
 	if multiplier == 1 {
 		return quantity
@@ -30,8 +28,7 @@ func Multiply(quantity resource.Quantity, multiplier int64) resource.Quantity {
 	return q
 }
 
-// StringMultiply multiplies q by multiplier and returns the result.
-// The input q is a string, which will be parsed into a resource.Quantity.
+// StringMultiply 先将字符串解析为 resource.Quantity，再按给定倍数计算。
 func StringMultiply(quantityStr string, multiplier int64) (resource.Quantity, error) {
 	q, err := resource.ParseQuantity(quantityStr)
 	if err != nil {
@@ -40,15 +37,7 @@ func StringMultiply(quantityStr string, multiplier int64) (resource.Quantity, er
 	return Multiply(q, multiplier), nil
 }
 
-// PercentMultiply scales quantity by percent/100, flooring the result to an integer
-// in the quantity's base unit, with a floor of 1 so a positive quantity never scales
-// down to zero. percent is clamped to [0,100]; percent >= 100 returns quantity unchanged
-// and a zero quantity stays zero. The input is not modified. Like Divide, it floors the
-// base-unit value, so it is intended for integer/count quantities (e.g. CPU cores, Gi of
-// RAM).
-//
-// A percent of 0 does not yield 0: a positive quantity still floors to 1, so a caller that
-// treats 0 as "no scaling" (the full quantity) must map it to 100 (or any value >= 100).
+// PercentMultiply 按 percent/100 缩放数量，向下取整到基本单位，确保正数的结果至少为 1。
 func PercentMultiply(quantity resource.Quantity, percent int64) resource.Quantity {
 	if percent >= 100 {
 		return quantity
@@ -57,9 +46,7 @@ func PercentMultiply(quantity resource.Quantity, percent int64) resource.Quantit
 		percent = 0
 	}
 	v := quantity.Value()
-	// v*percent can overflow int64 for very large quantities, so scale through big.Int
-	// (truncating toward zero, like integer division); the floored result is always <= |v|,
-	// so it always fits back into int64.
+	// v 与 percent 相乘可能超出 int64，先用 big.Int 计算再向零截断。最终结果的绝对值不大于原值，可放回 int64。
 	scaled := new(big.Int).Mul(big.NewInt(v), big.NewInt(percent))
 	scaled.Quo(scaled, big.NewInt(100))
 	s := scaled.Int64()
@@ -69,8 +56,7 @@ func PercentMultiply(quantity resource.Quantity, percent int64) resource.Quantit
 	return *resource.NewQuantity(s, quantity.Format)
 }
 
-// StringPercentMultiply scales q by percent/100 and returns the result.
-// The input q is a string, which will be parsed into a resource.Quantity.
+// StringPercentMultiply 将字符串解析为 resource.Quantity，再按百分比缩放。
 func StringPercentMultiply(quantityStr string, percent int64) (resource.Quantity, error) {
 	q, err := resource.ParseQuantity(quantityStr)
 	if err != nil {
@@ -79,29 +65,76 @@ func StringPercentMultiply(quantityStr string, percent int64) (resource.Quantity
 	return PercentMultiply(q, percent), nil
 }
 
-// OverflowsInt64 reports whether Quantity.Value() would misreport this quantity.
-//
-// It has to be asked, because Value() does not fail — it answers wrongly, and differently by how the
-// number was written. Measured, at both ends:
-//
-//	9223372036854775808   Value() = -9223372036854775808
-//	1e30                  Value() = 0
-//	-1e30                 Value() = 0
-//	-9223372036854775809  Value() = -1
-//
-// The first two are then read as "not positive", so a caller converting the quantity into a byte
-// count sees an impossible amount of memory as no memory at all, with nothing raised anywhere.
-//
-// BOTH bounds are checked, because the name and this sentence promise that. Every caller today
-// rejects a negative sign separately, so the lower bound catches nothing yet — but a function that
-// answered only for one end would be wrong for the contract it states rather than merely narrow, and
-// the sign check is the caller's rule, not this one's.
-//
-// A binary-suffixed form such as `8Ei` is already gone by the time this runs: ParseQuantity saturates
-// it at the maximum, so the field holds that maximum and Value() reports it faithfully. There is
-// nothing left here to detect and nothing to refuse.
+// OverflowsInt64 检查 Quantity.Value() 是否会溢出或给出错误结果。不同格式的越界数值可能回绕或按指数截断。
+// 已经被解析器钳制到边界的数值只能检查解析后的值。
 func OverflowsInt64(quantity resource.Quantity) bool {
 	largest := resource.NewQuantity(math.MaxInt64, resource.DecimalSI)
 	smallest := resource.NewQuantity(math.MinInt64, resource.DecimalSI)
 	return quantity.Cmp(*largest) > 0 || quantity.Cmp(*smallest) < 0
+}
+
+type _Unit struct {
+	scale  int64
+	suffix string
+}
+
+var binaryUnits = [...]_Unit{
+	{Ei, "Ei"},
+	{Pi, "Pi"},
+	{Ti, "Ti"},
+	{Gi, "Gi"},
+	{Mi, "Mi"},
+	{Ki, "Ki"},
+}
+
+var decimalUnits = [...]_Unit{
+	{1e18, "E"},
+	{1e15, "P"},
+	{1e12, "T"},
+	{1e9, "G"},
+	{1e6, "M"},
+	{1e3, "k"},
+}
+
+// Format 按数量自身的格式选择二进制或十进制 SI 单位。
+func Format(q resource.Quantity) string {
+	if q.Format == resource.BinarySI {
+		return FormatBinarySI(q)
+	}
+	return FormatDecimalSI(q)
+}
+
+// FormatBinarySI 选择合适的 Ki、Mi、Gi 等单位，对无法整除的值取近似便于展示。
+// 需要无损往返时使用 quantity 自带的 String 方法。
+func FormatBinarySI(q resource.Quantity) string {
+	return formatScaled(q, binaryUnits[:])
+}
+
+// FormatDecimalSI 选用合适的 k、M、G 等十进制单位，并将显示值四舍五入到整数。
+func FormatDecimalSI(q resource.Quantity) string {
+	return formatScaled(q, decimalUnits[:])
+}
+
+func formatScaled(
+	q resource.Quantity,
+	units []_Unit,
+) string {
+	if q.IsZero() {
+		return "0"
+	}
+
+	v := q.Value()
+	sign := ""
+	if v < 0 {
+		sign = "-"
+		v = -v
+	}
+
+	for _, u := range units {
+		if v >= u.scale {
+			n := (v + u.scale/2) / u.scale
+			return sign + strconv.FormatInt(n, 10) + u.suffix
+		}
+	}
+	return sign + strconv.FormatInt(v, 10)
 }

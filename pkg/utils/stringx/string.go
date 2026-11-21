@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// Join concatenates the elements of strs to create a single string.
+// Join 将字符串片段连接成一个字符串。
 func Join[T ~string](sep string, strs ...T) string {
 	switch len(strs) {
 	case 0:
@@ -32,7 +32,7 @@ func Join[T ~string](sep string, strs ...T) string {
 	return b.String()
 }
 
-// Strings converts a slice of fmt.Stringer to a slice of string.
+// Strings 将实现 fmt.Stringer 的切片转换为字符串切片。
 func Strings[T fmt.Stringer](v []T) []string {
 	if len(v) == 0 {
 		return nil
@@ -44,4 +44,14 @@ func Strings[T fmt.Stringer](v []T) []string {
 	}
 
 	return s
+}
+
+// ContainSubstrings 判断字符串是否包含候选子串中的任意一个。
+func ContainSubstrings(s string, substrings ...string) bool {
+	for i := range substrings {
+		if strings.Contains(s, substrings[i]) {
+			return true
+		}
+	}
+	return false
 }

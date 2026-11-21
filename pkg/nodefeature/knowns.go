@@ -30,88 +30,45 @@ const (
 )
 
 const (
-	// GeneralManufacturerGeneric is the fallback general(CPU) manufacturer used
-	// when the NFD cpu-model labels are absent or unrecognizable.
+	// GeneralManufacturerGeneric 是 NFD 缺少或无法识别 CPU 型号标签时的通用计算资源厂商。
 	GeneralManufacturerGeneric = "generic"
 )
 
 const (
-	// SharedResourceNameSuffix is the coarse-grained shared counting key,
-	// advertised by the device-plugin (its value is the sharing ownership accelerator
-	// count) and used for Kueue credits accounting.
+	// SharedResourceNameSuffix 是插件公布的共享份额资源键后缀。每卡可提供多个所有者名额，Kueue 据此折算额度。
 	SharedResourceNameSuffix = ".shared"
-	// SlicedResourceNameSuffix is the coarse sliced injection-token key, advertised
-	// by the device-plugin as a loose per-accelerator token pool sized by the device
-	// group's max slice count (so node allocatable is accelerators*maxSlices, not the
-	// accelerator count); it only triggers the allocator's Allocate() injection hook.
-	// The binding credits accounting lives on the fine-grained ".sliced.units" key.
+	// SlicedResourceNameSuffix 是触发逻辑切片注入的粗粒度令牌后缀。节点令牌数由卡数和各卡切片上限决定，
+	// 显存预算另行计量。
 	SlicedResourceNameSuffix = ".sliced"
-	// SlicedUnitsResourceNameSuffix is the fine-grained sliced counting key,
-	// reported per node via Patch Node and used for Kueue credits accounting.
+	// SlicedUnitsResourceNameSuffix 是按节点发布的软切 units 资源后缀，供 Kueue 统一计量。
 	SlicedUnitsResourceNameSuffix = ".sliced.units"
-	// SlicedCoresPercentageResourceNameSuffix is the per-accelerator SM (compute) budget
-	// key for sliced allocations, reported per node by the NodeCapacityReconciler and
-	// sized from the device group's max slice count and compute-overcommit flag:
-	//
-	//   - With compute overcommit, each slice is granted a full 100%, so the
-	//     per-accelerator budget scales with the slice count.
-	//   - Without it, the per-accelerator compute stays a single 100%.
-	//
-	// It is a gate-2 node-level counting resource consumed by the default
-	// scheduler/kubelet and the device-plugin (CUDA_DEVICE_SM_LIMIT); it is never folded
-	// into Kueue credits.
+	// SlicedCoresPercentageResourceNameSuffix 是软切算力百分比预算的后缀。
+	// NodeCapacityReconciler 按设备组实际支持的超配能力发布容量。
 	SlicedCoresPercentageResourceNameSuffix = ".sliced.cores-percentage"
-	// SlicedMemoryPercentageResourceNameSuffix is the per-accelerator VRAM-percentage
-	// budget key for sliced allocations, reported per node as count*100. Gate-2 node-level
-	// only (the webhook folds it into .sliced.units); never folded into Kueue credits.
+	// SlicedMemoryPercentageResourceNameSuffix 是软切显存百分比预算后缀。每卡贡献 100，
+	// webhook 将请求折算为调度使用的 units。
 	SlicedMemoryPercentageResourceNameSuffix = ".sliced.memory-percentage"
-	// SlicedMemoryMibResourceNameSuffix is the per-accelerator absolute VRAM budget key
-	// (MiB) for sliced allocations, reported per node as count*cardVRAMMib. Gate-2
-	// node-level only (drives CUDA_DEVICE_MEMORY_LIMIT_IN_BYTES; the webhook folds it
-	// into .sliced.units via floor(mib/cardVRAM*M)); never folded into Kueue credits.
+	// SlicedMemoryMibResourceNameSuffix 是以 MiB 计的软切显存预算后缀。节点容量按卡数乘单卡显存计算。
 	SlicedMemoryMibResourceNameSuffix = ".sliced.memory-mib"
-	// PartitionedResourceNameSuffix is the coarse physical-partition token key,
-	// advertised by the device-plugin for the accelerators put into a hardware partitioning
-	// mode. It only triggers the allocator's Allocate() hook, which places the
-	// instance itself; the counting lives on ".partitioned.units" and on the
-	// per-profile keys. It is advertised only by a manufacturer that has a partition
-	// kind.
+	// PartitionedResourceNameSuffix 是插件对硬切模式卡发布的注入令牌后缀，
+	// 实际分区的规格与额度在更细的资源键上登记。
 	PartitionedResourceNameSuffix = ".partitioned"
-	// PartitionedUnitsResourceNameSuffix is the fine-grained physical-partition counting
-	// key, reported per node via Patch Node and used for Kueue credits accounting. It
-	// values a partitioned accelerator at whole-accelerator units, mirroring
-	// ".sliced.units" for a logically sliceable accelerator.
+	// PartitionedUnitsResourceNameSuffix 是分区的细粒度计量后缀，将不同规格的显存份额折算为 Kueue 额度。
 	PartitionedUnitsResourceNameSuffix = ".partitioned.units"
 
-	// VisibilityResourceNamePrefix and VisibilityResourceNameSuffix compose the device-only
-	// "visibility" resource the SSH sidecar requests to co-allocate the same physical
-	// accelerator(s) its workload container (main) was granted, e.g.
-	// "device.gpustack.ai/nvidia.visibility". It is deliberately outside the accelerator
-	// resource families ("<vendor>/<device>[.shared|.sliced…]") so the Pod webhook's
-	// one-mode check ignores it, and the device-plugin serves it as a virtual resource that
-	// injects only device visibility (no slice, no ledger unit).
+	// VisibilityResourceNamePrefix 和 VisibilityResourceNameSuffix 构成 SSH sidecar 使用的可见性资源名，
+	// 使它能看到工作容器已获分配的同一批卡。
 	VisibilityResourceNamePrefix = "device.gpustack.ai/"
 	VisibilityResourceNameSuffix = ".visibility"
 )
 
 const (
-	// ResourceMaxUnits is the global denominator D = 2^9 * 5^5 = 1600000 and the
-	// single per-accelerator unit basis shared by every allocation mode: one whole
-	// accelerator is worth D normalized units, Shared yields D/10 per ownership, and an
-	// accelerator sliced into N partitions yields D/N units per slice. D keeps the 2^9
-	// factor so every power-of-two partition size up to SlicedResourceMaxSize=512 divides
-	// it exactly, and the 5^5 factor (vs the former 12800 = 2^9 * 5^2) makes the
-	// memory-1% step D/100 = 16000 an integer for the per-accelerator VRAM-percentage
-	// slice keys. It is also the integer credit base B = CreditsPerAccelerator (one whole
-	// accelerator = D credits), so the .sliced.units→credits Kueue factor is B/D = 1 and
-	// every per-mode credit value stays integer-valued. It also seeds the device-plugin
-	// per-accelerator unit grid and the Devices CR AcceleratorAllocation ruler.
+	// ResourceMaxUnits 是所有分配模式共用的整卡计量基准 D = 2^9 × 5^5 = 1,600,000。均分 N 份时每份为 D/N units，
+	// 插件和 Devices 分配账本使用同一标尺。
 	ResourceMaxUnits = 1_600_000
-	// SharedResourceMaxSize is the maximum number of owners an accelerator can be shared
-	// among.
+	// SharedResourceMaxSize 是每卡支持的最大共享所有者数量。
 	SharedResourceMaxSize = 10
-	// SlicedResourceMaxSize is the maximum number of partitions an accelerator can be
-	// sliced into (a power of two; the largest divisor of D below).
+	// SlicedResourceMaxSize 是单卡逻辑切片数量的上限，取能整除 D 的二次幂。
 	SlicedResourceMaxSize = 512
 )
 
@@ -127,13 +84,11 @@ var (
 	_SlicedResourceUnitsPerSlice              map[int64]int64
 )
 
-// _AcceleratablePciClassPrefixes are the PCI device-class prefixes a device carrying an
-// accelerator presents as. NFD is configured to label exactly these classes, and the
-// gpustack-cpu-info NodeFeatureRule matches them, so the two lists are one fact.
+// _AcceleratablePciClassPrefixes 列出加速器可能报告的 PCI 类别前缀，供 NFD 和控制器使用同一套分类。
 var _AcceleratablePciClassPrefixes = []string{"02", "03", "0b", "12"}
 
 func init() {
-	// Map manufacturer to PCI vendor ID.
+	// 建立厂商与 PCI 厂商编号的映射。
 	_ManufacturerPciVendorIDMap = map[string]string{
 		ManufacturerAMD:       "1002",
 		ManufacturerAscend:    "19e5",
@@ -146,19 +101,13 @@ func init() {
 		ManufacturerTHead:     "1ded",
 	}
 	for _, manufacturer := range maps.Keys(_ManufacturerPciVendorIDMap) {
-		// Extract PCI vendor ID from environment variable if exists,
-		// and override the default value in the map.
-		//
-		// E.g. for AMD, the environment variable is "GPUSTACK_AMD_PCI_VENDOR_ID".
-		//
-		// Allow pattern like ${class}_${vendor} or ${vendor} only.
+		// 如果设置 GPUSTACK_<厂商>_PCI_VENDOR_ID，则覆盖默认 PCI 厂商编号。例如 AMD 使用 GPUSTACK_AMD_PCI_VENDOR_ID。
 		if v := osx.Getenv("GPUSTACK_" + strings.ToUpper(manufacturer) + "_PCI_VENDOR_ID"); v != "" {
 			_ManufacturerPciVendorIDMap[manufacturer] = v
 		}
 	}
 
-	// Map manufacturer to resource name,
-	// the resource name is usually used as the prefix of the accelerator resource name in Kubernetes.
+	// 建立厂商与 Kubernetes 加速器资源名的映射，该名称也是相关资源键的基础。
 	_ManufacturerAcceleratableResourceNameMap = map[string]core.ResourceName{
 		ManufacturerAMD:       "amd.com/gpu",
 		ManufacturerAscend:    "huawei.com/npu",
@@ -171,17 +120,13 @@ func init() {
 		ManufacturerTHead:     "alibabacloud.com/ppu",
 	}
 	for _, manufacturer := range maps.Keys(_ManufacturerAcceleratableResourceNameMap) {
-		// Extract resource name from environment variable if exists,
-		// and override the default value in the map.
-		//
-		// E.g. for AMD, the environment variable is "GPUSTACK_AMD_ACCELERATABLE_RESOURCE_NAME".
+		// 使用厂商对应的环境变量覆盖默认资源名，例如 GPUSTACK_AMD_ACCELERATABLE_RESOURCE_NAME。
 		if v := osx.Getenv("GPUSTACK_" + strings.ToUpper(manufacturer) + "_ACCELERATABLE_RESOURCE_NAME"); v != "" {
 			_ManufacturerAcceleratableResourceNameMap[manufacturer] = core.ResourceName(v)
 		}
 	}
 
-	// Map manufacturer to runtime name,
-	// the runtime name is usually used as the container runtime class name for the accelerator resource.
+	// 建立厂商与加速器容器运行时名称的映射，供 RuntimeClass 使用。
 	_ManufacturerAcceleratableRuntimeNameMap = map[string]string{
 		ManufacturerAMD:       "amd",
 		ManufacturerAscend:    "ascend",
@@ -193,43 +138,31 @@ func init() {
 		ManufacturerNVIDIA:    "nvidia",
 	}
 	for _, manufacturer := range maps.Keys(_ManufacturerAcceleratableResourceNameMap) {
-		// Extract runtime name from environment variable if exists,
-		// and override the default value in the map.
-		//
-		// E.g. for AMD, the environment variable is "GPUSTACK_AMD_ACCELERATABLE_RUNTIME_NAME".
+		// 使用厂商对应的环境变量覆盖默认运行时名称，例如 GPUSTACK_AMD_ACCELERATABLE_RUNTIME_NAME。
 		if v := osx.Getenv("GPUSTACK_" + strings.ToUpper(manufacturer) + "_ACCELERATABLE_RUNTIME_NAME"); v != "" {
 			_ManufacturerAcceleratableRuntimeNameMap[manufacturer] = v
 		}
 	}
 
-	// _ManufacturerPartitionKindMap maps a manufacturer to its own name for hardware
-	// partitioning, which becomes the per-profile key's segment prefix — "mig" is NVIDIA's
-	// name, not the concept's. A manufacturer absent from the map has no hardware
-	// partitioning, so it advertises no ".partitioned" family at all. Each entry is
-	// overridable by GPUSTACK_<MANUFACTURER>_PARTITION_KIND.
+	// _ManufacturerPartitionKindMap 给出厂商的硬切技术名，供构造按规格计量的资源名，例如 NVIDIA 使用 mig。
 	_ManufacturerPartitionKindMap = map[string]string{
 		ManufacturerNVIDIA: "mig",
-		// T-Head PPU carves an accelerator into GPU instances under the same feature name its
-		// own management library and CLI use, so it shares the word rather than coining one.
+		// 平头哥管理库和 CLI 也使用 MIG 描述 PPU 分区，因此复用这一名称。
 		ManufacturerTHead: "mig",
-		// Hygon DCU does the same, and goes further: its management library exports the feature
-		// under NVML's own symbol names, and its profiles are reported as "MIG 2g.15gb".
+		// 海光管理库导出与 NVML 同名的多实例接口，规格的显示名称也使用 MIG 前缀，例如 MIG 2g.15gb。
 		ManufacturerHygon: "mig",
 	}
 	for _, manufacturer := range maps.Keys(_ManufacturerPartitionKindMap) {
-		// Extract the hardware partitioning name from environment variable if exists,
-		// and override the default value in the map.
-		//
-		// E.g. for NVIDIA, the environment variable is "GPUSTACK_NVIDIA_PARTITION_KIND".
+		// 用环境变量覆盖厂商的硬切技术名，例如 GPUSTACK_NVIDIA_PARTITION_KIND。
 		if v := osx.Getenv("GPUSTACK_" + strings.ToUpper(manufacturer) + "_PARTITION_KIND"); v != "" {
 			_ManufacturerPartitionKindMap[manufacturer] = v
 		}
 	}
 
-	// Make a set of all known resource names for quick lookup.
+	// 建立已知资源名集合，便于快速查找。
 	_AcceleratableResourceNameSet = sets.New[core.ResourceName](maps.Values(_ManufacturerAcceleratableResourceNameMap)...)
 
-	// Resolve the hardware partitioning names, which build on the resource names above.
+	// 基于已配置的资源名称解析各厂商的硬切技术名。
 	_PartitionedProfileResourceNamePrefixMap = make(map[string]string, len(_ManufacturerPartitionKindMap))
 	for manufacturer, kind := range _ManufacturerPartitionKindMap {
 		resName := _ManufacturerAcceleratableResourceNameMap[manufacturer]
@@ -239,12 +172,12 @@ func init() {
 		_PartitionedProfileResourceNamePrefixMap[manufacturer] = string(resName) + PartitionedResourceNameSuffix + "." + kind + "-"
 	}
 
-	// Define the available sizes for sliced resources.
+	// 列出逻辑切分支持的份数规格。
 	for val := int64(1); val <= SlicedResourceMaxSize; val <<= 1 {
 		_SlicedResourceSizes = append(_SlicedResourceSizes, val)
 	}
 
-	// Make a set of available sizes in string format for quick lookup.
+	// 将切分份数转换成字符串集合以便快速匹配。
 	_SlicedResourceOperatedSizesSet = sets.New[string]()
 	for _, size := range _SlicedResourceSizes {
 		if size < 2 {
@@ -253,19 +186,14 @@ func init() {
 		_SlicedResourceOperatedSizesSet.Insert(strconvx.FormatInt(size, 10))
 	}
 
-	// Pre-calculate the normalized per-slice unit value D/size for each sliced
-	// size. D is divisible by every power-of-two size up to SlicedResourceMaxSize,
-	// so these are exact integers.
+	// 预计算每种切分份数对应的 D/size units。D 可被上限以内的各二次幂整除，因此结果是整数。
 	_SlicedResourceUnitsPerSlice = make(map[int64]int64)
 	for _, size := range _SlicedResourceSizes {
 		_SlicedResourceUnitsPerSlice[size] = ResourceMaxUnits / size
 	}
 }
 
-// GetPartitionKind returns the manufacturer's own name for hardware partitioning
-// ("mig" for NVIDIA), which the per-profile key's segment prefix is built from. It
-// returns "" when the manufacturer has no hardware partitioning, in which case the
-// manufacturer advertises no key of the ".partitioned" family.
+// GetPartitionKind 返回厂商自己的硬切技术名，供构造按规格发布的资源键。未声明硬切类型时返回空字符串。
 func GetPartitionKind(manufacturer string) string {
 	if _PartitionedProfileResourceNamePrefixMap[manufacturer] == "" {
 		return ""
@@ -273,42 +201,31 @@ func GetPartitionKind(manufacturer string) string {
 	return _ManufacturerPartitionKindMap[manufacturer]
 }
 
-// GetPciVendorID returns the PCI vendor ID for the given manufacturer.
+// GetPciVendorID 返回厂商在 PCI 总线上的标识。
 func GetPciVendorID(manufacturer string) string {
 	return _ManufacturerPciVendorIDMap[manufacturer]
 }
 
-// GetKnownAcceleratableManufacturers returns the list of known accelerator manufacturers.
+// GetKnownAcceleratableManufacturers 返回已知加速器厂商列表。
 func GetKnownAcceleratableManufacturers() []string {
 	manus := maps.Keys(_ManufacturerAcceleratableResourceNameMap)
 	sort.Strings(manus)
 	return manus
 }
 
-// IsKnownAcceleratableManufacturer reports whether the given manufacturer is a well-known accelerator manufacturer.
+// IsKnownAcceleratableManufacturer 判断名称是否属于已知加速器厂商。
 func IsKnownAcceleratableManufacturer(manufacturer string) bool {
 	return _ManufacturerAcceleratableResourceNameMap[manufacturer] != ""
 }
 
-// GetAcceleratablePciClassPrefixes returns the PCI device-class prefixes an accelerator
-// presents as: display controllers, processing accelerators and the co-processor class
-// (see https://admin.pci-ids.ucw.cz/read/PD).
+// GetAcceleratablePciClassPrefixes 返回加速器相关 PCI 类别的前缀，例如显示控制器、处理加速器和协处理器。
+// PCI 类别编号见 https://admin.pci-ids.ucw.cz/read/PD
 func GetAcceleratablePciClassPrefixes() []string {
 	return slices.Clone(_AcceleratablePciClassPrefixes)
 }
 
-// GetAcceleratableResourceName returns the resource name advertised by the device-plugin
-// to the kubelet for the given manufacturer and allocation mode:
-//   - Exclusive → "nvidia.com/gpu", Shared → "nvidia.com/gpu.shared",
-//     Sliced → "nvidia.com/gpu.sliced" (the accelerator families).
-//   - Partitioned → "nvidia.com/gpu.partitioned", the hardware-partitioning family. It is
-//     empty for a manufacturer with no partition kind, which advertises no key of that
-//     family at all.
-//   - Visibility → "device.gpustack.ai/nvidia.visibility": the device-only resource the SSH
-//     sidecar requests (with the SAME quantity its workload container asks of the real
-//     accelerator) to co-allocate visibility to the same physical device(s). It is
-//     deliberately outside the accelerator families, so IsKnownAcceleratableResourceName is
-//     false for it and admission does not read it as an allocation mode.
+// GetAcceleratableResourceName 根据厂商和分配模式返回插件公布的资源名。
+// 整卡、共享、软切和硬切分别使用基础名、.shared、.sliced 和 .partitioned。可见性使用独立的 sidecar 资源名。
 func GetAcceleratableResourceName(manufacturer string, mode workercore.DeviceAllocationMode) core.ResourceName {
 	resName := _ManufacturerAcceleratableResourceNameMap[manufacturer]
 	switch mode {
@@ -328,22 +245,15 @@ func GetAcceleratableResourceName(manufacturer string, mode workercore.DeviceAll
 	}
 }
 
-// GetAcceleratableSlicedCoresPercentageResourceName returns the per-accelerator SM budget
-// key for the given manufacturer (e.g. "nvidia.com/gpu.sliced.cores-percentage").
-// It is a gate-2 node-level resource, distinct from the credits input returned by
-// GetAcceleratableSlicedUnitsResourceName.
+// GetAcceleratableSlicedCoresPercentageResourceName 构造厂商的每卡算力百分比预算键，
+// 例如 nvidia.com/gpu.sliced.cores-percentage。该键供节点预算检查使用。
 func GetAcceleratableSlicedCoresPercentageResourceName(manufacturer string) core.ResourceName {
 	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + SlicedCoresPercentageResourceNameSuffix
 }
 
-// GetAcceleratablePartitionedProfileResourceName returns the per-profile physical-partition
-// key for a manufacturer and profile — profile "3g.40gb" for nvidia yields
-// "nvidia.com/gpu.partitioned.mig-3g.40gb". The profile is published through
-// PublishPartitionedProfileName, so the key always carries the published spelling whichever
-// spelling the caller holds, and VendorPartitionedProfileOf maps it back. Beyond that the
-// name is used verbatim: one that is not a valid resource-name segment is excluded upstream
-// when the accelerator's inventory is built. It returns "" when the manufacturer has no partition
-// kind, or when the name would not yield a valid resource name.
+// GetAcceleratablePartitionedProfileResourceName 构造厂商的硬分区规格键。
+// 例如 NVIDIA 的 3g.40gb 对应 nvidia.com/gpu.partitioned.mig-3g.40gb。
+// 厂商未声明硬切或名称无法组成合法资源键时返回空值。
 func GetAcceleratablePartitionedProfileResourceName(manufacturer, profile string) core.ResourceName {
 	prefix := _PartitionedProfileResourceNamePrefixMap[manufacturer]
 	if prefix == "" || profile == "" {
@@ -351,8 +261,7 @@ func GetAcceleratablePartitionedProfileResourceName(manufacturer, profile string
 	}
 	name := prefix + PublishPartitionedProfileName(manufacturer, profile)
 	if errs := validation.IsQualifiedName(name); len(errs) != 0 {
-		// The profile name is never rewritten to make it key-safe: a rewritten key
-		// could not be mapped back to the hardware profile it names.
+		// 避免把非法名称强行改写为合法键，否则无法反向定位真实硬件规格。
 		klog.Warningf("excluding %s partition profile %q: it does not yield a valid resource name: %s",
 			manufacturer, profile, strings.Join(errs, "; "))
 		return ""
@@ -360,31 +269,17 @@ func GetAcceleratablePartitionedProfileResourceName(manufacturer, profile string
 	return core.ResourceName(name)
 }
 
-// _SeparatorlessPartitionedProfileManufacturerSet holds the manufacturers whose own library
-// spells a partition profile's geometry with no separator between its two numbers — T-Head
-// reports "MIG 4g48gb" where NVIDIA reports "3g.40gb". The two describe the same shape of
-// thing and read the same way to whoever writes a Pod spec only if they are spelled the same,
-// so a profile of a manufacturer listed here is published with the separator and handled
-// internally without one.
+// _SeparatorlessPartitionedProfileManufacturerSet 列出不以点分隔几何数字的厂商。平头哥写作 MIG 4g48gb。
+// 对外发布时统一为 4g.48gb，调用厂商库时保留其原写法。
 var _SeparatorlessPartitionedProfileManufacturerSet = sets.New(ManufacturerTHead)
 
 var (
-	// _VendorPartitionedProfileGeometryRegex matches a profile geometry spelled the way a
-	// separator-less manufacturer writes it, capturing the compute-slice and memory numbers.
+	// _VendorPartitionedProfileGeometryRegex 匹配无点分隔的规格，并提取计算切片数与显存容量。
 	_VendorPartitionedProfileGeometryRegex = regexp.MustCompile(`^([0-9]+)g([0-9]+)gb$`)
 )
 
-// PublishPartitionedProfileName converts a partition profile name from the spelling its
-// manufacturer's library uses to the spelling this operator publishes — for a manufacturer
-// that omits the separator, "4g48gb" becomes "4g.48gb". It is the forward half of the naming
-// boundary: the resource key, the per-profile ledgers a user reads, and the request a user
-// writes all carry the published name, while the Devices record, the ownership markers and
-// every name handed to or matched against a vendor library keep the vendor's own.
-//
-// A name outside the two-number geometry is published unchanged rather than guessed at, and a
-// name already carrying the separator is returned as-is — so the conversion is idempotent and
-// a caller need not know which spelling it holds. A manufacturer whose library writes the
-// separator itself (NVIDIA) is never touched, so its published keys are unaffected.
+// PublishPartitionedProfileName 将厂商规格名转换为对外发布的格式。对省略分隔点的厂商把 4g48gb 改为 4g.48gb，
+// 原本带点的名称保持不变。
 func PublishPartitionedProfileName(manufacturer, profile string) string {
 	if !_SeparatorlessPartitionedProfileManufacturerSet.Has(manufacturer) {
 		return profile
@@ -396,24 +291,14 @@ func PublishPartitionedProfileName(manufacturer, profile string) string {
 	return m[1] + "g." + m[2] + "gb"
 }
 
-// PartitionedProfileOf returns the physical-partition profile name encoded in a
-// "<base>.partitioned.<kind>-<profile>" resource key of a known accelerator base whose
-// manufacturer declares that kind, and whether name is such a key. It is the plain reverse of
-// GetAcceleratablePartitionedProfileResourceName: the name comes back in the published
-// spelling the key carries, which is what a user-facing ledger or message wants. A caller
-// about to match it against the Devices record, an ownership marker or a vendor library wants
-// VendorPartitionedProfileOf instead.
-//
-// The counting key "<base>.partitioned.units" shares the ".partitioned." prefix but is
-// not a per-profile key, so it is never read as a profile.
+// PartitionedProfileOf 从已知厂商的 <基础名>.partitioned.<技术名>-<规格> 资源键中提取规格名。
+// 它会校验基础资源名和技术名，.partitioned.units 属于额度键。
 func PartitionedProfileOf(name core.ResourceName) (string, bool) {
 	_, profile, ok := partitionedProfileOf(name)
 	return profile, ok
 }
 
-// partitionedProfileOf resolves a per-profile partition key to the manufacturer that owns it
-// and the profile name it carries, so the two public readers cannot disagree about which key
-// is a profile key.
+// partitionedProfileOf 同时解析规格所属厂商和规格名，让各公开读取入口使用相同的校验规则。
 func partitionedProfileOf(name core.ResourceName) (manufacturer, profile string, ok bool) {
 	s := string(name)
 	for m, prefix := range _PartitionedProfileResourceNamePrefixMap {
@@ -425,13 +310,7 @@ func partitionedProfileOf(name core.ResourceName) (manufacturer, profile string,
 	return "", "", false
 }
 
-// IsKnownAcceleratableResourceName reports whether the given resource name is a key of one
-// of the four accelerator families. It answers "is this one of ours"; ResourceFamilyOf, which
-// it defers to, answers "which one" — keeping a single definition means a newly added family
-// can never be known to one caller and unknown to the other.
-//
-// The visibility resource is deliberately excluded: it is outside the accelerator families,
-// so admission never reads it as an allocation mode.
+// IsKnownAcceleratableResourceName 判断名称是否属于 Operator 管理的四种加速器分配资源。
 func IsKnownAcceleratableResourceName(name core.ResourceName) bool {
 	switch ResourceFamilyOf(name) {
 	case ResourceFamilyExclusive, ResourceFamilyShared, ResourceFamilySliced, ResourceFamilyPartitioned:
@@ -440,35 +319,26 @@ func IsKnownAcceleratableResourceName(name core.ResourceName) bool {
 	return false
 }
 
-// ResourceFamily names the accelerator resource family a resource name belongs to.
-// Every key of a family — the coarse device-plugin token key, the fine-grained counting
-// keys, and any variable-tailed per-profile key — classifies as its family, since the
-// question the admission rules ask of a key is "which family does it belong to".
+// ResourceFamily 表示资源所属的加速器分配类别。同一类别包含粗粒度令牌、细粒度计量及可选的硬件规格键。
 type ResourceFamily string
 
 const (
-	// ResourceFamilyNone is the classification of a resource name outside every
-	// accelerator family, e.g. "cpu" or a credits resource.
+	// ResourceFamilyNone 表示该资源不属于任何加速器类别，例如 cpu 或额度资源。
 	ResourceFamilyNone ResourceFamily = "none"
-	// ResourceFamilyExclusive is the whole-accelerator family, "<base>".
+	// ResourceFamilyExclusive 表示直接使用基础资源名的整卡模式。
 	ResourceFamilyExclusive ResourceFamily = "exclusive"
-	// ResourceFamilyShared is the accelerator-sharing family, "<base>.shared".
+	// ResourceFamilyShared 表示使用 <base>.shared 的共享模式。
 	ResourceFamilyShared ResourceFamily = "shared"
-	// ResourceFamilySliced is the logical (software injection) slicing family,
-	// "<base>.sliced" and its sub-keys.
+	// ResourceFamilySliced 表示使用 <base>.sliced 及其子键的逻辑切分模式。
 	ResourceFamilySliced ResourceFamily = "sliced"
-	// ResourceFamilyPartitioned is the physical (hardware partitioning) family,
-	// "<base>.partitioned" and its sub-keys.
+	// ResourceFamilyPartitioned 表示使用 <base>.partitioned 及其子键的硬件分区模式。
 	ResourceFamilyPartitioned ResourceFamily = "partitioned"
-	// ResourceFamilyVisibility is the device-only co-allocation family the SSH sidecar
-	// requests, "device.gpustack.ai/<manufacturer>.visibility". It is deliberately
-	// outside the accelerator families, so the one-family rules ignore it.
+	// ResourceFamilyVisibility 是 SSH sidecar 复用同块设备的资源类别，
+	// 资源名形如 device.gpustack.ai/<manufacturer>.visibility，独立于四种分配模式。
 	ResourceFamilyVisibility ResourceFamily = "visibility"
 )
 
-// _ResourceFamilyFixedSuffixes maps each fixed key suffix to its family. The suffixes are
-// listed longest first for readability; the classification is order-independent, because a
-// key matches at most one suffix with a known accelerator base in front of it.
+// _ResourceFamilyFixedSuffixes 把固定后缀映射为资源类别。匹配时同时校验完整基础名，因此不依赖表中排列顺序。
 var _ResourceFamilyFixedSuffixes = []struct {
 	suffix string
 	family ResourceFamily
@@ -483,14 +353,8 @@ var _ResourceFamilyFixedSuffixes = []struct {
 	{SharedResourceNameSuffix, ResourceFamilyShared},
 }
 
-// ResourceFamilyOf classifies a resource name into the accelerator family it belongs to,
-// the single decision the Pod webhooks and the node-devices admission check drive their
-// one-family rules through.
-//
-// A name is classified only when it is well-formed: its base must be a known accelerator
-// resource name (or, for visibility, a known manufacturer) and any variable tail must be
-// non-empty. Anything else — an unrecognized sub-key, an unknown base, a non-accelerator
-// resource — is ResourceFamilyNone.
+// ResourceFamilyOf 按完整的已知基础名和合法后缀对资源分类。Pod webhook 与逐卡准入用该结果检查分配模式，
+// 名称不合法时返回 ResourceFamilyNone。
 func ResourceFamilyOf(name core.ResourceName) ResourceFamily {
 	s := string(name)
 
@@ -502,7 +366,7 @@ func ResourceFamilyOf(name core.ResourceName) ResourceFamily {
 		return ResourceFamilyNone
 	}
 
-	// The variable-tailed per-profile key carries its own base and tail checks.
+	// 名称末尾包含可变规格的资源键会单独校验基础名和规格后缀。
 	if _, ok := PartitionedProfileOf(name); ok {
 		return ResourceFamilyPartitioned
 	}
@@ -520,8 +384,17 @@ func ResourceFamilyOf(name core.ResourceName) ResourceFamily {
 	return ResourceFamilyNone
 }
 
-// GetAcceleratableRuntimeName returns the accelerator runtime name for the given manufacturer,
-// usually, it's used as the container runtime class name for the accelerator resource.
+// GetAcceleratableRuntimeName 根据厂商返回加速器运行时名称，通常用作容器 RuntimeClass 名。
 func GetAcceleratableRuntimeName(manufacturer string) string {
 	return _ManufacturerAcceleratableRuntimeNameMap[manufacturer]
+}
+
+// NormalizePartitionedProfileName 去除规格名周围空白及厂商显示前缀，再转为小写几何描述，
+// 例如将 MIG 1c.12g 转为 1c.12g。内部保留厂商自己的分隔写法，对外名称由 PublishPartitionedProfileName 转换。
+func NormalizePartitionedProfileName(raw string) string {
+	fields := strings.Fields(strings.ToLower(raw))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[len(fields)-1]
 }
