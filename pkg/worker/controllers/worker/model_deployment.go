@@ -1,0 +1,3387 @@
+package worker
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	app "k8s.io/api/apps/v1"
+	core "k8s.io/api/core/v1"
+	node "k8s.io/api/node/v1"
+	rbac "k8s.io/api/rbac/v1"
+	storage "k8s.io/api/storage/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	kmeta "k8s.io/apimachinery/pkg/api/meta"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	ctrlrecord "k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlevent "sigs.k8s.io/controller-runtime/pkg/event"
+	ctrlhandler "sigs.k8s.io/controller-runtime/pkg/handler"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlpredicate "sigs.k8s.io/controller-runtime/pkg/predicate"
+	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	kueuepodconst "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
+	kueueworkload "sigs.k8s.io/kueue/pkg/workload"
+
+	worker "gpustack.ai/gpustack/api/worker/v1"
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/controller"
+	kubeapistatus "gpustack.ai/gpustack/pkg/kubeapistatus"
+	"gpustack.ai/gpustack/pkg/kubediscovery"
+	"gpustack.ai/gpustack/pkg/kubemeta"
+	"gpustack.ai/gpustack/pkg/modelstore"
+	"gpustack.ai/gpustack/pkg/nodefeature"
+	"gpustack.ai/gpustack/pkg/setting"
+	"gpustack.ai/gpustack/pkg/system"
+	"gpustack.ai/gpustack/pkg/systemmeta"
+	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
+	"gpustack.ai/gpustack/pkg/worker/elasticengine"
+	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
+	"gpustack.ai/gpustack/pkg/worker/settings"
+)
+
+// ModelDeploymentReconciler reconciles v1alpha1.ModelDeployment objects to finish the following
+// tasks:
+//   - Render one Kubernetes Pod per (role, ordinal), owned by the ModelDeployment and carrying the
+//     entrance label that routes it into the role's pool plus the Kueue group metadata of that one
+//     replica. The API server names each replica, so a replacement never inherits the name of the
+//     replica it replaces.
+//   - Converge that set continuously: create the ordinals the role is short of once the ordinal
+//     reads empty on the API server, remove the ordinals the role no longer declares -- each with
+//     its own Workload -- and replace one whose spec no longer matches what it was built from,
+//     once every declared replica holds an admitted Workload.
+//
+// It creates NO Instance. An Instance renders exactly one Pod and its spec is immutable after
+// creation, so routing replicas through it would make "one replica, several Pods" inexpressible and
+// degenerate every rollout into recreate-everything. The admission chain keys on Pods, and a plain
+// Pod is a first-class citizen of it.
+type ModelDeploymentReconciler struct {
+	Client    ctrlcli.Client
+	APIReader ctrlcli.Reader
+	Recorder  ctrlrecord.EventRecorder
+
+	// CacheScraper reads each replica's own account of its cache client. It is an interface rather
+	// than a dial this reconciler makes, because every case the condition it feeds has to get right
+	// is a failure, and a real dial cannot be made to fail on demand.
+	//
+	// A nil scraper is every replica unreadable, which the condition reports as Unknown. It is nil
+	// today: the concrete per-engine reader is not written, and inventing a metric name would be the
+	// exact assumption the condition exists to refuse.
+	CacheScraper ModelDeploymentCacheScraper
+
+	// servingViewFetch reads one Router Pod's observer view. It is a function rather
+	// than a dial this reconciler makes, for the same reason CacheScraper is: the
+	// states the serving answer has to get right are failures, and a real dial cannot
+	// be made to fail on demand. A nil fetch means the production transport.
+	servingViewFetch routerViewFetch
+
+	// groupForwardFetch asks one member's engine whether the replica's forward path carries a
+	// request. A nil fetch means the production transport, and a member that cannot be asked is
+	// Unknown, which holds: the probe is only ever run to lift a hold, so a transport that cannot
+	// answer leaves the group exactly as held as it was before.
+	groupForwardFetch modelDeploymentGroupForwardFetch
+
+	// groupForwardPairFetch asks a prefill group and a decode group whether the transfer path
+	// between them carries a request. A nil fetch means the production transport, which is wired:
+	// the qualifier is what answers Unsupported when a caller hands it no pair transport at all.
+	groupForwardPairFetch modelDeploymentGroupForwardPairFetch
+
+	// drainReader reads one member's engine in-flight activity for the retirement protocol. A nil
+	// reader is the production transport, which is a refusal until a collector lands behind the
+	// seam: the protocol then holds at Draining and deletes nothing, which is the safe direction
+	// for a measurement that does not exist yet.
+	drainReader     modelDeploymentDrainReader
+	elasticObserver modelDeploymentElasticRayReader
+	elasticClient   func(*core.Pod) (*elasticengine.Client, error)
+
+	// clock reads the retirement protocol's budgets. It is a field rather than a call to time.Now
+	// so a test can place a phase's start and its expiry at moments of its choosing instead of
+	// waiting for them, which is the only way a budget assertion can be about the budget.
+	clock func() time.Time
+}
+
+var _ ctrlreconcile.Reconciler = (*ModelDeploymentReconciler)(nil)
+
+func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := ctrllog.FromContext(ctx)
+
+	// Fetch.
+	md := new(workercore.ModelDeployment)
+	err := r.Client.Get(ctx, req.NamespacedName, md)
+	if err != nil {
+		if !kerrors.IsNotFound(err) {
+			logger.Error(err, "fetch model deployment")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Clean up if the ModelDeployment is marked as deleted.
+	if md.DeletionTimestamp != nil {
+		return r.teardownModelDeployment(ctx, md)
+	}
+
+	// Lock.
+	if !systemmeta.Lock(md) {
+		err = r.Client.Update(ctx, md)
+		if err != nil {
+			logger.Error(err, "lock model deployment")
+			return ctrl.Result{}, err
+		}
+	}
+
+	return r.convergeModelDeployment(ctx, md)
+}
+
+// teardownModelDeployment deletes the replicas and releases the finalizer once they are gone.
+//
+// The finalizer is held until the last Pod has actually left rather than dropped as soon as the
+// deletes are issued, because a replica that outlives its owner keeps holding accelerators that the
+// admission ledger has already stopped accounting for.
+func (r *ModelDeploymentReconciler) teardownModelDeployment(
+	ctx context.Context, md *workercore.ModelDeployment,
+) (ctrl.Result, error) {
+	logger := ctrllog.FromContext(ctx)
+
+	if systemmeta.IsLocked(md) {
+		pods, err := r.listModelDeploymentPods(ctx, md)
+		if err != nil {
+			logger.Error(err, "list replicas")
+			return ctrl.Result{}, err
+		}
+
+		if len(pods) > 0 {
+			// Report the phase before issuing the deletes, so an operator watching the object sees
+			// Deleting rather than the last Ready it happened to reach. The Binding is deliberately
+			// not re-read: a teardown pass has no question to ask it, and the domain a replica is
+			// still writing into is the one that was last observed.
+			// A teardown pass evaluates no health predicate, so it passes no qualifications and
+			// the endpoint answer stays the unobserved one rather than a verdict this pass never made.
+			if err = r.syncModelDeploymentStatus(
+				ctx, md, pods, nil, nil, nil, modelDeploymentPassObservation{
+					Serving: modelDeploymentServingUnobserved(md, "the teardown pass observed no router"),
+				},
+			); err != nil {
+				// The predicate drops status-only and metadata-only updates, so the change behind a
+				// conflict may deliver no event: requeue rather than wait for one.
+				return objectWriteResult(logger, err, "update model deployment status to deleting",
+					_requeueAfterConflict)
+			}
+
+			for i := range pods {
+				if pods[i].DeletionTimestamp != nil {
+					continue
+				}
+				// TEARDOWN IS DELIBERATELY NOT INTERCEPTED BY THE RETIREMENT RESERVATION, and this is
+				// where that decision is recorded so it reads as a decision rather than as a path
+				// somebody forgot. A reservation holds its replica so the retirement protocol can
+				// withdraw it cleanly, and that reason expires the moment the owner stops asking for the
+				// deployment to exist: a DeletionTimestamp is the owner taking everything, not a request
+				// to keep one replica serving. Holding capacity against it would also be a deadlock and
+				// not merely wrong, because the finalizer below is only released once the last replica
+				// has left, so a reservation refusing to let it leave would hold the object in Deleting
+				// forever with nothing erroring anywhere.
+				//
+				// The preStop hook remains the post-delete last line, which is the graceful part of
+				// this: a replica being torn down still drains its own engine on the way out. What is
+				// given up is the controller-side withdrawal protocol, for a deployment being removed.
+				if err = r.Client.Delete(ctx, &pods[i]); err != nil && !kerrors.IsNotFound(err) {
+					logger.Error(err, "delete replica", "pod", pods[i].Name)
+					return ctrl.Result{}, err
+				}
+			}
+
+			// Deleting the replicas is not enough to make them leave. Kueue holds a finalizer on every
+			// Pod of a group it manages, and the group this operator builds is annotated as SERVING —
+			// which Kueue defines as a group that never finishes, so the terminal replicas are read as
+			// awaiting replacement and their finalizers are never released. The one path that does
+			// release them is the Workload being deleted.
+			//
+			// Nothing else breaks the cycle. That Workload's only owners are the very Pods that cannot
+			// leave, and they own it without a controller reference, so garbage collection waits for
+			// all of them; there is no replacement timeout to fall back on. Left alone the deployment
+			// stays in Deleting forever, which is what a run measured before this delete was added.
+			if err = r.deleteModelDeploymentGroupWorkload(ctx, md, pods); err != nil {
+				logger.Error(err, "delete group workload")
+				return ctrl.Result{}, err
+			}
+
+			logger.V(3).Info("replica deletion in progress; requeue in 2s", "replicas", len(pods))
+
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// The last replica has left, so the claim on the Binding can go. Released any earlier, the
+		// authorization could be deleted from under a process that is still writing through it.
+		if err := r.releaseModelDeploymentBinding(ctx, md); err != nil {
+			// The Binding watch passes every change to it, so the one behind a conflict wakes this
+			// deployment again.
+			return objectWriteResult(logger, err, "release kv cache pool binding", ctrl.Result{})
+		}
+	}
+
+	// Unlock.
+	if systemmeta.Unlock(md) {
+		logger.V(3).Info("skip deleted model deployment")
+		return ctrl.Result{}, nil
+	}
+
+	err := r.Client.Update(ctx, md)
+	if err != nil {
+		logger.Error(err, "unlock model deployment")
+	}
+
+	return ctrl.Result{}, ctrlcli.IgnoreNotFound(err)
+}
+
+// convergeModelDeployment brings the rendered replicas in line with the spec.
+//
+// It is level-based: it renders what the spec says should exist, compares that with what does, and
+// issues only the difference. A pass over a spec that has not changed writes nothing, which is what
+// keeps a controller that runs on every Pod event from rewriting the world.
+func (r *ModelDeploymentReconciler) convergeModelDeployment(
+	ctx context.Context, md *workercore.ModelDeployment,
+) (ctrl.Result, error) {
+	logger := ctrllog.FromContext(ctx)
+
+	// Resolved first, and its verdict deliberately does NOT gate the convergence below. A Binding
+	// that is missing or briefly not usable — a store leader restart makes every Binding not-Ready
+	// for tens of seconds — leaves the replicas serving; the condition is the signal. Refusing to
+	// converge here would turn a routine upgrade of the store into an outage of every deployment on
+	// it.
+	domain, err := r.resolveModelDeploymentDomain(ctx, md)
+	if err != nil {
+		logger.Error(err, "resolve kv cache pool binding")
+		return ctrl.Result{}, err
+	}
+
+	// Claimed whatever the verdict was, so long as the Binding could be read at all: the claim is
+	// what holds an admin's delete off a deployment that is still writing, and a claim that came and
+	// went with readiness would open exactly that window.
+	if err = r.claimModelDeploymentBinding(ctx, md); err != nil {
+		// The Binding watch passes every change to it, so the one behind a conflict wakes this
+		// deployment again.
+		return objectWriteResult(logger, err, "claim kv cache pool binding", ctrl.Result{})
+	}
+
+	// Resolved once per pass, not per role: the endpoint and the transport belong to the pool and its
+	// backend. A nil result means there is nothing to connect to yet, and the replicas are rendered
+	// without a connector rather than with a partial one.
+	connection, err := r.resolveModelDeploymentConnection(ctx, domain)
+	if err != nil {
+		logger.Error(err, "resolve kv cache connection")
+		return ctrl.Result{}, err
+	}
+	var interfaceProtocols []string
+	if connection != nil {
+		interfaceProtocols = connection.Protocols
+	} else if modelDeploymentRequestsInterfaces(md) && md.Spec.KVCache != nil {
+		interfaceProtocols, err = r.resolveModelDeploymentInterfaceProtocols(ctx, md)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// The weights are resolved before anything is rendered, because an artifact that has never
+	// resolved leaves nothing to render: no commit to pin, no claim to mount. That pass touches no
+	// replica at all -- a deployment waiting for its first resolution has none, and one whose
+	// artifact went away is protected by the artifact's finalizer -- and only says why it waits.
+	weights, err := r.resolveModelDeploymentWeights(ctx, md)
+	if err != nil {
+		logger.Error(err, "resolve model artifact")
+		return ctrl.Result{}, err
+	}
+	if weights != nil && weights.Render == nil {
+		pods, listErr := r.listModelDeploymentPods(ctx, md)
+		if listErr != nil {
+			return ctrl.Result{}, listErr
+		}
+
+		// The weights are still resolving, so this pass has not reached the replicas and makes no
+		// qualification claim; the endpoint answer stays unobserved until a pass that has.
+		if err = r.syncModelDeploymentStatus(
+			ctx, md, pods, domain, nil, weights, modelDeploymentPassObservation{
+				Serving: modelDeploymentServingUnobserved(md, "the weights are still resolving"),
+			},
+		); err != nil {
+			// The predicate drops status-only updates, so the change behind a conflict may deliver
+			// no event: requeue rather than wait for one.
+			return objectWriteResult(logger, err, "sync status while the weights resolve", _requeueAfterConflict)
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	desired, err := r.renderModelDeploymentPods(ctx, md, connection, interfaceProtocols, weights)
+	if err != nil {
+		// A render failure is the InstanceType not being ready, or a role the renderer cannot build
+		// a container from. The pass aborts before any status is written, so an Event is the only
+		// place the cause reaches a reader: the conditions still say "no replica has been created
+		// yet", which describes a slow start and a permanent failure identically.
+		// Guarded like both other emission paths in this file: Recorder is populated only by
+		// SetupController, so a reconciler built directly -- which every test here does -- may
+		// legitimately carry none.
+		if r.Recorder != nil {
+			r.Recorder.Event(md, core.EventTypeWarning, modelDeploymentEventRenderFailed, err.Error())
+		}
+		logger.Error(err, "render replicas")
+
+		return ctrl.Result{}, err
+	}
+
+	actual, err := r.listModelDeploymentPods(ctx, md)
+	if err != nil {
+		logger.Error(err, "list replicas")
+		return ctrl.Result{}, err
+	}
+
+	// THE RETIREMENT RESERVATION IS EVALUATED ONCE, HERE, BEFORE ANY DELETE DECISION IS TAKEN, and
+	// every path below consults the plan rather than the reservation. A path that read
+	// md.Status.Retirement itself would be re-deriving an answer the protocol has already reached,
+	// and the two answers could differ: this one has already advanced the state, applied the
+	// budget and resolved the target to live members, while a fresh read would see the state as it
+	// was written at the end of the last pass.
+	//
+	// WITH NO RESERVATION IN FLIGHT THIS IS THE EMPTY PLAN, and every path below then behaves
+	// exactly as it did before the protocol existed. That is the property the whole feature rests
+	// on, and it is asserted per path in the tests rather than stated here.
+	retirement := r.planModelDeploymentRetirement(ctx, md, actual)
+	// The state this pass reached is persisted HERE, before any delete decision, so the rest of the
+	// pass and the object's own status sync both see the operation as it now stands. It is a
+	// separate write rather than a field set on the object, because the pass's status sync compares
+	// the derived status with the observed one before writing and would find a field assigned in
+	// place already equal to itself.
+	if err = r.persistModelDeploymentRetirement(ctx, md, md.Status.Retirement, retirement); err != nil {
+		// The predicate drops status-only updates, so the change behind a conflict may deliver no
+		// event: requeue rather than wait for one.
+		return objectWriteResult(logger, err, "persist the retirement reservation", _requeueAfterConflict)
+	}
+
+	// A REPLICA IS A SCHEDULING UNIT OF ITS OWN: its Kueue group is the one-member group derived
+	// from its (role, ordinal), so a change to a role's replica count moves no total any running
+	// Pod carries. It names ordinals the spec now declares or stops naming ones it no longer does,
+	// and neither is a change the survivors have to agree on before Kueue composes anything -- the
+	// whole-group rebuild the per-role groups needed is gone with them, and the per-ordinal
+	// arithmetic below is what replaces it.
+	//
+	// A DEPARTING REPLICA NEVER FREES ITS OWN SLOT, whatever the phase it drains through, so what
+	// the replacement waits for is the Pod's absence and nothing shorter. Measured on the version
+	// this project runs: a deleted member of a serving group holds Running through its drain, moves
+	// to Succeeded -- a phase Kueue still counts as active -- and stays on the books, finalizer in
+	// place, with its Workload still admitted; deleting that Workload is what makes the Pod go, and
+	// the wait is the drain's own length rather than a constant. The create gate below therefore
+	// reads whether the ordinal still holds a Pod, and no timeout stands in for that reading.
+	//
+	// THE DEPARTING REPLICA'S OWN WORKLOAD IS WHAT HOLDS IT. A Pod of a serving group carries
+	// Kueue's finalizer until that group's Workload is deleted, and nothing else releases it. A
+	// replica this pass removes -- for good or to be replaced -- takes its Workload with it below:
+	// deleting the Pod alone would leave the Workload holding quota and the finalizer holding the
+	// Pod, forever, with nothing erroring. For a REPLACED replica the delete is doubly load-bearing
+	// -- it is what empties the ordinal the replacement's create gate observes, and the replacement
+	// is a fresh admission competing for the quota it releases.
+	//
+	// NO SUPPRESSION SET STANDS BETWEEN THE DELETES AND THE CREATES, and the reason is the shape of
+	// the decisions rather than a guard beside them. Every count below is taken from the member list
+	// this pass started from, so a role this pass removes a member from still sits at its declared
+	// count in that list and creates nothing -- and a role short of its declared count is one whose
+	// members were left standing, so the pass deletes nothing from it. A role cannot receive a
+	// create and a delete from the same pass, and a create beside a member on its way out waits for
+	// that member to be gone from the API server rather than for any ask about it.
+
+	// What this pass decides about replicas carrying an earlier spec, for the condition that reports
+	// it. A teardown pass records nothing: it deletes every replica without comparing a hash, so it
+	// has no answer to give and passes nil below rather than a zeroed one.
+	var rollout modelDeploymentRollout
+
+	// The live members are collected by role first, because the comparison this convergence makes is
+	// per role: which ordinals the role's Pods occupy, whether each matches what the role renders
+	// for ITS ordinal, and how many the spec declares. A Pod already on its way out is counted by
+	// neither side -- it is still a member of its group, but it is not one the spec can keep.
+	liveByRole := make(map[string][]*core.Pod, len(md.Spec.Roles))
+
+	// An ELASTIC DEPLOYMENT LEAVES HERE, BEFORE the fixed desired-set comparison below, because
+	// that comparison answers a question an elastic deployment does not have. It reads the spec's
+	// declared replica and size counts and deletes whatever the spec no longer names; the elastic
+	// members are not replicas of one declared count, and a width decrease must not read as a
+	// replica being scaled away. Letting the fixed path see them would make a member of a group of
+	// one deletable by a count, which is the withdrawal this slice explicitly does not own.
+	//
+	// A fixed-profile deployment is untouched by this branch and keeps the path below unchanged.
+	if elastic, observation, err := r.convergeModelDeploymentElastic(
+		ctx, md, actual, desired, weights,
+	); err != nil {
+		return ctrl.Result{}, err
+	} else if elastic {
+		actual, err = r.listModelDeploymentPods(ctx, md)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		masters := modelDeploymentElasticMasters(md, actual)
+		// THE STATUS PUBLISHES THE PASS'S OWN OBSERVATION AND THE PASS'S OWN QUALIFICATIONS. A
+		// second qualification here would be a second verdict about a second grouping of the same
+		// Pods, and a status could publish a verdict the labels were never written from.
+		if err = r.syncModelDeploymentStatus(ctx, md, masters, domain, nil, weights, observation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	// A replica of a role the spec no longer names is deleted here, and its Workload with it: the
+	// role was scaled to zero or renamed, and in both cases the departure is permanent rather than
+	// a gap a replacement fills.
+	departed := make([]core.Pod, 0, len(actual))
+	for i := range actual {
+		pod := &actual[i]
+		if pod.DeletionTimestamp != nil {
+			// Already on its way out; a create issued now would race the delete and be rejected.
+			continue
+		}
+
+		role := modelDeploymentPodRole(pod)
+		if _, wanted := desired[role]; !wanted {
+			// Scaled away, or renamed by a role rename. THE REMOVAL IS HANDED TO THE RETIREMENT
+			// PROTOCOL RATHER THAN ISSUED, and the helper either starts the protocol on this pass
+			// or refuses the removal because an operation is already in flight. Either way the
+			// replica stays, and it stays counted: a scale-away is exactly the moment a withdrawal
+			// and a drain are worth paying for, and deleting the Pod here is the cut they exist to
+			// prevent.
+			if r.refuseModelDeploymentRemoval(ctx, md, retirement, pod, actual, nil) {
+				logger.V(3).Info("holding a replica of a role no longer in the spec for the retirement",
+					"pod", pod.Name)
+				liveByRole[role] = append(liveByRole[role], pod)
+
+				continue
+			}
+
+			logger.Info("removing replica of a role no longer in the spec", "pod", pod.Name)
+			if err = r.Client.Delete(ctx, pod); err != nil && !kerrors.IsNotFound(err) {
+				logger.Error(err, "delete replica", "pod", pod.Name)
+				return ctrl.Result{}, err
+			}
+			departed = append(departed, *pod)
+
+			continue
+		}
+
+		// A TERMINAL POD IS A REPLICA THAT HAS ALREADY LEFT, though nothing deleted it: the kubelet
+		// evicting it under node pressure, or rejecting it at admission, leaves it in Failed with no
+		// deletion timestamp, and a Failed Pod never runs again. Succeeded is the same departure
+		// through a clean exit -- the engine answers an eviction's SIGTERM with exit 0, and with
+		// RestartPolicy Always no healthy replica ever reaches a terminal phase, so Succeeded on a
+		// serving Pod can only come from a termination the kubelet imposed. Counted as live it would
+		// still hold its ordinal and the current render's hash, so the pass would create nothing for
+		// the slot and report the replica current. It is deleted here, and its Workload with it
+		// below, on the same terms as any departure this pass initiates: the Workload is what
+		// releases Kueue's finalizer on the Pod, and the replacement is a fresh admission once the
+		// ordinal reads empty. A Member of a larger replica goes the same way, and its surviving
+		// Members are left short, which the rollout below turns over as a whole.
+		if pod.Status.Phase == core.PodFailed || pod.Status.Phase == core.PodSucceeded {
+			// A TERMINAL POD IS A DEPARTURE THIS OPERATOR DID NOT INITIATE, and one the retirement
+			// protocol cannot retain: the engine has already gone, and the reservation's targets no
+			// longer resolve. The hold is not consulted because there is nothing to hold, and the
+			// protocol learns of it on this same pass, where it records the termination instead of
+			// the clean abort a budget expiry would earn.
+			logger.Info("removing replica in a terminal phase",
+				"pod", pod.Name, "phase", pod.Status.Phase, "reason", pod.Status.Reason)
+			if err = r.Client.Delete(ctx, pod); err != nil && !kerrors.IsNotFound(err) {
+				logger.Error(err, "delete terminal replica", "pod", pod.Name)
+				return ctrl.Result{}, err
+			}
+			departed = append(departed, *pod)
+
+			continue
+		}
+
+		liveByRole[role] = append(liveByRole[role], pod)
+	}
+
+	// A delete this pass issued does not end it: the observations below run either way. Returning
+	// instead would mean that during exactly the window a departure event is for — a replica on its
+	// way out — no event and no status were written at all.
+	var requeue bool
+	if len(departed) > 0 {
+		// AFTER THE DELETES, NOT INSTEAD OF THEM: the survivors are deleted here rather than left
+		// to the stop Kueue performs when a Workload goes, because that stop is another
+		// controller's answer to our delete. The Workload removal is what releases Kueue's
+		// finalizer on each departed replica -- one Workload per replica now, so a removed role
+		// frees exactly the quota its replicas held.
+		if err = r.deleteModelDeploymentGroupWorkload(ctx, md, departed); err != nil {
+			logger.Error(err, "delete departed replicas' workloads")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// A replica already leaving when this pass began was sent away by something other than this
+	// operator: a hand deleting the Pod, a node drain, an eviction. None of those deletes the
+	// replica's Workload, and a serving group's finalizer is released by nothing else -- so without
+	// this the ordinal is held by a Pod that can never leave, and the create gate below never opens
+	// for it. The deletes above cover only what this pass itself sent away.
+	// A RESERVED MEMBER IS NEVER DEPARTING, so the sweep's own rule already protects it: a group
+	// with a member still standing keeps its Workload, and the reservation's target is standing by
+	// definition. That rule is the whole of the protection here, and it is enough: a reserved
+	// member terminated from outside reaches the reservation as an external termination, which the
+	// state machine observes and records, so this sweep has no need of the reservation to tell
+	// those two apart.
+	if err = r.releaseModelDeploymentStrandedWorkloads(ctx, md, actual); err != nil {
+		logger.Error(err, "release the workloads of replicas nothing here sent away")
+		return ctrl.Result{}, err
+	}
+
+	// THE PROTOCOL'S OWN DELETE IS ISSUED HERE, after the paths above have been held and before the
+	// per-role convergence, so the replica the operation is committed to removing goes on the pass
+	// that committed to it rather than a pass later. The convergence below then runs over a
+	// `retirement` that holds the same Pods it is looking at, and skips them for the same reason
+	// every other path does.
+	if err = r.commitModelDeploymentRetirement(ctx, md, retirement, actual); err != nil {
+		logger.Error(err, "delete the retired replica")
+		return ctrl.Result{}, err
+	}
+	// The convergence itself, one role at a time, and THE COUNT MOVES BEFORE THE CURRENCY: a role
+	// short of its declared count does not roll its outdated members in the same breath, because
+	// deleting from a set that is already short widens exactly the gap the create gate below is
+	// waiting to close -- and the admitted-counting guard below refuses a short role on its own,
+	// since a missing admission is one admission already in flight. A role's currency is worth
+	// nothing until its count is right.
+	// ONE LIST OF WORKLOADS PER PASS, TAKEN ONLY IF A ROLE ASKS FOR IT. The rollout guard below
+	// reads Kueue's Admitted verdicts, so the read stays uncached -- the informer lags the writer
+	// and the guard would act on the previous pass's answer. What is not defensible is issuing it
+	// once per rolling role: the list is the namespace's and the answer is the same for every
+	// role, while a held rollout requeues every couple of seconds for as long as it waits.
+	// Deferring it to first need keeps a deployment that is merely scaling, or settled, from
+	// paying for a read nobody looks at.
+	listWorkloads := sync.OnceValues(func() ([]kueue.Workload, error) {
+		wlList := new(kueue.WorkloadList)
+		if err := r.APIReader.List(ctx, wlList, ctrlcli.InNamespace(md.Namespace)); err != nil {
+			return nil, fmt.Errorf("list workloads: %w", err)
+		}
+
+		return wlList.Items, nil
+	})
+
+	createOrdinals := make(map[string][]int, len(md.Spec.Roles))
+	// partialCreates are the members filled into the group a replacement slot is building, gathered
+	// from the same decision below that admits a partial create as fillable at all.
+	partialCreates := make(map[string][]*core.Pod, len(md.Spec.Roles))
+	// The ordinals this pass condemns for replacement, gathered here so the whole-group health
+	// predicate can ask "is this replica on its way out" from the same decision the rollout makes
+	// rather than from a second comparison that could reach a different answer.
+	//
+	// Only a replica this pass selected is recorded. An outdated replica nobody has chosen is
+	// still serving, and failing its qualification would withdraw its endpoint before any
+	// replacement exists.
+	replacedByRole := make(map[string]map[int]bool, len(md.Spec.Roles))
+	// holdingRoles are the roles whose replacement has not been admitted yet. They take part in
+	// every decision below except selecting a further healthy replica.
+	holdingRoles := make(map[string]modelDeploymentReplacementSlot, len(md.Spec.Roles))
+	slots := modelDeploymentReplacementSlotsOf(md)
+	minRenderVersion := modelDeploymentEffectiveMinRenderVersion(md)
+	for i := range md.Spec.Roles {
+		role := &md.Spec.Roles[i]
+		live := liveByRole[role.Name]
+		declared := int(role.Replicas)
+		want := desired[role.Name]
+
+		// A ROLE ALREADY REPLACING ONE REPLICA DOES NOT SELECT ANOTHER until that replacement
+		// holds an admission. A queued one holds nothing, so spending a second healthy replica
+		// behind it would leave the role with less admitted capacity every pass it runs.
+		if slot, held := slots.slotFor(role.Name); held {
+			resolved, resolveErr := r.resolveReplacementSlot(ctx, md, slot, role, want[slot.Ordinal])
+			if resolveErr != nil {
+				return objectWriteResult(
+					logger, resolveErr, "resolve the replacement slot", _requeueAfterConflict,
+				)
+			}
+			if resolved.cleared {
+				// THE CLEARING IS PERSISTED, not just dropped from this pass's view: a slot left on
+				// the object would keep holding the role forever, because the next pass would read
+				// the same unresolved replacement this one just resolved.
+				if err = r.endReplacementSlot(ctx, md, role.Name); err != nil {
+					return objectWriteResult(
+						logger, err, "clear the replacement slot", _requeueAfterConflict,
+					)
+				}
+				slots = slots.clearRole(role.Name)
+			} else {
+				slots = slots.setSlot(resolved.slot)
+				holdingRoles[role.Name] = resolved.slot
+			}
+			if resolved.requeue {
+				requeue = true
+			}
+		}
+
+		// THE ORDINALS THE SPEC STILL NAMES KEEP THEIR PODS, and the ones it no longer names go --
+		// highest first, so a scale-down sheds the youngest slots and the ordinals stay dense from
+		// zero. Each departing replica takes its own Workload with it: its group is its own, so no
+		// other replica's admission is touched, and without the Workload the Pod would hold Kueue's
+		// finalizer -- and its quota -- forever.
+		//
+		// A POD WITH NO ORDINAL CLAIMS NO SLOT. It was rendered before the per-replica groups
+		// existed; it is kept for now and judged below, where no hash this pass computes can match
+		// it, so it turns over on the ordinary rollout cadence instead of being torn out at once.
+		// THE COUNTS BELOW ARE IN TWO DIFFERENT UNITS, and keeping them apart is what makes a role
+		// of multi-Member replicas arithmetically the same as one of single-Member replicas.
+		// `declared` counts REPLICAS, which is what the spec states and what a scale moves.
+		// The desired member size is not used to measure the live set at all: it describes what a
+		// replacement will be built at, while the running replicas were built at whatever the spec
+		// said when they were created.
+		removed := make([]*core.Pod, 0)
+		kept := make([]*core.Pod, 0, len(live))
+		occupied := make(map[int]bool, declared)
+		orphans := 0
+		for _, pod := range live {
+			// A REPLICA THIS PASS MAY NOT REMOVE IS KEPT BEFORE ANY ARITHMETIC RUNS, and it is kept
+			// in `kept` rather than merely not removed. The two are not the same: `kept` is what the
+			// ordinals are read from and what the count is taken over, so a replica that were only
+			// excluded from `removed` would free the slot below and let the create gate build a
+			// second replica onto the ordinal the protocol is about to take. This is also what makes
+			// a scale to zero hold: the spec declares nothing, the ordinal is past the declared
+			// count, the protocol is admitted, and the capacity stays exactly where it is.
+			//
+			// The removal is handed to the protocol rather than issued, so a scale-down this pass
+			// is the START of a retirement rather than an instantaneous cut of a serving engine.
+			ordinal, ok := modelDeploymentPodOrdinal(pod)
+			keepHeld := func() {
+				kept = append(kept, pod)
+				if ok {
+					occupied[ordinal] = true
+				}
+			}
+
+			if retirement.holds(pod.UID) {
+				keepHeld()
+
+				continue
+			}
+			// A REMOVAL THE SPEC MAKES HERE IS HANDED TO THE PROTOCOL rather than issued, so a
+			// scale-down this pass is the START of a retirement rather than an instantaneous cut of
+			// a serving engine. The hand-off is only made for an ordinal the role no longer
+			// declares; everything else below is the ordinary classification.
+			if ok && ordinal >= declared &&
+				r.refuseModelDeploymentRemoval(ctx, md, retirement, pod, actual, nil) {
+				keepHeld()
+
+				continue
+			}
+
+			switch {
+			case !ok:
+				kept = append(kept, pod)
+				orphans++
+			case ordinal >= declared:
+				removed = append(removed, pod)
+			default:
+				occupied[ordinal] = true
+				kept = append(kept, pod)
+			}
+		}
+
+		// THE COUNT STILL BINDS, for the state the ordinal arithmetic alone cannot name: more live
+		// Pods than the role declares, every one of them sitting on a slot the spec does keep --
+		// duplicates on one ordinal, or pods with no ordinal at all. The surplus leaves BY SLOT
+		// rather than by age: a Pod with no ordinal claims no seat and goes before any that holds
+		// one, and a slot carrying more than one member keeps the member its current render
+		// describes -- the one a replacement would build anyway, so shedding it would only schedule
+		// the same churn for the next pass -- with the greatest name deciding between members
+		// nothing separates, which is determinism rather than meaning. Each departing replica takes
+		// its Workload with it: leaving the excess standing would have Kueue evict a member of its
+		// own choosing on every pass.
+		if surplus := modelDeploymentSurplusCount(kept); surplus > 0 {
+			shedSurplus := modelDeploymentSurplusReplicas(kept, want, surplus, minRenderVersion)
+			// THE SHED IS ONE DECISION AND IT IS NOT PARTLY TAKEN. The protocol is handed the
+			// whole set rather than the first member of it, because a replica is removed as a
+			// replica: shedding one member of a set the protocol is about to take as a whole would
+			// leave the group short, which Kueue composes no Workload for at all. A member with no
+			// ordinal is not admitted and not held, and is left to the rollout below.
+			if _, seated := modelDeploymentRetirementShedSeat(shedSurplus); seated &&
+				r.refuseModelDeploymentRemoval(ctx, md, retirement, shedSurplus[0], actual,
+					modelDeploymentShedMembers(shedSurplus)) {
+				logger.V(3).Info("holding a surplus shed for the retirement", "role", role.Name,
+					"members", len(shedSurplus))
+				occupied[modelDeploymentOrdinalOrFloor(shedSurplus[0])] = true
+			} else {
+				removed = append(removed, shedSurplus...)
+				kept = slices.DeleteFunc(kept, func(pod *core.Pod) bool {
+					return slices.Contains(shedSurplus, pod)
+				})
+			}
+		}
+
+		// Highest ordinal first, so the departures are logged -- and issued -- from the top down and
+		// two passes over the same state delete in the same order. A pod with no ordinal sorts
+		// last: it holds no seat, so every seated one outranks it, and the name settles what the
+		// slot cannot.
+		slices.SortFunc(removed, func(a, b *core.Pod) int {
+			if c := modelDeploymentOrdinalOrFloor(b) - modelDeploymentOrdinalOrFloor(a); c != 0 {
+				return c
+			}
+
+			return strings.Compare(b.Name, a.Name)
+		})
+
+		var shed bool
+		if len(removed) > 0 {
+			for _, pod := range removed {
+				logger.Info("removing replica the role no longer declares",
+					"pod", pod.Name, "role", role.Name)
+				if err = r.Client.Delete(ctx, pod); err != nil && !kerrors.IsNotFound(err) {
+					logger.Error(err, "delete removed replica", "pod", pod.Name)
+					return ctrl.Result{}, err
+				}
+			}
+			removedPods := make([]core.Pod, 0, len(removed))
+			for _, pod := range removed {
+				removedPods = append(removedPods, *pod)
+			}
+			if err = r.deleteModelDeploymentGroupWorkload(ctx, md, removedPods); err != nil {
+				logger.Error(err, "delete removed replicas' workloads", "role", role.Name)
+				return ctrl.Result{}, err
+			}
+			shed = true
+			requeue = true
+		}
+
+		// Counted before the comparison rather than after: reaching this line is what makes the pass
+		// able to answer at all, and a pass that answers "nothing outdated" without having got here
+		// is reporting that it looked, not what it found.
+		//
+		// THE HASH IS THE SEAT'S OWN, because the group name -- and with it the fingerprint -- is
+		// derived per (role, ordinal): a Pod is current only against the render of its own seat,
+		// which is what keeps a scale-up from rolling the survivors and a slot swap from passing
+		// unnoticed.
+		//
+		// THE VERDICT IS THE REPLICA'S, NOT THE POD'S, and that is not a rounding of the same
+		// answer. A replica's members share one Kueue group and are admitted as one; Kueue holds a
+		// deleted member of an admitted group until that group's Workload goes, and deleting that
+		// Workload stops the surviving members anyway. So replacing one member of a replica is not
+		// a cheaper rollout than replacing the replica -- it is the same operation with a window in
+		// the middle where the deployment is serving from a group that cannot be repaired. One
+		// member reading outdated therefore condemns its replica, and the counts this feeds are in
+		// replicas so that a role of two replicas of four Pods reports two things that can roll,
+		// not eight.
+		outdatedByOrdinal := make(map[int]bool, len(kept))
+		orphaned := make([]*core.Pod, 0, orphans)
+		for _, pod := range kept {
+			ordinal, ok := modelDeploymentPodOrdinal(pod)
+			if !ok {
+				// A Pod claiming no ordinal belongs to no replica, so it is its own unit of
+				// rollout -- which is what it already was before replicas had members.
+				rollout.accounted++
+				rollout.outdated++
+				orphaned = append(orphaned, pod)
+
+				continue
+			}
+
+			member := modelDeploymentPodMemberIndex(pod)
+			members := want[ordinal]
+			if member < len(members) &&
+				modelDeploymentPodMatchesCurrency(pod, members[member], minRenderVersion) {
+				continue
+			}
+
+			// A HELD REPLICA READS CURRENT WHATEVER ITS FINGERPRINT SAYS. It is on its way out on
+			// the protocol's own terms, and condemning it here as well would have the rollout compete
+			// with the protocol for the same replica: this pick takes the highest ordinal, so a held
+			// ordinal would be deleted by whichever of the two ran first and the protocol's careful
+			// withdrawal would have been spent on a Pod the rollout already took. Reading it current
+			// costs nothing -- the fingerprint is still compared for every other replica -- and it
+			// makes the two paths disjoint.
+			if retirement.holds(pod.UID) {
+				continue
+			}
+
+			outdatedByOrdinal[ordinal] = true
+		}
+
+		// A REPLICA SHORT OF THE MEMBERS IT DECLARES IS OUTDATED TOO, and nothing above notices it:
+		// every Pod that IS there can carry the current fingerprint while the replica is still
+		// missing a member, and a replica Kueue cannot compose a Workload for is not one the
+		// deployment is serving from. It is condemned on the same terms as one carrying a stale
+		// render, which keeps the repair path single.
+		//
+		// The total compared is the one the members carry, never the role's desired size: a role
+		// edited from four members to two leaves every running replica whole at four, and reading
+		// that as loss would condemn them all at once.
+		incompleteByOrdinal := make(map[int]bool, len(occupied))
+		for _, view := range modelDeploymentGroupPods(modelDeploymentPodValues(kept), true) {
+			if !view.Seated || !occupied[view.Ordinal] {
+				continue
+			}
+			// AN ORDINAL THE RETIREMENT PROTOCOL OWNS IS NOT THIS RULE'S BUSINESS. The rollout
+			// condemns a replica whose members do not agree with the spec, and while a reservation
+			// is in flight the agreement is not yet decided -- the protocol is removing one member
+			// of a doubled ordinal, which leaves the ordinal looking over-complete to this rule for
+			// as long as the operation takes. Condemning it here would delete the whole ordinal, and
+			// with it the member the surplus rule existed to keep: the rollout would undo the
+			// surplus rule's careful choice with a blunter one, on a state the surplus rule had
+			// already resolved.
+			if retirement.names(role.Name, view.Ordinal) {
+				continue
+			}
+			if modelDeploymentDeployedReplicaShape(view).State == modelDeploymentReplicaShapeIncomplete {
+				outdatedByOrdinal[view.Ordinal] = true
+				incompleteByOrdinal[view.Ordinal] = true
+				continue
+			}
+			if !modelDeploymentReplicaRenderVersionUniform(view.Members) {
+				outdatedByOrdinal[view.Ordinal] = true
+			}
+		}
+
+		// A PARTIAL CREATE IS FILLED ONLY IN THE GROUP A SLOT IS BUILDING, and only while that
+		// group is the current render and holds nothing admitted. A create that failed leaves the
+		// replacement one member short of its total, and Kueue composes no Workload for an
+		// incomplete group, so the slot would otherwise wait on a group that can never be granted
+		// anything.
+		//
+		// IT IS NEVER FILLED BESIDE A GROUP RUNNING AN EARLIER CONFIGURATION. Equal size is not
+		// compatibility: a member rendered from the current spec beside one rendered from the
+		// previous one is a group whose members disagree about what they are, which is not a state
+		// this operator can render, admit or account for. So a replica that lost a member under an
+		// older render is not filled here -- it waits behind the slot below and is replaced whole.
+		//
+		// The members are those of the slot's own ordinal and no other, and the group must hold no
+		// Workload: a group with one standing has proved no admission, and a group with a Workload
+		// on it is a group Kueue has already composed, where topping it up is Kueue's business and
+		// not this operator's.
+		if slot, holding := holdingRoles[role.Name]; holding {
+			partial, fillable, err := r.modelDeploymentPartialGroupMembers(ctx, md, slot, want[slot.Ordinal])
+			if err != nil {
+				logger.Error(err, "read the replacing replica's group", "role", role.Name,
+					"ordinal", slot.Ordinal)
+
+				return ctrl.Result{}, err
+			}
+			if fillable {
+				partialCreates[role.Name] = append(partialCreates[role.Name], partial...)
+			}
+		}
+
+		outdated := orphaned
+		for ordinal := range occupied {
+			rollout.accounted++
+			if outdatedByOrdinal[ordinal] {
+				rollout.outdated++
+				outdated = append(outdated, modelDeploymentReplicaMembers(kept, ordinal)...)
+				continue
+			}
+			if members := modelDeploymentReplicaMembers(kept, ordinal); len(members) > 0 &&
+				!retirement.names(role.Name, ordinal) &&
+				modelDeploymentPodRenderVersion(members[0]) < modelDeploymentRenderVersion {
+				rollout.olderRenderVersion++
+			}
+		}
+
+		if connection == nil && md.Status.KVCache != nil && len(outdated) > 0 {
+			// LOSING THE CONNECTOR IS NOT A REASON TO REBUILD A REPLICA, and without this the hash
+			// makes it one. A pass that cannot resolve the connection renders replicas without a
+			// connector, so every running replica's hash differs from the desired one and the
+			// recreate below would fire on all of them at once.
+			//
+			// The guard is BOTH halves. A deployment that never resolved a domain has no connector
+			// to lose, so a hash difference there comes from the spec and must still roll out --
+			// suppressing it on `connection == nil` alone breaks the ordinary rollout of every
+			// deployment that does not use a cache at all, which is what the spec-change test says
+			// when this branch is written without the second half.
+			//
+			// What reaches that state is ordinary rather than exotic: a store leader restart makes
+			// every Binding on the pool briefly not-Ready -- measured at 3.5 to 32 seconds in this
+			// project -- and a deployment whose Binding is not usable resolves no connection. So a
+			// few seconds of store unavailability would delete every replica of every deployment on
+			// that pool, and each one then reloads its weights. The blip becomes the outage.
+			//
+			// The cost is that this also withholds a spec change that moves a running replica's
+			// rendered Pod, until the connection returns.
+			//
+			// THE SPLIT THAT WOULD AVOID IT IS REFUSED, and not for the price it was first parked on.
+			// That design keeps a base hash over the spec without the connector beside a separate
+			// connector fingerprint, so a spec edit rolls from the base hash while only the fingerprint
+			// comparison is skipped here. Acting on that precision is what costs: the base hash
+			// difference deletes a replica, the replacement is rendered by a pass that still has no
+			// connector to give it, and when the store returns the desired render regains the
+			// connector and rolls the replacement again. Where an edit is waiting, the split pays two
+			// reloads for one replica in place of one.
+			//
+			// The trade the operator used to hold is gone with the rebuild it rode on: a change to
+			// the replica counts no longer replaces anyone, so nothing carries a withheld edit past
+			// this guard. A scale during an outage still proceeds -- the ordinals it adds do not exist
+			// yet, and the creates below run -- but the replicas it creates pay the second turnover
+			// themselves when the store returns, which is exactly the cost the old lever charged for
+			// and nobody can decline any more. What bounds the wait now is the store's own recovery,
+			// and the message in the condition says what waits rather than promising a way out.
+			//
+			// Leaving them alone is also what this design already decided for the neighboring case:
+			// an admin deleting the Binding leaves running Pods running, because tearing down a
+			// serving deployment because an admin object vanished is worse than serving without a
+			// cache. The same reasoning covers a Binding that is merely unwell.
+			//
+			// Nothing is lost when it comes back. The connector resolves to the same values, the
+			// desired hash returns to what these replicas already carry, and this branch stops
+			// firing. If it comes back with a DIFFERENT endpoint, the hash differs from the one they
+			// carry and they are recreated on that pass -- which is the rollout that should happen.
+			//
+			// New replicas are still created below, without a connector: a replica that does not
+			// exist yet cannot be given an address that does not exist yet either.
+			logger.V(3).Info("no connection this pass; leaving the replicas as built", "role", role.Name)
+			// Counted in REPLICAS, matching rollout.outdated above: `outdated` is a list of the
+			// Pods to delete, and a multi-Member replica contributes several of them to it, so its
+			// length is the wrong unit for a figure that reports how many instances are waiting.
+			rollout.held += len(outdatedByOrdinal) + len(orphaned)
+			outdated = nil
+		}
+
+		if weights != nil && weights.Blocked && len(outdated) > 0 {
+			// A REPLICA IS NOT TURNED OVER WHILE ITS REPLACEMENT COULD NOT BE CREATED. The weights
+			// are what the replacement needs, and while they are blocked -- access revoked, a claim
+			// that cannot be placed -- the create below is withheld, so a recreate here would only
+			// delete a serving replica. The edit waits for the weights, as it waits for a lost
+			// connector above.
+			rollout.heldByWeights += len(outdatedByOrdinal) + len(orphaned)
+			outdated = nil
+		}
+
+		// The rollout is recreate rather than surge: a replica built before a spec change is deleted
+		// here and replaced by a later pass. The cost is this replica's cached blocks, which its
+		// siblings lose when it goes.
+		//
+		// THE CURRENCY OF A ROLLOUT IS AN ADMITTED REPLICA, NOT A LIVE ONE. A replacement is a
+		// fresh admission -- deleting the departed replica's Workload is what frees it, and with
+		// that delete the reservation is gone too -- so a created-but-still-queued replacement
+		// holds nothing while it waits. A guard that counted live replicas would read that queued
+		// Pod as progress and keep deleting outdated ones behind it, and on a contended pool the
+		// rollout walks the deployment down to zero admitted replicas and stops there, a deficit
+		// no declared count covers and the barrier does not catch. The guard therefore turns a
+		// replica over only when every replica the role declares holds an admitted Workload: one
+		// admission is in flight at a time, and the pass comes back for the next departure once
+		// the replacement has actually been admitted. A complete group still waiting for its first
+		// admission can be replaced without spending admitted capacity. Previously admitted groups
+		// keep this guard after their admission is revoked.
+		//
+		// THE DEPARTING REPLICA'S WORKLOAD IS DELETED WITH IT, and that is not bookkeeping. The
+		// group is annotated serving, so Kueue never releases the finalizer it holds on the Pod
+		// whatever phase the Pod drains through, and a Workload left standing keeps the ordinal
+		// occupied and the replacement unwritable forever. The delete is what empties the slot
+		// the create gate below observes, and it costs the reservation -- which is why the guard
+		// above refuses to run two of them at once.
+		//
+		// AT MOST ONE PER ROLE PER PASS, never beside a surplus this pass already shed, and THE
+		// HIGHEST ORDINAL TURNS OVER FIRST -- the end the scale-down sheds from -- so the ordinals
+		// a rollout keeps current stay dense from zero and two passes over the same state pick the
+		// same victim.
+		// A POD THAT CANNOT BE ADMITTED AS A DECLARED REPLICA IS TURNED OVER WITHOUT WAITING FOR THE
+		// GUARD, and this exception is what keeps the guard from being a deadlock rather than a
+		// brake. Two shapes qualify, for one reason.
+		//
+		// The guard exists to spend admitted capacity one replica at a time, and it reads that
+		// capacity as a count of admitted Workloads against a count of declared replicas. AN
+		// INCOMPLETE REPLICA has none to spend: Kueue composes no Workload at all for a group short
+		// of its declared total, so it holds no reservation, serves nothing, and contributes zero to
+		// the count. A POD CLAIMING NO ORDINAL breaks the correspondence the comparison rests on
+		// instead -- it seats no replica, so whatever Workload owns it answers for no declared slot:
+		// one of its own makes the count long, and one shared with its fellows makes it short. The
+		// two are the same defect seen from either side, and either way the comparison is against a
+		// number this role can never reach again.
+		//
+		// Left to the guard either one is unreachable in both directions at once -- it can never be
+		// admitted, so `admitted == declared` can never hold again for this role, so it is never
+		// replaced AND no later spec edit ever rolls either. The role sits broken and silently
+		// ignores every subsequent change.
+		//
+		// The create gate below does not cover either: an ordinal holding even one member is
+		// occupied, and a Pod with no ordinal is credited against the declared count there, so
+		// nothing is owed for them. Replacing WHOLE is the only repair, on the same terms as every
+		// other member loss -- an incomplete replica's surviving members hold a group Kueue will
+		// neither admit nor release, so putting a fresh member beside them would join a group that
+		// was already refused.
+		//
+		// THIS IS ALSO WHAT KEEPS THE ADMITTED COUNT BELOW HONEST. It is taken over every live Pod
+		// of the role, ordinal-less ones included, which would be the wrong denominator -- but every
+		// such Pod is outdated by the rule above, so reaching the comparison at all means there are
+		// none, and the count is over seated replicas exactly when it is read.
+		// TWO KINDS OF REPLICA TURN OVER WITHOUT THE ADMISSION A HEALTHY ONE NEEDS, and they are kept
+		// apart because they are not waited for the same way.
+		//
+		// A POD CLAIMING NO ORDINAL holds no seat and no admission, and no ordinal a slot could name
+		// describes it, so there is nothing for it to wait behind: it rolls on its own path here.
+		//
+		// A REPLICA SHORT OF ITS MEMBERS is broken, and a broken replica BEHIND A SLOT WAITS FOR IT.
+		// The slot's replacement has to be admitted first, because that is the one group the role is
+		// committed to; a broken group behind it is not admitted and will not be, and taking it now
+		// would delete the member it still holds to rebuild a group whose remaining members are
+		// already obsolete. Once the slot clears it is taken whole, ahead of any healthy outdated
+		// replica -- see the pick below.
+		ungated := make([]*core.Pod, 0, len(outdated))
+		broken := make([]*core.Pod, 0, len(outdated))
+		for _, pod := range outdated {
+			ordinal, ok := modelDeploymentPodOrdinal(pod)
+			switch {
+			case !ok:
+				ungated = append(ungated, pod)
+			case incompleteByOrdinal[ordinal]:
+				broken = append(broken, pod)
+			}
+		}
+
+		if len(outdated) > 0 && !shed {
+			workloads, wlErr := listWorkloads()
+			if wlErr != nil {
+				logger.Error(wlErr, "read the role's workloads", "role", role.Name)
+				return ctrl.Result{}, wlErr
+			}
+
+			// The victim is drawn from those when there are any, so that what the guard cannot clear
+			// is what leaves. Same pick as below -- highest ordinal -- so two passes over one state
+			// still choose the same Pod, and a seated replica goes before one holding no ordinal
+			// because the pick reads a missing ordinal as below every seat.
+			_, holding := holdingRoles[role.Name]
+			admitted := modelDeploymentAdmittedReplicas(workloads, live)
+			// A BROKEN REPLICA IS TAKEN WHOLE AND TAKEN FIRST, AHEAD OF ANY HEALTHY OLD REPLICA.
+			// It is the only one of the two that is already down, so leaving it for a healthy
+			// replica's turn is how a role ends up replacing capacity that was serving while the
+			// capacity that was lost waits. The ordinal it sits at does not enter into it: a broken
+			// replica below a healthy one is the more urgent of the two.
+			brokenTurnsOver := len(broken) > 0 && !holding
+			unguarded := len(ungated) > 0
+			var initiallyQueued []*core.Pod
+			if !holding && !brokenTurnsOver && !unguarded && admitted != declared {
+				for _, view := range modelDeploymentGroupPodsByReplica(modelDeploymentPodValues(outdated)) {
+					queued, queueErr := r.initialQueuedReplica(ctx, view, workloads)
+					if queueErr != nil {
+						return ctrl.Result{}, queueErr
+					}
+					if queued {
+						initiallyQueued = append(initiallyQueued, view.Members...)
+					}
+				}
+			}
+			pick := outdated
+			switch {
+			case brokenTurnsOver:
+				pick = broken
+			case unguarded:
+				pick = ungated
+			case len(initiallyQueued) > 0:
+				pick = initiallyQueued
+			}
+
+			// A ROLE WHOSE REPLACEMENT IS NOT ADMITTED YET SPENDS NO FURTHER HEALTHY CAPACITY. The
+			// queued replacement holds nothing, so a second deletion behind it would remove another
+			// admitted replica on every pass until the role held none.
+			//
+			// The hold covers the broken replicas too: the slot's own replacement is the group the
+			// role is committed to, and a broken group behind it is repaired whole once that one is
+			// admitted rather than being dismantled to save a pass.
+			turnsOver := brokenTurnsOver || unguarded || len(initiallyQueued) > 0 || (!holding && admitted == declared)
+			if turnsOver {
+				// THE WHOLE REPLICA TURNS OVER, not the member that was picked. The pick names one
+				// Pod, and that Pod's replica is what departs: its members hold one Kueue group,
+				// so a delete of some of them leaves a group Kueue will not admit and will not
+				// release, and the Workload delete below would stop the rest regardless.
+				pod := modelDeploymentHighestOrdinalReplica(pick)
+				ordinal, seated := modelDeploymentPodOrdinal(pod)
+				departing := []*core.Pod{pod}
+				if seated {
+					departing = modelDeploymentReplicaMembers(pick, ordinal)
+				}
+
+				// A POD CLAIMING NO ORDINAL IS NOT ANY SLOT'S, and a slot keyed on one cannot
+				// describe it: its vacancy question is about an ordinal its members do not sit
+				// on, so it would wait on a group the Pod never belonged to. Such a Pod rolls on
+				// the ungated repair path alone, where the group name it does carry is the evidence.
+				held, hasSlot := slots.slotFor(role.Name)
+				switch {
+				case hasSlot && seated && held.Ordinal == ordinal:
+					if err = r.cleanReplacementSlot(ctx, md, held, departing); err != nil {
+						logger.Error(err, "clean the replacing replica",
+							"role", role.Name, "ordinal", ordinal)
+						return ctrl.Result{}, err
+					}
+				case seated:
+					logger.Info("recreating replica",
+						"pod", pod.Name, "members", len(departing),
+						"why", map[bool]string{true: "short of its members", false: "built from an earlier spec"}[brokenTurnsOver])
+
+					// The slot is written before any delete, and it is what a restart between
+					// the delete and the create recovers.
+					slot := replacementCapturedIdentities(modelDeploymentReplicaView{
+						Role:    role.Name,
+						Ordinal: ordinal,
+						Members: departing,
+					}, workloads)
+					if err = r.beginReplacementSlot(ctx, md, slot); err != nil {
+						return objectWriteResult(
+							logger, err, "record the replacement slot", _requeueAfterConflict,
+						)
+					}
+					slots = slots.setSlot(slot)
+
+					if err = r.cleanReplacementSlot(ctx, md, slot, departing); err != nil {
+						logger.Error(err, "clean the replaced replica",
+							"role", role.Name, "ordinal", ordinal)
+						return ctrl.Result{}, err
+					}
+
+				default:
+					logger.Info("recreating replica",
+						"pod", pod.Name,
+						"why", map[bool]string{
+							true:  "holds no ordinal, so no slot can name it",
+							false: "short of its members",
+						}[unguarded])
+					departed := make([]core.Pod, 0, 1)
+					uid := pod.UID
+					if err = r.Client.Delete(ctx, pod, ctrlcli.Preconditions{UID: &uid}); err != nil &&
+						!kerrors.IsNotFound(err) {
+						logger.Error(err, "delete the ordinal-less replica member", "pod", pod.Name)
+						return ctrl.Result{}, err
+					}
+					departed = append(departed, *pod)
+					if err = r.deleteModelDeploymentGroupWorkload(ctx, md, departed); err != nil {
+						logger.Error(err, "delete the departing replica's workload", "pod", pod.Name)
+						return ctrl.Result{}, err
+					}
+				}
+
+				if seated {
+					if replacedByRole[role.Name] == nil {
+						replacedByRole[role.Name] = make(map[int]bool)
+					}
+					replacedByRole[role.Name][ordinal] = true
+				}
+
+				requeue = true
+			}
+			// Otherwise the rollout holds rather than proceeding short, and it asks for no requeue.
+			// The admission that releases it moves the waiting replica's Workload, and the Workload
+			// watch wakes this deployment on that move; the guard then reads the Workloads on the
+			// API server, which is at least as fresh as the cache the event came from.
+		}
+
+		// A reused ordinal requires both Pod and Workload vacancy on the API server.
+		// The cache can miss a successful create or a holder still leaving behind its finalizer.
+		// THE MISSING ORDINALS ARE FILLED LOWEST FIRST, and only as many as the count is short: a
+		// role short by one with two ordinals free -- a pre-per-replica pod still serving among
+		// them -- creates the lower slot and lets the surplus pod's own departure settle the other.
+		// IN REPLICAS, NOT PODS. A role short of its declared count is short of whole instances, and
+		// `kept` is a list of Pods -- at size one they are the same number, which is why this read
+		// as len(kept) for as long as a replica was a Pod. An ordinal that is occupied at all counts
+		// as present here even if it is short a member; the rollout above is what repairs that,
+		// because filling the gap in place would seat a member in a group Kueue already refused.
+		if missing := declared - len(occupied) - orphans; missing > 0 {
+			// Two uncached lists answer vacancy for every ordinal of this role.
+			taken, takenErr := r.modelDeploymentTakenGroups(ctx, md, role.Name, true)
+			if takenErr != nil {
+				return ctrl.Result{}, takenErr
+			}
+			workloads := new(kueue.WorkloadList)
+			if err := r.APIReader.List(ctx, workloads, ctrlcli.InNamespace(md.Namespace)); err != nil {
+				return ctrl.Result{}, err
+			}
+			for ordinal := range declared {
+				group := modelDeploymentReplicaGroupName(md, role.Name, ordinal)
+				for i := range workloads.Items {
+					if workloadOwnsGroupName(&workloads.Items[i], group) {
+						taken.Insert(group)
+						break
+					}
+				}
+			}
+
+			// The slot's ordinal is filled first: it is the one the role is committed to, and a role
+			// short for another reason would otherwise spend its creates while this one waits.
+			//
+			// IT ASKS THE SAME UNCACHED QUESTION AS EVERY OTHER ORDINAL. The member this slot
+			// deleted is still standing on the server behind its finalizer, and a replacement is
+			// rendered for the very name that member holds -- so filling this ordinal ahead of the
+			// gate would seat two members in one group and collide on the name.
+			if slot, held := holdingRoles[role.Name]; held && !occupied[slot.Ordinal] {
+				if !taken.Has(modelDeploymentReplicaGroupName(md, role.Name, slot.Ordinal)) {
+					createOrdinals[role.Name] = append(createOrdinals[role.Name], slot.Ordinal)
+				} else {
+					requeue = true
+				}
+			}
+
+			for ordinal := 0; ordinal < declared && len(createOrdinals[role.Name]) < missing; ordinal++ {
+				if occupied[ordinal] || slices.Contains(createOrdinals[role.Name], ordinal) {
+					continue
+				}
+
+				// A SLOT THE RETIREMENT IS EMPTYING STAYS EMPTY until the operation ends. A held
+				// replica keeps itself counted as occupied above, so this only bites after the
+				// protocol's own delete has landed and the Pods are gone from the API server -- at
+				// which point the create gate would otherwise read the ordinal free and build a
+				// replacement onto it, one pass before the reservation is cleared. Filling the slot
+				// the operation is about to release is how a retirement turns into a rollout.
+				if retirement.Reservation != nil &&
+					retirement.Reservation.RoleName == role.Name &&
+					int(retirement.Reservation.ReplicaOrdinal) == ordinal {
+					requeue = true
+
+					continue
+				}
+
+				if taken.Has(modelDeploymentReplicaGroupName(md, role.Name, ordinal)) {
+					// The server holds a Pod for this ordinal the cached list does not account
+					// for: a create whose response was lost, or a departure still draining. The
+					// pass creates nothing beside it and comes back -- the informer will deliver
+					// the Pod's eventual event, and the requeue is what covers the gap either
+					// way, because nothing else wakes this deployment when the drain completes.
+					requeue = true
+
+					continue
+				}
+
+				createOrdinals[role.Name] = append(createOrdinals[role.Name], ordinal)
+			}
+		}
+	}
+
+	// A RUNNING OPERATION REQUEUES, and it is read HERE rather than beside the delete above because
+	// ADMISSION HAPPENS INSIDE THE LOOP JUST FINISHED. Nothing else wakes a deployment whose
+	// replica is merely waiting for a queue to empty or a Service to converge: no object changes
+	// while it waits, and the event that eventually matters is the one the operation is waiting for.
+	if retirement.InFlight {
+		requeue = true
+	}
+
+	// NO REPLICA IS CREATED WHILE THE WEIGHTS ARE BLOCKED, and none that runs is touched: a revoked
+	// credential stops new consumption, never running consumption, and a claim that cannot be placed
+	// would only produce a Pod that sits Pending while its Workload holds quota.
+	if weights != nil && weights.Blocked {
+		clear(createOrdinals)
+		clear(partialCreates)
+	}
+
+	// The placement preference is read once for every member this pass creates, and not at all by a
+	// pass that creates none.
+	var preference *core.PreferredSchedulingTerm
+	for _, ordinals := range createOrdinals {
+		if len(ordinals) > 0 {
+			preference = weights.placementPreference(ctx, r.Client)
+			break
+		}
+	}
+	if preference == nil {
+		for _, created := range partialCreates {
+			if len(created) > 0 {
+				preference = weights.placementPreference(ctx, r.Client)
+				break
+			}
+		}
+	}
+
+	// A FAILED CREATE DOES NOT END THE PASS EITHER, and that is what makes the incomplete group a
+	// REPORTED state rather than a silent one. Returning here would skip the status write below, so
+	// the one pass that knows the group is short of its total would be the one pass that says
+	// nothing — and the symptom of an incomplete group is already silence: Pods exist, they are
+	// gated, and Kueue composes no Workload at all.
+	//
+	// The remaining creates are still issued, because the group needs every one of them before
+	// anything is admitted; stopping at the first failure would leave the group shorter than it had
+	// to be. The error is returned after the status is written, so the pass is still not treated as
+	// successful and the missing replicas are retried.
+	var createErr error
+	for _, role := range modelDeploymentCreateRoleOrder(md) {
+		for _, ordinal := range createOrdinals[role.Name] {
+			if slot, held := slots.slotFor(role.Name); held && slot.Ordinal == ordinal &&
+				slot.Phase == modelDeploymentReplacementCleanup {
+				slot = modelDeploymentReplacementSlot{
+					Role: role.Name, Ordinal: ordinal, Phase: modelDeploymentReplacementWaitingForAdmission,
+					MemberHashes: replacementRenderHashes(desired[role.Name][ordinal]),
+				}
+				if err := r.advanceReplacementSlot(ctx, md, slot); err != nil {
+					return objectWriteResult(logger, err, "record replacement creation", _requeueAfterConflict)
+				}
+				slots = slots.setSlot(slot)
+			}
+
+			// EVERY MEMBER OF THE REPLICA IS ISSUED, AND A FAILURE ON ONE DOES NOT ABANDON THE REST.
+			// The members share one Kueue group whose declared total is the replica's size, and
+			// Kueue composes no Workload at all until that many exist -- so a replica left short is
+			// a replica whose members sit gated with nothing naming a cause. Issuing the rest costs
+			// nothing when the failure was transient and is the only way out when it was not.
+			for _, want := range desired[role.Name][ordinal] {
+				// One fresh object per member: the template is every Pod of the role's, stamped for
+				// its own ordinal and member index.
+				pod := want.DeepCopy()
+				// Added at creation rather than rendered, so a replica created before its claim
+				// bound -- which then carries no affinity -- is not rolled once the claim has one.
+				// The placement preference follows the same rule for a stronger reason: which nodes
+				// hold the weights changes with every download and collection, and a fingerprint
+				// covering it would recreate every replica each time. It was read once for the pass,
+				// so every member of a replica carries the same term, which Kueue needs because it
+				// builds the replica's PodSet from one member's spec.
+				if weights != nil {
+					injectModelArtifactAffinity(pod, weights.Affinity)
+				}
+				injectModelPlacementPreference(pod, preference)
+				if err = r.Client.Create(ctx, pod); err != nil {
+					logger.Error(err, "create replica member",
+						"role", role.Name, "ordinal", ordinal,
+						"member", pod.Labels[modelDeploymentMemberIndexLabel])
+					if createErr == nil {
+						createErr = err
+					}
+
+					continue
+				}
+				logger.Info("created replica member", "pod", pod.Name)
+			}
+			// A replica this pass just rendered and created is current by construction, so the pass
+			// can answer for it. Without this a deployment's first pass could not answer at all, and
+			// its second pass would write a status for a spec nobody changed.
+			//
+			// IT COUNTS THE REPLICA AND NOT ITS MEMBERS, because the rollout figures this feeds are
+			// about instances: a role of two replicas of four Pods each is two things that can be
+			// outdated, not eight.
+			rollout.accounted++
+		}
+
+		// THE MISSING MEMBER OF A PARTIAL REPLICA IS ISSUED THE WAY A WHOLE REPLICA'S MEMBERS ARE,
+		// into the group its own ordinal names and with the same placement terms, because it is that
+		// group's member and Kueue composes the group from all of them alike.
+		for _, rendered := range partialCreates[role.Name] {
+			pod := rendered.DeepCopy()
+			if weights != nil {
+				injectModelArtifactAffinity(pod, weights.Affinity)
+			}
+			injectModelPlacementPreference(pod, preference)
+			if err = r.Client.Create(ctx, pod); err != nil {
+				logger.Error(err, "create the missing member of a partial replica",
+					"role", role.Name,
+					"ordinal", pod.Labels[modelDeploymentReplicaOrdinalLabel],
+					"member", pod.Labels[modelDeploymentMemberIndexLabel])
+				if createErr == nil {
+					createErr = err
+				}
+
+				continue
+			}
+			logger.Info("created the missing member of a partial replica", "pod", pod.Name)
+		}
+	}
+
+	for name, slot := range slots {
+		if slot.Phase != modelDeploymentReplacementWaitingForAdmission ||
+			(len(createOrdinals[name]) == 0 && len(partialCreates[name]) == 0) {
+			continue
+		}
+		members, err := r.replacementOccupancyOnServer(ctx, md, name, slot.Ordinal)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		uids := sets.New[types.UID]()
+		for _, member := range members {
+			uids.Insert(member.UID)
+		}
+		slot.CurrentMemberUIDs = sets.List(uids)
+		if err := r.advanceReplacementSlot(ctx, md, slot); err != nil {
+			return objectWriteResult(logger, err, "record replacement members", _requeueAfterConflict)
+		}
+	}
+
+	// The whole-group health predicate is evaluated ONCE here, before any Service or selector
+	// that carries the eligibility equality, and the same result serves both the label write
+	// below and the status written further down. Regrouping per replica twice is how two
+	// figures come to disagree about what a replica is, and a disagreement here would be silent:
+	// one of the two answers would drive selection and the other would be published.
+	groupForwardFetch := r.groupForwardFetch
+	if groupForwardFetch == nil {
+		groupForwardFetch = defaultGroupForwardFetch
+	}
+	groupForwardPairFetch := r.groupForwardPairFetch
+	if groupForwardPairFetch == nil {
+		groupForwardPairFetch = defaultGroupForwardPairFetch
+	}
+	qualifications := qualifyModelDeploymentInstances(
+		ctx, md, actual, modelDeploymentPendingReplacement{ordinals: replacedByRole},
+		groupForwardFetch, groupForwardPairFetch,
+	)
+	qualificationByMember := modelDeploymentQualificationsByMember(qualifications)
+
+	eligibilityDecided := modelDeploymentQualificationsDecided(qualifications)
+
+	// THE PASS'S OBSERVATION IS COLLECTED ONCE, AFTER THE QUALIFICATION AND BEFORE THE LABEL WRITE,
+	// and the label write and the status both read it. The qualification can spend a whole probe, and
+	// a collection taken before it would be stale by the time the restore decision reads it; and two
+	// collections would be two answers about two moments.
+	observation := modelDeploymentPassObservation{
+		Serving:        r.observeModelDeploymentServing(ctx, md),
+		Qualifications: qualifications,
+	}
+
+	if err = r.convergeModelDeploymentEndpointEligibility(
+		ctx, md, actual, qualificationByMember, replacedByRole, observation,
+	); err != nil {
+		logger.Error(err, "converge endpoint eligibility")
+		return ctrl.Result{}, err
+	}
+	servicePods, err := readModelDeploymentPods(ctx, md, r.APIReader)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err = r.syncModelDeploymentService(ctx, md, eligibilityDecided, servicePods); err != nil {
+		logger.Error(err, "sync service")
+		return ctrl.Result{}, err
+	}
+	// A ROUTER SYNC FAILURE DOES NOT ABORT THE PASS, for the same reason a failed create does not:
+	// the cause is projected onto the status written below, and returning here would skip the one
+	// write that says what is wrong. The error is still returned after that write, so the pass is
+	// retried exactly as if it had failed here.
+	routerErr := r.syncModelDeploymentRouter(ctx, md, eligibilityDecided)
+	if routerErr != nil {
+		logger.Error(routerErr, "sync router")
+	}
+
+	// Read the replicas back rather than reusing the list this pass started from: status must
+	// describe what exists now, not the snapshot the convergence decided against.
+	actual, err = r.listModelDeploymentPods(ctx, md)
+	if err != nil {
+		logger.Error(err, "list replicas")
+		return ctrl.Result{}, err
+	}
+
+	r.recordModelDeploymentDepartures(md, actual)
+
+	if err = r.syncModelDeploymentStatus(
+		ctx, md, actual, domain, &rollout, weights, observation,
+	); err != nil {
+		// The predicate drops status-only updates, so the change behind a conflict may deliver no
+		// event: requeue rather than wait for one. The requeued pass also retries a failed create
+		// or router sync, whose errors would otherwise be returned below.
+		return objectWriteResult(logger, err, "sync status", _requeueAfterConflict)
+	}
+
+	// Returned only now, so the pass is not treated as successful and the missing replicas are
+	// retried — but after the status has told a reader why the group is short.
+	if createErr != nil {
+		return ctrl.Result{}, createErr
+	}
+
+	if routerErr != nil {
+		return ctrl.Result{}, routerErr
+	}
+
+	if requeue {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// A deployment held by the delivery is woken by the CSIDriver and Settings watches; it is also
+	// looked at again on its own, so a missed event or a Settings read that was still cached costs a
+	// minute rather than the rest of the deployment's life.
+	if weights != nil && weights.Blocked && (weights.Reason == modelWeightsReasonNodeUnavailable ||
+		weights.Reason == modelWeightsReasonFilterNeedsNode) {
+		return ctrl.Result{RequeueAfter: modelDeploymentDeliveryRecheck}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// recordModelDeploymentDepartures records one event per replica that has left, so an operator
+// correlating a burst of failed requests with a preemption has the correlation written down rather
+// than having to infer it.
+func (r *ModelDeploymentReconciler) recordModelDeploymentDepartures(
+	md *workercore.ModelDeployment, pods []core.Pod,
+) {
+	if r.Recorder == nil {
+		return
+	}
+
+	for _, d := range modelDeploymentReplicaDepartures(pods) {
+		r.Recorder.Event(md, core.EventTypeWarning, d.reason, d.message)
+	}
+}
+
+// convergeModelDeploymentEndpointEligibility is the single write path of the eligibility label:
+// every pass re-derives, from the Pods as they exist now, which members serve and patches the key
+// onto exactly those, removing it from any member that stopped qualifying.
+//
+// IT RUNS BEFORE THE SERVICES CONVERGE, in the same pass, because the ordinary Services' selectors
+// carry the eligibility equality: the labels must be on the healthy members of a deployment that
+// predates the feature before any selector gains the term, or the first enable would zero every
+// ordinary Service's endpoints. For a tree already in the new shape the order costs nothing — the
+// pass re-derives what it finds and writes only what differs.
+//
+// THE KEY IS OUTSIDE EVERY RENDERED HASH. It is patched onto running Pods at runtime, never
+// rendered into the template, so gaining or losing it moves no generation, no UID, no stored
+// fingerprint and no replica — eligibility is the one lever that must move without a rollout.
+//
+// A CONFLICT IS OBSERVED STATE. Two writers would be two answers to one question, so nothing
+// else writes the key; a patch that loses a race with some other change fails the pass and the
+// next pass re-derives from what then exists. Nothing is written blind: the diff is computed
+// against the object as it was read.
+//
+// THE OBSERVATION IS PART OF THE WRITE AND NOT A SECOND STEP AFTER IT: the label and the annotation
+// are written from one decision, and the decision is the one the same pass publishes.
+func (r *ModelDeploymentReconciler) convergeModelDeploymentEndpointEligibility(
+	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
+	qualificationByMember map[types.UID]modelDeploymentInstanceQualification,
+	replacedByRole map[string]map[int]bool,
+	observation modelDeploymentPassObservation,
+) error {
+	logger := ctrllog.FromContext(ctx)
+
+	roles := make(map[string]*workercore.ModelDeploymentRole, len(md.Spec.Roles))
+	for i := range md.Spec.Roles {
+		roles[md.Spec.Roles[i].Name] = &md.Spec.Roles[i]
+	}
+
+	// THE REPLICA EACH POD BELONGS TO, grouped once. Which members of a replica answer is a question
+	// about the replica, so it is answered from the replica's own members rather than from each Pod
+	// in isolation and the role the spec states now.
+	replicaOf := make(map[types.UID]modelDeploymentReplicaView, len(pods))
+	for _, view := range modelDeploymentGroupPods(pods, true) {
+		for _, member := range view.Members {
+			replicaOf[member.UID] = view
+		}
+	}
+
+	// The selector already published decides whether an undecided deployment keeps its existing
+	// routing. Reading it rather than passing nothing is what keeps an enabled selector enabled
+	// across the passes that did not decide it.
+	liveSelectors, err := r.modelDeploymentLiveRoleSelectors(ctx, md)
+	if err != nil {
+		return err
+	}
+
+	for i := range pods {
+		pod := &pods[i]
+		role := roles[modelDeploymentPodRole(pod)]
+		if role == nil {
+			continue
+		}
+		view, seated := replicaOf[pod.UID]
+		if !seated {
+			// A Pod holding no seat of its own answers under readiness alone, which is the rule a
+			// pre-replica deployment ran on.
+			view = modelDeploymentReplicaView{Members: []*core.Pod{pod}, Seated: false}
+		}
+
+		qualification, evaluated := qualificationByMember[pod.UID]
+		decision := r.modelDeploymentGroupDecisionOf(observation, md, role, view, pod)
+		eligible := modelDeploymentPodEligible(md, role, pod, view, qualification, evaluated, decision)
+		// The gate is asked of the mode this replica is running, not of the mode the spec states
+		// now. A desired command line would take the gate away from an old managed replica that has
+		// activated revocation, which is the replica the gate exists to withdraw.
+		effective := *role
+		if modelDeploymentReplicaRunsCommand(view.Members) {
+			effective.Command = nil
+		}
+		gated := modelDeploymentEligibilitySelectorActive(md, &effective,
+			liveSelectors[role.Name], modelDeploymentEligibilityDecided(md))
+		answering := modelDeploymentPodAnswersAPI(pod, view, md.Spec.Engine.Name,
+			eligible, gated, replacedByRole[role.Name])
+		// THE CANDIDATE FOLLOWS THE ROLE THE OPERATOR CONTROLS. A role it can ask about has its
+		// members judged, and the marker follows that judgement in the same write. A role it can
+		// never ask about has no judgement to follow, and its members keep the discovery membership
+		// they always had.
+		candidate := modelDeploymentRouterCandidateOf(md,
+			modelDeploymentRoleJudged(md, &effective), eligible,
+			modelDeploymentShapeOfMember(pod, view, md.Spec.Engine.Name),
+			pod.Labels[modelDeploymentRouterCandidateLabel] == modelDeploymentEndpointEligibleValue)
+		patched := pod.DeepCopy()
+		changed := modelDeploymentApplyLabel(
+			patched, modelDeploymentLabelKeyEndpointEligible, eligible,
+		)
+		changed = modelDeploymentApplyLabel(
+			patched, modelDeploymentLabelKeyAPIAnswering, answering,
+		) || changed
+		changed = modelDeploymentApplyGenerationAnnotation(
+			patched, eligible, decision.Generation,
+		) || changed
+		changed = modelDeploymentApplyLabel(
+			patched, modelDeploymentRouterCandidateLabel, candidate,
+		) || changed
+		if !changed {
+			continue
+		}
+
+		// The write is bound to the Pod this pass judged. A name is not an identity, so a take-over
+		// replica's legacy membership must not land on a managed replica that has qualified nothing
+		// yet. The object is read back, a different incarnation under that name is skipped, and the
+		// patch carries the version that read returned.
+		fresh := new(core.Pod)
+		if err := r.Client.Get(ctx, ctrlcli.ObjectKeyFromObject(pod), fresh); err != nil {
+			if kerrors.IsNotFound(err) {
+				// A Pod this pass deleted has no labels left to write, and reporting a whole
+				// deployment unhealthy over a replica on its way out would be worse than the label.
+				continue
+			}
+
+			return err
+		}
+		if fresh.UID != pod.UID {
+			// A different object now holds this name. The answer computed above describes the one
+			// that is gone, and the next pass judges whatever stands here now.
+			logger.V(3).Info("skipping a routing write for a member that was replaced",
+				"role", role.Name, "pod", pod.Name,
+				"observed", pod.UID, "standing", fresh.UID)
+
+			continue
+		}
+		rewritten := fresh.DeepCopy()
+		modelDeploymentApplyLabel(
+			rewritten, modelDeploymentLabelKeyEndpointEligible, eligible,
+		)
+		modelDeploymentApplyLabel(
+			rewritten, modelDeploymentLabelKeyAPIAnswering, answering,
+		)
+		modelDeploymentApplyGenerationAnnotation(
+			rewritten, eligible, decision.Generation,
+		)
+		modelDeploymentApplyLabel(
+			rewritten, modelDeploymentRouterCandidateLabel, candidate,
+		)
+		if err := r.Client.Patch(ctx, rewritten, ctrlcli.MergeFromWithOptions(fresh,
+			ctrlcli.MergeFromWithOptimisticLock{})); err != nil && !kerrors.IsNotFound(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// modelDeploymentApplyLabel writes or removes one membership label and reports whether the object
+// moved. Absence is the disqualification, so a false never writes "false".
+func modelDeploymentApplyLabel(pod *core.Pod, key string, present bool) bool {
+	carried := pod.Labels[key] == modelDeploymentEndpointEligibleValue
+	if present == carried {
+		return false
+	}
+	if present {
+		pod.Labels[key] = modelDeploymentEndpointEligibleValue
+	} else {
+		delete(pod.Labels, key)
+	}
+
+	return true
+}
+
+// modelDeploymentRouterCandidateOf reports whether a member is a routing candidate of its group.
+//
+// A MEMBER OF A ROLE THE OPERATOR CONTROLS IS ONE ONLY WHILE ITS GROUP IS ELIGIBLE, so it gains and
+// loses the marker in the same write as the eligibility label and under the same decision.
+//
+// A MEMBER OF A ROLE THE OPERATOR CANNOT JUDGE IS ONE WHILE THE SHAPE LETS IT ANSWER, which is the
+// membership it always had: a route this operator cannot judge is discovered by its own rules, and
+// the marker says the same thing about it. A follower of such a role does not answer, so it is not
+// a candidate and stays out of the deployment-wide discovery.
+//
+// A SHAPE THAT CANNOT BE READ HOLDS WHAT THE MEMBER ALREADY CARRIES, because a membership nobody
+// can read is not a membership to change.
+//
+// THE MARKER IS NEVER RETENTION AUTHORITY. Nothing here reads it to decide whether a group keeps
+// what it has: the retention fact is the eligibility label and the generation annotation, and the
+// marker says only that a member may be discovered.
+//
+// A DEPLOYMENT THAT DECLARES NO ROUTER HAS NO DISCOVERY SURFACE, so it carries no marker at all.
+func modelDeploymentRouterCandidateOf(
+	md *workercore.ModelDeployment, controllable, eligible bool,
+	shape modelDeploymentMemberShape, carried bool,
+) bool {
+	if md.Spec.Router == nil {
+		return false
+	}
+	if controllable {
+		return eligible
+	}
+	switch shape {
+	case modelDeploymentMemberShapeAllows:
+		return true
+	case modelDeploymentMemberShapeForbids:
+		return false
+	default:
+		// A SHAPE THAT CANNOT BE READ HOLDS THE MEMBERSHIP THE MEMBER ALREADY CARRIES.
+		return carried
+	}
+}
+
+// modelDeploymentMemberShape is what the deployed shape says about one member's membership.
+type modelDeploymentMemberShape int
+
+const (
+	// modelDeploymentMemberShapeUnknown is a shape that could not be read.
+	modelDeploymentMemberShapeUnknown modelDeploymentMemberShape = iota
+	// modelDeploymentMemberShapeAllows is a shape that lets this member answer.
+	modelDeploymentMemberShapeAllows
+	// modelDeploymentMemberShapeForbids is a shape that lets only another member answer.
+	modelDeploymentMemberShapeForbids
+)
+
+// modelDeploymentShapeOfMember reports what the deployed shape says about one member's membership.
+//
+// IT IS THE SHAPE HALF OF THE ANSWERING RULE ON ITS OWN: the leader of a leader-served replica
+// answers, every member of an External-DP one answers, and a shape that cannot be read is
+// unknown rather than a verdict.
+func modelDeploymentShapeOfMember(
+	pod *core.Pod, view modelDeploymentReplicaView, engine string,
+) modelDeploymentMemberShape {
+	switch modelDeploymentDeployedAnsweringShape(view, engine) {
+	case modelDeploymentAnsweringAll, modelDeploymentAnsweringSole:
+		return modelDeploymentMemberShapeAllows
+	case modelDeploymentAnsweringLeader:
+		if modelDeploymentAnsweringMemberLeader(pod) {
+			return modelDeploymentMemberShapeAllows
+		}
+
+		return modelDeploymentMemberShapeForbids
+	default:
+		return modelDeploymentMemberShapeUnknown
+	}
+}
+
+// modelDeploymentPodAnswersAPI reports whether a member is behind the deployment's HTTP Service
+// under the routing rules of the mode and the shape it was built with.
+//
+// THE MODE AND THE SHAPE ARE READ FROM THE POD AND ITS REPLICA, never from the spec. A role mid-edit
+// carries replicas of both modes at once, and each keeps the routing it had: a take-over replica
+// answers under the legacy membership rules, which this operator cannot verify and does not pretend
+// to, and a managed replica answers only once it qualifies, which is the eligibility key beside it.
+// A replica whose followers are still serving its previous four-member shape answers under that shape
+// until its own turn comes.
+//
+// A MEMBER THIS PASS SELECTED FOR REPLACEMENT ANSWERS NOTHING, however its mode reads. That is the
+// one rule that removes capacity, and it names one replica rather than the whole role: its outdated
+// siblings keep serving until they are selected in their own turn.
+func modelDeploymentPodAnswersAPI(
+	pod *core.Pod, view modelDeploymentReplicaView, engine string,
+	eligible, gated bool, replacingByOrdinal map[int]bool,
+) bool {
+	if !podIsReady(pod) {
+		return false
+	}
+	ordinal, seated := modelDeploymentPodOrdinal(pod)
+	if !seated || replacingByOrdinal[ordinal] {
+		return false
+	}
+
+	switch modelDeploymentDeployedAnsweringShape(view, engine) {
+	case modelDeploymentAnsweringAll, modelDeploymentAnsweringSole:
+	case modelDeploymentAnsweringLeader:
+		if !modelDeploymentAnsweringMemberLeader(pod) {
+			return false
+		}
+	default:
+		// Unknown shape retains carried routing, subject to readiness and qualification.
+		if pod.Labels[modelDeploymentLabelKeyAPIAnswering] != modelDeploymentAPIAnsweringValue {
+			return false
+		}
+	}
+
+	managed, readable := modelDeploymentMemberExecution(pod)
+	if !readable {
+		// A member whose mode cannot be read keeps what readiness alone allows, which is the legacy
+		// behavior rather than a new judgement about it.
+		return true
+	}
+	if !managed {
+		return true
+	}
+	if !gated {
+		// A ROLE WHOSE ELIGIBILITY SELECTOR WAS NEVER ACTIVATED IS STILL ROUTED THE WAY IT ALWAYS
+		// WAS, and readiness was always the whole rule there. Reading "managed means qualified" for
+		// such a role would withdraw every managed endpoint in the deployment on the first pass that
+		// touched it -- which on a mode edit is the pass that rewrites the selector.
+		return true
+	}
+
+	return eligible
+}
+
+// modelDeploymentPodEligible is the member rule: a Pod's endpoints may be selected exactly when
+// the whole group it belongs to qualifies and the member itself is one the shape lets answer.
+//
+// THE GROUP IS THE UNIT, NOT THE MEMBER. A replica whose members do not all qualify serves
+// nothing, so a member that is up beside a peer that is down is not a working member of anything
+// and must not be selectable on its own account.
+//
+// WITHDRAWAL IS NOT GATED AND RESTORE IS. Every leg that reports a DEFINITE fault removes the key
+// whatever the group predicate can or cannot see, because a broken group needs no further
+// evidence and a fault that could be masked behind a missing observation would be the one fault
+// worth masking. Restoring is the opposite: putting an endpoint back into selection is the act
+// that must not happen on a signal weaker than the spec requires, so when the group predicate is
+// unavailable the reconciler leaves the key exactly as it found it and the status reports why.
+//
+// THE PER-MEMBER SHAPE TERMS ARE UNCHANGED. Which members answer is still the shape's decision:
+// every rank-carrying member of an External-DP role, only the leader of a leader-served role, and
+// the whole replica at size one. Nothing here widens or narrows that.
+//
+// THE OBSERVATION CONJUNCTION IS ADDED AT THE RESTORATION DECISION, and nowhere else: a group is
+// restored on a fresh, complete and coherent observation of ITSELF, an already eligible group whose
+// generation is unchanged keeps what it has while the observation is lost, and everything else is
+// withdrawn.
+func modelDeploymentPodEligible(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, pod *core.Pod,
+	view modelDeploymentReplicaView,
+	qualification modelDeploymentInstanceQualification, evaluated bool,
+	decision modelDeploymentGroupDecision,
+) bool {
+	if role.ElasticEP != nil {
+		if pod.Annotations[modelDeploymentElasticWithdrawnAnnotation] == modelDeploymentTrueValue {
+			return false
+		}
+		ordinal, valid := modelDeploymentPodOrdinal(pod)
+		if !valid || ordinal != 0 {
+			return false
+		}
+	}
+	// The unconditional half: a member that stopped being ready leaves the pool, and it does so
+	// whether or not this operator can say anything about the group.
+	if !podIsReady(pod) {
+		return false
+	}
+	// THE CARRIED VALUE IS THE MEMBER'S OWN PRE-WRITE FACT, and not a label this pass wrote and not a
+	// fact the collection read: it is what the member had before this pass decided anything.
+	//
+	// A PROTECTED GROUP HONORS IT ONLY UNDER THE GENERATION IT WAS ESTABLISHED UNDER. A carried
+	// label whose annotation does not name the group's CURRENT membership generation describes an
+	// earlier membership, and it is not carried forward: that is the check that stops a replaced
+	// group from being restored on the strength of the group it replaced.
+	carried := pod.Labels[modelDeploymentLabelKeyEndpointEligible] ==
+		modelDeploymentEndpointEligibleValue
+	carriedUnderThisGeneration := carried
+	if decision.Protected && !decision.GenerationNamed {
+		carriedUnderThisGeneration = false
+	}
+	if !evaluated {
+		// A PASS THAT EVALUATED NO PREDICATE LEAVES THE KEY ALONE, in either direction. The passes
+		// that return before the predicate is built are the ones that pass no qualifications, and
+		// a member missing from the map is a member whose group was never looked at. Reading the
+		// zero value as an empty, therefore eligible, leg set would grant eligibility on no
+		// evidence at all.
+		return carriedUnderThisGeneration
+	}
+	if !qualification.Activated() {
+		// A DEFINITE FAULT WITHDRAWS THROUGH THE GATE. The gate is about RESTORE only: a group this
+		// operator cannot verify says nothing about whether a member is healthy, so a key already on
+		// one is left there, but a member the predicate has positively found faulted is taken out of
+		// the pool whatever the group's own leg says. Returning the carried value unconditionally
+		// would leave a NotReady member selectable inside the very replica that is unverifiable.
+		if qualification.HasFailure() {
+			return false
+		}
+		// AN UNSAFE GROUP IS WITHDRAWN TOO, WHETHER OR NOT THIS OPERATOR CAN SAY ANYTHING ABOUT
+		// ITS FORWARD PATH. Ready=True is the only positive answer a member gives, so a group whose
+		// member has not reported ready, or has reported it as anything but ready, is unsafe, and an
+		// unsafe group has no selectable endpoint in it. The member itself is already out by the
+		// readiness check above; this is what takes its healthy sibling out with it.
+		//
+		// WHAT STAYS UNTOUCHED IS THE GROUP WHOSE MEMBERS ARE ALL READY and whose forward path this
+		// operator cannot verify: there the key is left exactly as it was, because revoking on a
+		// signal the predicate never made would be a verdict it did not reach.
+		if !qualification.MembersReady() {
+			return false
+		}
+		// Nothing to revoke on, and nothing may be restored. The key is left exactly as it was,
+		// which is what makes a first enable over a deployment whose engine cannot be verified
+		// leave existing routing untouched rather than narrow it.
+		return carriedUnderThisGeneration
+	}
+	if qualification.HasFailure() {
+		return false
+	}
+	if !qualification.Eligible() {
+		return false
+	}
+
+	// Which members answer is the replica's own shape, read from the members it is running rather
+	// than from the role the spec states now. An activated External-DP replica whose argv has since
+	// been edited to an internal one keeps its ranks; reading the role would revoke every follower
+	// of a group that is still serving.
+	shape := modelDeploymentDeployedAnsweringShape(view, md.Spec.Engine.Name)
+	if shape == modelDeploymentAnsweringAll || shape == modelDeploymentAnsweringSole {
+		return modelDeploymentPodRestores(decision, carried)
+	}
+
+	if !modelDeploymentAnsweringMemberLeader(pod) {
+		return false
+	}
+
+	return modelDeploymentPodRestores(decision, carried)
+}
+
+// modelDeploymentPodRestores is the observation conjunction, applied to a member that has earned its
+// place in the pool.
+//
+// A PROTECTED MANAGED GROUP IS RESTORED ONLY ON A FRESH, COMPLETE AND COHERENT OBSERVATION OF ITSELF.
+// An already eligible group whose generation is unchanged keeps what it has while the observation is
+// lost, and a group the barrier holds is withdrawn rather than left serving on a stale answer.
+//
+// THE COMPATIBILITY CLASSES ARE EXEMPT, and the exemption is the point of them: a route this
+// operator cannot judge, and an ordinary single-member Server, keep the behavior they have today.
+func modelDeploymentPodRestores(
+	decision modelDeploymentGroupDecision, carried bool,
+) bool {
+	if !decision.Protected {
+		return true
+	}
+	if decision.Observed && decision.Fresh && decision.Fact.SnapshotValid {
+		return true
+	}
+	if decision.Observed && decision.Fact.Retained {
+		return carried
+	}
+
+	return false
+}
+
+// modelDeploymentGroupDecision is the collected answer read for one member's group.
+//
+// IT IS WHAT THE RESTORATION DECISION READS, and nothing else: the qualification and the probe stay
+// separate from it, because a Router that cannot be read says nothing about whether a member is
+// healthy.
+type modelDeploymentGroupDecision struct {
+	// Fact is what the collection knows about this group, and Observed says whether it knows
+	// anything at all: a group whose generation the answer does not carry has no fact, and a fact
+	// that is missing is not a fact that is valid.
+	Fact     modelDeploymentGroupServing
+	Observed bool
+	// Fresh is whether the collected answer is still inside its freshness window.
+	Fresh bool
+	// Generation is the group's current membership generation.
+	Generation modelDeploymentMembershipGeneration
+	// GenerationNamed says whether this member's own eligibility annotation names the group's
+	// current membership generation, which is what proves the label belongs to this membership.
+	GenerationNamed bool
+	// Protected says whether the protected-group rules apply to this group: it is a managed group
+	// with a cross-member fact, and the deployment declares a Router. WITHOUT A ROUTER THERE IS NO
+	// OBSERVATION TO WAIT FOR, and the group's existing qualification contract stands.
+	Protected bool
+}
+
+// modelDeploymentGroupDecisionOf reads the collected answer for one member's group.
+//
+// A GROUP THE ANSWER DOES NOT CARRY IS A GROUP WITH NO OBSERVATION, and that is a hold rather than a
+// confirmation: the answer is keyed by the group's CURRENT membership generation, so a group whose
+// membership moved since the collection is not the group the collection saw.
+func (r *ModelDeploymentReconciler) modelDeploymentGroupDecisionOf(
+	observation modelDeploymentPassObservation, md *workercore.ModelDeployment,
+	role *workercore.ModelDeploymentRole, view modelDeploymentReplicaView, pod *core.Pod,
+) modelDeploymentGroupDecision {
+	generation := modelDeploymentGenerationOf(view)
+	key := modelDeploymentGroupKey{Role: role.Name, Ordinal: view.Ordinal, Generation: generation}
+	fact, observed := observation.Serving.Groups[key]
+	protected := md.Spec.Router != nil &&
+		modelDeploymentGroupProtectionOf(md, role, view) == modelDeploymentGroupProtected
+
+	return modelDeploymentGroupDecision{
+		Fact:       fact,
+		Observed:   observed,
+		Fresh:      r.modelDeploymentServingFreshNow(observation.Serving),
+		Generation: generation,
+		GenerationNamed: pod.Annotations[modelDeploymentAnnotationKeyEndpointEligibleGeneration] ==
+			string(generation),
+		Protected: protected,
+	}
+}
+
+// modelDeploymentApplyGenerationAnnotation writes or removes the eligibility generation annotation
+// and reports whether the object moved.
+//
+// IT IS WRITTEN WITH THE ELIGIBILITY LABEL AND NOT ON ITS OWN, so the two cannot disagree about
+// whether a member is eligible under which generation. A member that is not eligible carries no
+// annotation, because an annotation without a label would claim a qualification nobody holds.
+func modelDeploymentApplyGenerationAnnotation(
+	pod *core.Pod, eligible bool, generation modelDeploymentMembershipGeneration,
+) bool {
+	value := ""
+	if eligible {
+		value = string(generation)
+	}
+	if pod.Annotations[modelDeploymentAnnotationKeyEndpointEligibleGeneration] == value {
+		return false
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	if value == "" {
+		delete(pod.Annotations, modelDeploymentAnnotationKeyEndpointEligibleGeneration)
+
+		return true
+	}
+	pod.Annotations[modelDeploymentAnnotationKeyEndpointEligibleGeneration] = value
+
+	return true
+}
+
+// modelDeploymentRoleExternalDP reads the role's own argument stream for its balance shape: the
+// shapes in which every member carries a rank and answers are the External-DP shapes. The read is
+// the same one the status and the size check make, so three readers cannot disagree about what a
+// role's shape is.
+func modelDeploymentRoleExternalDP(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
+) bool {
+	reading, err := scanModelDeploymentParallelism(
+		md.Spec.Engine.Name, role.ExtraArgs, role.Env,
+	)
+	if err != nil {
+		// A scan error answers leader-only. Admission parses the same stream, so the two
+		// readers are expected to agree; if they ever diverge this default would narrow an
+		// External-DP role to its leader without any signal. Surfacing the error instead is
+		// an accepted error-path semantics change, deliberately kept for a reviewed change.
+		return false
+	}
+	shape, _ := modelDeploymentLoadBalance(md.Spec.Engine.Name,
+		ModelDeploymentEffectiveRoleKind(role), role.Env, reading.declared)
+
+	return shape != workercore.ModelDeploymentLoadBalanceInternal &&
+		shape != workercore.ModelDeploymentLoadBalanceUnknown
+}
+
+// syncModelDeploymentService converges every Service the deployment owns: the one it is reached
+// through, and one per role.
+//
+// It aligns an existing Service rather than replacing it, because the allocated ClusterIP is state
+// the operator did not write and every client that resolved the name is still using. It is also why
+// a Service is NOT rebuilt when the group is: the group's shape decides which Pods exist, and the
+// address they answer on must survive that.
+func (r *ModelDeploymentReconciler) syncModelDeploymentService(
+	ctx context.Context, md *workercore.ModelDeployment, eligibilityDecided bool, pods []core.Pod,
+) error {
+	// The standing members come from the API server: a cache that has not caught up would retire
+	// the peer records of a collective whose members are still running.
+	rendered := renderModelDeploymentServices(md, r.modelDeploymentRoleManufacturers(ctx, md), pods)
+	if ModelDeploymentElasticRole(md) != nil {
+		for _, service := range rendered {
+			service.Spec.Selector[modelDeploymentReplicaOrdinalLabel] = "0"
+		}
+		rendered = append(rendered, renderModelDeploymentElasticHeadService(md))
+	}
+	// RETENTION: an eligibility term a previous pass narrowed onto a live Service is cluster
+	// state this pass must not un-write just because the newest observation went quiet. Enrich
+	// the rendered expectation from the live object; the static activatability half still
+	// governs, so a shape that stopped being activatable loses the term on this pass.
+	liveServices := new(core.ServiceList)
+	if err := r.Client.List(ctx, liveServices,
+		ctrlcli.InNamespace(md.Namespace),
+		ctrlcli.MatchingLabels{
+			modelDeploymentLabelKeyName:     modelDeploymentLabelValueName,
+			modelDeploymentLabelKeyInstance: md.Name,
+		}); err != nil {
+		return err
+	}
+	liveByName := make(map[string]*core.Service, len(liveServices.Items))
+	for i := range liveServices.Items {
+		liveByName[liveServices.Items[i].Name] = &liveServices.Items[i]
+	}
+	for i := range rendered {
+		live := liveByName[rendered[i].GetName()]
+		if live == nil {
+			continue
+		}
+		role := modelDeploymentServiceRoleOf(md, rendered[i].GetName())
+		if role == nil {
+			continue
+		}
+		members := make([]*core.Pod, 0, len(pods))
+		for i := range pods {
+			if modelDeploymentPodRole(&pods[i]) == role.Name && modelDeploymentOwns(&pods[i], md) &&
+				pods[i].DeletionTimestamp == nil {
+				members = append(members, &pods[i])
+			}
+		}
+		role = modelDeploymentEffectiveRoleForEligibility(role, members)
+
+		selector := maps.Clone(live.Spec.Selector)
+		if live.Annotations[modelDeploymentEligibilityActiveAnnotation] == modelDeploymentEndpointEligibleValue {
+			selector[modelDeploymentLabelKeyEndpointEligible] = modelDeploymentEndpointEligibleValue
+		}
+		if modelDeploymentEligibilitySelectorActive(md, role, selector, eligibilityDecided) {
+			modelDeploymentSelectEligibleEndpoints(rendered[i], md, role)
+		}
+	}
+	expected := make([]ctrlcli.Object, len(rendered))
+	for i := range rendered {
+		expected[i] = rendered[i]
+	}
+
+	return r.syncModelDeploymentOwnedChildren(
+		ctx,
+		md,
+		expected,
+		func() ctrlcli.Object { return new(core.Service) },
+		new(core.ServiceList),
+		func(actual, expected ctrlcli.Object) bool {
+			// The metadata align is what keeps a role-owned Service inside the prune gate: the
+			// resource note is written at Create only, and the gate exempts a child whose note is
+			// gone.
+			changed := alignModelDeploymentService(actual.(*core.Service), expected.(*core.Service))
+			return alignModelDeploymentChildMetadata(actual, expected) || changed
+		},
+		ModelDeploymentResourceNoteRole,
+		"service",
+	)
+}
+
+// modelDeploymentServiceRoleOf resolves which role a rendered Service was rendered for: the
+// front Service names the deployment itself and fronts the first role; a role Service is named
+// deployment-role.
+func modelDeploymentServiceRoleOf(
+	md *workercore.ModelDeployment, serviceName string,
+) *workercore.ModelDeploymentRole {
+	if serviceName == md.Name {
+		return modelDeploymentFrontRole(md)
+	}
+	for i := range md.Spec.Roles {
+		if serviceName == md.Name+"-"+md.Spec.Roles[i].Name {
+			return &md.Spec.Roles[i]
+		}
+	}
+
+	return nil
+}
+
+// syncModelDeploymentOwnedChildren creates, aligns and prunes one kind of rendered child.
+func (r *ModelDeploymentReconciler) syncModelDeploymentOwnedChildren(
+	ctx context.Context,
+	md *workercore.ModelDeployment,
+	expected []ctrlcli.Object,
+	newObject func() ctrlcli.Object,
+	actualList ctrlcli.ObjectList,
+	align func(actual, expected ctrlcli.Object) bool,
+	resourceNote,
+	kind string,
+) error {
+	wanted := sets.New[string]()
+	for _, want := range expected {
+		wanted.Insert(want.GetName())
+
+		actual := newObject()
+		err := r.Client.Get(ctx, ctrlcli.ObjectKeyFromObject(want), actual, ctrlclix.WithoutQuorum)
+		if err != nil {
+			if !kerrors.IsNotFound(err) {
+				return err
+			}
+
+			if err = r.Client.Create(ctx, want); err != nil && !kerrors.IsAlreadyExists(err) {
+				return err
+			}
+			continue
+		}
+
+		if !modelDeploymentOwns(actual, md) {
+			return fmt.Errorf("%s %s/%s is not owned by this deployment",
+				kind, actual.GetNamespace(), actual.GetName())
+		}
+
+		if align(actual, want) {
+			if err = r.Client.Update(ctx, actual); err != nil {
+				return err
+			}
+		}
+	}
+
+	logger := ctrllog.FromContext(ctx)
+	err := r.Client.List(ctx, actualList,
+		ctrlcli.InNamespace(md.Namespace),
+		ctrlcli.MatchingLabels{
+			modelDeploymentLabelKeyName:     modelDeploymentLabelValueName,
+			modelDeploymentLabelKeyInstance: md.Name,
+		},
+		ctrlclix.WithoutQuorum)
+	if err != nil {
+		return err
+	}
+
+	return kmeta.EachListItem(actualList, func(obj runtime.Object) error {
+		actual := obj.(ctrlcli.Object)
+		if wanted.Has(actual.GetName()) ||
+			!modelDeploymentOwns(actual, md) ||
+			systemmeta.DescribeResourceNote(actual, resourceNote) == "" {
+			return nil
+		}
+
+		logger.Info("removing a child no longer in the spec", kind, actual.GetName())
+		if err = r.Client.Delete(ctx, actual); err != nil && !kerrors.IsNotFound(err) {
+			return err
+		}
+
+		return nil
+	})
+}
+
+// renderModelDeploymentPods renders the deployment's desired replicas: the members of one replica,
+// keyed by role name and then by ordinal.
+//
+// ONE RENDER PER ORDINAL rather than one per role: the spec declares a count of replicas and names
+// none of them, but the ordinals it implies -- zero through count minus one -- each carry group
+// metadata of their own, and the spec-hash fingerprint covers it. Two ordinals of one role therefore
+// hash differently, and the converge loop compares a live Pod against the render of ITS ordinal,
+// which is what keeps a scale-up from rolling the survivors.
+//
+// A REPLICA IS A SLICE BECAUSE A REPLICA MAY BE SEVERAL PODS, and the slice is ordered by member
+// index so that entry zero is the leader. Every entry shares the replica's Kueue group -- one
+// Workload, one admission, all members or none -- so the slice is a unit the converger creates,
+// compares and deletes whole. It is never partially applied: Kueue holds a deleted member of an
+// admitted group on the API server until the group's Workload goes, and deleting that Workload
+// stops the surviving members anyway, so a half-replica is not a state this operator can reach on
+// purpose or recover from by halves.
+//
+// The render is still ONE TEMPLATE PER ROLE, stamped per member -- the template is every Pod of the
+// role's, and nothing that names one replica or one member may be produced inside it. What separates
+// two members is what the stamp writes: a name, a hostname and an index label.
+func (r *ModelDeploymentReconciler) renderModelDeploymentPods(
+	ctx context.Context, md *workercore.ModelDeployment,
+	connection *ModelDeploymentConnectorInput, interfaceProtocols []string, weights *modelArtifactWeights,
+) (map[string]map[int][]*core.Pod, error) {
+	if ModelDeploymentElasticRole(md) != nil {
+		return r.renderModelDeploymentElasticPods(ctx, md, connection, interfaceProtocols, weights)
+	}
+	return r.renderModelDeploymentRolePods(ctx, md, connection, interfaceProtocols, weights)
+}
+
+func (r *ModelDeploymentReconciler) renderModelDeploymentRolePods(
+	ctx context.Context, md *workercore.ModelDeployment,
+	connection *ModelDeploymentConnectorInput, interfaceProtocols []string, weights *modelArtifactWeights,
+) (map[string]map[int][]*core.Pod, error) {
+	// The overcommit setting is the Instance path's, deliberately: it decides how a declared
+	// resource becomes a request, and this renderer derives the same values the Instance webhook
+	// does. A second knob for one translation would let the two disagree on one cluster.
+	overcommit := settings.InstanceGeneralResourcesOvercommit.ShouldValueBool(ctx)
+	// Read once per pass so every role renders against one value; the render decides which Pods
+	// turn it into a sysctl.
+	tcpTWReuse := settings.ModelDeploymentTCPTWReuse.ShouldValueBool(ctx)
+
+	// Resolved once per reconcile rather than per role: the answer is the cluster's, not the
+	// role's, and it reads the version snapshot configured at startup, so it costs no API call.
+	clusterVersion := system.LoopbackKubeVersion.Get()
+	nativeSidecar := kubediscovery.SupportsFeature(&clusterVersion, kubediscovery.FeatureNativeSidecar)
+
+	// The pair's declared parallel shape is also resolved once per reconcile, and only when
+	// the deployment IS a pair: the transfer document both halves carry asserts on it, so the
+	// two roles' syntheses must read one resolution -- and a declaration nobody can read fails
+	// the render here rather than becoming a silent 1/1 in a document the engine then trusts.
+	// A deployment holding one half renders no document, so the resolution has no consumer and
+	// an unreadable declaration there stays the engine's own startup refusal instead of
+	// failing the reconcile of every unrelated field.
+	var pair inject.ParallelismPair
+	if ModelDeploymentDeclaresBothHalves(md) {
+		var err error
+		pair, err = modelDeploymentDeclaredParallelismPair(md)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	desired := make(map[string]map[int][]*core.Pod, len(md.Spec.Roles))
+	for i := range md.Spec.Roles {
+		role := &md.Spec.Roles[i]
+
+		instType, err := r.getModelDeploymentInstanceType(ctx, role.InstanceType)
+		if err != nil {
+			return nil, err
+		}
+
+		in := ModelDeploymentRenderInput{
+			Deployment:                 md,
+			Role:                       role,
+			InstanceType:               instType,
+			RuntimeClassName:           r.getModelDeploymentRuntimeClassName(ctx, instType),
+			GeneralResourcesOvercommit: overcommit,
+			TCPTWReuse:                 tcpTWReuse,
+			NativeSidecar:              nativeSidecar,
+		}
+		if weights != nil {
+			in.Artifact = weights.Render
+		}
+
+		// The connector is synthesized PER ROLE even though its connection is per deployment,
+		// because the accelerator is the role's: it selects the store connector the engine
+		// registers, and only the role's InstanceType knows it.
+		//
+		// ENCODE REACHES THE RENDERER, BUT NOT THE KV CONNECTOR. The synthesizer renders the
+		// encoder-cache leg on it, which is the whole point of it being here; what an encoder does
+		// not do is reach the shared KV store. The early skip that used to keep Encode out of this
+		// block has therefore become a term below that excludes the KV terms alone, so a leg the
+		// operator owns is configured while the store the operator does not own is left alone.
+		kvTransfer := modelDeploymentUsesKVTransfer(md, role, instType.Status.Detail.Manufacturer)
+		publishKVEvents := modelDeploymentPublishesKVEvents(md, role, instType.Status.Detail.Manufacturer)
+		routingSidecar := modelDeploymentFrontsDecodeWithSidecar(md, role)
+		roleKind := ModelDeploymentEffectiveRoleKind(role)
+		// The encoder stage is the row's answer for this combination, taken once per role because
+		// the render is per role: the leg differs by half and the sidecar flag is the same on both
+		// ends of the data plane. Both are empty for a deployment with no encoder stage, so the
+		// fields below are set unconditionally rather than behind a test.
+		encoderLeg := modelDeploymentEPDEncoderLeg(md, role, instType.Status.Detail.Manufacturer)
+		encoderURLs := modelDeploymentEPDEncoderURLs(md)
+		if roleKind != workercore.ModelDeploymentRoleKindEncode &&
+			ModelDeploymentMaySynthesizeConnector(md) &&
+			(connection != nil || kvTransfer || publishKVEvents || routingSidecar) {
+			roleConnection := ModelDeploymentConnectorInput{}
+			if connection != nil {
+				roleConnection = *connection
+			}
+			roleConnection.Engine = md.Spec.Engine.Name
+			roleConnection.Manufacturer = instType.Status.Detail.Manufacturer
+			// The kind is the role's, and it is the only per-role term in the synthesized
+			// configuration: it is what makes a prefiller and a decoder two configurations rather
+			// than two copies of one, which is what the atomic admission of the pair is FOR.
+			roleConnection.Kind = role.Kind
+			// Deployment-wide rather than per role, because the split mode it gates answers "is
+			// this deployment a pair" -- the same question the router's own mode answers -- and a
+			// half of an undeclared pair runs undivided on both layers now.
+			roleConnection.Disaggregated = ModelDeploymentDeclaresBothHalves(md)
+			// The same pair for every role, which is what keeps the two Pods' parallel blocks
+			// identical: the document asserts on the pair, so each role carries the one
+			// resolution rather than a read of its own books alone.
+			roleConnection.Parallelism = pair
+			roleConnection.KVTransfer = kvTransfer
+			roleConnection.RoutingSidecar = routingSidecar
+			roleConnection.EncoderCache = encoderLeg
+			roleConnection.EncoderURLs = encoderURLs
+			if md.Spec.KVTransfer != nil {
+				roleConnection.KVTransferProtocol = md.Spec.KVTransfer.Protocol
+			}
+			if weights != nil && connection != nil {
+				roleConnection.CachePrefix = weights.KVIdentity
+			}
+			roleConnection.PublishKVEvents = publishKVEvents
+			if roleConnection.PublishKVEvents {
+				roleConnection.KVEventsHost = md.Name + "-" + role.Name + "." + md.Namespace + ".svc"
+			}
+
+			connector, err := SynthesizeModelDeploymentConnector(roleConnection)
+			if err != nil {
+				return nil, fmt.Errorf("role %q cannot be given a cache client: %w", role.Name, err)
+			}
+			in.Connector = connector
+		} else if roleKind == workercore.ModelDeploymentRoleKindEncode &&
+			modelDeploymentEPDReachesEncoderStage(md, instType.Status.Detail.Manufacturer) {
+			// AN ENCODER TAKES THE LEG WITHOUT ANYTHING ELSE, so this is its own path rather than a
+			// term in the condition above: an encoder has no store connection, no transfer leg and
+			// no sidecar, and folding it into that branch would carry four false terms to reach the
+			// one that is true.
+			//
+			// THE CONDITION IS REACHABILITY, NOT THE ROLE ALONE. An engine can be told about an encoder stage
+			// either because an admitted row names the connector it runs or because that engine splits
+			// its encoder by address; a combination with neither renders this role undivided, which is
+			// what it rendered before any of this existed and what a reconcile of an object admission
+			// refuses should keep doing rather than fail over a field nothing consumes.
+			connector, err := SynthesizeModelDeploymentConnector(ModelDeploymentConnectorInput{
+				Engine:       md.Spec.Engine.Name,
+				Manufacturer: instType.Status.Detail.Manufacturer,
+				Kind:         role.Kind,
+				EncoderCache: encoderLeg,
+				EncoderURLs:  encoderURLs,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("role %q cannot be given an encoder leg: %w", role.Name, err)
+			}
+			in.Connector = connector
+		}
+		// The sidecar half of the same row the engine half was configured from above, in the
+		// sidecar's own spelling. It is read from the deployment rather than from the leg above
+		// because the sidecar runs on the decode Pod, which carries no leg of its own: the reader
+		// of this flag is never one of the two roles the leg is configured onto.
+		//
+		// It is set here rather than beside the sidecar call because this is the one place holding
+		// both the deployment and its InstanceType, and therefore the one place that can ask which
+		// row this deployment runs under. Empty renders no flag, which is what a deployment
+		// declaring no encoder role gets.
+		in.ECConnector = ModelDeploymentECSidecarConnector(
+			modelDeploymentEPDConnector(md, instType.Status.Detail.Manufacturer),
+		)
+		if role.Resources != nil && role.Resources.Interface != nil && role.Resources.Interface.Sign() > 0 {
+			count, whole := role.Resources.Interface.AsInt64()
+			if !whole {
+				return nil, fmt.Errorf("role %q requests a fractional interface count", role.Name)
+			}
+			var protocols []string
+			if len(role.Command) == 0 {
+				protocols = interfaceProtocols
+			}
+			in.InterfaceResource, err = ModelDeploymentInterfaceResource(protocols,
+				ModelDeploymentDirectInterfaceProtocol(md, role, instType.Status.Detail.Manufacturer), count)
+			if err != nil {
+				return nil, fmt.Errorf("role %q interface request: %w", role.Name, err)
+			}
+		}
+
+		template, err := renderModelDeploymentPodTemplate(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+
+		size := modelDeploymentRoleSize(role)
+		rolePods := make(map[int][]*core.Pod, role.Replicas)
+		for ordinal := range int(role.Replicas) {
+			members := make([]*core.Pod, 0, size)
+			for member := range size {
+				pod := template.DeepCopy()
+				stampModelDeploymentPod(pod, md, role, ordinal, member)
+				members = append(members, pod)
+			}
+			rolePods[ordinal] = members
+		}
+		desired[role.Name] = rolePods
+	}
+
+	return desired, nil
+}
+
+// modelDeploymentDeclaredParallelismPair resolves the parallel shape both halves of the
+// deployment's prefill/decode pair declared, reading each role's own books -- its argument
+// stream and, for vLLM's data-parallel width, its literal environment.
+//
+// THE FIRST ROLE OF EACH KIND WINS, in declaration order. Admission already refuses a second
+// role of either kind, and this resolver still pins its own rule rather than lean on a check it
+// does not own: a render running past admission must still pick one half's books
+// deterministically. A kind with no role stays the zero half, and a role declaring nothing
+// parses to all ones; the renderer maps both to the engine's own default of one.
+//
+// A TAKE-OVER ROLE'S BOOKS ARE ITS COMMAND: the replaced argv is the only line that runs, so
+// it -- and never the inert extra arguments beside it -- is what the parse reads for that half.
+// A degree hidden inside a shell string, a script or a config file stays invisible, the
+// contract's accepted class; a degree written on the line itself is read exactly as a managed
+// role's is.
+//
+// A ROLE WHOSE BOOKS CANNOT BE READ IS AN ERROR, never a silent 1/1: the same declaration
+// would keep the engine itself from starting, and rendering a default beside it would trade the
+// engine's loud refusal for a wrong block layout.
+func modelDeploymentDeclaredParallelismPair(md *workercore.ModelDeployment) (inject.ParallelismPair, error) {
+	var pair inject.ParallelismPair
+	var prefillSeen, decodeSeen bool
+
+	for i := range md.Spec.Roles {
+		role := &md.Spec.Roles[i]
+
+		var half *inject.Parallelism
+		switch ModelDeploymentEffectiveRoleKind(role) {
+		case workercore.ModelDeploymentRoleKindPrefill:
+			if prefillSeen {
+				continue
+			}
+			prefillSeen = true
+			half = &pair.Prefill
+		case workercore.ModelDeploymentRoleKindDecode:
+			if decodeSeen {
+				continue
+			}
+			decodeSeen = true
+			half = &pair.Decode
+		default:
+			continue
+		}
+
+		declared, err := ParseModelDeploymentDeclaredParallelism(
+			md.Spec.Engine.Name, ModelDeploymentRoleArgs(role), role.Env,
+		)
+		if err != nil {
+			return pair, fmt.Errorf("role %q declares parallelism the operator cannot read: %w", role.Name, err)
+		}
+		half.TensorParallel = declared.TensorParallel
+		half.DataParallel = declared.DataParallel
+	}
+
+	return pair, nil
+}
+
+// modelDeploymentTakenGroups names the replica groups of one role the API server still holds a
+// member of, read uncached.
+//
+// THE READ GOES TO THE API SERVER AND NOT THE CACHE, because the two disagree in exactly the
+// window this read exists to close: a create the server persisted whose response never came back
+// is on the server and not yet in the informer cache, and a cache read would call the ordinal
+// free and create a second Pod for it -- two members of a one-member group, which Kueue answers
+// by deleting the newer one.
+//
+// ONE READ ANSWERS FOR THE WHOLE ROLE, and that is what keeps the create gate off the hot path it
+// would otherwise sit on. The question is asked once per ordinal the gate finds free, so narrowing
+// each read to one group meant a role short of n replicas paid n uncached lists -- and paid them
+// again on every requeue for as long as a departure took to drain. Listing the role once and
+// bucketing the result by the group label each Pod carries answers all of those ordinals from the
+// same bytes; the selection is strictly wider, so no Pod the per-ordinal read would have found is
+// missed.
+//
+// THE BUCKET KEY IS THE GROUP NAME RATHER THAN THE ORDINAL LABEL, and the two differ in
+// exactly one population: a replica rendered before the per-replica groups existed can carry a
+// group's membership label with no ordinal label of its own, and it still sits in the ordinal's
+// group counting as a member -- creating beside it is the same excess, so the occupancy the gate
+// reads is the group's, which is also the unit Kueue counts. Any member is the right threshold at
+// every size: a group short of its declared total is one Kueue composes no Workload for, so seating
+// a new member beside a straggler produces a replica that never gets admitted rather than one that
+// is merely crowded. The owner reference is confirmed client-side for the same reason
+// listModelDeploymentPods confirms it: a Pod carrying this deployment's labels but controlled by an
+// earlier incarnation of the same name claims no slot this deployment owes, and the deployment
+// creates around it rather than waiting behind it.
+func (r *ModelDeploymentReconciler) modelDeploymentTakenGroups(
+	ctx context.Context, md *workercore.ModelDeployment, role string, includeTerminal bool,
+) (sets.Set[string], error) {
+	podList := new(core.PodList)
+	err := r.APIReader.List(ctx, podList,
+		ctrlcli.InNamespace(md.Namespace),
+		ctrlcli.MatchingLabels{
+			modelDeploymentLabelKeyName:      modelDeploymentLabelValueName,
+			modelDeploymentLabelKeyInstance:  md.Name,
+			modelDeploymentLabelKeyComponent: role,
+		})
+	if err != nil {
+		return nil, fmt.Errorf("list the members of role %q's groups: %w", role, err)
+	}
+
+	taken := sets.New[string]()
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if !modelDeploymentOwns(pod, md) {
+			continue
+		}
+		if !includeTerminal && (pod.Status.Phase == core.PodSucceeded || pod.Status.Phase == core.PodFailed) {
+			continue
+		}
+		group := pod.Labels[kueuepodconst.GroupNameLabel]
+		if group == "" && ModelDeploymentElasticRole(md) != nil && role == modelDeploymentElasticHeadName(md) {
+			// The auxiliary head has no Kueue group, but its uncached presence still holds the slot.
+			group = modelDeploymentReplicaGroupName(md, role, 0)
+		}
+		if group != "" {
+			taken.Insert(group)
+		}
+	}
+
+	return taken, nil
+}
+
+// modelDeploymentAdmittedReplicas counts how many of these replicas hold an admitted Workload of
+// their own.
+//
+// A REPLICA COUNTS WHEN ITS WORKLOAD IS ADMITTED, and by nothing weaker. Admission is the
+// statement that quota was granted; a created-but-still-queued replacement has a Workload that is
+// composed and not admitted, or none yet, and either way it holds nothing -- counting it as
+// progress is what would let a rollout on a contended pool strip a deployment to zero admitted
+// replicas. Matching is by ownership rather than by any derived name, for the reason
+// findModelDeploymentGroupWorkloads states: a group's Workload carries plain owner references to
+// its members, and it is the members that say which Workload is theirs.
+func modelDeploymentAdmittedReplicas(workloads []kueue.Workload, pods []*core.Pod) int {
+	ours := sets.New[types.UID]()
+	for _, pod := range pods {
+		ours.Insert(pod.UID)
+	}
+
+	admitted := 0
+	for i := range workloads {
+		wl := &workloads[i]
+		if modelDeploymentWorkloadOwnsAny(wl, ours) &&
+			kubeapistatus.ConditionType(kueue.WorkloadAdmitted).IsTrue(wl) {
+			admitted++
+		}
+	}
+
+	return admitted
+}
+
+// modelDeploymentPodValues copies a list of live Pods into the value form the grouping helpers
+// take, so a caller holding pointers does not have to hold a second copy of the same list.
+func modelDeploymentPodValues(pods []*core.Pod) []core.Pod {
+	values := make([]core.Pod, 0, len(pods))
+	for _, pod := range pods {
+		values = append(values, *pod)
+	}
+
+	return values
+}
+
+// modelDeploymentReplicaMembers is every live Pod seated on one ordinal, which is what a replica is
+// once it may have more than one member. The order is the caller's list order and carries no
+// meaning: a replica leaves as a whole, so nothing downstream picks between its members.
+func modelDeploymentReplicaMembers(pods []*core.Pod, ordinal int) []*core.Pod {
+	members := make([]*core.Pod, 0, 1)
+	for _, pod := range pods {
+		if at, ok := modelDeploymentPodOrdinal(pod); ok && at == ordinal {
+			members = append(members, pod)
+		}
+	}
+
+	return members
+}
+
+// seat is one position inside one replica: an ordinal and a member index within it.
+type seat struct{ ordinal, member int }
+
+// modelDeploymentSurplusCount measures the excess this rule exists for: members beyond the seats
+// they can occupy.
+//
+// It counts seats, not desired members: a replica edited from four members to two still fills the
+// four seats it was built at, and comparing that against the desired count would trim a healthy
+// admitted group until it matched a size the spec only wants for its replacement.
+//
+// A POD CLAIMING NO ORDINAL IS NOT SURPLUS. It cannot be excess on a seat, and it is judged on the
+// ungated rollout instead: it holds a Workload of its own, so it is a replica the rollout turns
+// over one per pass rather than a duplicate to trim here.
+func modelDeploymentSurplusCount(kept []*core.Pod) int {
+	seats := make(map[seat]bool, len(kept))
+	excess := 0
+	for _, pod := range kept {
+		ordinal, ok := modelDeploymentPodOrdinal(pod)
+		if !ok {
+			continue
+		}
+		key := seat{ordinal: ordinal, member: modelDeploymentPodMemberIndex(pod)}
+		if seats[key] {
+			excess++
+
+			continue
+		}
+		seats[key] = true
+	}
+
+	return excess
+}
+
+// modelDeploymentSurplusReplicas picks which Pods of an over-counted role leave: the Pods that
+// claim no ordinal first, then the Pods a seat holds beyond its one occupant, at most `surplus` of
+// them.
+//
+// A SEAT IS AN (ORDINAL, MEMBER) PAIR rather than an ordinal, because a replica of size n has n
+// seats and each of them holds exactly one Pod. At size one the two readings coincide, which is
+// why this generalisation leaves the single-Member decisions untouched: there is one seat per
+// ordinal and it is the leader's.
+//
+// A SEAT KEEPS THE POD ITS CURRENT RENDER DESCRIBES -- the one whose fingerprint matches what the
+// role renders for that seat -- because that is the Pod a replacement would build anyway, and
+// shedding it would only schedule the same churn for the next pass. The greatest name decides
+// between occupants nothing separates, which is determinism rather than meaning: the name is
+// stable across passes, and nothing else about two occupants of one seat tells them apart. A Pod
+// with no ordinal leaves before any seated one because every seated Pod is accounted for by the
+// declared count.
+func modelDeploymentSurplusReplicas(
+	kept []*core.Pod, want map[int][]*core.Pod, surplus, minRenderVersion int,
+) []*core.Pod {
+	type seat struct{ ordinal, member int }
+
+	var shed []*core.Pod
+	bySeat := make(map[seat][]*core.Pod, len(kept))
+	for _, pod := range kept {
+		ordinal, ok := modelDeploymentPodOrdinal(pod)
+		if !ok {
+			shed = append(shed, pod)
+
+			continue
+		}
+		bySeat[seat{ordinal, modelDeploymentPodMemberIndex(pod)}] = append(
+			bySeat[seat{ordinal, modelDeploymentPodMemberIndex(pod)}], pod,
+		)
+	}
+
+	for at, occupants := range bySeat {
+		if len(occupants) < 2 {
+			continue
+		}
+		// The render of THIS seat, or nothing when the seat is one the role no longer describes --
+		// a member index beyond the declared size, left by a Pod of some earlier shape. Absence is
+		// carried as its own flag rather than as an empty string, because a Pod carrying no
+		// fingerprint at all -- one built by a hand -- would otherwise compare EQUAL to it and be
+		// kept as the seat's current occupant. Nothing matches an absent render, so those occupants
+		// sort by name alone and the seat still sheds down to one.
+		var wantMember *core.Pod
+		if members := want[at.ordinal]; at.member < len(members) {
+			wantMember = members[at.member]
+		}
+		peerVersion := 0
+		for peerSeat, peerOccupants := range bySeat {
+			if peerSeat.ordinal != at.ordinal || peerSeat.member == at.member || len(peerOccupants) != 1 {
+				continue
+			}
+			v := modelDeploymentPodRenderVersion(peerOccupants[0])
+			if v <= 0 {
+				peerVersion = -1
+				break
+			}
+			if peerVersion == 0 {
+				peerVersion = v
+			} else if peerVersion != v {
+				peerVersion = -1
+				break
+			}
+		}
+		slices.SortFunc(occupants, func(a, b *core.Pod) int {
+			am := modelDeploymentPodMatchesCurrency(a, wantMember, minRenderVersion)
+			bm := modelDeploymentPodMatchesCurrency(b, wantMember, minRenderVersion)
+			if am != bm {
+				if am {
+					return -1
+				}
+
+				return 1
+			}
+			if am && bm {
+				av := modelDeploymentPodRenderVersion(a)
+				bv := modelDeploymentPodRenderVersion(b)
+				if peerVersion > 0 {
+					aPeer := av == peerVersion
+					bPeer := bv == peerVersion
+					if aPeer != bPeer {
+						if aPeer {
+							return -1
+						}
+
+						return 1
+					}
+				}
+				if av != bv {
+					return bv - av
+				}
+			}
+
+			return strings.Compare(b.Name, a.Name)
+		})
+		shed = append(shed, occupants[1:]...)
+	}
+
+	// ORDINAL-LESS PODS FIRST, then the highest ordinal, so that two passes over the same state shed
+	// in the same order and the seated departures issue from the top down like every other removal.
+	//
+	// THE FIRST HALF IS LOAD-BEARING WHENEVER THE CAP BELOW BITES. Sorting by ordinal alone puts an
+	// ordinal-less Pod last, because it floors below every seat -- so a state holding both an
+	// ordinal-less Pod and a duplicated seat sheds the duplicate and keeps the Pod that belongs to
+	// no replica at all. That Pod then counts against the declared total on the next pass, which is
+	// how a role can sit one replica short with nothing left to shed.
+	slices.SortFunc(shed, func(a, b *core.Pod) int {
+		aSeated, bSeated := modelDeploymentOrdinalOrFloor(a) >= 0, modelDeploymentOrdinalOrFloor(b) >= 0
+		if aSeated != bSeated {
+			if !aSeated {
+				return -1
+			}
+
+			return 1
+		}
+		if c := modelDeploymentOrdinalOrFloor(b) - modelDeploymentOrdinalOrFloor(a); c != 0 {
+			return c
+		}
+
+		return strings.Compare(b.Name, a.Name)
+	})
+	if len(shed) > surplus {
+		shed = shed[:surplus]
+	}
+
+	return shed
+}
+
+// modelDeploymentHighestOrdinalReplica picks the replica a rollout replaces first: the highest
+// ordinal, and the greatest name when one slot's members are otherwise indistinguishable.
+//
+// THE CHOICE IS BY ORDINAL AND NOT BY CREATION TIMESTAMP -- a timestamp says when an object was
+// made, not which slot it holds, and the slot is what the replacement renders against. The
+// greatest name is the tiebreak for determinism rather than meaning: it is the API server's own
+// assignment and it is stable, which is the only property a level-based choice needs. A Pod with
+// no ordinal outranks nothing: it holds no seat, so every seated replica goes before it.
+func modelDeploymentHighestOrdinalReplica(pods []*core.Pod) *core.Pod {
+	choice := pods[0]
+	for _, pod := range pods[1:] {
+		if c := modelDeploymentOrdinalOrFloor(pod) - modelDeploymentOrdinalOrFloor(choice); c > 0 ||
+			(c == 0 && strings.Compare(pod.Name, choice.Name) > 0) {
+			choice = pod
+		}
+	}
+
+	return choice
+}
+
+// modelDeploymentOrdinalOrFloor reads the ordinal a replica holds, with a Pod carrying none
+// reading below every seat: it claims no slot, so it sorts after every replica that does.
+func modelDeploymentOrdinalOrFloor(pod *core.Pod) int {
+	ordinal, ok := modelDeploymentPodOrdinal(pod)
+	if !ok {
+		return -1
+	}
+
+	return ordinal
+}
+
+// getModelDeploymentInstanceType reads the InstanceType a role is admitted against.
+//
+// A missing type is an error rather than a render without one: the type supplies both how to spell
+// the accelerator keys and the per-card resources the host request is derived from, so a Pod
+// rendered without it would ask for something other than what the role declared.
+func (r *ModelDeploymentReconciler) getModelDeploymentInstanceType(
+	ctx context.Context, name string,
+) (*worker.InstanceType, error) {
+	instType := new(worker.InstanceType)
+	err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: name}, instType,
+		ctrlclix.WithoutQuorum)
+	if err == nil {
+		return instType, nil
+	}
+	if !kerrors.IsNotFound(err) {
+		return nil, fmt.Errorf("get instance type %s: %w", name, err)
+	}
+
+	// Maybe the InstanceType is not cached yet; read through to the API server rather than treat a
+	// cold cache as a missing type.
+	err = r.APIReader.Get(ctx, ctrlcli.ObjectKey{Name: name}, instType,
+		ctrlclix.WithoutQuorum)
+	if err != nil {
+		return nil, fmt.Errorf("get instance type %s: %w", name, err)
+	}
+
+	return instType, nil
+}
+
+// modelDeploymentRoleManufacturers resolves each role's accelerator manufacturer, keyed by role
+// name, for the routed-path decisions that depend on it. An unrouted deployment gets nil, because
+// nothing it renders reads a manufacturer.
+//
+// The read is BEST-EFFORT, and deliberately narrower than getModelDeploymentInstanceType's: a role
+// whose type cannot be read simply has no entry, and every consumer treats a missing entry as "not
+// known to be Ascend" -- the answer these paths gave before they looked. The pod render already
+// fails the pass on an unreadable type, so a gap here means the type went away mid-pass, and one
+// pass with the old answer beats failing a sync over it.
+func (r *ModelDeploymentReconciler) modelDeploymentRoleManufacturers(
+	ctx context.Context, md *workercore.ModelDeployment,
+) map[string]string {
+	if md.Spec.Router == nil {
+		return nil
+	}
+
+	manufacturers := make(map[string]string, len(md.Spec.Roles))
+	for i := range md.Spec.Roles {
+		instType := new(worker.InstanceType)
+		if err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: md.Spec.Roles[i].InstanceType}, instType,
+			ctrlclix.WithoutQuorum); err != nil {
+			continue
+		}
+		manufacturers[md.Spec.Roles[i].Name] = instType.Status.Detail.Manufacturer
+	}
+
+	return manufacturers
+}
+
+// getModelDeploymentRuntimeClassName reports the runtime class an accelerated replica needs, and ""
+// when it needs none or the cluster does not have it.
+//
+// A missing class is not an error: it is how a cluster that runs the vendor's runtime under a
+// different name, or not at all, reports itself. It is looked up rather than assumed because a
+// Pod naming a RuntimeClass that does not exist is rejected outright.
+func (r *ModelDeploymentReconciler) getModelDeploymentRuntimeClassName(
+	ctx context.Context, instType *worker.InstanceType,
+) string {
+	if !instType.Spec.Acceleratable {
+		return ""
+	}
+
+	name := nodefeature.GetAcceleratableRuntimeName(instType.Status.Detail.Manufacturer)
+	if name == "" {
+		return ""
+	}
+
+	rc := new(node.RuntimeClass)
+	if err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: name}, rc, ctrlclix.WithoutQuorum); err != nil {
+		return ""
+	}
+
+	return name
+}
+
+// listModelDeploymentPods returns the replicas this deployment owns.
+//
+// It selects on the identity labels and then confirms the controller reference, so a Pod that
+// carries the labels but belongs to a deployment of the same name that has since been recreated is
+// not adopted by the new one.
+func (r *ModelDeploymentReconciler) listModelDeploymentPods(
+	ctx context.Context, md *workercore.ModelDeployment,
+) ([]core.Pod, error) {
+	return readModelDeploymentPods(ctx, md, r.Client)
+}
+
+// readModelDeploymentPods filters by identity labels and requires the deployment's owner UID.
+func readModelDeploymentPods(
+	ctx context.Context, md *workercore.ModelDeployment, reader ctrlcli.Reader,
+) ([]core.Pod, error) {
+	podList := new(core.PodList)
+	err := reader.List(ctx, podList,
+		ctrlcli.InNamespace(md.Namespace),
+		ctrlcli.MatchingLabels{
+			modelDeploymentLabelKeyName:     modelDeploymentLabelValueName,
+			modelDeploymentLabelKeyInstance: md.Name,
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	owned := make([]core.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		if !modelDeploymentOwns(&podList.Items[i], md) {
+			continue
+		}
+		owned = append(owned, podList.Items[i])
+	}
+
+	return owned, nil
+}
+
+// modelDeploymentOwns reports whether the object is controlled by this deployment.
+func modelDeploymentOwns(obj ctrlcli.Object, md *workercore.ModelDeployment) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Controller != nil && *ref.Controller && ref.UID == md.UID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func modelDeploymentOwnedResource(obj ctrlcli.Object) bool {
+	if obj.GetLabels()[elasticOperationLabel] == modelDeploymentTrueValue ||
+		obj.GetLabels()[elasticObservationLabel] == modelDeploymentTrueValue {
+		return true
+	}
+	if !systemmeta.MatchResource(obj, ModelDeploymentResourceType) {
+		return false
+	}
+
+	return systemmeta.DescribeResourceNote(obj, ModelDeploymentResourceNoteRole) != "" ||
+		systemmeta.DescribeResourceNote(obj, modelDeploymentResourceNoteRouter) != ""
+}
+
+func (r *ModelDeploymentReconciler) SetupController(ctx context.Context, opts controller.SetupOptions) error {
+	r.Client = opts.Manager.GetClient()
+	r.APIReader = opts.Manager.GetAPIReader()
+	r.Recorder = opts.Manager.GetEventRecorderFor("modeldeployment")
+
+	// The drain reader resolves one member by its UID, and a UID is not a field the cache can be
+	// asked for without an index. Registering it here, before the manager is started, is what keeps
+	// the lookup one cache read instead of a sweep of every Pod in the cluster on every read of
+	// every member of every retiring replica.
+	err := opts.Manager.GetFieldIndexer().IndexField(ctx, &core.Pod{}, modelDeploymentDrainIndexPodUID,
+		func(obj ctrlcli.Object) []string {
+			if obj == nil {
+				return nil
+			}
+			pod := obj.(*core.Pod)
+			if pod.UID == "" {
+				return nil
+			}
+			return []string{string(pod.UID)}
+		})
+	if err != nil {
+		return fmt.Errorf("index pod by uid for the drain reader: %w", err)
+	}
+
+	// THE EXEC TRANSPORT IS BUILT HERE AND NOWHERE ELSE, so the reader a production pass resolves
+	// is the one wired below and not the refusal the seam falls back to. A nil reader is the
+	// refusal; this is what replaces it.
+	coreClient, err := corev1client.NewForConfig(opts.Manager.GetConfig())
+	if err != nil {
+		return fmt.Errorf("build core client for the drain reader: %w", err)
+	}
+	// THE MANAGER'S API READER IS THE AUTHORITY, and the cached client is the locator. Every fact the
+	// drain acts on is read live before and after the exec, because a controller that reads its own
+	// cache cannot tell a member that restarted from one that merely looks the same.
+	r.drainReader = newModelDeploymentDrainCollector(
+		r.Client, opts.Manager.GetAPIReader(), opts.Manager.GetConfig(), coreClient,
+	)
+	r.elasticObserver = newModelDeploymentElasticObserver(
+		r.Client, r.APIReader, opts.Manager.GetConfig(), coreClient,
+	)
+
+	return ctrl.NewControllerManagedBy(opts.Manager).
+		Named("modeldeployment").
+		For(
+			&workercore.ModelDeployment{},
+			ctrlbuilder.WithPredicates(
+				ctrlpredicate.Or(
+					ctrlpredicate.GenerationChangedPredicate{},
+					modelDeploymentMinRenderVersionChangedPredicate(),
+				),
+			),
+		).
+		Owns(
+			// Watch the replicas this deployment renders. Ownership rather than a label match is
+			// what enqueues here, so a Pod that has lost its owner cannot keep waking a deployment
+			// that no longer claims it.
+			&core.Pod{},
+			ctrlbuilder.WithPredicates(
+				ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource),
+			),
+		).
+		Owns(
+			// The Service is reconciled by this controller, so it has to be watched by it. Without
+			// this, an externally deleted or edited Service is corrected only when something else
+			// happens to wake the deployment, or at the next resync hours away: the endpoint stays
+			// broken while reconcile code that would realign it never runs.
+			//
+			// A watch is what makes the convergence level-based rather than a one-shot at creation.
+			// The gap does not show up in manual testing, because nobody deletes the Service by
+			// hand -- it shows up when something else in the cluster does.
+			&core.Service{},
+			ctrlbuilder.WithPredicates(
+				ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource),
+			),
+		).
+		Owns(
+			&app.Deployment{},
+			ctrlbuilder.WithPredicates(ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource)),
+		).
+		Owns(
+			&core.ConfigMap{},
+			ctrlbuilder.WithPredicates(ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource)),
+		).
+		Owns(
+			&core.ServiceAccount{},
+			ctrlbuilder.WithPredicates(ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource)),
+		).
+		Owns(
+			&rbac.Role{},
+			ctrlbuilder.WithPredicates(ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource)),
+		).
+		Owns(
+			&rbac.RoleBinding{},
+			ctrlbuilder.WithPredicates(ctrlpredicate.NewPredicateFuncs(modelDeploymentOwnedResource)),
+		).
+		Watches(
+			// A Binding's readiness is observed rather than declared, so the deployment has to be
+			// woken when it moves. Without this the transition would only be noticed at the next
+			// resync, which is hours away: a store leader restart would leave every deployment on it
+			// reporting a domain it had already regained.
+			&workercore.KVCachePoolBinding{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentBinding),
+		).
+		Watches(
+			// The InstanceType's OBSERVED detail is now an input to the rendered Pod: a role that
+			// names no image has one synthesized from the pool's accelerator runtime version, so a
+			// driver rollout changes the image every replica should be running. Without this watch
+			// that change would be picked up only when something else woke the deployment, and the
+			// spec-hash comparison would go on matching a Pod built from a version the pool no
+			// longer reports.
+			//
+			// No GenerationChangedPredicate here, and that is the point: what moves is the status,
+			// which does not bump the generation. The predicate on the primary object would filter
+			// out exactly the updates this watch exists for.
+			&worker.InstanceType{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentInstanceType),
+		).
+		Watches(
+			// The pool's published client endpoint is the address every replica dials, and it is
+			// rendered into the Pod. It MOVES: a store leader restart or a recreated Service gives
+			// the pool a new address, and the deployment's own Binding can stay Ready across that,
+			// so the Binding watch above does not cover it. Without this watch the spec hash goes on
+			// matching replicas built from an address nobody answers, which is the one failure this
+			// design refuses to render on purpose -- from outside the Pod it is indistinguishable
+			// from a cache miss.
+			&workercore.KVCachePool{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentPool),
+		).
+		Watches(
+			// The backend's transport protocol is the connector's other rendered input, and
+			// `spec.transport` is absent from the backend webhook's immutability rule, so an admin
+			// can edit it on a running pool. Same staleness, same silence.
+			&workercore.KVCacheBackend{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentBackend),
+		).
+		Watches(
+			// The artifact's resolution and access decide whether replicas may be created and what
+			// they are rendered from, and they move on the artifact's status alone.
+			&workercore.ModelArtifact{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentArtifact),
+		).
+		Watches(
+			// A claim artifact's binding decides whether replicas may be created and where they
+			// may run, and it moves on the claim, not on the artifact.
+			&core.PersistentVolumeClaim{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentClaim),
+		).
+		Watches(
+			// The plugin's CSIDriver decides whether a node-delivered artifact can be delivered.
+			&storage.CSIDriver{},
+			enqueueDeliveryChange(r.mapModelDeploymentDelivery, 0),
+			ctrlbuilder.WithPredicates(namePredicate(modelstore.DriverName)),
+		).
+		Watches(
+			// The delivery Setting decides how a hub artifact is delivered; its value is read through
+			// the Settings cache, so the deployments are looked at once that cache has expired.
+			&core.Secret{},
+			enqueueDeliveryChange(r.mapModelDeploymentDelivery, settingsReadDelay),
+			ctrlbuilder.WithPredicates(ctrlpredicate.NewPredicateFuncs(func(o ctrlcli.Object) bool {
+				return o.GetNamespace() == setting.DelegatedSecretNamespace && o.GetName() == setting.DelegatedSecretName
+			})),
+		).
+		Watches(
+			// A node-delivered artifact's materialization is reported by the node, and a replica
+			// Pod waiting on it changes nothing while the node downloads or fails, so WeightsReady
+			// follows the node's NodeModelStore.
+			&workercore.NodeModelStore{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentNodeModelStore),
+			ctrlbuilder.WithPredicates(nodeModelStoreModelsChanged()),
+		).
+		Watches(
+			// Kueue's verdict on a replica is written to the replica's Workload and nowhere else: the
+			// Workload appearing, reserving quota and being admitted change neither this deployment
+			// nor its Pods, which Kueue leaves untouched until it lifts their gates. The status reads
+			// those verdicts, so without this watch the QuotaReserved condition keeps the answer of
+			// whichever pass last ran -- a replica "with no workload yet" whose Workload already
+			// exists -- until something unrelated wakes the deployment.
+			//
+			// The Workload is owned by its Pods with plain references, so the mapping walks to the
+			// Pods and from them to their controller. The predicate passes only the changes the
+			// status reads; Kueue's scheduling bookkeeping moves far more often than its verdicts.
+			&kueue.Workload{},
+			ctrlhandler.EnqueueRequestsFromMapFunc(r.mapModelDeploymentWorkload),
+			ctrlbuilder.WithPredicates(modelDeploymentWorkloadPredicate()),
+		).
+		Complete(r)
+}
+
+// mapModelDeploymentPool enqueues every deployment attached to a pool, through the Bindings that
+// grant access to it.
+//
+// It goes pool -> Bindings -> deployments rather than listing every deployment and resolving each
+// one's Binding: the Binding is what names the pool, and a cluster has far fewer Bindings than the
+// N+1 reads that walk would cost. Each deployment matches exactly one Binding, so no request is
+// emitted twice.
+func (r *ModelDeploymentReconciler) mapModelDeploymentPool(
+	ctx context.Context, obj ctrlcli.Object,
+) []ctrlreconcile.Request {
+	kvcpbList := new(workercore.KVCachePoolBindingList)
+	if err := r.Client.List(ctx, kvcpbList, ctrlclix.WithoutQuorum); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "list kv cache pool bindings for kv cache pool",
+			"kv cache pool", ctrlcli.ObjectKeyFromObject(obj))
+
+		return nil
+	}
+
+	var reqs []ctrlreconcile.Request
+	for i := range kvcpbList.Items {
+		kvcpb := &kvcpbList.Items[i]
+		if kvcpb.Spec.PoolRef.Name != obj.GetName() {
+			continue
+		}
+		reqs = append(reqs, r.mapModelDeploymentBinding(ctx, kvcpb)...)
+	}
+
+	return reqs
+}
+
+// mapModelDeploymentBackend enqueues every deployment on a pool that names this backend.
+//
+// One more hop than the pool's, for the same reason: the deployment references a Binding, the
+// Binding a pool, and the pool a backend. A pool admits exactly one backend, but the field is a
+// list, so membership is tested rather than equality.
+func (r *ModelDeploymentReconciler) mapModelDeploymentBackend(
+	ctx context.Context, obj ctrlcli.Object,
+) []ctrlreconcile.Request {
+	kvcpList := new(workercore.KVCachePoolList)
+	if err := r.Client.List(ctx, kvcpList, ctrlclix.WithoutQuorum); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "list kv cache pools for kv cache backend",
+			"kv cache backend", ctrlcli.ObjectKeyFromObject(obj))
+
+		return nil
+	}
+
+	var reqs []ctrlreconcile.Request
+	for i := range kvcpList.Items {
+		kvcp := &kvcpList.Items[i]
+		if !slices.Contains(kvcp.Spec.Backends, obj.GetName()) {
+			continue
+		}
+		reqs = append(reqs, r.mapModelDeploymentPool(ctx, kvcp)...)
+	}
+
+	return reqs
+}
+
+// mapModelDeploymentInstanceType enqueues every deployment with a role admitted against the type.
+//
+// The scan crosses namespaces, unlike the Binding's, and it has to: an InstanceType is
+// cluster-scoped, so the deployments referencing one are not confined to any namespace. The set
+// walked is every ModelDeployment on the cluster, which is bounded by how many a cluster has rather
+// than by how many nodes or Pods it runs.
+func (r *ModelDeploymentReconciler) mapModelDeploymentInstanceType(
+	ctx context.Context, obj ctrlcli.Object,
+) []ctrlreconcile.Request {
+	mdList := new(workercore.ModelDeploymentList)
+	if err := r.Client.List(ctx, mdList, ctrlclix.WithoutQuorum); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "list model deployments for instance type",
+			"instance type", ctrlcli.ObjectKeyFromObject(obj))
+
+		return nil
+	}
+
+	var reqs []ctrlreconcile.Request
+	for i := range mdList.Items {
+		md := &mdList.Items[i]
+		for j := range md.Spec.Roles {
+			if md.Spec.Roles[j].InstanceType != obj.GetName() {
+				continue
+			}
+			reqs = append(reqs, ctrlreconcile.Request{
+				NamespacedName: ctrlcli.ObjectKeyFromObject(md),
+			})
+
+			break // one request per deployment, however many of its roles match
+		}
+	}
+
+	return reqs
+}
+
+// mapModelDeploymentBinding enqueues the deployments in a Binding's namespace that reference it.
+//
+// The scan is a namespaced List rather than an index because the reference is a plain field on a
+// namespaced object: the query never crosses a namespace, so the set it walks is one team's
+// deployments.
+func (r *ModelDeploymentReconciler) mapModelDeploymentBinding(
+	ctx context.Context, obj ctrlcli.Object,
+) []ctrlreconcile.Request {
+	mdList := new(workercore.ModelDeploymentList)
+	if err := r.Client.List(ctx, mdList,
+		ctrlcli.InNamespace(obj.GetNamespace()), ctrlclix.WithoutQuorum); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "list model deployments for kv cache pool binding",
+			"kv cache pool binding", ctrlcli.ObjectKeyFromObject(obj))
+
+		return nil
+	}
+
+	var reqs []ctrlreconcile.Request
+	for i := range mdList.Items {
+		md := &mdList.Items[i]
+		if md.Spec.KVCache == nil || md.Spec.KVCache.PoolRef.Name != obj.GetName() {
+			continue
+		}
+		reqs = append(reqs, ctrlreconcile.Request{
+			NamespacedName: ctrlcli.ObjectKeyFromObject(md),
+		})
+	}
+
+	return reqs
+}
+
+// mapModelDeploymentWorkload enqueues the deployments whose replicas a Workload names as owners.
+//
+// Kueue owns a replica's Workload from its Pods, one plain owner reference per member and no
+// controller reference, so the path runs Workload to Pod to the Pod's controlling deployment. A Pod
+// is matched the way the Pod watch matches it: it has to carry this deployment's resource note and
+// be controlled by a ModelDeployment.
+//
+// A Pod the cache no longer holds maps to nothing rather than being retried. Its own deletion
+// already woke its deployment through the Pod watch, and the other members of the same Workload
+// are still resolved.
+func (r *ModelDeploymentReconciler) mapModelDeploymentWorkload(
+	ctx context.Context, obj ctrlcli.Object,
+) []ctrlreconcile.Request {
+	mdGVK := workercore.SchemeGroupVersionKind("ModelDeployment")
+
+	var reqs []ctrlreconcile.Request
+	for _, ref := range obj.GetOwnerReferences() {
+		if !modelDeploymentOwnerRefNamesAPod(ref) {
+			continue
+		}
+
+		pod := new(core.Pod)
+		err := r.Client.Get(ctx,
+			ctrlcli.ObjectKey{Namespace: obj.GetNamespace(), Name: ref.Name}, pod, ctrlclix.WithoutQuorum)
+		if err != nil {
+			if !kerrors.IsNotFound(err) {
+				ctrllog.FromContext(ctx).Error(err, "get pod for workload",
+					"workload", ctrlcli.ObjectKeyFromObject(obj), "pod", ref.Name)
+			}
+
+			continue
+		}
+		if !modelDeploymentOwnedResource(pod) || !kubemeta.IsControlledByGVK(pod, mdGVK) {
+			continue
+		}
+
+		req := ctrlreconcile.Request{NamespacedName: types.NamespacedName{
+			Namespace: pod.Namespace,
+			Name:      kubemeta.GetOwnerRefOfNoCopy(pod, mdGVK).Name,
+		}}
+		if !slices.Contains(reqs, req) { // a group's members share one deployment
+			reqs = append(reqs, req)
+		}
+	}
+
+	return reqs
+}
+
+// modelDeploymentWorkloadPredicate passes a Workload's create and delete, and an update only when
+// it moves something the deployment's status reads.
+//
+// Those are the owner references (which replicas the Workload admits), spec.active (the joint
+// barrier parking it), and from the status the conditions, the admission and the admission checks.
+// Conditions and checks are compared without their timestamps: the status reads their type,
+// status, reason and message, and a timestamp moving alone changes no answer. Everything else Kueue
+// writes -- requeue state, scheduling stats, resource requests -- is scheduling bookkeeping that
+// moves on every attempt, and passing it would reconcile every deployment waiting for capacity on
+// each scheduler cycle.
+func modelDeploymentWorkloadPredicate() ctrlpredicate.Predicate {
+	return ctrlpredicate.Funcs{
+		UpdateFunc: func(e ctrlevent.UpdateEvent) bool {
+			oldWl, ok := e.ObjectOld.(*kueue.Workload)
+			if !ok {
+				return true
+			}
+			newWl, ok := e.ObjectNew.(*kueue.Workload)
+			if !ok {
+				return true
+			}
+
+			return modelDeploymentWorkloadVerdictMoved(oldWl, newWl)
+		},
+	}
+}
+
+// modelDeploymentWorkloadVerdictMoved reports whether an update changed what the deployment's
+// status reads off a Workload.
+func modelDeploymentWorkloadVerdictMoved(oldWl, newWl *kueue.Workload) bool {
+	oldConditions, oldChecks := modelDeploymentWorkloadVerdict(oldWl)
+	newConditions, newChecks := modelDeploymentWorkloadVerdict(newWl)
+
+	return kueueworkload.IsActive(oldWl) != kueueworkload.IsActive(newWl) ||
+		!kubemeta.DeepEqual(oldWl.OwnerReferences, newWl.OwnerReferences) ||
+		!kubemeta.DeepEqual(oldWl.Status.Admission, newWl.Status.Admission) ||
+		!kubemeta.DeepEqual(oldConditions, newConditions) ||
+		!kubemeta.DeepEqual(oldChecks, newChecks)
+}
+
+// modelDeploymentWorkloadVerdict copies a Workload's conditions and admission checks without their
+// timestamps.
+func modelDeploymentWorkloadVerdict(wl *kueue.Workload) ([]meta.Condition, []kueue.AdmissionCheckState) {
+	conditions := make([]meta.Condition, 0, len(wl.Status.Conditions))
+	for _, c := range wl.Status.Conditions {
+		conditions = append(conditions, meta.Condition{
+			Type: c.Type, Status: c.Status, Reason: c.Reason, Message: c.Message,
+		})
+	}
+	checks := make([]kueue.AdmissionCheckState, 0, len(wl.Status.AdmissionChecks))
+	for _, c := range wl.Status.AdmissionChecks {
+		checks = append(checks, kueue.AdmissionCheckState{Name: c.Name, State: c.State, Message: c.Message})
+	}
+
+	return conditions, checks
+}
+
+// modelDeploymentMinRenderVersionChangedPredicate passes an update when the deployment's
+// modeldeployment.gpustack.ai/min-render-version annotation changes.
+func modelDeploymentMinRenderVersionChangedPredicate() ctrlpredicate.Predicate {
+	return ctrlpredicate.Funcs{
+		CreateFunc: func(ctrlevent.CreateEvent) bool {
+			return false
+		},
+		DeleteFunc: func(ctrlevent.DeleteEvent) bool {
+			return false
+		},
+		GenericFunc: func(ctrlevent.GenericEvent) bool {
+			return false
+		},
+		UpdateFunc: func(e ctrlevent.UpdateEvent) bool {
+			if e.ObjectOld == nil || e.ObjectNew == nil {
+				return false
+			}
+			return e.ObjectOld.GetAnnotations()[modelDeploymentMinRenderVersionAnnotation] !=
+				e.ObjectNew.GetAnnotations()[modelDeploymentMinRenderVersionAnnotation]
+		},
+	}
+}

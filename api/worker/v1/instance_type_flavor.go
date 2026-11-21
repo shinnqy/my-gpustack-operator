@@ -1,0 +1,76 @@
+package v1
+
+import (
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// InstanceTypeFlavor is an aggregated, read-only projection over the operator-owned Kueue
+// ResourceFlavors — the catalog of hardware groups an InstanceType can be built on. Each
+// distinct pool (accelerated or generic CPU-only) surfaces as one InstanceTypeFlavor, parsed
+// from the flavor's note.gpustack.ai/* annotations, deduplicated, and sorted. It is served
+// read-only (get, list and watch) by the aggregated apiserver: there is no backing CRD and no
+// controller, so an administrator can discover the group + descriptor fields needed to author
+// an InstanceType. Get resolves a single flavor by name against the same aggregated list.
+//
+// +genclient
+// +genclient:nonNamespaced
+// +genclient:onlyVerbs=get,list,watch
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:apireg-gen:resource:scope="Cluster",categories=["gpustack"],shortName=["instypeflavor"]
+type InstanceTypeFlavor struct {
+	meta.TypeMeta   `json:",inline"`
+	meta.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+	Spec InstanceTypeFlavorSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+}
+
+var _ runtime.Object = (*InstanceTypeFlavor)(nil)
+
+// InstanceTypeFlavorSpec describes one pool aggregated from the ResourceFlavor notes. Its
+// fields mirror the InstanceTypeSpec identity — accelerator/general group + acceleratable +
+// manufacturer/product/family + memory/cores — so the catalog and an InstanceType read
+// consistently. Which group fields are populated tracks instance-type-aware-cpu-manufacturer:
+// with awareness off a generic pool carries GeneralGroup="generic" and an accelerated pool only
+// its AcceleratorGroup; with awareness on both carry the real CPU key in GeneralGroup.
+type InstanceTypeFlavorSpec struct {
+	// AcceleratorGroup is the accelerator group (the acceleratable key) of an accelerated pool,
+	// e.g. "nvidia-a10g"; empty for a generic pool.
+	AcceleratorGroup string `json:"acceleratorGroup,omitempty" protobuf:"bytes,1,opt,name=acceleratorGroup"`
+
+	// Acceleratable reports whether the pool represents accelerated hardware; a generic
+	// (CPU-only) pool is false. It delimits generic from accelerated flavors.
+	Acceleratable bool `json:"acceleratable" protobuf:"varint,2,name=acceleratable"`
+
+	// Manufacturer is the device (or CPU) manufacturer, e.g. "nvidia", "generic".
+	Manufacturer string `json:"manufacturer,omitempty" protobuf:"bytes,3,opt,name=manufacturer"`
+
+	// Product is the product name, e.g. "NVIDIA A10G"; empty for a generic pool.
+	Product string `json:"product,omitempty" protobuf:"bytes,4,opt,name=product"`
+
+	// Family is the product family, e.g. "ampere"; empty for a generic pool.
+	Family string `json:"family,omitempty" protobuf:"bytes,5,opt,name=family"`
+
+	// Memory is the per-accelerator VRAM, e.g. "24576Mi"; empty for a generic pool.
+	Memory string `json:"memory,omitempty" protobuf:"bytes,6,opt,name=memory"`
+
+	// Cores is the per-accelerator core count, e.g. "9216"; empty for a generic pool.
+	Cores string `json:"cores,omitempty" protobuf:"bytes,7,opt,name=cores"`
+
+	// GeneralGroup is the general(CPU) group of the pool: the real CPU key when
+	// instance-type-aware-cpu-manufacturer is on, or the "generic" sentinel for a collapsed
+	// (unaware) generic pool; empty for an accelerated pool when awareness is off.
+	GeneralGroup string `json:"generalGroup,omitempty" protobuf:"bytes,8,opt,name=generalGroup"`
+}
+
+// InstanceTypeFlavorList holds the list of InstanceTypeFlavor.
+//
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+type InstanceTypeFlavorList struct {
+	meta.TypeMeta `json:",inline"`
+	meta.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+	Items []InstanceTypeFlavor `json:"items" protobuf:"bytes,2,rep,name=items"`
+}
+
+var _ runtime.Object = (*InstanceTypeFlavorList)(nil)

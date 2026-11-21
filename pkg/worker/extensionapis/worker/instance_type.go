@@ -1,0 +1,134 @@
+package worker
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/registry/rest"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+
+	worker "gpustack.ai/gpustack/api/worker/v1"
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/extensionapi"
+)
+
+const (
+	_InstanceTypeResource = "instancetypes"
+)
+
+// InstanceTypeHandler handles v1.InstanceType objects.
+//
+// InstanceTypeHandler proxies the v1.InstanceType to the v1alpha1.InstanceType CRD.
+// The backing ClusterQueue and the four-view status are reconciled by the
+// InstanceTypeReconciler; this handler only serves the CRD storage.
+type InstanceTypeHandler struct {
+	extensionapi.ObjectInfo
+	extensionapi.CurdOperations
+}
+
+func (h *InstanceTypeHandler) SetupHandler(
+	ctx context.Context,
+	opts extensionapi.SetupOptions,
+) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
+	// Configure field indexer.
+	fi := opts.Manager.GetFieldIndexer()
+	err = fi.IndexField(ctx, &workercore.InstanceType{}, "metadata.name",
+		func(obj ctrlcli.Object) []string {
+			if obj == nil {
+				return nil
+			}
+			return []string{obj.GetName()}
+		})
+	if err != nil {
+		return schema.GroupVersionResource{}, srs, err
+	}
+
+	// Declare GVR.
+	gvr = worker.SchemeGroupVersionResource(_InstanceTypeResource)
+
+	// The four-view column can only show the partition view as a single scalar, which is a best
+	// case over profiles competing for the same physical slices. This column is the per-profile
+	// menu behind it — which profiles the pool can still host, a profile it offers but cannot
+	// currently build shown at zero. Priority 1 keeps it to `-o wide`: it is long, and empty for
+	// every pool with no partitioned card.
+	partitions := extensionapi.RenderColumn("Partitions", func(obj *worker.InstanceType) string {
+		profiles := obj.Status.AcceleratorPartitioned.RemainingProfiles
+		if len(profiles) == 0 {
+			// A pool with no partitioned card offers no menu. Render the same placeholder the
+			// jsonpath columns use for a missing value, so the wide table stays uniform.
+			return "-"
+		}
+		parts := make([]string, 0, len(profiles))
+		for i := range profiles {
+			parts = append(parts, fmt.Sprintf("%s:%d", profiles[i].Name, profiles[i].Count))
+		}
+		return strings.Join(parts, " ")
+	})
+	partitions.Priority = 1
+
+	// Create table converter to pretty the kubectl's output.
+	tc, err := extensionapi.NewJSONPathTemplateTableConvertor(
+		extensionapi.JSONPathTemplateColumn("Entrance", "{.status.entrance}"),
+		extensionapi.JSONPathTemplateColumn("Unit(CPU/RAM)/Storage",
+			"{.spec.unitResources.cpu}/{.spec.unitResources.ram}/{.spec.localStorage}"),
+		// Fold the exclusive/shared/sliced/partitioned four-view into one column: four
+		// space-separated onceMaxRequest/remaining groups, in the order named
+		// by the column header.
+		extensionapi.JSONPathTemplateColumn("Accelerator(EX/SH/SL/PT)",
+			"{.status.accelerator.onceMaxRequest}/{.status.accelerator.remaining} "+
+				"{.status.acceleratorShared.onceMaxRequest}/{.status.acceleratorShared.remaining} "+
+				"{.status.acceleratorSliced.onceMaxRequest}/{.status.acceleratorSliced.remaining} "+
+				"{.status.acceleratorPartitioned.onceMaxRequest}/{.status.acceleratorPartitioned.remaining}"),
+		partitions,
+		extensionapi.JSONPathTemplateColumn("CPU", "{.status.cpu.onceMaxRequest}/{.status.cpu.remaining}"),
+		extensionapi.JSONPathTemplateColumn("Phase", "{.status.phase}"),
+	)
+	if err != nil {
+		return gvr, srs, err
+	}
+
+	// As storage.
+	h.ObjectInfo = &worker.InstanceType{}
+	h.CurdOperations = extensionapi.WithCurdProxy[
+		*worker.InstanceType, *worker.InstanceTypeList, *workercore.InstanceType, *workercore.InstanceTypeList,
+	](tc, h, opts.Manager.GetClient().(ctrlcli.WithWatch), opts.Manager.GetAPIReader())
+
+	return gvr, srs, err
+}
+
+var (
+	_ rest.Storage           = (*InstanceTypeHandler)(nil)
+	_ rest.Creater           = (*InstanceTypeHandler)(nil)
+	_ rest.Lister            = (*InstanceTypeHandler)(nil)
+	_ rest.Watcher           = (*InstanceTypeHandler)(nil)
+	_ rest.Getter            = (*InstanceTypeHandler)(nil)
+	_ rest.Updater           = (*InstanceTypeHandler)(nil)
+	_ rest.Patcher           = (*InstanceTypeHandler)(nil)
+	_ rest.GracefulDeleter   = (*InstanceTypeHandler)(nil)
+	_ rest.CollectionDeleter = (*InstanceTypeHandler)(nil)
+)
+
+func (h *InstanceTypeHandler) New() runtime.Object {
+	return &worker.InstanceType{}
+}
+
+func (h *InstanceTypeHandler) Destroy() {}
+
+func (h *InstanceTypeHandler) NewList() runtime.Object {
+	return &worker.InstanceTypeList{}
+}
+
+func (h *InstanceTypeHandler) NewListForProxy() runtime.Object {
+	return &workercore.InstanceTypeList{}
+}
+
+func (h *InstanceTypeHandler) CastObjectTo(do *worker.InstanceType) (uo *workercore.InstanceType) {
+	return (*workercore.InstanceType)(do)
+}
+
+func (h *InstanceTypeHandler) CastObjectFrom(_ context.Context, uo *workercore.InstanceType) (do *worker.InstanceType) {
+	return (*worker.InstanceType)(uo)
+}

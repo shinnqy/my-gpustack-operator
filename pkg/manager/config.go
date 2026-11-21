@@ -3,42 +3,146 @@ package manager
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	kmeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/rest"
 	klog "k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlapiutil "sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/config"
+	ctrlmetricsrv "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"gpustack.ai/gpustack/pkg/kubeclients/kubernetes"
+	"gpustack.ai/gpustack/pkg/kubeclients/kubernetes/scheme"
+	"gpustack.ai/gpustack/pkg/system"
+	"gpustack.ai/gpustack/pkg/systemname"
+	"gpustack.ai/gpustack/pkg/webserver"
 )
 
 type Config struct {
-	RestConfig *rest.Config
-	Scheme     *runtime.Scheme
+	InformerCacheResyncPeriod time.Duration
+	LoopbackKubeConfigPath    string
+	LoopbackKubeRestConfig    rest.Config
+	LoopbackKubeHTTPClient    *http.Client
+	LoopbackKubeClient        kubernetes.Interface
+	KubeLeaderElection        bool
+	KubeLeaderElectionID      string
+	KubeLeaderLease           time.Duration
+	KubeLeaderRenewTimeout    time.Duration
+
+	// Internal assigned fields.
+	// Override these fields before call Apply.
+	WebhookServer webserver.Server
+	// CacheByObject narrows what the informer cache watches per object type. A component whose
+	// RBAC covers one namespace or one object must say so here, or its informer's cluster-wide
+	// list is refused and the cache never syncs.
+	CacheByObject map[ctrlcli.Object]ctrlcache.ByObject
 }
 
 func (c *Config) Apply(ctx context.Context) (*Manager, error) {
-	ctrl.SetLogger(klog.Background().WithName("ctrl"))
-	raw, err := ctrl.NewManager(c.RestConfig, ctrl.Options{
-		Scheme:         c.Scheme,
-		MapperProvider: apiutil.NewDynamicRESTMapper,
+	// controller-runtime 和 Manager 各使用一个带名称的日志器。
+	ctrl.SetLogger(klog.Background().V(3).WithName("ctrl"))
+
+	ctrlMgrOpts := ctrl.Options{
+		// General.
+		GracefulShutdownTimeout: ptr.To(30 * time.Second),
+		Scheme:                  scheme.Scheme,
+		Logger:                  klog.Background().WithName("ctrlmgr"),
+
+		// Context.
 		BaseContext: func() context.Context {
 			return ctx
 		},
-		// Devices 使用非结构化对象。启用缓存后，控制器读取的是 informer 同步的视图。
-		Client:  client.Options{Cache: &client.CacheOptions{Unstructured: true}},
-		Metrics: metricsserver.Options{BindAddress: "0"},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create controller manager: %w", err)
+
+		// Mapper.
+		MapperProvider: func(config *rest.Config, _ *http.Client) (kmeta.RESTMapper, error) {
+			// 显式传入已有的 HTTP client，让 discovery 和对象请求复用连接。
+			return ctrlapiutil.NewDynamicRESTMapper(config, c.LoopbackKubeHTTPClient)
+		},
+
+		// Client.
+		Client: ctrlcli.Options{
+			// Reuse http client.
+			HTTPClient: c.LoopbackKubeHTTPClient,
+		},
+		NewClient: func(config *rest.Config, options ctrlcli.Options) (ctrlcli.Client, error) {
+			// 聚合 API 需要向存储版本转发 Watch。
+			return ctrlcli.NewWithWatch(config, options)
+		},
+
+		// Cache.
+		Cache: ctrlcache.Options{
+			// Reuse http client.
+			HTTPClient: c.LoopbackKubeHTTPClient,
+			// informer 按这个周期重新同步；ByObject 限定各类对象的监听范围。
+			SyncPeriod: ptr.To(c.InformerCacheResyncPeriod),
+			ByObject:   c.CacheByObject,
+		},
+
+		// Controller.
+		Controller: ctrlcfg.Controller{
+			// How long we should wait for the watching cache to be synced before controller starts.
+			CacheSyncTimeout: 2 * time.Minute,
+			// Recover from panic.
+			RecoverPanic: ptr.To(true),
+			// NB(thxCode): make controllers run with leader election by default,
+			// this configuration does not affect the manager leader election.
+			NeedLeaderElection: ptr.To(true),
+		},
+
+		// Controller manager leader election.
+		LeaderElectionReleaseOnCancel: true,
+		LeaderElectionNamespace:       systemname.NamespaceName,
+		LeaderElectionID:              c.KubeLeaderElectionID,
+		LeaderElection:                c.KubeLeaderElection,
+		LeaseDuration:                 ptr.To(c.KubeLeaderLease),
+		RenewDeadline:                 ptr.To(c.KubeLeaderRenewTimeout),
+		RetryPeriod:                   ptr.To(2 * time.Second),
+
+		// Disable default webhook server.
+		WebhookServer: c.WebhookServer,
+		// Disable default metrics service.
+		Metrics: ctrlmetricsrv.Options{BindAddress: "0"},
+		// Disable default healthcheck service.
+		HealthProbeBindAddress: "0",
+		// Disable default profiling service.
+		PprofBindAddress: "0",
 	}
 
-	ctrlManager := CtrlManager{Manager: raw}
+	// Create controller manager and wrap it.
+	var ctrlManager CtrlManager
+	{
+		rawCtrlManager, err := ctrl.NewManager(rest.CopyConfig(&c.LoopbackKubeRestConfig), ctrlMgrOpts)
+		if err != nil {
+			return nil, fmt.Errorf("create controller manager: %w", err)
+		}
+		ctrlManager = CtrlManager{
+			Manager:       rawCtrlManager,
+			options:       ctrlMgrOpts,
+			httpClient:    c.LoopbackKubeHTTPClient,
+			indexedFields: sets.Set[string]{},
+		}
+	}
+
+	// 把启动信号作为 runnable 注册，让 WaitForReady 能等待实际启动。
 	sentinel := _CtrlManagerSentinel{done: make(chan struct{})}
-	if err := ctrlManager.Add(sentinel); err != nil {
-		return nil, fmt.Errorf("register controller manager sentinel: %w", err)
+	err := ctrlManager.Add(sentinel)
+	if err != nil {
+		return nil, fmt.Errorf("add controller manager sentinel: %w", err)
 	}
 
-	return &Manager{CtrlManager: ctrlManager, sentinel: sentinel}, nil
+	// 普通读取可以命中缓存；需要确认最新状态时走直连 APIReader。
+	system.ConfigureLoopbackCtrlRuntime(ctrlManager.GetClient(), ctrlManager.GetAPIReader())
+
+	return &Manager{
+		KubeClient:  c.LoopbackKubeClient,
+		CtrlManager: ctrlManager,
+		sentinel:    sentinel,
+	}, nil
 }

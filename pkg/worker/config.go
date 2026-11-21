@@ -2,151 +2,194 @@ package worker
 
 import (
 	"context"
-	"crypto/x509"
-	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
-	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/apiserver/pkg/server/healthz"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/component-base/compatibility"
-	apiregistration "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/dynamic"
+	kinformers "k8s.io/client-go/informers"
+	kclientset "k8s.io/client-go/kubernetes"
+	klog "k8s.io/klog/v2"
 
+	"gpustack.ai/gpustack/api"
+	"gpustack.ai/gpustack/api/worker"
+	"gpustack.ai/gpustack/pkg/extensionapi"
 	"gpustack.ai/gpustack/pkg/manager"
+	"gpustack.ai/gpustack/pkg/system"
+	"gpustack.ai/gpustack/pkg/utils/osx"
+	"gpustack.ai/gpustack/pkg/utils/version"
+	"gpustack.ai/gpustack/pkg/utils/waitx"
 	"gpustack.ai/gpustack/pkg/worker/extensionapis"
+	"gpustack.ai/gpustack/pkg/worker/kuberess"
 )
 
 type Config struct {
-	RestConfig  *rest.Config
-	Kubeconfig  string
-	BindAddress net.IP
-	BindPort    int
-	CertDir     string
-	Namespace   string
-	Service     string
+	Manufacturers      []string
+	ManagerConfig      *manager.Config
+	APIServerConfig    *genericapiserver.RecommendedConfig
+	Serve              *genericoptions.SecureServingOptions
+	Authn              *genericoptions.DelegatingAuthenticationOptions
+	Authz              *genericoptions.DelegatingAuthorizationOptions
+	Audit              *genericoptions.AuditOptions
+	Admit              *genericoptions.AdmissionOptions
+	KubeNativeClient   kclientset.Interface
+	KubeNativeInformer kinformers.SharedInformerFactory
 }
 
-func (c *Config) Apply(ctx context.Context) (_ *Worker, err error) {
-	scheme := runtime.NewScheme()
-	for _, register := range []func(*runtime.Scheme) error{
-		clientgoscheme.AddToScheme,
-		apiextensions.AddToScheme,
-		apiregistration.AddToScheme,
-	} {
-		if err := register(scheme); err != nil {
-			return nil, fmt.Errorf("register Kubernetes API types: %w", err)
-		}
-	}
-
-	mgr, err := (&manager.Config{RestConfig: c.RestConfig, Scheme: scheme}).Apply(ctx)
+func (c *Config) Apply(ctx context.Context) (*Worker, error) {
+	mgr, err := c.ManagerConfig.Apply(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// Prepare 发生在 Manager 启动前。安装资源时直接访问 API，不经过缓存。
-	installer, err := client.New(c.RestConfig, client.Options{
-		Scheme:     scheme,
-		Mapper:     mgr.CtrlManager.GetRESTMapper(),
-		HTTPClient: mgr.CtrlManager.GetHTTPClient(),
-	})
+
+	apiSrvCfg := c.APIServerConfig
+
+	// Apply the server configuration.
+	err = c.Serve.ApplyTo(&apiSrvCfg.SecureServing)
 	if err != nil {
-		return nil, fmt.Errorf("create API installer client: %w", err)
+		return nil, fmt.Errorf("apply server config: %w", err)
 	}
 
-	codecs := serializer.NewCodecFactory(scheme)
-	apiConfig := genericapiserver.NewRecommendedConfig(codecs)
-	apiConfig.EffectiveVersion = compatibility.NewEffectiveVersionFromString("1.36", "", "")
-	apiConfig.EnableProfiling = false
-	apiConfig.EnableMetrics = false
-
-	// 一旦申请监听端口，后续构造失败也要释放它。
-	defer func() {
-		if err != nil && apiConfig.SecureServing != nil {
-			_ = apiConfig.SecureServing.Listener.Close()
+	// Apply the authentication configuration.
+	if c.Authn != nil {
+		err = c.Authn.ApplyTo(&apiSrvCfg.Authentication, apiSrvCfg.SecureServing, nil)
+		if err != nil {
+			return nil, fmt.Errorf("apply authentication config: %w", err)
 		}
-	}()
+	}
 
-	serve, caBundle, err := c.servingOptions()
+	// Apply the authorization configuration.
+	if c.Authz != nil {
+		err = c.Authz.ApplyTo(&apiSrvCfg.Authorization)
+		if err != nil {
+			return nil, fmt.Errorf("apply authorization config: %w", err)
+		}
+	}
+
+	// Apply the audit configuration.
+	err = c.Audit.ApplyTo(&apiSrvCfg.Config)
 	if err != nil {
-		return nil, err
-	}
-	if err := serve.WithLoopback().ApplyToConfig(&apiConfig.Config); err != nil {
-		return nil, fmt.Errorf("configure HTTPS: %w", err)
+		return nil, fmt.Errorf("apply audit config: %w", err)
 	}
 
-	// 使用 Kubernetes 的委托认证授权，并信任集群提供的聚合层证书配置。
-	authn := genericoptions.NewDelegatingAuthenticationOptions()
-	authn.RemoteKubeConfigFile = c.Kubeconfig
-	if err := authn.ApplyTo(&apiConfig.Authentication, apiConfig.SecureServing, nil); err != nil {
-		return nil, fmt.Errorf("configure delegated authentication: %w", err)
-	}
-	authz := genericoptions.NewDelegatingAuthorizationOptions()
-	authz.RemoteKubeConfigFile = c.Kubeconfig
-	if err := authz.ApplyTo(&apiConfig.Authorization); err != nil {
-		return nil, fmt.Errorf("configure delegated authorization: %w", err)
+	// Apply the admission configuration.
+	{
+		dcli, err := dynamic.NewForConfig(apiSrvCfg.ClientConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create dynamic client: %w", err)
+		}
+		err = c.Admit.ApplyTo(
+			&apiSrvCfg.Config,
+			apiSrvCfg.SharedInformerFactory,
+			c.KubeNativeClient,
+			dcli,
+			feature.DefaultFeatureGate,
+			apiSrvCfg.EffectiveVersion,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("apply admission config: %w", err)
+		}
 	}
 
-	server, err := apiConfig.Complete().New("gpustack", genericapiserver.NewEmptyDelegate())
+	// Apply OpenAPI configuration.
+	var (
+		title       = "GPUStack - Open Source Accelerator Management Platform"
+		fullVersion = version.Get()
+	)
+	openapiDefinitionsGetter := extensionapi.MergeOpenAPIDefinitionsGetter(
+		worker.GetOpenAPIDefinitions,
+		api.GetOpenAPIDefinitions,
+	)
+	apiSrvCfg.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(
+		openapiDefinitionsGetter, openapinamer.NewDefinitionNamer(extensionapis.Scheme),
+	)
+	apiSrvCfg.OpenAPIConfig.Info.Title = title
+	apiSrvCfg.OpenAPIConfig.Info.Version = fullVersion
+	apiSrvCfg.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(
+		openapiDefinitionsGetter, openapinamer.NewDefinitionNamer(extensionapis.Scheme),
+	)
+	apiSrvCfg.OpenAPIV3Config.Info.Title = title
+	apiSrvCfg.OpenAPIV3Config.Info.Version = fullVersion
+
+	apiSrvCompletedCfg := apiSrvCfg.Complete()
+	apiSrv, err := apiSrvCompletedCfg.New("gpustack", genericapiserver.NewEmptyDelegate())
 	if err != nil {
-		return nil, fmt.Errorf("create extension API server: %w", err)
+		return nil, fmt.Errorf("create APIServer: %w", err)
 	}
-	extensionapis.Setup(server, codecs, mgr.CtrlManager.GetAPIReader())
-	if err := server.AddReadyzChecks(healthz.NamedCheck("controller-manager", func(r *http.Request) error {
-		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
-		defer cancel()
-		return mgr.WaitForReady(ctx)
-	})); err != nil {
-		return nil, fmt.Errorf("register manager readiness check: %w", err)
+
+	lpCli := system.LoopbackKubeClient.Get()
+
+	// Get routing port and CA bundle for webhook and extension API services.
+	var (
+		routingPort     = int32(c.Serve.BindPort)
+		routingCaBundle []byte
+	)
+	if system.LoopbackKubeInside.Get() || !system.LoopbackKubeNearby.Get() {
+		svc, err := lpCli.CoreV1().Services(kuberess.SystemNamespaceName).
+			Get(ctx, kuberess.SystemRoutingServiceName,
+				meta.GetOptions{
+					ResourceVersion: "0",
+				})
+		if err == nil {
+			routingPort = svc.Spec.Ports[0].Port
+		}
 	}
+	if c.Serve.ServerCert.CertKey.KeyFile == "" {
+		err = waitx.RetryUntilSuccessWithTimeout(ctx, time.Second, 30*time.Second, true,
+			func(ctx context.Context) error {
+				for _, ns := range []string{
+					kuberess.SystemNamespaceName,
+					meta.NamespacePublic,
+					meta.NamespaceDefault,
+					meta.NamespaceSystem,
+				} {
+					cm, err := lpCli.CoreV1().ConfigMaps(ns).
+						Get(ctx, "kube-root-ca.crt",
+							meta.GetOptions{
+								ResourceVersion: "0",
+							})
+					if err != nil {
+						continue
+					}
+					if cm.Data["ca.crt"] == "" {
+						continue
+					}
+					routingCaBundle = []byte(cm.Data["ca.crt"])
+					break
+				}
+				if len(routingCaBundle) == 0 {
+					return fmt.Errorf("cluster CA bundle not found")
+				}
+				return nil
+			})
+		if err != nil {
+			return nil, fmt.Errorf("get kube-root-ca.crt: %w", err)
+		}
+	} else {
+		caFile := filepath.Join(filepath.Dir(c.Serve.ServerCert.CertKey.KeyFile), "ca.crt")
+		if osx.Exists(caFile) {
+			caBs, err := os.ReadFile(caFile)
+			if err != nil {
+				return nil, fmt.Errorf("read CA file: %w", err)
+			}
+			routingCaBundle = caBs
+		} else {
+			klog.InfoS("CA bundle not found", "path", caFile)
+		}
+	}
+	klog.Infof("routing port: %d, CA bundle:\n %s", routingPort, string(routingCaBundle))
 
 	return &Worker{
+		RoutingPort:     routingPort,
+		RoutingCaBundle: routingCaBundle,
+		Manufacturers:   c.Manufacturers,
 		Manager:         mgr,
-		APIServer:       server,
-		installer:       installer,
-		routingCABundle: caBundle,
-		namespace:       c.Namespace,
-		service:         c.Service,
+		APIServer:       apiSrv,
 	}, nil
-}
-
-func (c *Config) servingOptions() (*genericoptions.SecureServingOptions, []byte, error) {
-	serve := genericoptions.NewSecureServingOptions()
-	serve.BindAddress = c.BindAddress
-	serve.BindPort = c.BindPort
-	if c.CertDir == "" {
-		// 单个学习用 Worker 可以使用内存证书，并将它注册给 Kubernetes 聚合层。
-		serve.ServerCert.CertDirectory = ""
-		dns := c.Service + "." + c.Namespace + ".svc"
-		if err := serve.MaybeDefaultWithSelfSignedCerts(dns, nil, nil); err != nil {
-			return nil, nil, fmt.Errorf("generate serving certificate: %w", err)
-		}
-		caBundle, _ := serve.ServerCert.GeneratedCert.CurrentCertKeyContent()
-		return serve, caBundle, nil
-	}
-
-	serve.ServerCert.CertKey = genericoptions.CertKey{
-		CertFile: filepath.Join(c.CertDir, "tls.crt"),
-		KeyFile:  filepath.Join(c.CertDir, "tls.key"),
-	}
-	caBundle, err := os.ReadFile(filepath.Join(c.CertDir, "ca.crt"))
-	if errors.Is(err, os.ErrNotExist) {
-		caBundle, err = os.ReadFile(serve.ServerCert.CertKey.CertFile)
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("read serving CA bundle: %w", err)
-	}
-	if !x509.NewCertPool().AppendCertsFromPEM(caBundle) {
-		return nil, nil, errors.New("serving CA bundle contains no PEM certificates")
-	}
-	return serve, caBundle, nil
 }

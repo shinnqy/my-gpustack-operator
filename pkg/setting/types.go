@@ -1,0 +1,279 @@
+package setting
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"time"
+
+	cache "github.com/patrickmn/go-cache"
+	core "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"gpustack.ai/gpustack/pkg/kubeclientset"
+	"gpustack.ai/gpustack/pkg/system"
+	"gpustack.ai/gpustack/pkg/utils/funcx"
+)
+
+// Prop represents the properties of a setting, which can be a combination of editable, private and sensitive.
+type Prop uint8
+
+const (
+	PropEditable Prop = 1 << iota
+	PropPrivate
+	PropSensitive
+)
+
+type (
+	// Setting represents a server setting, which has a name, description, default value, admission function and properties.
+	Setting struct {
+		name        string
+		description string
+		defVal      string
+		// envName is the environment variable read during registration, or empty when none.
+		envName string
+		// declared reports whether envName was present during registration, including an empty value.
+		declared bool
+		admit    Admission
+		props    Prop
+	}
+
+	// IndexFunc is a function type that takes a setting name and returns the corresponding setting and a boolean indicating whether the setting exists.
+	IndexFunc = func(name string) (Setting, bool)
+)
+
+// Name returns the name of the setting.
+func (s Setting) Name() string {
+	return s.name
+}
+
+// Description returns the description of the setting.
+func (s Setting) Description() string {
+	return s.description
+}
+
+func (s Setting) DefaultValue() string {
+	return s.defVal
+}
+
+// Editable returns true if the setting is editable.
+func (s Setting) Editable() bool {
+	return s.props&PropEditable == PropEditable
+}
+
+// Sensitive returns true if the setting is sensitive.
+func (s Setting) Sensitive() bool {
+	return s.props&PropSensitive == PropSensitive
+}
+
+// Private returns true if the setting is private.
+func (s Setting) Private() bool {
+	return s.props&PropPrivate == PropPrivate
+}
+
+// Configure configures the value of the setting.
+func (s Setting) Configure(ctx context.Context, newVal string) error {
+	lpCli := system.LoopbackKubeClient.Get()
+
+	// Update.
+	eSec := &core.Secret{
+		ObjectMeta: meta.ObjectMeta{
+			Namespace: DelegatedSecretNamespace,
+			Name:      DelegatedSecretName,
+		},
+	}
+	alignFn := func(aSec *core.Secret) (*core.Secret, bool, error) {
+		var oldVal string
+		if aSec.Data != nil {
+			oldVal = string(aSec.Data[s.name])
+		}
+		if admitErr := s.admit(ctx, oldVal, newVal); admitErr != nil {
+			// NB(thxCode): Skip update if the new value is invalid.
+			return nil, false, admitErr
+		}
+		if oldVal == newVal {
+			// Skip update if the new value is the same as the old value.
+			return nil, true, nil
+		}
+		// Update the value of the setting.
+		aSec.Data[s.name] = []byte(newVal)
+		return aSec, false, nil
+	}
+
+	secCli := lpCli.CoreV1().Secrets(DelegatedSecretNamespace)
+	_, err := kubeclientset.Update(ctx, secCli, eSec,
+		kubeclientset.WithUpdateAlign(alignFn))
+	if err != nil {
+		return fmt.Errorf("configure setting %s: %w", s.name, err)
+	}
+
+	return nil
+}
+
+// ReadCacheTTL is how long a read setting value is served from the cache: a change reaches a reader
+// at most this long after it was stored.
+const ReadCacheTTL = 30 * time.Second
+
+// _Cache is a cache for the values of settings,
+// which is used to reduce the number of API calls to the Kubernetes API server.
+var _Cache = cache.New(ReadCacheTTL, cache.NoExpiration)
+
+// ValueFromRemote returns the value of the setting by directly accessing the delegated secret in Kubernetes API server,
+// which is used for remote access and does not involve the controller-runtime client cache.
+//
+// This is useful for scenarios when the controller-runtime client cache has not been synced yet,
+// or when we want to bypass the cache for some reason.
+// However, it may have performance implications and should be used with caution.
+//
+// If the value is not found in the delegated secret, it returns the default value of the setting.
+func (s Setting) ValueFromRemote(ctx context.Context) (string, error) {
+	if val, found := _Cache.Get(s.name); found {
+		return val.(string), nil
+	}
+
+	lpCli := system.LoopbackKubeClient.Get()
+
+	sec, err := lpCli.CoreV1().
+		Secrets(DelegatedSecretNamespace).
+		Get(ctx, DelegatedSecretName,
+			meta.GetOptions{})
+	if err != nil {
+		return s.defVal, fmt.Errorf("get value of setting %s: %w", s.name, err)
+	}
+
+	if sec.Data == nil || sec.Data[s.name] == nil {
+		return s.defVal, fmt.Errorf("get value of setting %s: not found", s.name)
+	}
+
+	ret := string(sec.Data[s.name])
+	_Cache.Set(s.name, ret, cache.DefaultExpiration)
+	return ret, nil
+}
+
+// ShouldValueFromRemote returns the value of the setting from remote without error.
+func (s Setting) ShouldValueFromRemote(ctx context.Context) string {
+	return funcx.NoError(s.ValueFromRemote(ctx))
+}
+
+// ValueBoolFromRemote returns the boolean value of the setting, reading from remote (see
+// ValueFromRemote). Prefer this over comparing ShouldValueFromRemote to a literal "true": the bool
+// admission (AllowBool) accepts any strconv.ParseBool form ("1"/"TRUE"/...), so it mirrors ValueBool.
+func (s Setting) ValueBoolFromRemote(ctx context.Context) (bool, error) {
+	// ValueFromRemote returns the setting's default in valStr even on error, so parse valStr
+	// unconditionally to honor the "default on not found" contract; surface the fetch error alongside.
+	valStr, err := s.ValueFromRemote(ctx)
+	b, perr := strconv.ParseBool(valStr)
+	if err != nil {
+		return b, err
+	}
+	return b, perr
+}
+
+// ShouldValueBoolFromRemote returns the boolean value of the setting from remote without error.
+func (s Setting) ShouldValueBoolFromRemote(ctx context.Context) bool {
+	return funcx.NoError(s.ValueBoolFromRemote(ctx))
+}
+
+// Value returns the value of the setting.
+//
+// If the value is not found in the delegated secret, it returns the default value of the setting.
+func (s Setting) Value(ctx context.Context) (string, error) {
+	if val, found := _Cache.Get(s.name); found {
+		return val.(string), nil
+	}
+
+	lpCli := system.LoopbackCtrlClient.Get()
+
+	sec := &core.Secret{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      DelegatedSecretName,
+			Namespace: DelegatedSecretNamespace,
+		},
+	}
+	err := lpCli.Get(ctx, ctrlcli.ObjectKeyFromObject(sec), sec,
+		&ctrlcli.GetOptions{
+			Raw: &meta.GetOptions{
+				ResourceVersion: "0",
+			},
+		})
+	if err != nil {
+		return s.defVal, fmt.Errorf("get value of setting %s: %w", s.name, err)
+	}
+
+	if sec.Data == nil || sec.Data[s.name] == nil {
+		return s.defVal, fmt.Errorf("get value of setting %s: not found", s.name)
+	}
+
+	ret := string(sec.Data[s.name])
+	_Cache.Set(s.name, ret, cache.DefaultExpiration)
+	return ret, nil
+}
+
+// ShouldValue returns the value of the setting without error.
+func (s Setting) ShouldValue(ctx context.Context) string {
+	return funcx.NoError(s.Value(ctx))
+}
+
+// ValueBool returns the boolean value of the setting.
+//
+// A failed read falls back to the setting's default, not to false, and the read error is returned
+// alongside it. Callers read through ShouldValueBool, which drops the error, so false would turn a
+// single failed read into the "off" behavior of every setting that defaults to on, and the
+// reconcile that read it would write that behavior back. A caller for which a read error must mean
+// false, such as a gate that grants access, checks the error itself.
+func (s Setting) ValueBool(ctx context.Context) (bool, error) {
+	// Value returns the default in valStr on error, so parse it unconditionally, as
+	// ValueBoolFromRemote does.
+	valStr, err := s.Value(ctx)
+	b, perr := strconv.ParseBool(valStr)
+	if err != nil {
+		return b, err
+	}
+	return b, perr
+}
+
+// ShouldValueBool returns the boolean value of the setting without error.
+func (s Setting) ShouldValueBool(ctx context.Context) bool {
+	return funcx.NoError(s.ValueBool(ctx))
+}
+
+type Settings map[string]Setting
+
+// New creates a new setting with the given name, description, properties, initializer and admissions,
+// and registers it in the settings map.
+func (h Settings) New(
+	name, description string, props Prop,
+	init Initializer, admits ...Admission,
+) Setting {
+	defVal, envName, declared := init(name)
+	s := Setting{
+		name:        name,
+		defVal:      defVal,
+		envName:     envName,
+		declared:    declared,
+		admit:       AdmitWith(admits...),
+		description: description,
+		props:       props,
+	}
+	h[name] = s
+	return s
+}
+
+// NewEditable creates a new editable setting with the given name, description, initializer and admissions.
+// This setting is editable on UI, and its value can be modified by users, but it is not hidden on UI and logs.
+func (h Settings) NewEditable(
+	name, description string,
+	init Initializer, admits ...Admission,
+) Setting {
+	return h.New(
+		name, description, PropEditable,
+		init, admits...,
+	)
+}
+
+// Index returns the setting with the given name.
+func (h Settings) Index(name string) (Setting, bool) {
+	s, ok := h[name]
+	return s, ok
+}
