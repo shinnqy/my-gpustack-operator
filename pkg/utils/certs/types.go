@@ -10,15 +10,17 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 )
 
-// ErrCacheMiss is returned when a certificate is not found in cache.
+// 当证书未在缓存中找到时，会返回 ErrCacheMiss。
 var ErrCacheMiss = autocert.ErrCacheMiss
 
-// Cache is used by Manager to store and retrieve previously obtained certificates
-// and other account data as opaque blobs.
+// Cache 被 Manager 用于存储和检索之前获得的证书及其他账户数据，以不透明的 Blob 形式进行存储。
 //
-// Cache implementations should not rely on the key naming pattern. Keys can
-// include any printable ASCII characters, except the following: \/:*?"<>|.
+// 缓存实现不应依赖键命名模式。键可以包含任何可打印的 ASCII 字符，但以下字符除外：\/:*?"<>|.
 type Cache = autocert.Cache
+
+// HostPolicy 指定了管理器允许响应哪些主机名称。如果应拒绝该主机，它将返回非空错误。该错误可通过
+// tls.Conn.Handshake 及其调用方访问。
+type HostPolicy = autocert.HostPolicy
 
 type SecretInterface interface {
 	Create(context.Context, *core.Secret, metav1.CreateOptions) (*core.Secret, error)
@@ -29,7 +31,7 @@ type SecretInterface interface {
 	Watch(context.Context, metav1.ListOptions) (watch.Interface, error)
 }
 
-// CertificateSigningRequestInterface holds the operations on certificate signing requests.
+// CertificateSigningRequestInterface 包含与证书签名请求相关的操作。
 type CertificateSigningRequestInterface interface {
 	Create(context.Context, *cert.CertificateSigningRequest, metav1.CreateOptions) (*cert.CertificateSigningRequest, error)
 	Update(context.Context, *cert.CertificateSigningRequest, metav1.UpdateOptions) (*cert.CertificateSigningRequest, error)

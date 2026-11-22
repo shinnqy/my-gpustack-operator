@@ -24,11 +24,11 @@ import (
 type Options struct {
 	FlagOptions
 
-	// Control.
+	// 控制。
 	GopoolWorkerFactor        int
 	InformerCacheResyncPeriod time.Duration
 
-	// Connect Kubernetes.
+	// 连接 Kubernetes。
 	KubeConnTimeout        time.Duration
 	KubeConnQPS            float64
 	KubeConnBurst          int
@@ -41,11 +41,11 @@ type Options struct {
 
 func NewOptions() *Options {
 	return &Options{
-		// Control.
+		// 控制。
 		GopoolWorkerFactor:        100,
 		InformerCacheResyncPeriod: 1 * time.Hour,
 
-		// Connect Kubernetes.
+		// 连接 Kubernetes。
 		KubeConnTimeout:        5 * time.Minute,
 		KubeConnQPS:            200,
 		KubeConnBurst:          400,
@@ -65,19 +65,25 @@ type (
 	FlagOption func(opts *FlagOptions)
 )
 
+func WithoutKubeElectionOptions() FlagOption {
+	return func(opts *FlagOptions) {
+		opts.noKubeElectionOptions = true
+	}
+}
+
 func (o *Options) AddFlags(fs *pflag.FlagSet, opts ...FlagOption) {
 	for i := range opts {
 		opts[i](&o.FlagOptions)
 	}
 
-	// Control.
+	// 控制。
 	fs.IntVar(&o.GopoolWorkerFactor, "gopool-worker-factor", o.GopoolWorkerFactor,
 		"the number of tasks of the goroutine worker pool, "+
 			"it is calculated by the number of CPU cores multiplied by this factor.")
 	fs.DurationVar(&o.InformerCacheResyncPeriod, "informer-cache-resync-period", o.InformerCacheResyncPeriod,
 		"the period at which the informer's cache is resynced.")
 
-	// Connect Kubernetes.
+	// 连接 Kubernetes。
 	fs.DurationVar(&o.KubeConnTimeout, "kube-conn-timeout", o.KubeConnTimeout,
 		"the timeout for dialing the loopback Kubernetes cluster.")
 	fs.Float64Var(&o.KubeConnQPS, "kube-conn-qps", o.KubeConnQPS,
@@ -108,7 +114,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet, opts ...FlagOption) {
 }
 
 func (o *Options) Validate(_ context.Context) error {
-	// Control.
+	// 控制。
 	if o.GopoolWorkerFactor < 100 {
 		return errors.New("--gopool-worker-factor: less than 100")
 	}
@@ -116,7 +122,7 @@ func (o *Options) Validate(_ context.Context) error {
 		return errors.New("--informer-cache-resync-period: less than 5 minutes")
 	}
 
-	// Connect Kubernetes.
+	// 连接 Kubernetes。
 	if o.KubeConnTimeout < 10*time.Second {
 		return errors.New("--kube-conn-timeout: less than 10 seconds")
 	}
@@ -143,23 +149,22 @@ func (o *Options) Validate(_ context.Context) error {
 }
 
 func (o *Options) Complete(ctx context.Context) (*Config, error) {
-	// Configure goruntime,
-	// which is able to query by `runtime.GOMAXPROCS(0)`.
+	// 配置 goruntime，它可以通过 `runtime.GOMAXPROCS(0)`进行查询。
 	_, err := maxprocs.Set(maxprocs.Logger(klog.NewStandardLogger("INFO").Printf))
 	if err != nil {
 		return nil, fmt.Errorf("set maxprocs: %w", err)
 	}
 
-	// Configure goroutine pool.
+	// 配置协程池。
 	gox.Configure(o.GopoolWorkerFactor)
 
-	// Configure network.
+	// 配置网络。
 	err = system.ConfigureNetwork()
 	if err != nil {
 		return nil, fmt.Errorf("configure network: %w", err)
 	}
 
-	// Get loopback config.
+	// 获取回环配置。
 	lpCfgPath, lpRestCfg, lpInside, err := kubeconfig.LoadRestConfigNonInteractive()
 	if err != nil {
 		var (
@@ -182,14 +187,14 @@ func (o *Options) Complete(ctx context.Context) (*Config, error) {
 		}
 	}
 
-	// Set the timeout, QPS and burst of the rest config.
+	// 设置其余配置的超时时间、QPS 和突发量。
 	lpRestCfg.Timeout = o.KubeConnTimeout
 	lpRestCfg.QPS = float32(o.KubeConnQPS)
 	lpRestCfg.Burst = o.KubeConnBurst
 	lpRestCfg.ContentType = o.KubeContentType
 	lpRestCfg.UserAgent = version.GetUserAgent()
 
-	// Get loopback client.
+	// 获取回环客户端。
 	lpHttpCli, err := rest.HTTPClientFor(lpRestCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create http client: %w", err)
@@ -205,15 +210,13 @@ func (o *Options) Complete(ctx context.Context) (*Config, error) {
 		return nil, fmt.Errorf("wait loopback Kubernetes cluster ready: %w", err)
 	}
 
-	// Read the cluster version once here: feature predicates answer from this snapshot
-	// instead of dialing /version on every ask.
+	// 在此处阅读集群版本：功能谓词将从此快照中响应，无需每次询问时都调用 /version。
 	lpVersion, err := kubediscovery.GetVersion(ctx, lpCli.Discovery())
 	if err != nil {
 		return nil, fmt.Errorf("get loopback Kubernetes cluster version: %w", err)
 	}
 
-	// Configure loopback Kubernetes,
-	// including the client config and client.
+	// 配置回环 Kubernetes，包括客户端配置和客户端设置。
 	system.ConfigureLoopbackKube(lpInside, lpCfgPath, *lpRestCfg, lpHttpCli, lpCli, *lpVersion)
 
 	return &Config{

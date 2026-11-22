@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	klog "k8s.io/klog/v2"
 
@@ -191,6 +192,154 @@ func (in *mthreads) DetectAccelerator(noPciCheck bool) (_ device.DevicesGroupLis
 	}
 
 	device.SetGroupSlicedDetails(grpList)
+
+	return grpList, nil
+}
+
+func (in *mthreads) MonitorAccelerator(noPciCheck bool) (_ device.MetricsGroupList, err error) {
+	defer loggerx.RecoverWithStackScanner(func(s loggerx.Scanner, e error) {
+		in.logger.Error(e, "failed to monitor mthreads devices")
+		for s.Scan() {
+			in.logger.Error(nil, s.Text())
+		}
+		err = e
+	})
+
+	pciDevs := binding.GetPCIDevices([]string{_PciVendor}, nil)
+	if !noPciCheck && len(pciDevs) == 0 {
+		in.logger.Info("no mthreads pci devices found")
+		return nil, nil
+	}
+
+	in.init()
+
+	cnt, ret := in.mtml.CountDevice()
+	if !ret.IsSuccess() || cnt == 0 {
+		if ret.IsSuccess() {
+			in.logger.Info("no mthreads devices found")
+		} else {
+			in.logger.Error(ret, "no mthreads devices found")
+		}
+		return nil, nil
+	}
+
+	grpList := device.MetricsGroupList{
+		{
+			Manufacturer: Manufacturer,
+			Timestamp:    time.Now(),
+			Accelerators: make([]device.AcceleratorMetrics, 0, cnt),
+		},
+	}
+	for i := 0; i < cnt; i++ {
+		logger := in.logger.WithValues("index", i)
+
+		dev, ret := in.mtml.InitDeviceByIndex(i)
+		if !ret.IsSuccess() {
+			logger.Error(ret, "failed to get device handle")
+			continue
+		}
+
+		func() {
+			defer func() {
+				_ = dev.Free()
+			}()
+
+			prop, ret := dev.GetProperty()
+			if !ret.IsSuccess() {
+				logger.Error(ret, "failed to get device property")
+				return
+			}
+			if mtml.VirtRole(prop.VirtCap) == mtml.VIRT_ROLE_GUEST_VIRTDEVICE {
+				logger.Info("skipping virtual device")
+				return
+			}
+
+			uuid, ret := dev.GetUUID()
+			if !ret.IsSuccess() {
+				logger.Error(ret, "failed to get device UUID")
+				return
+			}
+
+			var (
+				memory            uint64
+				memoryUsage       uint64
+				memoryUtilization uint32
+				memoryUnhealthy   bool
+			)
+			{
+				memHandler, ret := dev.InitMemory()
+				if !ret.IsSuccess() {
+					logger.Error(ret, "failed to initialize memory handler")
+					return
+				}
+				defer func() {
+					_ = memHandler.Free()
+				}()
+
+				memTotal, ret := memHandler.GetTotal()
+				if !ret.IsSuccess() {
+					logger.Error(ret, "failed to get device memory total")
+					return
+				}
+				memory = device.ConvertBytesToMiB(memTotal)
+
+				memUsed, ret := memHandler.GetUsed()
+				if !ret.IsSuccess() {
+					logger.V(3).Error(ret, "failed to get device memory used")
+				} else {
+					memoryUsage = device.ConvertBytesToMiB(memUsed)
+				}
+
+				memoryUtilization = device.CalculateUtilization(memoryUsage, memory)
+				memoryUnhealthy = isDeviceUnhealthy(memHandler)
+			}
+
+			var (
+				coresUtilization uint32
+				temperature      uint32
+				powerUsage       uint32
+			)
+			{
+				gpuHandler, ret := dev.InitGpu()
+				if !ret.IsSuccess() {
+					logger.Error(ret, "failed to initialize gpu handler")
+					return
+				}
+				defer func() {
+					_ = gpuHandler.Free()
+				}()
+
+				coresUtilization, ret = gpuHandler.GetUtilization()
+				if !ret.IsSuccess() {
+					logger.V(3).Error(ret, "failed to get device cores utilization")
+				}
+
+				temperature, ret = gpuHandler.GetTemperature()
+				if !ret.IsSuccess() {
+					logger.V(3).Error(ret, "failed to get device temperature")
+				}
+
+				powerUsage, ret = dev.GetPowerUsage()
+				if !ret.IsSuccess() {
+					logger.V(3).Error(ret, "failed to get device power usage")
+				}
+			}
+
+			grpList[0].Accelerators = append(
+				grpList[0].Accelerators,
+				device.AcceleratorMetrics{
+					ID:                uuid,
+					Memory:            memory,
+					MemoryUsage:       memoryUsage,
+					MemoryUtilization: memoryUtilization,
+					CoresUtilization:  coresUtilization,
+					Temperature:       temperature,
+					PowerUsage:        powerUsage,
+					Unhealthy:         memoryUnhealthy,
+				},
+			)
+		}()
+	}
 
 	return grpList, nil
 }

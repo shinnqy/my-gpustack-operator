@@ -125,6 +125,19 @@ func (r Return) IsSuccess() bool {
 	return r == SUCCESS
 }
 
+// IsAPIUnavailable 用于指示是否因为加载的库或安装的驱动程序无法提供该功能，导致调用无法完成：共享对象不存
+// 在，符号缺失，或者库与驱动程序版本不兼容。
+//
+// 对于调用者可以不同地操作的每个代码——另一种结构版本、另一种设备、不同的权限——以及作为驱动程序对设备的个
+// 人回应，尤其是 ERROR_NOT_SUPPORT，都是错误的。
+func (r Return) IsAPIUnavailable() bool {
+	switch r {
+	case ERROR_LIBRARY_NOT_FOUND, ERROR_FUNCTION_NOT_FOUND:
+		return true
+	}
+	return false
+}
+
 // String 返回厂商返回码的文字说明。
 func (r Return) String() string {
 	return r.Error()

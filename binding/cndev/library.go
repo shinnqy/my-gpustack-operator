@@ -54,6 +54,22 @@ func (r Return) IsSuccess() bool {
 	return r == SUCCESS
 }
 
+// IsAPIUnavailable 用于指示是否因为加载的库或安装的驱动程序无法提供该功能，导致调用无法完成：共享对象不存
+// 在，符号缺失，或者驱动程序过于老旧，无法支持该 API。
+//
+// 对于每一个本身就是关于该设备或请求的答案的代码来说，这都是错误的。值得注意的是：
+//   - ERROR_NOT_SUPPORTED 表示驱动程序指出该设备缺少所查询的功能——这涉及硬件情况，而非 API 的存在问题。
+//   - ERROR_UNSUPPORTED_API_VERSION 是一个结构体版本协商失败的错误。头文件中的描述为：“该 API 的版本不受
+//     支持或无效。请使用正确的 API 版本号。”——入口点已提供，调用者可以重试该驱动程序已知的版本。
+func (r Return) IsAPIUnavailable() bool {
+	switch r {
+	case ERROR_LIBRARY_NOT_FOUND, ERROR_FUNCTION_NOT_FOUND,
+		ERROR_NO_DRIVER, ERROR_LOW_DRIVER_VERSION:
+		return true
+	}
+	return false
+}
+
 // String 返回厂商返回码的文字说明。
 func (r Return) String() string {
 	return r.Error()

@@ -5,42 +5,99 @@ import (
 	"strings"
 
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"gpustack.ai/gpustack/pkg/device"
+	"gpustack.ai/gpustack/pkg/kubemeta"
 	"gpustack.ai/gpustack/pkg/systemname"
 	"gpustack.ai/gpustack/pkg/utils/mapx"
+	"gpustack.ai/gpustack/pkg/utils/quantityx"
+	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
 const (
-	// FeatureLabelPrefix prefixes the node feature label/annotation keys.
+	// FeatureLabelPrefix 是节点特征标签和注解使用的键前缀。
 	FeatureLabelPrefix = "feature." + systemname.LabelPrefix
 
-	// CreditsLabelPrefix prefixes the node feature credits label/annotation keys.
+	// CreditsLabelPrefix 是记录调度配额单位的标签和注解使用的键前缀。
 	CreditsLabelPrefix = "credits." + systemname.LabelPrefix
 )
 
 const (
-	// AcceleratableFeatureLabelPrefix prefixes the acceleratable(device) feature label keys,
-	// e.g. "acceleratable.feature.gpustack.ai/nvidia-tesla-t4.product".
+	// AcceleratableFeatureLabelPrefix 是加速器特征标签的前缀，例如
+	// acceleratable.feature.gpustack.ai/nvidia-tesla-t4.product。
 	AcceleratableFeatureLabelPrefix = "acceleratable." + FeatureLabelPrefix
 
-	// NodeAcceleratableLabelKey is the umbrella label set on a node that carries any
-	// accelerator, e.g. "feature.gpustack.ai/acceleratable=true". It is the cheap
-	// "is this node accelerated?" check, set alongside the per-device keys.
+	// NodeAcceleratableLabelKey 概括节点上是否有加速器。有卡时设置
+	// feature.gpustack.ai/acceleratable=true，并另外发布各设备组的标签。
 	NodeAcceleratableLabelKey = FeatureLabelPrefix + "acceleratable"
-	// NodeCPUOnlyLabelKey selects nodes without a detected accelerator for CPU-only flavors.
+	// NodeCPUOnlyLabelKey 让纯 CPU 规格选中尚未探测到加速器的节点。
 	NodeCPUOnlyLabelKey = FeatureLabelPrefix + "cpu-only"
 )
 
-// ExtractAcceleratableKeys returns the acceleratable keys, each in the format
-// "${manufacturer}-${id}", that the given labels pin. It reads any label map — a Node's, or the
-// spec.nodeLabels a ResourceFlavor pins — so the one predicate that decides what an acceleratable
-// key is has a single home beside ConstructAcceleratableNodeLabels, which writes them.
+// ConstructAcceleratableNodeLabels 将设备组清单转换为节点加速器标签。
+func ConstructAcceleratableNodeLabels(groups device.DevicesGroupList) map[string]string {
+	labels := map[string]string{}
+	for i := range groups {
+		applyAcceleratorLabels(labels, groups[i])
+	}
+	return labels
+}
+
+// applyAcceleratorLabels 把一组同型号加速器的特征写入标签集合。
+func applyAcceleratorLabels(labels map[string]string, group device.DevicesGroup) {
+	if len(group.Accelerators) == 0 {
+		return
+	}
+
+	// 节点具备加速能力，设置 "${prefix}acceleratable=true"。
+	labels[NodeAcceleratableLabelKey] = "true"
+
+	manuKey := AcceleratableFeatureLabelPrefix + group.Manufacturer
+
+	// 记录厂商是否存在，设置 "acceleratable.${prefix}${manufacturer}=true"。
+	labels[manuKey] = "true"
+	// 记录驱动版本 "acceleratable.${prefix}${manufacturer}.driver-version=${driverVersion}"。
+	if v := group.DriverVersion; v != "" {
+		labels[manuKey+".driver-version"] = v
+	}
+	// 记录运行时版本 "acceleratable.${prefix}${manufacturer}.runtime-version=${runtimeVersion}"。
+	if v := group.RuntimeVersion; v != "" {
+		labels[manuKey+".runtime-version"] = v
+	}
+
+	nodeKey := manuKey + "-" + group.ID
+
+	// 标记本节点具有这一设备组，设置 "acceleratable.${prefix}${manufacturer}-${id}=true"。
+	labels[nodeKey] = "true"
+	// 记录产品名称 "acceleratable.${prefix}${manufacturer}-${id}.product=${name}"。
+	labels[nodeKey+".product"] = group.Name
+	// 记录单卡显存 "acceleratable.${prefix}${manufacturer}-${id}.memory=${memory}"。
+	labels[nodeKey+".memory"] = quantityx.Format(resource.MustParse(strconvx.Itoa(group.Memory) + "Mi"))
+	// 记录单卡核心数 "acceleratable.${prefix}${manufacturer}-${id}.cores=${cores}"。
+	labels[nodeKey+".cores"] = strconvx.Itoa(group.Cores)
+	// 记录本组卡数 "acceleratable.${prefix}${manufacturer}-${id}.count=${accelerator}"。
+	labels[nodeKey+".count"] = strconvx.Itoa(len(group.Accelerators))
+	// 记录设备系列 "acceleratable.${prefix}${manufacturer}-${id}.family=${family}"。
+	if v := group.Family; v != "" {
+		labels[nodeKey+".family"] = v
+	}
+	// 记录计算能力 "acceleratable.${prefix}${manufacturer}-${id}.comcap=${computeCapability}"。
+	if v := group.ComputeCapability; v != "" {
+		labels[nodeKey+".comcap"] = v
+	}
+
+	// 将各属性值转换成 Kubernetes 标签允许的形式。
+	for k := range labels {
+		labels[k] = kubemeta.SanitizeLabelValue(labels[k])
+	}
+}
+
+// ExtractAcceleratableKeys 从标签中提取形如 ${manufacturer}-${id} 的加速器组标识。输入既可以是 Node 的标
+// 签，也可以是 ResourceFlavor.spec.nodeLabels。
 //
-// What identifies such a key is the VALUE, not the key's shape: every per-key metadata sibling
-// written beside it (".count", ".product", ".memory", …) carries something other than "true", while
-// a device group id may legally contain a period — device.NormalizeName preserves "-", "_" and "."
-// — so reading a period as a metadata suffix would discard a real identity.
+// 设备组标识的标签值为 true，并且键中包含已知的厂商。设备组 ID 自身允许包含小数点，所以不能用“键里有点”来
+// 判断它是否只是 .count、.product 或 .memory 等属性。
 func ExtractAcceleratableKeys(labels map[string]string) []string {
 	return mapx.FilterSlice(labels, func(k, v string) (string, bool) {
 		if strings.HasPrefix(k, AcceleratableFeatureLabelPrefix) {
@@ -57,28 +114,19 @@ func ExtractAcceleratableKeys(labels map[string]string) []string {
 }
 
 const (
-	// GeneralFeatureLabelPrefix prefixes the general(CPU) feature label keys,
-	// e.g. "general.feature.gpustack.ai/amd-25-1.cpu".
+	// GeneralFeatureLabelPrefix 是 CPU 特征标签的键前缀，例如
+	// general.feature.gpustack.ai/amd-25-1.cpu。
 	GeneralFeatureLabelPrefix = "general." + FeatureLabelPrefix
 
-	// GeneralGroupGeneric is the sentinel general(CPU) group of a CPU-manufacturer-agnostic
-	// pool. It contributes no general.* discriminator, so a collapsed (unaware) pool and an
-	// aware pool whose CPU is left generic both aggregate every CPU of the os/arch.
+	// GeneralGroupGeneric 表示不指定 CPU 厂商的资源池。选择器省略 general.* 条件后，可以合并操作系统
+	// 和架构相同的不同 CPU。
 	GeneralGroupGeneric = GeneralManufacturerGeneric
 )
 
-// PoolScheduleLabels builds the schedule discriminator labels for a pool from its identity and
-// the CPU-manufacturer awareness setting. They are stamped on both the InstanceType and its
-// backing ClusterQueue and drive the ResourceFlavor/Devices reverse-lookup:
-//   - feature.gpustack.ai/acceleratable=<bool> is always present, separating generic from
-//     accelerated pools so an aware generic pool never matches an accelerated flavor sharing
-//     its CPU key;
-//   - an accelerated pool adds acceleratable.feature.gpustack.ai/<acceleratorGroup>=true;
-//   - the general.feature.gpustack.ai/<generalGroup>=true key is added only when aware and the
-//     general group is a real CPU (not the "generic" sentinel), so an unaware pool collapses
-//     every CPU and an aware pool splits by CPU.
+// PoolScheduleLabels 生成资源池的选择标签，同时写到 InstanceType 和 ClusterQueue。它总会记录是否带加速器，
+// 按需添加加速器组。启用了 CPU 厂商区分并且分组明确时，也写入 CPU 组。
 //
-// os/arch are included when non-empty.
+// 已知操作系统或架构时，也加入相应标签。
 func PoolScheduleLabels(acceleratable, cpuAware bool, generalGroup, acceleratorGroup, os, arch string) map[string]string {
 	lbs := map[string]string{
 		NodeAcceleratableLabelKey: strconv.FormatBool(acceleratable),
@@ -98,13 +146,8 @@ func PoolScheduleLabels(acceleratable, cpuAware bool, generalGroup, acceleratorG
 	return lbs
 }
 
-// PoolFlavorSelector is the inverse of PoolScheduleLabels: it extracts the ResourceFlavor selector
-// from a pool's labels (a ClusterQueue's or a ResourceFlavor's) — the generic-vs-accelerated
-// boolean, any feature key, and kubernetes.io/os|arch. It returns nil when the labels carry no
-// discriminator, so a caller never matches every object. The feature.gpustack.ai/acceleratable
-// boolean is a sufficient discriminator on its own (a collapsed generic pool carries only it, no
-// general.* key) and, kept in the selector, stops an aware generic pool (general.<gKey>=true) from
-// matching an accelerated flavor that shares that CPU key (acceleratable=true).
+// PoolFlavorSelector 从池的标签中取出用于反查规格的条件，包括加速器标志、设备或 CPU 分组、操作系统和架构。
+// 没有足够条件时返回 nil，避免选中所有对象。通用 CPU 池也保留加速器标志，以区分具有相同 CPU 的带卡节点。
 func PoolFlavorSelector(labels map[string]string) map[string]string {
 	lbs := make(map[string]string, 4)
 	hasDiscriminator := false
@@ -134,38 +177,23 @@ const (
 	_NFDCPUModelIDLabelKey       = "feature.node.kubernetes.io/cpu-model.id"
 )
 
-// ExtractGeneralNodeKey derives the general(CPU) node key of the given Node; it always
-// returns a non-empty key blending the node's real CPU identity.
+// ExtractGeneralNodeKey 从 Node 的信息计算 CPU 分组键，即使硬件信息不全也会返回非空的键。
 //
-// os/arch are not part of the key: the ResourceFlavor/ClusterQueue name carries os/arch
-// explicitly and spec.nodeLabels pins kubernetes.io/os|arch, so nodes of different ISAs
-// cannot pool into one flavor/queue even when the key collides (the cpu-model family and
-// id labels are independent numbering spaces on x86 versus arm64, so a small value such as
-// "25-1" can legitimately appear on both).
+// 操作系统和架构已写入 ResourceFlavor、ClusterQueue 的名称和节点选择标签。即使 x86 与 arm64 的 CPU 型号恰
+// 好使用相同的编号，它们也会进入不同的池。
 //
-// The manufacturer (the lowercased NFD cpu-model vendor_id, or "generic" when unknown)
-// leads and a CPU identity is blended in after it: the sanitized
-// "feature.gpustack.ai/cpu-name" annotation when reported (e.g. "amd-epyc-7763"), the NFD
-// cpu-model family and id labels as the fallback when the annotation is absent (e.g.
-// "amd-25-1"), or nothing when no CPU identity is usable (e.g. "amd", or "generic" when the
-// vendor is unknown too — the graceful degradation when NFD is absent).
+// CPU 键以小写厂商名开头，厂商未知时使用 generic。优先拼接清洗后的 cpu-name，没有名称时用 NFD 的 family
+// 和 id，都缺失时只保留厂商名。
 func ExtractGeneralNodeKey(node *core.Node) string {
-	// The manufacturer part of the general node key is derived from the NFD cpu-model
-	// vendor_id label.
+	// 从 NFD 的 cpu-model.vendor_id 标签读取 CPU 厂商。
 	manu := extractGeneralNodeKeyManufacturer(node)
 
-	// Blend the CPU name into the general node key for readability and differentiation. The
-	// CPU name is reported by the NFD NodeFeatureRule with the "feature.gpustack.ai/cpu-name"
-	// annotation; it is sanitized and truncated to fit the Kubernetes label value
-	// requirements. When the annotation is unavailable, the NFD cpu-model family and id
-	// labels are the fallback id prefix. If NFD is not deployed, or the CPU information is
-	// not collected, the id prefix is empty and the key falls back to "${manufacturer}".
+	// 优先采用 NFD NodeFeatureRule 在 feature.gpustack.ai/cpu-name 中报告的 CPU 名称。清洗之后再拼入
+	// 键中，便于区分 CPU 型号。
 	var idPrefix string
 	if name := generalFeatureAnnotation(node, "name"); name != "" {
-		// "${manufacturer}-${idPrefix}", limited so the key plus its longest sibling suffix still
-		// fits a Kubernetes label name segment: the general key is used bare AND with a ".count"/
-		// ".capacity" suffix on the Node and ResourceFlavor, so "<gKey>.capacity" must stay within
-		// 63. 53 = 63 - 1 (the "-" joiner) - len(".capacity").
+		// 为 .count 和 .capacity 等后缀预留长度，使组合后的标签名称仍满足 Kubernetes 的 63 字符限
+		// 制。
 		budget := 53 - len(manu)
 		idPrefix = device.NormalizeName(name, manu, budget, true)
 	} else {
@@ -176,22 +204,20 @@ func ExtractGeneralNodeKey(node *core.Node) string {
 		}
 	}
 
-	// "${manufacturer}"
+	// 只有厂商信息时，键为 "${manufacturer}"。
 	if idPrefix == "" {
 		return manu
 	}
 
-	// "${manufacturer}-${idPrefix}"
+	// 已知型号时，键为 "${manufacturer}-${idPrefix}"。
 	return manu + "-" + idPrefix
 }
 
-// extractGeneralNodeKeyManufacturer returns the manufacturer part of the general(CPU) node key of the given Node,
-// derived from the NFD cpu-model vendor_id label.
-// It returns "generic" when the vendor_id is unknown or empty.
+// extractGeneralNodeKeyManufacturer 读取 NFD 的 CPU 厂商标识并转换成小写。缺少厂商信息时返回 generic。
 func extractGeneralNodeKeyManufacturer(node *core.Node) string {
-	// feature.node.kubernetes.io/cpu-model.vendor_id is reported by
+	// feature.node.kubernetes.io/cpu-model.vendor_id 由 NFD 上报。
 	// https://github.com/klauspost/cpuid,
-	// it always to be a meaningful string if the CPU information is properly collected.
+	// 成功采集 CPU 信息时，这个值应包含厂商名。
 	manu := strings.ToLower(node.Labels[_NFDCPUModelVendorIDLabelKey])
 	if manu == "vendorunknown" || manu == "" {
 		manu = GeneralManufacturerGeneric
@@ -201,96 +227,105 @@ func extractGeneralNodeKeyManufacturer(node *core.Node) string {
 
 type (
 	ConstructNodeCapacityLabelsOptions struct {
-		// ManualNodeManagement, when true, skips auto-injecting the managed label so
-		// an administrator opts nodes in by hand (the node-management-manual setting).
+		// ManualNodeManagement 为 true 时，管理员通过节点标签决定是否纳管。
 		ManualNodeManagement bool
 	}
 
 	ConstructNodeCapacityLabelsOption func(*ConstructNodeCapacityLabelsOptions)
 )
 
-// WithManualNodeManagement skips auto-injecting the managed label when manual is
-// true, so the operator does not auto-onboard nodes. The caller passes the
-// node-management-manual setting value, read per-reconcile, so a runtime flip
-// applies on the next reconcile without a restart.
+// WithManualNodeManagement 把当前的 node-management-manual 配置传给标签构造函数。控制器在每次协调时重新读
+// 取这个配置。
 func WithManualNodeManagement(manual bool) ConstructNodeCapacityLabelsOption {
 	return func(opts *ConstructNodeCapacityLabelsOptions) {
 		opts.ManualNodeManagement = manual
 	}
 }
 
-// ConstructNodeCapacityLabels constructs node capacity labels from the given node status and existing labels.
+// ConstructNodeCapacityLabels 根据 Node 容量和已有标签生成管理状态及 CPU 分组标签。
 func ConstructNodeCapacityLabels(node *core.Node, opt ...ConstructNodeCapacityLabelsOption) map[string]string {
-	// Implement this function in chapter 05.
-	return nil
+	var opts ConstructNodeCapacityLabelsOptions
+	for i := range opt {
+		opt[i](&opts)
+	}
+
+	labels := map[string]string{}
+	// 自动模式默认加上 managed=true。管理员明确设置的值总是优先。手动模式下，管理员可以用这个标签决定
+	// 是否纳管节点。
+	if !opts.ManualNodeManagement {
+		labels[systemname.ManagedLabelKey] = "true"
+	}
+	if node.Labels != nil && node.Labels[systemname.ManagedLabelKey] != "" {
+		labels[systemname.ManagedLabelKey] = node.Labels[systemname.ManagedLabelKey]
+	}
+	if node.Labels[NodeAcceleratableLabelKey] != "true" {
+		labels[NodeCPUOnlyLabelKey] = "true"
+	}
+
+	// 写出 CPU 厂商键和型号键，供 NodeFlavorReconciler 把同类 CPU 节点归入同一组。每单位的 CPU、内存
+	// 和存储规格由控制器读取 Node 的 status.capacity 后写入 ResourceFlavor 的说明。
+	gKey := ExtractGeneralNodeKey(node)
+	gManu, _, _ := strings.Cut(gKey, "-")
+	// 标记 CPU 厂商，设置 "general.${prefix}${manufacturer}=true"。
+	labels[GeneralFeatureLabelPrefix+gManu] = "true"
+	// 标记 CPU 型号组，设置 "general.${prefix}${manufacturer}-${id}=true"。
+	labels[GeneralFeatureLabelPrefix+gKey] = "true"
+	// "general.${prefix}${manufacturer}-${id}.count=${count}" 中的 count 是向上取整后的 CPU 核数。
+	// ExtractNodeFlavors 用它确定规格大小，节点选择器也用它保证选中的节点核数一致。
+	cpuQ := node.Status.Capacity[core.ResourceCPU]
+	if count := cpuQ.Value(); count > 0 {
+		labels[GeneralFeatureLabelPrefix+gKey+".count"] = strconvx.Itoa(count)
+	}
+
+	return labels
 }
 
-// NodeFlavor identifies one Kueue ResourceFlavor a node contributes to, derived
-// from the node's feature labels and status capacity. Every managed node yields
-// one CPU flavor (its general key, sized by CPU cores) plus one device flavor per
-// acceleratable key it carries (sized by device count).
+// NodeFlavor 表示一个节点可以贡献给 Kueue 的一种规格。每个受管节点有按 CPU 键和核数区分的 CPU 规格，每个
+// 加速器组另有按型号和数量区分的设备规格。
 //
-// The NodeFlavorReconciler pools the nodes that share a Name: the flavor's capacity
-// is the count of pooled nodes times Count. The unit spec is not derived here: the
-// reconciler resolves it from Manufacturer and Product via PresetUnitResources when it
-// authors the pool's InstanceType.
+// NodeFlavorReconciler 把相同名称的规格聚到一起，总容量为节点数乘以 Count。每单位资源由控制器根据
+// Manufacturer、Product 和 PresetUnitResources 确定，创建 InstanceType 时使用。
 type NodeFlavor struct {
-	// Name is the ResourceFlavor name, with the CPU key always encoded and full os/arch:
-	// "gpustack--${gKey}-${os}-${arch}-${count}c" for a CPU flavor or
-	// "gpustack--${gKey}--${aKey}-${os}-${arch}-${count}d" for a device flavor.
+	// Name 是 ResourceFlavor 的名称。CPU 规格采用 gpustack--${gKey}-${os}-${arch}-${count}c，设备规格
+	// 采用 gpustack--${gKey}--${aKey}-${os}-${arch}-${count}d。
 	Name string
-	// GeneralKey is the node's general(CPU) key, always set. It mirrors the InstanceType's
-	// GeneralGroup.
+	// GeneralKey 是 CPU 分组键，始终有值，对应 InstanceType 的 GeneralGroup。
 	GeneralKey string
-	// AcceleratorKey is the acceleratable(device) key of a device flavor, empty for a CPU
-	// flavor. It mirrors the InstanceType's AcceleratorGroup, so an accelerated flavor encodes
-	// both the CPU (GeneralKey) and the accelerator (AcceleratorKey).
+	// AcceleratorKey 是设备规格的加速器组，对应 InstanceType 的 AcceleratorGroup。纯 CPU 规格的这个字
+	// 段为空。
 	AcceleratorKey string
-	// OS and Arch are the node's kubernetes.io/os and kubernetes.io/arch values
-	// (full, e.g. "linux"/"amd64"), carried verbatim into the Name and the
-	// schedule labels.
+	// OS 和 Arch 分别来自节点的 kubernetes.io/os 和 kubernetes.io/arch，完整值如 linux 和 amd64 也会
+	// 进入规格名和调度标签。
 	OS   string
 	Arch string
-	// Count is the node's CPU core count (CPU flavor) or device count (device flavor).
+	// Count 对 CPU 规格表示该节点的 CPU 核数，对设备规格表示该组的卡数。
 	Count int64
-	// Acceleratable reports whether the flavor represents accelerated resources.
+	// Acceleratable 指明这个规格是否包含加速器。
 	Acceleratable bool
-	// Manufacturer is the device manufacturer (device flavor) or the CPU
-	// manufacturer (CPU flavor).
+	// Manufacturer 对设备规格表示设备厂商，对 CPU 规格表示 CPU 厂商。
 	Manufacturer string
-	// Product and Family describe the device (device flavor); for a CPU flavor they
-	// are populated only when CPU-name blending is enabled, since the default
-	// "generic" key pools heterogeneous CPUs where one node's identity is misleading.
+	// Product 和 Family 描述设备产品和系列。CPU 规格只有在区分 CPU 名称时才填入这两项，因为同一
+	// generic 组内可能有多种 CPU。
 	Product string
 	Family  string
-	// Memory is the per-card VRAM of a device flavor (e.g. "24576Mi"); empty for a
-	// CPU flavor. Carried into ResourceFlavor notes so the webhook can fold a
-	// memory-mib request without reading the node.
+	// Memory 是设备规格中每张卡的显存，例如 24576Mi。CPU 规格留空。Webhook 可以从 ResourceFlavor 的说
+	// 明中读取它，换算请求的显存配额。
 	Memory string
-	// Cores is the per-card accelerator core count of a device flavor (e.g. "9216");
-	// empty for a CPU flavor. Carried into the ResourceFlavor notes.
+	// Cores 是设备规格中每张卡的核心数，例如 9216，写入 ResourceFlavor 的说明。CPU 规格留空。
 	Cores string
-	// NodeLabels selects the pooled nodes: the managed mark, kubernetes.io/os and
-	// kubernetes.io/arch (full values), the flavor's feature key label, and its
-	// per-node .count sibling so a reserved flavor binds one homogeneous batch of nodes.
+	// NodeLabels 匹配资源池的节点，包括管理标记、操作系统、架构、设备或 CPU 组及 .count。因此预留了某
+	// 个规格的任务只会落到容量与该规格一致的节点。
 	NodeLabels map[string]string
 }
 
-// ExtractNodeFlavors derives the ResourceFlavors a node contributes to from its
-// feature labels and status capacity: one CPU flavor keyed by the general node
-// key, plus one device flavor per acceleratable key. It returns nil when the node
-// carries no labels.
+// ExtractNodeFlavors 根据节点特征标签和容量构造 CPU 规格，并为每个加速器组构造相应的设备规格。
 func ExtractNodeFlavors(node *core.Node) (flavors []NodeFlavor) {
-	// Implement this function in chapter 06.
+	// 第 6 章补上此函数的实现。
 	return nil
 }
 
-// generalFeatureAnnotation returns the "feature.gpustack.ai/cpu-${name}"
-// annotation of the given Node, the shared accessor for every CPU attribute
-// reported by the NFD NodeFeatureRule (name, family, the core counts, the cache
-// sizes, ...). When NFD cannot resolve an attribute it leaves the "@cpu.model.*"
-// template reference verbatim as the value, so any value leading with "@" is
-// treated as unreported and returned as empty.
+// generalFeatureAnnotation 读取 NFD NodeFeatureRule 记录的 feature.gpustack.ai/cpu-${name} 注解，各类 CPU
+// 属性共用这一个读取入口。
 func generalFeatureAnnotation(node *core.Node, name string) string {
 	v := node.Annotations[FeatureLabelPrefix+"cpu-"+name]
 	if strings.HasPrefix(v, "@") {
@@ -299,29 +334,24 @@ func generalFeatureAnnotation(node *core.Node, name string) string {
 	return v
 }
 
-// FormatLocalQueueName formats the LocalQueue name for the given ClusterQueue name.
+// FormatLocalQueueName 根据 ClusterQueue 名称生成 LocalQueue 名称。
 //
-// ClusterQueue names may exceed the 63-character label value limit that the
-// "kueue.x-k8s.io/queue-name" label is subject to, so the LocalQueue is named
-// by the FNV-64a hash of the ClusterQueue name instead:
+// ClusterQueue 名称可能超过 kueue.x-k8s.io/queue-name 标签值允许的 63 个字符，因此对其计算 FNV-64a 哈希，
+// 用于生成 LocalQueue 名称。
 //
-//	"gpustack-fnv64-${fnv64a-hex}"
+// 名称格式为 "gpustack-fnv64-${fnv64a-hex}"。
 //
-// which is always 31 characters long.
+// 生成后的长度固定为 31 个字符。
 func FormatLocalQueueName(clusterQueueName string) string {
-	// Implement this function in chapter 06.
+	// 第 6 章补上此函数的实现。
 	return clusterQueueName
 }
 
-// LocalQueueNamePrefix starts the name of every LocalQueue this operator creates, see
-// FormatLocalQueueName.
+// LocalQueueNamePrefix 是 Operator 创建 LocalQueue 时使用的名称前缀。
 const LocalQueueNamePrefix = "gpustack-fnv64-"
 
-// IsAcceleratableCreditsResourceName reports whether name is a known manufacturer's accelerator
-// credits resource — the quota currency an accelerated ClusterQueue covers, which Kueue's resource
-// transformation every accelerator key maps onto. It is the inverse of
-// GetAcceleratableCreditsResourceName and lives beside it, so a caller telling an accelerator's
-// quota resource from a CPU's does not restate how that name is spelled.
+// IsAcceleratableCreditsResourceName 判断资源名是否属于某个厂商的加速器配额。Kueue 将请求换算成这种单位后，
+// 在 ClusterQueue 中统一计量。
 func IsAcceleratableCreditsResourceName(name core.ResourceName) bool {
 	manufacturer, ok := strings.CutPrefix(string(name), CreditsLabelPrefix)
 	return ok && IsKnownAcceleratableManufacturer(manufacturer)

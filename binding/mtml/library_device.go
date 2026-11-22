@@ -90,6 +90,64 @@ func (l Device) CountGpuCores() (uint32, Return) {
 	return coreCount, ret
 }
 
+// GetPowerUsage 以毫瓦为单位获取设备的电力使用量，这对监控和管理电力消耗非常有用。
+func (l Device) GetPowerUsage() (uint32, Return) {
+	if l.so.Lookup("mtmlDeviceGetPowerUsage") != nil {
+		return 0, ERROR_FUNCTION_NOT_FOUND
+	}
+
+	var powerUsage uint32
+	ret := mtmlDeviceGetPowerUsage(l.handle, &powerUsage)
+	return powerUsage, ret
+}
+
+// InitGpu 会为设备初始化 GPU 处理程序，并获取 GPU 温度和利用率，从而能够监控 GPU 性能和热态状况。
+func (l Device) InitGpu() (GpuHandler, Return) {
+	if l.so.Lookup("mtmlDeviceInitGpu") != nil {
+		return GpuHandler{}, ERROR_FUNCTION_NOT_FOUND
+	}
+
+	var handle *mtmlGpu
+	ret := mtmlDeviceInitGpu(l.handle, &handle)
+	return GpuHandler{handle: handle, so: l.so}, ret
+}
+
+type GpuHandler struct {
+	handle *mtmlGpu
+	so     binding.Library
+}
+
+// Free 释放了 GPU 处理程序及其所持有的所有资源。
+func (l GpuHandler) Free() Return {
+	if l.so.Lookup("mtmlDeviceFreeGpu") != nil {
+		return ERROR_FUNCTION_NOT_FOUND
+	}
+
+	return mtmlDeviceFreeGpu(l.handle)
+}
+
+// GetTemperature 函数用于获取以摄氏度为单位的 GPU 温度。
+func (l GpuHandler) GetTemperature() (uint32, Return) {
+	if l.so.Lookup("mtmlGpuGetTemperature") != nil {
+		return 0, ERROR_FUNCTION_NOT_FOUND
+	}
+
+	var temperature int32
+	ret := mtmlGpuGetTemperature(l.handle, &temperature)
+	return uint32(temperature), ret
+}
+
+// GetUtilization 以百分比形式返回 GPU 利用率。
+func (l GpuHandler) GetUtilization() (uint32, Return) {
+	if l.so.Lookup("mtmlGpuGetUtilization") != nil {
+		return 0, ERROR_FUNCTION_NOT_FOUND
+	}
+
+	var utilization uint32
+	ret := mtmlGpuGetUtilization(l.handle, &utilization)
+	return utilization, ret
+}
+
 func (l Device) InitMemory() (MemoryHandler, Return) {
 	if l.so.Lookup("mtmlDeviceInitMemory") != nil {
 		return MemoryHandler{}, ERROR_FUNCTION_NOT_FOUND
@@ -123,6 +181,17 @@ func (l MemoryHandler) GetTotal() (uint64, Return) {
 	var total uint64
 	ret := mtmlMemoryGetTotal(l.handle, &total)
 	return total, ret
+}
+
+// GetUsed 获取已使用的内存大小（以字节为单位）。
+func (l MemoryHandler) GetUsed() (uint64, Return) {
+	if l.so.Lookup("mtmlMemoryGetUsed") != nil {
+		return 0, ERROR_FUNCTION_NOT_FOUND
+	}
+
+	var used uint64
+	ret := mtmlMemoryGetUsed(l.handle, &used)
+	return used, ret
 }
 
 // GetEccErrorCounter 按错误类型、计数器和位置查询 ECC 错误次数。

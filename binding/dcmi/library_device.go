@@ -1,7 +1,7 @@
 package dcmi
 
-import "C"
 import (
+	"C"
 	"fmt"
 	"strconv"
 	"strings"
@@ -189,6 +189,120 @@ func (l VDieHandler) V2() (DieId, Return) {
 	ret := Return(dcmiGetDeviceDieV2(l.cardId, l.deviceId, VDIE, &dieId))
 
 	return dieId, ret
+}
+
+// GetUtilizationRateV 用于获取设备各组件的利用率，并返回一个 UtilizationRateHandler 以供进一步查询。
+func (l Device) GetUtilizationRateV() UtilizationRateHandler {
+	return UtilizationRateHandler(l)
+}
+
+type UtilizationRateHandler Device
+
+// V1 通过四种按类型进行的读取数据，组合出多组件比率。
+//
+// 两个代次都提供了按类型划分的入口点，因此此调整是合理的：在 V2 版本中，四个读取操作会指向
+// dcmiv2_get_device_utilization_rate。首先尝试调用 V2() 的调用者，在任一代次下都会得到多类型划分和按类型
+// 划分的结果，这与他们预期的情况一致。
+func (l UtilizationRateHandler) V1() (MultiUtilizationInfo, Return) {
+	var (
+		info  MultiUtilizationInfo
+		ret   Return
+		devId int32
+		onV2  = apiVersion() == APIVersionV2
+	)
+
+	if onV2 {
+		if devId, ret = Device(l).devID(); !ret.IsSuccess() {
+			return info, ret
+		}
+	}
+
+	rate := func(inputType int32, out *uint32) Return {
+		if onV2 {
+			return Return(dcmiv2GetDeviceUtilizationRate(devId, inputType, out))
+		}
+		return Return(dcmiGetDeviceUtilizationRate(l.cardId, l.deviceId, inputType, out))
+	}
+
+	// 按与 GetVDeviceInfo 相同的原因，将数据读入本地每个组件：返回的结构体中没有任何地址会传递到 C 语
+	// 言，因此安全性并不取决于该结构体当前包含什么内容。MultiUtilizationInfo 采用纯 C 语言布局，没有
+	// 指针槽需要查找，因此目前没有任何成本——这样就能让文件保持单一规则而非两个。
+	//
+	// 每个本地变量在自身读取成功时就会被分配，而不是在最后一批中分配。在返回码处停止的调用者仍然会收
+	// 到在失败前已读取的组件，这与在本地变量引入之前的情况一致。
+	var aic, aiv, aicore, npu uint32
+	if ret = rate(UTILIZATION_RATE_AICPU, &aic); !ret.IsSuccess() {
+		return info, ret
+	}
+	info.Aic_util = aic
+	if ret = rate(UTILIZATION_RATE_VECTORCORE, &aiv); !ret.IsSuccess() {
+		return info, ret
+	}
+	info.Aiv_util = aiv
+	if ret = rate(UTILIZATION_RATE_AICORE, &aicore); !ret.IsSuccess() {
+		return info, ret
+	}
+	info.Aicore_util = aicore
+	ret = rate(UTILIZATION_RATE_NPU, &npu)
+	info.Npu_util = npu
+
+	return info, ret
+}
+
+func (l UtilizationRateHandler) V2() (MultiUtilizationInfo, Return) {
+	var info MultiUtilizationInfo
+
+	if apiVersion() == APIVersionV2 {
+		devId, ret := Device(l).devID()
+		if !ret.IsSuccess() {
+			return info, ret
+		}
+		ret = Return(dcmiv2GetDeviceMultiUtilizationRate(devId, &info))
+
+		return info, ret
+	}
+
+	ret := Return(dcmiGetDeviceUtilizationRateV2(l.cardId, l.deviceId, &info))
+
+	return info, ret
+}
+
+// GetTemperature 函数用于获取设备的当前温度。
+func (l Device) GetTemperature() (int32, Return) {
+	var temp int32
+
+	if apiVersion() == APIVersionV2 {
+		devId, ret := l.devID()
+		if !ret.IsSuccess() {
+			return 0, ret
+		}
+		ret = Return(dcmiv2GetDeviceTemperature(devId, &temp))
+
+		return temp, ret
+	}
+
+	ret := Return(dcmiGetDeviceTemperature(l.cardId, l.deviceId, &temp))
+
+	return temp, ret
+}
+
+// GetPowerInfo 用于获取设备的当前电源信息。
+func (l Device) GetPowerInfo() (int32, Return) {
+	var power int32
+
+	if apiVersion() == APIVersionV2 {
+		devId, ret := l.devID()
+		if !ret.IsSuccess() {
+			return 0, ret
+		}
+		ret = Return(dcmiv2GetDevicePowerInfo(devId, &power))
+
+		return power, ret
+	}
+
+	ret := Return(dcmiGetDevicePowerInfo(l.cardId, l.deviceId, &power))
+
+	return power, ret
 }
 
 // GetHealth 返回设备健康状态。0 表示正常，1、2、3 分别表示轻微、严重和危急告警，0xFFFFFFFF 表示找不到设备。
@@ -427,4 +541,95 @@ func (l Device) GetGateway(portType PortType, portId int32) (IpAddr, Return) {
 	var gateway IpAddr
 	ret := Return(dcmiGetDeviceGateway(l.cardId, l.deviceId, portType, portId, &gateway))
 	return gateway, ret
+}
+
+// GetShareEnabled 用于报告设备是否启用了容器共享模式。在驱动程序 25.5.1 下的 910B2 设备上测试发现：当该模
+// 式被禁用时，打开同一设备的第二个容器会失败，而第一个容器及整个卡片的所有用户则不受影响。目前尚未确定是
+// 否所有共租配置都依赖于该模式，因此应将其视为驱动程序自身的单容器保护机制，而非完整规则。如果驱动程序未
+// 实现该查询功能，将返回 ERROR_FUNCTION_NOT_FOUND。
+//
+// V2 根本不声明任何容器共享入口点，因此该请求会被传递，而 V2 驱动程序会拒绝它。那个代次没有用于读取的标记，
+// 这与存在但被关闭的标记不同，分配器能够区分这两种情况。
+func (l Device) GetShareEnabled() (bool, Return) {
+	var enableFlag int32
+	ret := Return(dcmiGetDeviceShareEnable(l.cardId, l.deviceId, &enableFlag))
+	return enableFlag != 0, ret
+}
+
+// SetShareEnabled 用于启用或禁用设备的容器共享模式。该标志位于驱动程序中，而非本进程中，因此会持续存在直
+// 到调用者结束，除非驱动程序的共享配置恢复模式也处于开启状态，否则重启后该设置将被重置。
+//
+// 与上面的 GetShareEnabled 函数一样，V2 没有对应的实现：没有用于写入的标记。
+func (l Device) SetShareEnabled(enabled bool) Return {
+	var enableFlag int32
+	if enabled {
+		enableFlag = 1
+	}
+	return Return(dcmiSetDeviceShareEnable(l.cardId, l.deviceId, enableFlag))
+}
+
+const (
+	// maxProcMemInfoRows 表示读取设备时可接受的进程行数。这一数值远高于任何实际工作负载——只有少数几个
+	// 进程使用加速器，而非数百个——这种差异是故意设计的，因为库无法确定缓冲区结束的位置。
+	maxProcMemInfoRows = 256
+	// procMemInfoGuardRows 是指超过 maxProcMemInfoRows 后剩余待被库层占用内存的量。它的整体目的就是让
+	// 这些超出部分被该包所拥有的内存占用。
+	//
+	// 它远大于该读取器能接受的列表大小，这种不对称性正是关键：尾部无法阻止溢出——因为没有任何办法可以
+	// 做到，而计数仅用于输出——它只能足够大，以便一个合理的列表能保留在这一分配范围内。一行仅包含几字
+	// 节数据，因此整个缓冲区在每次读取时占用数十千字节，并弥补了读取被拒绝与过程中其他内存损坏之间的
+	// 差异。驱动程序写入的计数仍会与接受的列表进行比对，因此扩大这一范围并不会增加调用者所收到的内容。
+	procMemInfoGuardRows = 4096
+	// procMemInfoGuard 标记了一个未写入的保护行。进程 ID 为正数，因此在任何保护行上写入内容的库都会更
+	// 改它。
+	procMemInfoGuard int32 = -1
+)
+
+// GetProcessMemoryUsage 会返回每个进程在设备上的内存占用情况，库层报告的 Mem_usage 单位为字节。
+//
+// `count` 是一个仅作为输出使用的参数——其测量基准是驱动程序 25.5.1，即使传入了值为 0 的计数，第一行仍会被
+// 写入，且计数会被实际值覆盖——因此无法告诉库程序缓冲区的大小。如果一个设备的进程数超过缓冲区容量，该设备
+// 就会将数据写入缓冲区末尾。因此，缓冲区被过度分配了保护尾行，库程序预计无法触及该区域：写入的保护行意味
+// 着设备的进程数超过了读取所能接受的数量，此时会返回 ERROR_LIST_TRUNCATED，而不是较短的列表。这种溢出仅局
+// 限于该函数所拥有的内存范围内。
+//
+// 被截断的读取操作是一种不完整的读取，而非小规模的读取。如果返回那些确实符合要求的行，就会让设备的部分处
+// 理流程看起来像是全部都如此，因此从这些行中计算出的每个租户数量就会显得合理且错误。
+//
+// V2 入口点采用相同的计数方式——仅输出数据，因此保护尾部和计数检查均保持不变地适用于它。
+func (l Device) GetProcessMemoryUsage() ([]ProcMemInfo, Return) {
+	rows := make([]ProcMemInfo, maxProcMemInfoRows+procMemInfoGuardRows)
+	for i := maxProcMemInfoRows; i < len(rows); i++ {
+		rows[i].Id = procMemInfoGuard
+	}
+
+	var (
+		procNum int32
+		ret     Return
+	)
+
+	if apiVersion() == APIVersionV2 {
+		devId, devRet := l.devID()
+		if !devRet.IsSuccess() {
+			return nil, devRet
+		}
+		ret = Return(dcmiv2GetDeviceProcMemInfo(devId, &rows[0], &procNum))
+	} else {
+		ret = Return(dcmiGetDeviceResourceInfo(l.cardId, l.deviceId, &rows[0], &procNum))
+	}
+	if !ret.IsSuccess() {
+		return nil, ret
+	}
+
+	for i := maxProcMemInfoRows; i < len(rows); i++ {
+		if rows[i].Id != procMemInfoGuard {
+			return nil, ERROR_LIST_TRUNCATED
+		}
+	}
+	// 同时检查计数和保护机制：如果一个库报告的内容超过其写入的内容，那么超出其填充范围的行将被视为没
+	// 有内存的进程。
+	if procNum < 0 || procNum > maxProcMemInfoRows {
+		return nil, ERROR_LIST_TRUNCATED
+	}
+	return rows[:procNum], ret
 }

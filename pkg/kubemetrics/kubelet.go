@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubeletstats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	worker "gpustack.ai/gpustack/api/worker/v1"
@@ -15,28 +16,25 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/json"
 )
 
-// DefaultMaxAge is the accepted age of a cached node readout for a caller with no sampling
-// cadence of its own — a request-driven one, whose bursts this bounds to one readout per node.
+// DefaultMaxAge 是指没有自主采样策略的调用者所缓存的节点读取结果可接受的最大年龄——这种由请求驱动的采样方
+// 式将每个节点的读取次数限制在单次。
 //
-// A caller that samples on a fixed period must pass 0 rather than its period. Its rounds start
-// exactly one period apart while an entry is stamped mid-round, so an entry is always younger
-// than the period when the next round asks: it would read the source every other round and
-// republish the round between, at half the cadence it advertises.
+// 在固定周期进行采样的调用者必须设置为 0，而不是其周期值。其轮次开始时间恰好间隔一个周期，而条目在轮间中
+// 点被标记，因此条目始终比周期值年轻——它会在每隔一轮读取源数据，并在该轮之间重新发布内容，其频率仅为所发
+// 布的半倍。
 const DefaultMaxAge = 15 * time.Second
 
-// FetchPodSample returns one Instance pod's utilization sample: the totals it declared, and
-// the usage the node kubelet measured for it.
+// FetchPodSample 返回一个 Instance Pod 的利用率样本：包括其声明的总利用率，以及节点 kubelet 测量的使用情
+// 况。
 //
-// When the kubelet cannot answer — it is unreachable, or it answered without carrying the pod,
-// which happens while its stats provider catches up after a restart — the usage degrades to the
-// metrics.k8s.io API, which serves CPU and memory but no storage. The totals survive either
-// way, because they come from the Instance's own declaration rather than from a measurement.
+// 当 kubelet 无法响应时——可能是无法访问，或者响应时未携带 Pod，这种情况发生在重启后其统计提供器重新获取数
+// 据时——使用情况会降级到 metrics.k8s.io API，该 API 提供 CPU 和内存数据，但不提供存储数据。总数据量在任何
+// 情况下都保持不变，因为它们来自“实例”自身的声明，而非测量结果。
 //
-// The kubelet readout is node-wide, so maxAge states how old a readout of this node the caller
-// still accepts; see fetchPodStatsFromKubelet for what that buys.
+// kubelet 的读取结果是节点级的，因此 maxAge 表示调用者仍接受该节点的读取结果保留多久。关于其含义，请参考
+// fetchPodStatsFromKubelet。
 //
-// A returned error names every source that failed and why, so an API-serving caller can hand
-// the message to its client as it stands.
+// 返回的错误信息会列出所有失败的来源及其原因，因此 API 调用方可以原样将消息交付给其客户端。
 func FetchPodSample(
 	ctx context.Context,
 	nodeName string,
@@ -48,9 +46,9 @@ func FetchPodSample(
 		if ps := podStatsOf(pods, pod); ps != nil {
 			return newSampleFromPodStats(pod, ps), nil
 		}
-		// A cached readout can simply predate the pod. Re-read once before concluding the
-		// kubelet does not know it: degrading on a stale readout costs the storage figures, and
-		// can even report the pod as gone when the metrics API still holds its predecessor.
+		// 缓存的读取结果可能早于容器本身的状态。在断定 kubelet 不知道该信息之前，请重新读取一次：
+		// 基于过时的读取结果进行降级操作会消耗存储空间，甚至当指标 API 仍保留旧数据时，可能会将容
+		// 器视为已消失。
 		if maxAge > 0 {
 			if fresh, ferr := refetchPodStatsFromKubelet(ctx, nodeName, maxAge); ferr == nil {
 				if ps := podStatsOf(fresh, pod); ps != nil {
@@ -58,18 +56,17 @@ func FetchPodSample(
 				}
 			}
 		}
-		// The kubelet answered but does not carry the pod. Degrade as well: a sample stamped
-		// with a measurement that never happened is worse than degraded CPU/memory figures.
+		// kubelet 已返回响应，但其中没有该 Pod 的信息。此时也走降级路径，避免给 CPU 和内存数据标
+		// 记一个实际从未采集过的时间。
 		err = fmt.Errorf("node %s reports no stats for the pod", nodeName)
 	}
 
 	cpu, memory, ts, ferr := fetchPodUsageFromMetricsAPI(ctx, pod)
-	// The metrics entry was measured before this pod existed: it belongs to a previous
-	// incarnation of the same name — never serve it.
+	// 这个指标条目是在该 Pod 存在之前测量的：它属于同一名称的先前版本——不应使用它。
 	previousIncarnation := ferr == nil && cpu != nil && ts != nil && ts.Time.Before(pod.CreationTimestamp.Time)
 
-	// Name the actual reason: "the metrics API failed", "it is not served here" and "it only
-	// knows a previous pod of this name" are three different operator actions.
+	// 说明具体原因：“指标 API 失败”、“在此处无法访问”以及“仅知道之前存在名为此的 Pod”是三种不同的操作
+	// 行为。
 	switch {
 	case ferr != nil:
 		return nil, fmt.Errorf(
@@ -90,7 +87,7 @@ func FetchPodSample(
 		)
 	}
 
-	// The fallback carries no storage figures, so StorageUsedMiB stays absent.
+	// 回退方案没有存储数据，因此 StorageUsedMiB 字段保持为空。
 	sample := NewSample(pod)
 	sample.CPUUsedMilliCores = nanoCoresToMilliCores(cpu)
 	sample.MemoryUsedMiB = bytesToMiB(memory)
@@ -100,31 +97,57 @@ func FetchPodSample(
 	return sample, nil
 }
 
-// readTimeout bounds one node readout. A readout is deliberately detached from whichever
-// caller happened to start it — the others are waiting on that same read, and one of them
-// giving up must not cancel it out from under them — so it carries a deadline of its own.
+// FetchPodSamples 根据 pod UID 返回每个 pod 的一个使用情况样本。
+//
+// 这是 FetchPodSample 的节点级对应实现，用于让调用者一次性采样节点的每个 Instance。它获取的是 Pod，因为样
+// 本的汇总数据源自其容器限制，而 kubelet 的输出并不包含这些限制信息。此外，它根据 UID 对结果进行键化处理，
+// 因为样本本身没有独立的身份标识。
+//
+// 两者在处理 kubelet 无法处理的 Pod 问题上存在差异。FetchPodSample 会将该 Pod 降级为 metrics.k8s.io 格式，
+// 因为其调用者曾询问过该 Pod 的问题，必须给出答案。而在这里，该 Pod 则被完全忽略：报告整个节点的 Exporter
+// 没有对象可以回应单个 Pod 的问题，而对每个 Pod 进行降级操作则会导致每个周期中每个 Pod 多产生一次请求。只
+// 有整个节点范围内的读取失败才属于错误，因为那会同时使所有 Pod 失去其数据。
+func FetchPodSamples(
+	ctx context.Context,
+	nodeName string,
+	pods []*core.Pod,
+	maxAge time.Duration,
+) (map[types.UID]*worker.InstanceMetricsSample, error) {
+	stats, err := fetchPodStatsFromKubelet(ctx, nodeName, maxAge)
+	if err != nil {
+		return nil, err
+	}
+
+	samples := make(map[types.UID]*worker.InstanceMetricsSample, len(pods))
+	for _, pod := range pods {
+		ps := podStatsOf(stats, pod)
+		if ps == nil {
+			continue
+		}
+		samples[pod.UID] = newSampleFromPodStats(pod, ps)
+	}
+	return samples, nil
+}
+
+// readTimeout 设定了单个节点读取的超时限制。该读取操作被特意与启动它的调用者分离——其他节点正在等待该读取
+// 结果，其中某个节点放弃时，不应导致该读取操作被取消——因此它具有自己的截止时间。
 const readTimeout = 10 * time.Second
 
-// fetchPodStatsFromKubelet returns the per-pod stats the kubelet of the given node measured,
-// read through the API-server node proxy.
+// fetchPodStatsFromKubelet 返回了给定节点 kubelet 通过 API-server 节点代理测量的每个 Pod 统计信息。
 //
-// Going through the proxy means no kubelet address resolution and no kubelet TLS handling, and
-// it keeps the caller's ServiceAccount token where it belongs: reading the kubelet directly
-// would hand that token to a peer whose serving certificate cannot be verified on most
-// distributions.
+// 通过代理进行操作意味着不需要进行 kubelet 地址解析，也不需要进行 kubelet TLS 处理，同时会保留调用者的
+// ServiceAccount 令牌在其原处：直接读取 kubelet 会将该令牌交给一个在大多数发行版上无法验证其服务证书的对
+// 等方。
 //
-// The readout is node-wide, so asking about several pods of one node would otherwise re-read
-// the same payload once per pod. Two things stop that: a successful readout younger than maxAge
-// is served from a process-wide cache, and concurrent misses for one node collapse onto a
-// single in-flight read. A maxAge of 0 or less bypasses the cache — not the collapsing, which
-// costs nothing and is always right. Freshness stays visible either way, because a sample is
-// stamped with the kubelet's own measurement time rather than with the time it was read.
-// Failures are never cached.
+// 读取结果是整个节点的，因此如果询问某个节点的多个 Pod，否则每个 Pod 都会重新读取相同的数据。有两点可以避
+// 免这种情况：在 maxAge 之前成功读取的数据会从进程全局缓存中获取。对于某个节点的并发缺失情况，会合并到一
+// 次正在进行的读取中。当 maxAge 为 0 或更低时，就会绕过缓存——但不会发生数据合并，因为数据合并没有任何成本
+// 且总是正确的。无论哪种情况，数据的新鲜度都能被保留，因为样本会被标记为 kubelet 自身的测量时间，而不是读
+// 取时间。失败数据则永远不会被缓存。
 //
-// A caller waiting on another's read still leaves when its own context says so.
+// 当其他人的阅读正在进行时，等待的调用者仍会继续工作，只要其自身上下文允许。
 //
-// The returned slice is shared with every other caller inside the maxAge window: read it, never
-// write to it.
+// 返回的切片在 maxAge 时间窗口内与其他调用者共享：可以读取它，但不可写入。
 func fetchPodStatsFromKubelet(
 	ctx context.Context,
 	nodeName string,
@@ -133,10 +156,9 @@ func fetchPodStatsFromKubelet(
 	return podStatsFromKubelet(ctx, nodeName, maxAge, true)
 }
 
-// refetchPodStatsFromKubelet reads past a cached readout the caller found unusable — one taken
-// before the pod it is asking about existed — and caches what it reads under maxAge like any
-// other readout. Reading past the cache without replacing it would leave the stale entry in place
-// for the rest of its window, so every caller behind this one would repeat the same extra read.
+// refetchPodStatsFromKubelet 会读取过期的缓存数据，这些数据是调用者之前发现无法使用的——即该 Pod 在出现之
+// 前就存在的数据——它会像其他读取数据一样，在 maxAge 时间范围内缓存所读取的数据。如果不替换缓存数据，过期
+// 的条目将在其有效时间内继续存在，因此每个调用者都会重复进行同样的额外读取操作。
 func refetchPodStatsFromKubelet(
 	ctx context.Context,
 	nodeName string,
@@ -145,9 +167,8 @@ func refetchPodStatsFromKubelet(
 	return podStatsFromKubelet(ctx, nodeName, maxAge, false)
 }
 
-// podStatsFromKubelet performs the readout, optionally serving it from the cache first. Whether
-// the cache is consulted and whether the result is cached are two different questions: a forced
-// re-read skips the lookup and still stores what it read.
+// podStatsFromKubelet 执行读取操作，可选择先从缓存中提供数据。是否查询缓存以及结果是否被缓存是两个不同的
+// 问题：强制重新读取会跳过查找过程，但仍会保存所读取的内容。
 func podStatsFromKubelet(
 	ctx context.Context,
 	nodeName string,
@@ -161,8 +182,8 @@ func podStatsFromKubelet(
 	}
 
 	ch := podStatsFlight.DoChan(nodeName, func() (any, error) {
-		// A caller can arrive in the gap between the leader storing its readout and its
-		// flight being forgotten, and would otherwise re-read what is already cached.
+		// 调用者可能会出现在主节点存储读取结果与执行操作之间的空白期，从而被遗忘，否则就会重新读
+		// 取已缓存的内容。
 		if useCache {
 			if pods, ok := podStatsCache.load(nodeName, maxAge); ok {
 				return pods, nil
@@ -184,7 +205,7 @@ func podStatsFromKubelet(
 	}
 }
 
-// getPodStats performs one node-proxy readout and caches it when it succeeds.
+// getPodStats 会执行一次节点代理读取操作，并在成功时将其缓存起来。
 func getPodStats(
 	ctx context.Context,
 	nodeName string,
@@ -207,11 +228,10 @@ func getPodStats(
 	return summary.Pods, nil
 }
 
-// podStatsOf returns the readout's entry for the given pod, or nil when the node-wide readout
-// does not carry it — e.g. the kubelet's stats provider has not picked the pod up yet.
+// podStatsOf 返回给定 Pod 的读取数据条目。如果属于节点级读取，则返回 `nil`——例如，kubelet 的统计提供器尚
+// 未获取该 Pod 的数据。
 //
-// The match includes the pod UID: a deleted-and-recreated pod keeps its namespace and name,
-// and must never be served the previous incarnation's figures.
+// 该匹配包含 Pod UID：被删除后重新创建的 Pod 会保留其命名空间和名称，绝不得提供之前版本的内容。
 func podStatsOf(pods []kubeletstats.PodStats, pod *core.Pod) *kubeletstats.PodStats {
 	for i := range pods {
 		ref := &pods[i].PodRef
@@ -222,26 +242,23 @@ func podStatsOf(pods []kubeletstats.PodStats, pod *core.Pod) *kubeletstats.PodSt
 	return nil
 }
 
-// maxCachedNodes bounds how many nodes' readouts are held at once. The age sweep alone does not:
-// a client walking every Instance of a large cluster inside one window reads every node, and each
-// entry is a full decoded summary of every pod on that node. Past this many, the oldest go first —
-// they are the ones closest to expiring anyway.
+// maxCachedNodes 定义了同时保留的节点输出数量上限。仅通过年龄扫描无法达到此限制：一个客户端在单个窗口内遍
+// 历大型集群中的每个 Instance，就会读取所有节点，每个条目都是该节点上所有 Pod 的完整解析摘要。超过此数量
+// 后，最旧的节点会优先被处理——因为它们无论如何都是即将过期的。
 const maxCachedNodes = 64
 
-// cacheRetention is how long an entry is kept regardless of who asks for it. The sweep is
-// deliberately not the asking caller's maxAge: a caller that accepts only very fresh readouts
-// would otherwise evict entries still perfectly good for every other caller. Nothing stale can be
-// served either way — load compares each entry against the age its own caller stated — so this
-// only decides what is worth keeping, and maxCachedNodes is what bounds the memory.
+// cacheRetention 指的是无论谁请求，条目都会被保留的时间长度。这种清理机制并非按照调用者的 maxAge 来设定：
+// 如果调用者只接受非常新的数据，那么其他调用者仍然可以获取仍然完好的条目。无论采用哪种方式，都不会提供过
+// 时的数据——加载过程会将每个条目与其调用者所指定的有效期进行比较，因此这仅用于决定哪些条目值得保留，而
+// maxCachedNodes 则用于限制内存容量。
 const cacheRetention = 5 * time.Minute
 
-// podStatsCache holds the latest successful readout per node, so several pods of one node
-// cost one node-proxy request between them instead of one each.
+// podStatsCache 保存了每个节点最新的成功读取数据，因此一个节点上的多个 pod 会共享一个节点代理请求，而非各
+// 自单独请求。
 var podStatsCache = podStatsStore{entries: map[string]podStatsEntry{}}
 
-// podStatsFlight keeps one readout per node in flight at a time. The cache alone only
-// halves a steady polling load: a client asking about every Instance of a node at once misses
-// together and reads together, once per window.
+// podStatsFlight 会同时处理每个运行中的节点的一次读取操作。仅就缓存而言，它就能将稳定的轮询负载减少一半：
+// 一个客户端同时查询节点的每个 Instance，就会同时被拒绝和读取，每次都发生在特定的时间窗口内。
 var podStatsFlight singleflight.Group
 
 type podStatsEntry struct {
@@ -254,7 +271,7 @@ type podStatsStore struct {
 	entries map[string]podStatsEntry
 }
 
-// load returns the node's cached readout when it is younger than maxAge.
+// 当节点年龄小于 maxAge 时，load 函数会返回该节点的缓存读取值。
 func (c *podStatsStore) load(nodeName string, maxAge time.Duration) ([]kubeletstats.PodStats, bool) {
 	if maxAge <= 0 {
 		return nil, false
@@ -270,10 +287,9 @@ func (c *podStatsStore) load(nodeName string, maxAge time.Duration) ([]kubeletst
 	return e.pods, true
 }
 
-// store caches the node's readout, dropping every entry past cacheRetention on the way, then the
-// oldest of whatever is left until at most maxCachedNodes remain. Without the sweep the map would
-// hold one readout per node ever asked about for the life of the process; without the bound, one
-// burst across a large cluster would hold them all at once.
+// store 会保存节点的读取结果，在超过 cacheRetention 时删除所有条目，然后保留剩余的最旧数据，直到最多保留
+// maxCachedNodes 个节点。如果没有进行清理操作，映射表在进程运行期间会按每个节点存储一次读取结果。如果没有
+// 设置限制，大集群中的一次读取操作会一次性获取所有数据。
 func (c *podStatsStore) store(nodeName string, pods []kubeletstats.PodStats, maxAge time.Duration) {
 	if maxAge <= 0 {
 		return
@@ -292,8 +308,7 @@ func (c *podStatsStore) store(nodeName string, pods []kubeletstats.PodStats, max
 	c.evictOldest()
 }
 
-// evictOldest drops entries, oldest first, until the store is back within maxCachedNodes.
-// The caller holds the write lock.
+// evictOldest 会按最旧的顺序移除条目，直到存储量重新达到 maxCachedNodes 值。调用者持有写锁。
 func (c *podStatsStore) evictOldest() {
 	for len(c.entries) > maxCachedNodes {
 		var oldestName string

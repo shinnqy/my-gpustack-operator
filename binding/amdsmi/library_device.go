@@ -1,7 +1,7 @@
 package amdsmi
 
-import "C"
 import (
+	"C"
 	"fmt"
 	"strings"
 	"unsafe"
@@ -140,6 +140,17 @@ func (l Device) GetGpuDeviceBdf() (Bdf, Return) {
 	return bdf, ret
 }
 
+// GetGpuMetricsInfo 用于获取指定 GPU 设备的性能指标。
+func (l Device) GetGpuMetricsInfo() (GpuMetrics, Return) {
+	if l.so.Lookup("amdsmi_get_gpu_metrics_info") != nil {
+		return GpuMetrics{}, STATUS_FUNCTION_NOT_FOUND
+	}
+
+	var metrics GpuMetrics
+	ret := amdsmiGetGpuMetricsInfo(l.handle, &metrics)
+	return metrics, ret
+}
+
 // GetGpuVramUsage 读取 GPU 的显存使用信息。
 func (l Device) GetGpuVramUsage() (VramUsage, Return) {
 	if l.so.Lookup("amdsmi_get_gpu_vram_usage") != nil {
@@ -160,4 +171,15 @@ func (l Device) GetGpuEccCount(block GpuBlock) (ErrorCount, Return) {
 	var eccCount ErrorCount
 	ret := amdsmiGetGpuEccCount(l.handle, block, &eccCount)
 	return eccCount, ret
+}
+
+// GetPowerInfo 用于获取指定 GPU 设备的电源信息。
+func (l Device) GetPowerInfo() (PowerInfo, Return) {
+	if l.so.Lookup("amdsmi_get_power_info") != nil {
+		return PowerInfo{}, STATUS_FUNCTION_NOT_FOUND
+	}
+
+	var powerInfo PowerInfo
+	ret := amdsmiGetPowerInfo(l.handle, &powerInfo)
+	return powerInfo, ret
 }

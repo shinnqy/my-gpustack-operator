@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	klog "k8s.io/klog/v2"
 
@@ -16,6 +17,7 @@ import (
 	"gpustack.ai/gpustack/pkg/device"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/utils/loggerx"
+	"gpustack.ai/gpustack/pkg/utils/slicex"
 )
 
 const Manufacturer = nodefeature.ManufacturerMetaX
@@ -157,6 +159,120 @@ func (in *metax) DetectAccelerator(noPciCheck bool) (_ device.DevicesGroupList, 
 	}
 
 	device.SetGroupSlicedDetails(grpList)
+
+	return grpList, nil
+}
+
+func (in *metax) MonitorAccelerator(noPciCheck bool) (_ device.MetricsGroupList, err error) {
+	defer loggerx.RecoverWithStackScanner(func(s loggerx.Scanner, e error) {
+		in.logger.Error(e, "failed to monitor metax devices")
+		for s.Scan() {
+			in.logger.Error(nil, s.Text())
+		}
+		err = e
+	})
+
+	pciDevs := binding.GetPCIDevices([]string{_PciVendor}, nil)
+	if !noPciCheck && len(pciDevs) == 0 {
+		in.logger.Info("no iluvatar pci devices found")
+		return nil, nil
+	}
+
+	in.init()
+
+	cnt := in.mxsml.GetDeviceCount()
+	if cnt == 0 {
+		in.logger.Info("no metax devices found")
+		return nil, nil
+	}
+
+	grpList := device.MetricsGroupList{
+		{
+			Manufacturer: Manufacturer,
+			Timestamp:    time.Now(),
+			Accelerators: make([]device.AcceleratorMetrics, 0, cnt),
+		},
+	}
+	for i := 0; i < cnt; i++ {
+		logger := in.logger.WithValues("index", i)
+
+		dev := in.mxsml.GetDeviceHandleByIndex(i)
+
+		info, ret := dev.GetInfo()
+		if !ret.IsSuccess() {
+			logger.Error(ret, "failed to get device info")
+			continue
+		}
+		if mxsml.DeviceVirtualizationMode(info.Mode) == mxsml.Virtualization_Mode_Vf {
+			logger.Info("skipping virtual function device")
+			continue
+		}
+
+		uuid := info.GetUUID()
+
+		var (
+			memory            uint64
+			memoryUsage       uint64
+			memoryUtilization uint32
+			memoryUnhealthy   bool
+		)
+		{
+			memInfo, ret := dev.GetMemoryInfo()
+			if !ret.IsSuccess() {
+				logger.Error(ret, "failed to get device memory info")
+				continue
+			}
+
+			memory = device.ConvertKiBToMiB(memInfo.VramTotal)
+			memoryUsage = device.ConvertKiBToMiB(memInfo.VramUse)
+			memoryUtilization = device.CalculateUtilization(memoryUsage, memory)
+			memoryUnhealthy = isDeviceUnhealthy(dev)
+		}
+
+		var (
+			coresUtilization uint32
+			temperature      uint32
+			powerUsage       uint32
+		)
+		{
+			ipUsage, ret := dev.GetIpUsage(mxsml.Usage_Xcore)
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device core utilization")
+			} else {
+				coresUtilization = uint32(ipUsage)
+			}
+
+			tempInfo, ret := dev.GetTemperatureInfo(mxsml.Temperature_Hotspot)
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device temperature")
+			} else {
+				temperature = uint32(tempInfo)
+			}
+
+			powerInfo, ret := dev.GetBoardPowerInfo()
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device power usage")
+			} else {
+				powerUsage = slicex.Sum(powerInfo, func(info mxsml.BoardWayElectricInfo) uint32 {
+					return info.Power / 1_000 // 将 mW 转换为 W。
+				})
+			}
+		}
+
+		grpList[0].Accelerators = append(
+			grpList[0].Accelerators,
+			device.AcceleratorMetrics{
+				ID:                uuid,
+				Memory:            memory,
+				MemoryUsage:       memoryUsage,
+				MemoryUtilization: memoryUtilization,
+				CoresUtilization:  coresUtilization,
+				Temperature:       temperature,
+				PowerUsage:        powerUsage,
+				Unhealthy:         memoryUnhealthy,
+			},
+		)
+	}
 
 	return grpList, nil
 }

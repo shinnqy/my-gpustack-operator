@@ -251,6 +251,18 @@ func GetAcceleratableSlicedCoresPercentageResourceName(manufacturer string) core
 	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + SlicedCoresPercentageResourceNameSuffix
 }
 
+// GetAcceleratableSlicedMemoryPercentageResourceName 返回给定制造商的每加速器 VRAM 比例预算键（例如 "
+// nvidia.com/gpu.sliced.memory-percentage"）。这是 Gate-2 节点级资源。
+func GetAcceleratableSlicedMemoryPercentageResourceName(manufacturer string) core.ResourceName {
+	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + SlicedMemoryPercentageResourceNameSuffix
+}
+
+// GetAcceleratableSlicedMemoryMibResourceName 返回给定制造商的每加速器绝对 VRAM 预算键，单位为单位字节（
+// MiB）（例如 "nvidia.com/gpu.sliced.memory-mib"）。属于 Gate-2 节点级资源。
+func GetAcceleratableSlicedMemoryMibResourceName(manufacturer string) core.ResourceName {
+	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + SlicedMemoryMibResourceNameSuffix
+}
+
 // GetAcceleratablePartitionedProfileResourceName 构造厂商的硬分区规格键。
 // 例如 NVIDIA 的 3g.40gb 对应 nvidia.com/gpu.partitioned.mig-3g.40gb。
 // 厂商未声明硬切或名称无法组成合法资源键时返回空值。

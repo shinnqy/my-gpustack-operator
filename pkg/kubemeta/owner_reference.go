@@ -7,10 +7,10 @@ import (
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// MetaObject is the interface for the object with metadata.
+// MetaObject 是包含元数据的对象的接口。
 type MetaObject = ctrlcli.Object
 
-// IsControlledBy checks if the object has a controller owner reference set to the given owner.
+// IsControlledBy 用于检查对象是否有一个设置为指定所有者的控制器所有者引用。
 func IsControlledBy(obj, owner MetaObject) bool {
 	ref := GetControllerOfNoCopy(obj)
 	if ref == nil {
@@ -19,7 +19,7 @@ func IsControlledBy(obj, owner MetaObject) bool {
 	return ref.UID == owner.GetUID()
 }
 
-// IsControlledByGVK checks if the object has a controller owner reference set to the given owner GVK.
+// IsControlledByGVK 用于检查该对象是否有一个控制器所有者引用，该引用被设置为指定的所有者 GVK。
 func IsControlledByGVK(obj MetaObject, ownerGVK schema.GroupVersionKind) bool {
 	ref := GetOwnerRefOfNoCopy(obj, ownerGVK)
 	if ref == nil {
@@ -28,7 +28,7 @@ func IsControlledByGVK(obj MetaObject, ownerGVK schema.GroupVersionKind) bool {
 	return ptr.Deref(ref.Controller, false)
 }
 
-// GetControllerOfNoCopy returns a pointer to the controller owner reference if obj has a controller.
+// GetControllerOfNoCopy 如果对象有控制器，则返回指向控制器所有者的指针。
 func GetControllerOfNoCopy(obj MetaObject) *meta.OwnerReference {
 	refs := obj.GetOwnerReferences()
 	for i := range refs {
@@ -39,7 +39,7 @@ func GetControllerOfNoCopy(obj MetaObject) *meta.OwnerReference {
 	return nil
 }
 
-// NewControllerRef creates a blocked owner reference pointing to the given owner.
+// NewControllerRef 会创建一个指向指定所有者的被阻塞所有者引用。
 func NewControllerRef(owner MetaObject, gvk schema.GroupVersionKind) *meta.OwnerReference {
 	return &meta.OwnerReference{
 		APIVersion:         gvk.GroupVersion().String(),
@@ -51,10 +51,9 @@ func NewControllerRef(owner MetaObject, gvk schema.GroupVersionKind) *meta.Owner
 	}
 }
 
-// ControlOn sets the owner reference of obj to owner with the given GVK.
+// ControlOn 将 obj 的拥有者引用设置为给定的 GVK。
 //
-// ControlOn will append a new owner reference if obj does not have the given kind of owner,
-// otherwise it will replace the existing owner reference.
+// ControlOn 会如果对象没有指定的类型拥有者，则添加一个新的拥有者引用。否则会替换现有的拥有者引用。
 func ControlOn(obj, owner MetaObject, gvk schema.GroupVersionKind) {
 	var (
 		gv  = gvk.GroupVersion().String()
@@ -70,20 +69,19 @@ func ControlOn(obj, owner MetaObject, gvk schema.GroupVersionKind) {
 		}
 	}
 	if idx == -1 {
-		// Append.
+		// 追加。
 		ors = append(ors, *ref)
 	} else {
-		// Replace.
+		// 替换。
 		ors[idx] = *ref
 	}
 	obj.SetOwnerReferences(ors)
 }
 
-// ControlOnWithoutBlock is similar to ControlOn,
-// which sets the owner reference of obj to owner with the given GVK without block.
+// ControlOnWithoutBlock 与 ControlOn 类似，它会将 obj 的拥有者引用设置为给定的 GVK，且无需等待阻塞完成。
 //
-// ControlOnWithoutBlock will append a new owner reference if obj does not have the given kind of owner,
-// otherwise it will replace the existing owner reference.
+// ControlOnWithoutBlock 如果对象没有指定的类型拥有者，则会添加一个新的拥有者引用。否则会替换现有的拥有者
+// 引用。
 func ControlOnWithoutBlock(obj, owner MetaObject, gvk schema.GroupVersionKind) {
 	var (
 		gv  = gvk.GroupVersion().String()
@@ -101,16 +99,36 @@ func ControlOnWithoutBlock(obj, owner MetaObject, gvk schema.GroupVersionKind) {
 		}
 	}
 	if idx == -1 {
-		// Append.
+		// 追加。
 		ors = append(ors, *ref)
 	} else {
-		// Replace.
+		// 替换。
 		ors[idx] = *ref
 	}
 	obj.SetOwnerReferences(ors)
 }
 
-// GetOwnerRefOfNoCopy returns a pointer to the owner reference if obj has the given kind of owner.
+// ControlOff 会将 obj 的拥有者引用移除至给定的 GVK，并报告是否发生了移除。
+//
+// ControlOff 会移除对象的所有者引用，如果对象具有指定类型的所有者。一个空的所有者会匹配任何指定类型的引用，
+// 无论其指向何种所有者，这就是对未知、已消失或不再符合预期的所有者引用的处理方式。
+func ControlOff(obj, owner MetaObject, gvk schema.GroupVersionKind) (removed bool) {
+	var (
+		gv  = gvk.GroupVersion().String()
+		ors = obj.GetOwnerReferences()
+	)
+
+	for i := range ors {
+		if ors[i].APIVersion == gv && ors[i].Kind == gvk.Kind &&
+			(owner == nil || ors[i].UID == owner.GetUID()) {
+			obj.SetOwnerReferences(append(ors[:i], ors[i+1:]...))
+			return true
+		}
+	}
+	return false
+}
+
+// GetOwnerRefOfNoCopy 如果对象具有指定的所有者类型，则返回指向该所有者引用的指针。
 func GetOwnerRefOfNoCopy(obj MetaObject, gvk schema.GroupVersionKind) *meta.OwnerReference {
 	var (
 		gv  = gvk.GroupVersion().String()

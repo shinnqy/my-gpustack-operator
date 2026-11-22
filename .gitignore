@@ -1,2 +1,48 @@
-/.sbin/
-/gpustack-operator
+# Files
+.DS_Store
+*.lock
+*.test
+*.out
+*.swp
+*.swo
+*.db
+*.exe
+*.exe~
+*.dll
+# *.so
+*.dylib
+*.log
+*.rej
+*.orig
+*.py[co]
+go.work
+go.work.*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.*
+*.tfplan
+
+# Dirs
+__pycache__/
+/.idea
+/.vscode
+/.kube
+/.vagrant
+/.bundle
+/.cache
+/.docker
+/.entc
+/.sbin
+/.dist
+/log
+/certs
+.terraform
+.claude/*
+!.claude/skills
+!.claude/settings.json
+.site-public/
+site/public/
+
+# Hugo image processing cache.
+site/resources/

@@ -88,5 +88,7 @@ func (o *Options) Complete(_ context.Context) (*Config, error) {
 	return &Config{
 		NoPCICheck:    o.NoPCICheck,
 		Manufacturers: sets.New(o.Manufacturers...),
+		NoFastFailed:  o.NoFastFailed,
+		MonitorPeriod: o.MonitorPeriod,
 	}, nil
 }

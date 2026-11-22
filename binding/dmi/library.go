@@ -79,6 +79,20 @@ func (l *DMI) GetSystemMigMode() (current, pending uint32, ret Return) {
 	return current, pending, ret
 }
 
+// GetDeviceCount 报告了库中看到的物理 `DCU` 数量。
+func (l *DMI) GetDeviceCount() (uint32, Return) {
+	var count uint32
+	ret := nvmlDeviceGetCount(&count)
+	return count, ret
+}
+
+// GetDeviceHandleByIndex 返回索引对应物理 DCU 的句柄。
+func (l *DMI) GetDeviceHandleByIndex(index uint32) (Device, Return) {
+	var handle dmiDevice
+	ret := nvmlDeviceGetHandleByIndex(index, &handle)
+	return Device{handle: handle, lib: l}, ret
+}
+
 // GetDeviceHandleByPciBusId 用完整 PCI 地址把 RSMI 枚举的物理 DCU 映射到 DMI 句柄。地址必须含域，
 // 如 0000:09:00.0。厂商的 PCI 读取和 UUID 查询无法替代这次映射。找不到该地址时返回 NOT_FOUND。
 func (l *DMI) GetDeviceHandleByPciBusId(pciBusID string) (Device, Return) {

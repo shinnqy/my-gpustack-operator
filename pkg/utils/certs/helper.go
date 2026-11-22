@@ -16,12 +16,11 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/bytex"
 )
 
-// EncodeTLSCertificate encodes a TLS certificate to PEM format,
-// include private key and public key.
+// EncodeTLSCertificate 将 TLS 证书编码为 PEM 格式，包含私钥和公钥。
 func EncodeTLSCertificate(cert *tls.Certificate) ([]byte, error) {
 	buf := bytex.GetBuffer()
 
-	// Encode private key.
+	// 对私钥进行编码。
 	switch k := cert.PrivateKey.(type) {
 	case *ecdsa.PrivateKey:
 		b, err := x509.MarshalECPrivateKey(k)
@@ -44,7 +43,7 @@ func EncodeTLSCertificate(cert *tls.Certificate) ([]byte, error) {
 		return nil, errors.New("unknown private key type")
 	}
 
-	// Encode public key.
+	// 对公共密钥进行编码。
 	for _, b := range cert.Certificate {
 		pb := &pem.Block{Type: "CERTIFICATE", Bytes: b}
 		if err := pem.Encode(buf, pb); err != nil {
@@ -55,10 +54,9 @@ func EncodeTLSCertificate(cert *tls.Certificate) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// DecodeTLSCertificate decodes a TLS certificate from PEM format,
-// include private key and public key.
+// DecodeTLSCertificate 用于解码来自 PEM 格式的 TLS 证书，包含私钥和公钥。
 func DecodeTLSCertificate(data []byte, hostname string) (*tls.Certificate, error) {
-	// Decode private key.
+	// Decode 私有密钥。
 	keyBlock, data := pem.Decode(data)
 	if keyBlock == nil || !strings.Contains(keyBlock.Type, "PRIVATE") {
 		return nil, errors.New("corrupt private key: invalid format")
@@ -66,15 +64,15 @@ func DecodeTLSCertificate(data []byte, hostname string) (*tls.Certificate, error
 
 	var (
 		key crypto.PrivateKey
-		// Decode public key.
+		// Decode 公共密钥。
 		certs [][]byte
-		// Get leaf certificate.
+		// 获取叶证书。
 		n int
 	)
 
 	key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
 	if err != nil {
-		// Try RSA.
+		// 尝试 RSA。
 		k, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 		if err != nil {
 			return nil, errors.New("corrupt private key: parse failed")
@@ -117,7 +115,7 @@ func DecodeTLSCertificate(data []byte, hostname string) (*tls.Certificate, error
 	}
 	leaf := x509Certs[0]
 
-	// Validate leaf certificate.
+	// 验证叶证书。
 	err = VerifyX509Certificate(leaf, hostname)
 	if err != nil {
 		return nil, err
@@ -151,7 +149,7 @@ func DecodeTLSCertificate(data []byte, hostname string) (*tls.Certificate, error
 	}, nil
 }
 
-// VerifyX509Certificate verifies the x509 certificate.
+// VerifyX509Certificate 用于验证 x509 证书。
 func VerifyX509Certificate(cert *x509.Certificate, hostname string) error {
 	now := time.Now()
 	if now.Before(cert.NotBefore) {
@@ -172,7 +170,7 @@ func VerifyX509Certificate(cert *x509.Certificate, hostname string) error {
 	return nil
 }
 
-// EncodeX509CertificateRequest encodes a x509 certificate request to PEM format.
+// EncodeX509CertificateRequest 将 x509 证书请求编码为 PEM 格式。
 func EncodeX509CertificateRequest(certReq *x509.CertificateRequest, key crypto.Signer) ([]byte, error) {
 	b, err := x509.CreateCertificateRequest(rand.Reader, certReq, key)
 	if err != nil {
@@ -182,7 +180,7 @@ func EncodeX509CertificateRequest(certReq *x509.CertificateRequest, key crypto.S
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: b}), nil
 }
 
-// DecodeX509Certificate decodes a x509 certificate from PEM format.
+// DecodeX509Certificate 用于解码来自 PEM 格式的 x509 证书。
 func DecodeX509Certificate(data []byte, hostname string) (*x509.Certificate, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {
@@ -202,10 +200,59 @@ func DecodeX509Certificate(data []byte, hostname string) (*x509.Certificate, err
 	return cert, nil
 }
 
-// EncodeTLSCertificateAndKey is similar to EncodeTLSCertificate,
-// but returns private key and certificate separately.
+// RequestECDSA 返回 true 表示正在请求 ECDSA 算法。
+func RequestECDSA(hello *tls.ClientHelloInfo) bool {
+	if hello.SignatureSchemes != nil {
+		var ecdsaOK bool
+	schemeLoop:
+		for _, scheme := range hello.SignatureSchemes {
+			switch scheme {
+			case tls.ECDSAWithSHA1, tls.ECDSAWithP256AndSHA256,
+				tls.ECDSAWithP384AndSHA384, tls.ECDSAWithP521AndSHA512:
+				ecdsaOK = true
+				break schemeLoop
+			}
+		}
+
+		if !ecdsaOK {
+			return false
+		}
+	}
+
+	if hello.SupportedCurves != nil {
+		var ecdsaOK bool
+
+		for _, curve := range hello.SupportedCurves {
+			if curve == tls.CurveP256 {
+				ecdsaOK = true
+				break
+			}
+		}
+
+		if !ecdsaOK {
+			return false
+		}
+	}
+
+	for _, suite := range hello.CipherSuites {
+		switch suite {
+		case tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305:
+			return true
+		}
+	}
+
+	return false
+}
+
+// EncodeTLSCertificateAndKey 与 EncodeTLSCertificate 类似，但会分别返回私钥和证书。
 func EncodeTLSCertificateAndKey(cert *tls.Certificate) ([]byte, []byte, error) {
-	// Encode private key.
+	// 对私钥进行编码。
 	priBuf := bytex.GetBuffer()
 	switch k := cert.PrivateKey.(type) {
 	case *ecdsa.PrivateKey:
@@ -229,7 +276,7 @@ func EncodeTLSCertificateAndKey(cert *tls.Certificate) ([]byte, []byte, error) {
 		return nil, nil, errors.New("unknown private key type")
 	}
 
-	// Encode public key.
+	// 对公共密钥进行编码。
 	pubBuf := bytex.GetBuffer()
 	for _, b := range cert.Certificate {
 		pb := &pem.Block{Type: "CERTIFICATE", Bytes: b}

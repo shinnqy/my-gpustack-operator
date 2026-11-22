@@ -11,20 +11,18 @@ import (
 
 var settings = setting.Settings{}
 
-// Indexer returns the index function of the settings,
-// which can be used to index the settings in other packages.
+// Indexer 返回设置的索引函数，可用于在其他包中对设置进行索引操作。
 func Indexer() setting.IndexFunc {
 	return settings.Index
 }
 
-// the built-in settings for worker. Each Setting carries its effect window: "Immediate" marks a
-// Setting whose change is pushed — the consuming controller watches the delegated settings Secret,
-// because a Setting never watches itself — while every other Setting is "next trigger", applied
-// when the next natural event named in its own description arrives.
+// worker 的内置设置。每个设置都对应一个生效窗口："Immediate"表示该设置的变化会被立即应用——消费控制器会监
+// 视委托设置 Secret，因为某个设置永远不会自我监视——而其他所有设置则属于“下一个触发点”，在其描述中指定的下
+// 一个自然事件出现时生效。
 var (
-	// Global.
+	// 全局配置。
 
-	// ContainerNamespace is the namespace to pull images, which is used in all built-in applications' deployment.
+	// ContainerNamespace 是用于拉取镜像的命名空间，所有内置应用程序的部署都使用该命名空间。
 	ContainerNamespace = settings.NewEditable(
 		"container-namespace",
 		"Indicates the namespace to pull images.",
@@ -32,7 +30,7 @@ var (
 		setting.AllowBlank(),
 	)
 
-	// ContainerRegistry is the registry to pull images, which is used in all built-in applications' deployment.
+	// ContainerRegistry 是用于拉取镜像的注册表，所有内置应用程序的部署都会使用它。
 	ContainerRegistry = settings.NewEditable(
 		"container-registry",
 		"Indicates the registry to pull images.",
@@ -41,7 +39,7 @@ var (
 		setting.AllowContainerRegistry(),
 	)
 
-	// ImagePullPolicy is the image pull policy for pulling images, which is used in all built-in applications' deployment.
+	// ImagePullPolicy 是用于拉取图像的镜像拉取策略，所有内置应用的部署都会使用该策略。
 	ImagePullPolicy = settings.NewEditable(
 		"image-pull-policy",
 		"Indicates the image pull policy for pulling images.",
@@ -49,7 +47,7 @@ var (
 		setting.AllowBlank(),
 	)
 
-	// ImagePullSecrets is the image pull secret for pulling images, which is used in all built-in applications' deployment.
+	// ImagePullSecrets 是用于拉取图像的镜像拉取机密，它被所有内置应用的部署所使用。
 	ImagePullSecrets = settings.NewEditable(
 		"image-pull-secrets",
 		"Indicates the image pull secret for pulling images.",
@@ -57,10 +55,9 @@ var (
 		setting.AllowBlank(),
 	)
 
-	// Instance.
+	// Instance 的配置项。
 
-	// InstanceAccessStaticAddress is the access static address for all Instances,
-	// which is used to access Instances.
+	// InstanceAccessStaticAddress 是所有实例的访问静态地址，用于访问这些实例。
 	InstanceAccessStaticAddress = settings.NewEditable(
 		"instance-access-static-address",
 		"Indicates the access static address for all Instances. "+
@@ -69,8 +66,8 @@ var (
 		setting.AllowBlank(),
 	)
 
-	// InstanceAccessWildcardDNS is the wildcard DNS for all Instances,
-	// which is used to generate the domain name for each Instance, like <instance-host-ip>.<wildcard-dns>.
+	// InstanceAccessWildcardDNS 是所有实例的通配符 DNS，用于为每个 `实例` 生成域名，例如 <
+	// instance-host-ip>.<wildcard-dns>。
 	InstanceAccessWildcardDNS = settings.NewEditable(
 		"instance-access-wildcard-dns",
 		"Indicates the wildcard DNS for all Instances, like traefik.me. "+
@@ -79,8 +76,8 @@ var (
 		setting.AllowBlank(),
 	)
 
-	// InstanceGeneralResourcesOvercommit indicates to overcommit instance general resources or not,
-	// which is used when deploying Instances.
+	// InstanceGeneralResourcesOvercommit 用于指示是否对实例通用资源进行超额分配，该参数在部署实例时会
+	// 被使用。
 	InstanceGeneralResourcesOvercommit = settings.NewEditable(
 		"instance-general-resources-overcommit",
 		"Indicates to overcommit instance general resources or not. "+
@@ -93,10 +90,10 @@ var (
 		setting.AllowBool(),
 	)
 
-	// InstanceHostPathVolumeAllowed indicates to allow Instances to mount hostPath volumes,
-	// which reaches the node's filesystem. It is separate from InstancePrivilegedAllowed
-	// because it grants strictly less: the filesystem, but not the node's devices or kernel.
-	// Enforced when an Instance takes a hostPath mount, like InstancePrivilegedAllowed.
+	// InstanceHostPathVolumeAllowed 表示允许实例挂载 hostPath 卷，这些卷会指向节点的文件系统。它与
+	// InstancePrivilegedAllowed 是分开的，因为后者的权限限制更严格：它仅允许挂载文件系统，而不允许挂
+	// 载节点的设备或内核组件。当某个 `实例` 采用 hostPath 挂载方式时，该设置就会生效，类似于
+	// InstancePrivilegedAllowed。
 	InstanceHostPathVolumeAllowed = settings.NewEditable(
 		"instance-host-path-volume-allowed",
 		"Indicates to allow Instances to mount hostPath volumes. "+
@@ -106,11 +103,9 @@ var (
 		setting.AllowBool(),
 	)
 
-	// InstancePrivilegedAllowed indicates to allow Instances to request privileged mode,
-	// which escapes the container boundary and exposes the node's devices and kernel surface.
-	// Enforced when an Instance takes privileged mode, whether at creation or by a later
-	// change: turning it off never blocks an Instance that already runs privileged from
-	// being updated, edited while stopped, or restarted.
+	// InstancePrivilegedAllowed 表示允许实例请求特权模式，从而突破容器边界，暴露节点的设备和内核接口。
+	// 当某个 Instance 在创建时或后续更改时启用特权模式时，该设置就会生效。将其关闭并不会阻止已经运行
+	// 在特权模式的 Instance 在停止或重启期间进行更新、编辑操作。
 	InstancePrivilegedAllowed = settings.NewEditable(
 		"instance-privileged-allowed",
 		"Indicates to allow Instances to request privileged mode. "+
@@ -120,18 +115,14 @@ var (
 		setting.AllowBool(),
 	)
 
-	// InstanceIsolationPodCIDRs carries the cluster's pod address space the Instance
-	// namespace-isolation NetworkPolicy carves out of its external allow. The policy is opt-in:
-	// a blank value (the default) renders no policy at all, so turning it on is the
-	// administrator's decision and no cluster ever has its Instance networking tightened
-	// under it silently. The values cannot be learned reliably for every CNI — a node's
-	// podCIDR and what a CNI's own IPAM actually allocates routinely disagree — so the one
-	// source is whoever can see the real addresses. Every entry must be an IPv4 CIDR an
-	// ipBlock except list can carry; admission refuses anything else rather than letting a
-	// dropped entry widen the allow back open.
+	// InstanceIsolationPodCIDRs 包含了集群的 Pod 地址空间，而 Instance 命名空间隔离的 NetworkPolicy
+	// 则对其外部允许范围进行了限制。该策略是可选的：空白值（默认值）则不会应用任何策略，因此是否启用
+	// 由管理员决定，且任何集群都不会在无人干预的情况下被严格限制其 Instance 网络访问。对于每种 CNI，
+	// 无法可靠地获取这些值——节点的 podCIDR 与 CNI 自己的 IPAM 实际分配地址往往不一致——因此唯一的来源
+	// 是能够看到真实地址的人。除了列表中的 IPv4 CIDR 和 ipBlock 之外，每个条目都必须符合要求。准入机
+	// 制会拒绝其他类型，以免出现被遗漏的条目导致允许范围重新开放。
 	//
-	// Immediate: the namespace-isolation controller watches the delegated settings Secret and
-	// reconciles every non-reserved namespace when this value changes.
+	// 即时性：命名空间隔离控制器会监控委托设置 Secret，并在该值发生变化时对所有非保留命名空间进行协调。
 	InstanceIsolationPodCIDRs = settings.NewEditable(
 		"instance-isolation-pod-cidrs",
 		"Indicates the comma-separated IPv4 pod CIDRs the Instance namespace-isolation "+
@@ -148,14 +139,13 @@ var (
 		setting.AllowIPv4CIDRList(),
 	)
 
-	// InstanceType.
+	// InstanceType 的配置项。
 
-	// InstanceTypeAwareCPUManufacturer governs whether the derived ClusterQueue/InstanceType/
-	// InstanceTypeFlavor aggregation layer treats the CPU manufacturer as a discriminator. When
-	// false (default) non-accelerated flavors collapse into one generic pool per os/arch and
-	// accelerated flavors pool per accelerator (CPU ignored); when true every pool splits by the
-	// CPU key. It never changes a ResourceFlavor's name or labels — flavors are always the finest
-	// grain — and additionally gates the cpuDetail note on an accelerated flavor.
+	// InstanceTypeAwareCPUManufacturer 控制着派生出的 ClusterQueue/InstanceType/InstanceTypeFlavor 聚
+	// 合层是否将 CPU 制造商作为区分维度。当为 false（默认）时，非加速版本会合并为每个操作系统/架构下
+	// 的一个通用资源池，而加速版本则按每个加速器划分资源池（CPU 被忽略）。当为 true 时，每个资源池会
+	// 按 CPU 键进行划分。该设置不会更改 ResourceFlavor 的名称或标签——版本始终以最细粒度呈现——并且还会
+	// 对加速版本上的 cpuDetail 说明进行限制。
 	InstanceTypeAwareCPUManufacturer = settings.NewEditable(
 		"instance-type-aware-cpu-manufacturer",
 		"Indicates whether the derived ClusterQueue/InstanceType/InstanceTypeFlavor split by CPU "+
@@ -166,12 +156,10 @@ var (
 		setting.AllowBool(),
 	)
 
-	// InstanceTypeDrainWhenNoFlavors indicates whether a ClusterQueue whose pool has lost
-	// all its ResourceFlavors is drained (HoldAndDrain) before its resource groups are
-	// emptied. When true (default) the queue is drained first so admitted workloads are
-	// evicted; when false the operator waits for the reservations to clear on their own,
-	// then empties without draining. Either way the resource groups are emptied only once
-	// all reservations are zero, so Kueue's counters never go negative.
+	// InstanceTypeDrainWhenNoFlavors 指示当资源池中的所有 ResourceFlavors 被移除后，是否会在资源组清
+	// 空之前将 ClusterQueue 排空（HoldAndDrain）。当为真时（默认状态），队列会先被排空，从而被已准入
+	// 的工作负载被移除。当为假时，运营方会等待预留资源自行清除，然后再进行排空操作，而不会进行排空。
+	// 无论哪种情况，资源组都只会在所有预留为零时清空一次，因此 Kueue 的计数器永远不会变为负数。
 	InstanceTypeDrainWhenNoFlavors = settings.NewEditable(
 		"instance-type-drain-when-no-flavors",
 		"Indicates whether a ClusterQueue whose pool lost all ResourceFlavors is drained "+
@@ -181,28 +169,35 @@ var (
 		setting.AllowBool(),
 	)
 
-	// KV cache.
+	// KV 缓存。
 
-	// KVCacheBackendImage is the image every role of a KVCacheBackend runs when the object does
-	// not name one itself.
+	// NodeManagementManual 控制节点是否需要手动纳管。默认自动设置 gpustack.ai/managed=true，启用手动
+	// 模式后由管理员给节点加标签。
+	NodeManagementManual = settings.NewEditable(
+		"node-management-manual",
+		"Indicates to skip auto-managing nodes. "+
+			"When false (default), the operator auto-onboards discovered nodes by injecting the managed label; "+
+			"when true, an administrator must opt nodes in manually.",
+		setting.InitializeFromEnv("false"),
+		setting.AllowBool(),
+	)
+
+	// KVCacheBackendImage 是当对象没有指定自身名称时，KVCacheBackend 的每一个角色在运行时所使用的图像。
 	//
-	// The default is this project's own build, pack/mirrored-mooncake. It is the only image that can
-	// run leader.electionBackend: Kubernetes, because no published upstream image carries a leadership backend
-	// at all, and it is the build every cluster case in this repository exercises.
+	// 默认值为该项目的自构建版本 pack/mirrored-mooncake。这是唯一一个能够运行 leader.electionBackend
+	// 的镜像：Kubernetes。因为没有任何已发布的上游镜像包含领导层后端功能，而此仓库中每个集群案例的构
+	// 建均使用此版本。
 	//
-	// WHAT THE DEFAULT DOES NOT FIT, because one value cannot be right for every backend at once:
-	// it is a CPU build carrying TCP and EFA over DRAM, so a backend whose members sit on a vendor
-	// fabric -- the Ascend transport, or a member group placed on other accelerator hardware -- needs
-	// a build assembled against that runtime, and gets a transport it cannot use from this one. The
-	// leader and the members do not want the same thing either: the leader needs no accelerator
-	// runtime at all, while a member's transports and the runtime it links are compiled into its
-	// wheel. Those backends name their image on the object, which always wins over this setting.
+	// 默认的配置并不适用，因为一个值无法同时适用于所有后端：这是一款基于 DRAM 的 CPU 构建版本，支持
+	// TCP 和 EFA 功能。因此，那些位于厂商互联网络上的后端——比如 Ascend 传输层，或位于其他加速器硬件上
+	// 的成员组——需要针对该运行时环境进行构建，并且会获得一个无法在此环境中使用的传输层。主节点和成员
+	// 节点也不希望使用相同的情况：主节点根本不需要加速器运行时环境，而成员的传输层和其所链接的运行时
+	// 环境则被编译到其镜像中。这些后端会在对象上命名其镜像，而这一命名方式总是会优先于此设置。
 	//
-	// The failure mode moved with the default, and that is the cost of having one. Blank made a
-	// missing image an ADMISSION REFUSAL naming both places to fix; a default makes a WRONG image a
-	// loader error at runtime, which is quieter and further from the person who can fix it.
-	// Clearing this setting restores the refusal -- it still allows blank for exactly that reason --
-	// so a cluster that would rather have every backend name its own image can have that.
+	// 故障模式会随默认设置进行，这就是采用该设置所带来的代价。Blank 将缺失的图像命名为“准入拒绝”，并
+	// 指定两个位置进行修复。而默认设置则会让错误的图像在运行时引发加载错误，这种问题较为隐蔽，也更难
+	// 被能够修复它的人处理。清除此设置即可恢复拒绝状态——因为出于同样的原因，blank 仍然可以保留该设置—
+	// —因此，那些更希望每个后端名称都有独立图像的集群也可以采用这种设置。
 	KVCacheBackendImage = settings.NewEditable(
 		"kv-cache-backend-image",
 		"Indicates the image to run a KV cache backend, when the backend does not name one.",
@@ -211,13 +206,12 @@ var (
 		setting.AllowContainerImageReference(),
 	)
 
-	// Model artifact.
+	// 模型制品。
 
-	// ModelArtifactCABundle names a ConfigMap in the worker's namespace whose "ca.crt" holds PEM
-	// certificates the ModelArtifact controller trusts beside the system pool. It is not given to
-	// engine Pods: they run in tenant namespaces, which cannot mount a ConfigMap from this one, and
-	// copying it into every tenant namespace would put an administrator object where tenants own
-	// everything.
+	// ModelArtifactCABundle 指的是工作节点命名空间中的 ConfigMap，其 "ca.crt" 中存储了 ModelArtifact
+	// 控制器信任的 PEM 证书，这些证书来自系统池。这些文件不会提供给推理引擎的 Pods：它们运行在租户命
+	// 名空间中，无法从该 ConfigMap 中挂载内容，若将其复制到每个租户命名空间，则会导致管理员对象出现在
+	// 租户所有的内容中。
 	ModelArtifactCABundle = settings.NewEditable(
 		"model-artifact-ca-bundle",
 		"Indicates the ConfigMap, in the worker's namespace, whose ca.crt the ModelArtifact controller trusts "+
@@ -227,10 +221,10 @@ var (
 		setting.Allow(),
 	)
 
-	// ModelArtifactHTTPSProxy is the proxy the ModelArtifact controller reaches the Hub through, and
-	// the HTTPS_PROXY an engine downloading the weights itself is given, where a role's own value
-	// wins. Blank leaves the worker's own environment in effect and renders nothing. It carries no
-	// credentials: the value is rendered into tenant Pods, where anyone who can read a Pod reads it.
+	// ModelArtifactHTTPSProxy 是 ModelArtifact 控制器用于连接到 Hub 的代理，同时会指定一个
+	// HTTPS_PROXY 作为推理引擎下载权重所使用的代理，其中以角色自己的值为优先。空白值则使工作器自己的
+	// 环境生效，不会渲染任何内容。该值不携带凭证：其内容会被渲染到租户 Pods 中，任何能够读取 Pod 的人
+	// 都可以访问它。
 	ModelArtifactHTTPSProxy = settings.NewEditable(
 		"model-artifact-https-proxy",
 		"Indicates the HTTPS proxy ModelArtifacts resolve through, also given to engines that download "+
@@ -240,10 +234,9 @@ var (
 		func(_ context.Context, _, newVal string) error { return modelartifact.ValidateProxy(newVal) },
 	)
 
-	// ModelArtifactHuggingFaceEndpoint is the Hugging Face Hub the ModelArtifact controller
-	// resolves and revalidates against, and the HF_ENDPOINT an engine downloading the weights
-	// itself is given. It is administrator configuration: no tenant object can change where the
-	// controller connects. Changing it does not re-resolve an artifact that already resolved.
+	// ModelArtifactHuggingFaceEndpoint 是 Hugging Face Hub 的地址，由 ModelArtifact 控制器进行解析和
+	// 验证。而 HF_ENDPOINT 则是用于下载权重的推理引擎所使用的地址。这是管理员配置项：没有租户对象可以
+	// 更改控制器连接的地址。更改该地址不会重新解析已解析过的工件。
 	ModelArtifactHuggingFaceEndpoint = settings.NewEditable(
 		"model-artifact-huggingface-endpoint",
 		"Indicates the Hugging Face Hub endpoint ModelArtifacts resolve against and engines download from. "+
@@ -251,16 +244,14 @@ var (
 		setting.InitializeFromEnv("https://huggingface.co"),
 		setting.DisallowBlank(),
 		setting.AllowUrlWithSchema("https", "http"),
-		// A URL without a host passes the schema check and fails every node's; refused here, a
-		// write never freezes the node configuration it feeds.
+		// 没有主机地址的 URL 可以通过模式验证，但会失败并拒绝通过每个节点的检查。在此情况下，写入
+		// 操作不会冻结其所依赖的节点配置。
 		func(_ context.Context, _, newVal string) error { return modelstore.ValidateEndpoint(newVal) },
 	)
 
-	// ModelArtifactModelScopeEndpoint is the ModelScope hub the ModelArtifact controller resolves
-	// and revalidates against and the node plugin downloads from. It is administrator
-	// configuration, admitted as the Hugging Face endpoint is, and it rides every node's
-	// configuration like the Hugging Face one does. Changing it does not re-resolve an artifact
-	// that already resolved.
+	// ModelArtifactModelScopeEndpoint 是 ModelScope 中心节点，该中心节点被 ModelArtifact 控制器用于解
+	// 析和重新验证，也是节点插件下载的来源。这是管理员配置项，如同 Hugging Face 端点一样被纳入其中，
+	// 它遵循与 Hugging Face 相同的节点配置规则。更改该配置不会重新解析已解析的工件。
 	ModelArtifactModelScopeEndpoint = settings.NewEditable(
 		"model-artifact-modelscope-endpoint",
 		"Indicates the ModelScope endpoint ModelArtifacts resolve against and the node plugin downloads from. "+
@@ -271,8 +262,8 @@ var (
 		func(_ context.Context, _, newVal string) error { return modelstore.ValidateEndpoint(newVal) },
 	)
 
-	// ModelArtifactNoProxy is the comma-separated host list that bypasses ModelArtifactHTTPSProxy,
-	// given to engines as NO_PROXY on the same terms.
+	// ModelArtifactNoProxy 是一个用逗号分隔的主机列表，可以绕过 ModelArtifactHTTPSProxy，该列表以相同
+	// 条款被赋予引擎“NO_PROXY”设置。
 	ModelArtifactNoProxy = settings.NewEditable(
 		"model-artifact-no-proxy",
 		"Indicates the comma-separated hosts that bypass model-artifact-https-proxy, also given to engines as NO_PROXY.",
@@ -281,8 +272,8 @@ var (
 		setting.Allow(),
 	)
 
-	// ModelArtifactRevalidateInterval is how often a resolved Hugging Face ModelArtifact's access is
-	// checked again. A check also runs whenever the artifact's Secret changes.
+	// ModelArtifactRevalidateInterval 表示已解析的 Hugging Face ModelArtifact 的访问权限会再次被检查
+	// 的频率。当该 Artifact 的 Secret 发生变化时，也会进行检查。
 	ModelArtifactRevalidateInterval = settings.NewEditable(
 		"model-artifact-revalidate-interval",
 		"Indicates how often a resolved Hugging Face ModelArtifact's access is checked again, at least 1m. "+
@@ -291,29 +282,25 @@ var (
 		setting.AllowDurationInRange(time.Minute, 365*24*time.Hour),
 	)
 
-	// Model deployment.
+	// 模型部署。
 
-	// The three router images front a ModelDeployment's roles. Unlike KVCacheBackendImage they DO
-	// ship defaults, because one value is right for every cluster at once: none of them runs a
-	// model, so none of them links an accelerator runtime, and the operator renders configuration
-	// they must be able to read. They are settings rather than constants so that an air-gapped
-	// cluster can point them at its own registry, and so that a broken upstream release can be
-	// pinned back without rebuilding the operator.
+	// 这三个路由器图像代表了 ModelDeployment 的多种角色。与 KVCacheBackendImage 不同，它们确实包含默
+	// 认设置，因为每个集群都有适合的值：它们都不运行模型，因此也不连接加速器运行时环境，而操作员需要
+	// 能够读取这些配置。它们是设置而非常量，这样与网络隔离的集群可以将其指向自己的注册表，同时如果上
+	// 游版本出现故障，也可以在不重新构建操作员的情况下将其恢复。
 
-	// ModelDeploymentKVCacheDtypeOwned hands a KVCachePoolBinding's spec.domain.dtype to every
-	// engine attached through it, as --kv-cache-dtype, and makes that flag the operator's.
+	// ModelDeploymentKVCacheDtypeOwned 会将通过它连接的每个推理引擎所拥有的 KVCachePoolBinding 的
+	// spec.domain.dtype 设置为 --kv-cache-dtype，并让该标志成为操作器的属性。
 	//
-	// Neither engine's store key carries the dtype, so two engines on one Binding running different
-	// KV cache dtypes read each other's blocks as the wrong element type, and the direction where the
-	// reader's type is wider reports a hit. While on, the operator renders the Binding's value on a
-	// ModelDeployment role and on an injected Pod, refuses a role or container naming the flag
-	// itself, and refuses a new Binding declaring "auto", which binds nothing.
+	// 没有任何推理引擎的存储键包含 dtype 信息，因此运行在同一个 Binding 下的两个推理引擎使用不同的 KV
+	// 缓存 dtype，它们会将对方的块当作错误类型的元素进行读取，而读取器类型更宽泛的方向则会被识别为命
+	// 中。在运行时，该运算符会在 ModelDeployment 角色和注入的 Pod 上渲染 Binding 的值。对于指定了该标
+	// 志的角色或容器，该运算符会拒绝处理。对于声明为 "auto" 的新 Binding，该运算符也不会进行绑定操作。
 	//
-	// IT IS THE ESCAPE FROM A BINDING WHOSE SPELLING THE ENGINE REJECTS. The value is passed
-	// verbatim, so such a spelling makes every new Pod fail argument parsing, and the dtype is
-	// immutable. Off, nothing is rendered and nothing is refused, which is the behavior before the
-	// flag was owned. Flipping it moves the spec hash of every pool-attached Pod, so their replicas
-	// are recreated at the deployment's next reconcile.
+	// 这是对一种被拼写规则拒绝的约束条件的逃避。该值会被原样传递，因此这种拼写会导致每个新的 Pod 在参
+	// 数解析时失败，且数据类型是不可变的。无论发生什么，都不会被渲染或被拒绝，这与在标志被设置之前的
+	// 行为一致。翻转该标志会改变每个与池关联的 Pod 的规范哈希值，因此它们的复制品会在部署的下一次同步
+	// 时重新创建。
 	ModelDeploymentKVCacheDtypeOwned = settings.NewEditable(
 		"model-deployment-kv-cache-dtype-owned",
 		"Indicates to render a KV cache pool Binding's dtype as --kv-cache-dtype on every engine "+
@@ -323,24 +310,20 @@ var (
 		setting.AllowBool(),
 	)
 
-	// ModelDeploymentTCPTWReuse renders net.ipv4.tcp_tw_reuse=1 into the Pod security context of
-	// the prefill half of every SGLang prefill/decode pair.
+	// ModelDeploymentTCPTWReuse 会在每个 SGLang prefill/decode 对中的 Prefill 部分，将
+	// net.ipv4.tcp_tw_reuse=1 渲染到 Pod 安全上下文中。
 	//
-	// That half opens a new TCP connection for every transfer, to its decode half and to each store
-	// member, and closes it first, so the TIME-WAIT sockets pile up in its network namespace until
-	// they hold every ephemeral port; from then on every transfer fails until the Pod is recreated.
-	// The sysctl lets the kernel reuse a TIME-WAIT port for a new outgoing connection. It changes
-	// nothing on the accepting side, which is why the decode half and the store members do not get
-	// it, and a vLLM pair keeps its transfer connections open across requests, so it does not get it
-	// either.
+	// 那部分在每次传输时都会打开一个新的 TCP 连接，分别连接到其解码端和每个存储成员，然后先关闭该连接，
+	// 因此 TIME-WAIT 套接字会堆积在其网络命名空间中，直到占据所有临时端口。从那时起，每次传输都会失败，
+	// 直到 Pod 被重新创建。sysctl 允许内核复用一个 TIME-WAIT 端口用于新的出站连接。它不会在接收端做任
+	// 何改变，这就是为什么解码端和存储成员无法获取该设置，而 vLLM 对则能在多个请求之间保持传输连接开
+	// 放，因此它也无法获取该设置。
 	//
-	// IT IS OFF BY DEFAULT BECAUSE THE KUBELET REFUSES IT UNTIL TOLD OTHERWISE. The sysctl is
-	// namespaced but not on the kubelet's safe list, so a node whose kubelet does not allow it
-	// through --allowed-unsafe-sysctls rejects the Pod with SysctlForbidden, and the replacement is
-	// rejected the same way. The kubelet change is the cluster administrator's, not this operator's.
+	// 默认情况下是关闭的，因为 Kubelet 在未被明确允许前会拒绝它。该 sysctl 被命名了，但不在 Kubelet
+	// 的安全列表中，因此那些 Kubelet 不允许通过 --allowed-unsafe-sysctls 的节点会以 SysctlForbidden
+	// 错误拒绝 Pod，替换方案也会以同样方式被拒绝。Kubelet 的修改属于集群管理员，而非此操作员。
 	//
-	// Flipping it moves the spec hash of the Pods it targets, so their replicas are recreated at the
-	// deployment's next reconcile.
+	// 翻转操作会移动其所针对的 Pods 的规范哈希值，因此它们的复制品会在部署的下一次同步时重新创建。
 	ModelDeploymentTCPTWReuse = settings.NewEditable(
 		"model-deployment-tcp-tw-reuse",
 		"Indicates to render net.ipv4.tcp_tw_reuse=1 on the prefill half of every SGLang "+
@@ -352,15 +335,14 @@ var (
 		setting.AllowBool(),
 	)
 
-	// Model prefetch.
+	// 模型预取。
 
-	// Workload.
+	// 工作负载的配置项。
 
-	// WorkloadFitAffinity indicates whether the Workload webhook pins a slice or shared request of
-	// an operator queue to nodes whose fit labels show one card can still host it.
-	// When true (default) the pin is added, so Kueue's topology-aware scheduling skips a fragmented
-	// node; when false Workloads pass unchanged while the fit labels are still published, so the pin
-	// can be switched off on its own. Read on every webhook call.
+	// WorkloadFitAffinity 表示 Workload webhook 是否会将操作员队列中的切片或共享请求固定到那些符合适
+	// 配标签的节点上，即一个节点能够容纳该请求。当值为真（默认）时，该固定操作会被执行，因此 Kueue 的
+	// 拓扑感知调度会跳过该节点。当值为假时，Workloads 数据会保持不变，而适配标签仍会发布，因此该固定
+	// 操作可以自行关闭。请在每次 webhook 调用中读取该值。
 	WorkloadFitAffinity = settings.NewEditable(
 		"workload-fit-affinity",
 		"Indicates whether the Workload webhook pins a slice or shared request to nodes whose fit labels "+

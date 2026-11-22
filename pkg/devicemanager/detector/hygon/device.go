@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	klog "k8s.io/klog/v2"
 
@@ -244,6 +245,120 @@ func (in *hygon) DetectAccelerator(noPciCheck bool) (_ device.DevicesGroupList, 
 	}
 
 	device.SetGroupSlicedDetails(grpList)
+
+	return grpList, nil
+}
+
+func (in *hygon) MonitorAccelerator(noPciCheck bool) (_ device.MetricsGroupList, err error) {
+	defer loggerx.RecoverWithStackScanner(func(s loggerx.Scanner, e error) {
+		in.logger.Error(e, "failed to monitor hygon devices")
+		for s.Scan() {
+			in.logger.Error(nil, s.Text())
+		}
+		err = e
+	})
+
+	pciDevs := binding.GetPCIDevices([]string{_PciVendor}, nil)
+	if !noPciCheck && len(pciDevs) == 0 {
+		in.logger.Info("no hygon pci devices found")
+		return nil, nil
+	}
+
+	in.init()
+
+	cnt, ret := in.rsmi.GetDeviceCount()
+	if !ret.IsSuccess() || cnt == 0 {
+		if ret.IsSuccess() {
+			in.logger.Info("no hygon devices found")
+		} else {
+			in.logger.Error(ret, "no hygon devices found")
+		}
+		return nil, nil
+	}
+
+	grpList := device.MetricsGroupList{
+		{
+			Manufacturer: Manufacturer,
+			Timestamp:    time.Now(),
+			Accelerators: make([]device.AcceleratorMetrics, 0, cnt),
+		},
+	}
+	for i := 0; i < cnt; i++ {
+		logger := in.logger.WithValues("index", i)
+
+		dev := in.rsmi.GetDeviceHandleByIndex(i)
+
+		uuid, ret := dev.GetUniqueId()
+		if !ret.IsSuccess() {
+			logger.Error(ret, "failed to get device UUID")
+			continue
+		}
+
+		var (
+			memory            uint64
+			memoryUsage       uint64
+			memoryUtilization uint32
+			memoryUnhealthy   bool
+		)
+		{
+			memTotal, ret := dev.GetMemoryTotal(rsmi.MEM_TYPE_VRAM)
+			if !ret.IsSuccess() {
+				logger.Error(ret, "failed to get device memory total")
+				continue
+			}
+			memory = device.ConvertBytesToMiB(memTotal)
+
+			memUsage, ret := dev.GetMemoryUsage(rsmi.MEM_TYPE_VRAM)
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device memory usage")
+			} else {
+				memoryUsage = device.ConvertBytesToMiB(memUsage)
+			}
+
+			memoryUtilization = device.CalculateUtilization(memoryUsage, memory)
+			memoryUnhealthy = isDeviceUnhealthy(dev)
+		}
+
+		var (
+			coresUtilization uint32
+			temperature      uint32
+			powerUsage       uint32
+		)
+		{
+			coresUtilization, ret = dev.GetBusyPercent()
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device cores utilization")
+			}
+
+			temp, ret := dev.GetTempMetric(rsmi.TEMP_CURRENT)
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device temperature")
+			} else if temp > 0 {
+				temperature = uint32(temp) / 1_000 // 将毫摄氏度转换为摄氏度。
+			}
+
+			power, ret := dev.GetPower()
+			if !ret.IsSuccess() {
+				logger.V(3).Error(ret, "failed to get device power usage")
+			} else if power > 0 {
+				powerUsage = uint32(power) / 1_000_000 // 从微瓦转换为瓦特。
+			}
+		}
+
+		grpList[0].Accelerators = append(
+			grpList[0].Accelerators,
+			device.AcceleratorMetrics{
+				ID:                uuid,
+				Memory:            memory,
+				MemoryUsage:       memoryUsage,
+				MemoryUtilization: memoryUtilization,
+				CoresUtilization:  coresUtilization,
+				Temperature:       temperature,
+				PowerUsage:        powerUsage,
+				Unhealthy:         memoryUnhealthy,
+			},
+		)
+	}
 
 	return grpList, nil
 }

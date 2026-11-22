@@ -37,6 +37,7 @@ var setups = []controller.Setup{
 	new(worker.NodeDevicesAdmissionCheckReconciler),
 }
 
+// IMPORTANT: 控制面 Deployment 入口
 // Setup sets up all controllers.
 func Setup(ctx context.Context, mgr manager.CtrlManager) error {
 	return controller.ExecuteSetup(ctx, mgr, setups)

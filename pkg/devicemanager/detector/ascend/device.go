@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	klog "k8s.io/klog/v2"
 
@@ -259,6 +260,147 @@ func (in *ascend) DetectAccelerator(noPciCheck bool) (_ device.DevicesGroupList,
 	return grpList, nil
 }
 
+func (in *ascend) MonitorAccelerator(noPciCheck bool) (_ device.MetricsGroupList, err error) {
+	defer loggerx.RecoverWithStackScanner(func(s loggerx.Scanner, e error) {
+		in.logger.Error(e, "failed to monitor ascend devices")
+		for s.Scan() {
+			in.logger.Error(nil, s.Text())
+		}
+		err = e
+	})
+
+	pciDevs := binding.GetPCIDevices([]string{_PciVendor}, nil)
+	if !noPciCheck && len(pciDevs) == 0 {
+		in.logger.Info("no ascend pci devices found")
+		return nil, nil
+	}
+
+	in.init()
+
+	_, cardList, ret := in.dcmi.GetCardList()
+	if !ret.IsSuccess() || len(cardList) == 0 {
+		if ret.IsSuccess() {
+			in.logger.Info("no ascend devices found")
+		} else {
+			in.logger.Error(ret, "no ascend devices found")
+		}
+		return nil, nil
+	}
+
+	grpList := device.MetricsGroupList{
+		{
+			Manufacturer: Manufacturer,
+			Timestamp:    time.Now(),
+			Accelerators: make([]device.AcceleratorMetrics, 0, len(cardList)*2),
+		},
+	}
+	for _, card := range cardList {
+		logger := in.logger.WithValues("card", card)
+
+		cnt, ret := in.dcmi.GetDeviceNumInCard(card)
+		if !ret.IsSuccess() {
+			logger.Error(ret, "failed to get device count in card")
+			continue
+		}
+
+		for i := int32(0); i < cnt; i++ {
+			logger := logger.WithValues("index", i)
+
+			dev := in.dcmi.GetDeviceHandleByCardAndIndex(card, i)
+
+			typ, ret := dev.GetType()
+			if ret.IsSuccess() && typ != dcmi.NPU_TYPE {
+				logger.Info("skipping non-NPU device")
+				continue
+			}
+
+			uuid, ret := deviceUUID(dev)
+			if !ret.IsSuccess() {
+				logger.Error(ret, "failed to get device vdie info")
+				continue
+			}
+
+			var (
+				memory            uint64
+				memoryUsage       uint64
+				memoryUtilization uint32
+				memoryUnhealthy   bool
+			)
+			{
+				hbmInfo, ret := dev.GetHbmInfo()
+				if !ret.IsSuccess() {
+					memHandler := dev.GetMemoryInfoV()
+					memInfo, ret := memHandler.V2()
+					if !ret.IsSuccess() {
+						logger.Error(ret, "failed to get device memory info")
+						continue
+					}
+
+					memory = memInfo.Memory_size
+					memoryUsage = memInfo.Memory_size - memInfo.Memory_available
+					memoryUtilization = device.CalculateUtilization(memoryUsage, memory)
+					memoryUnhealthy = isDeviceUnhealthy(dev, dcmi.DEVICE_TYPE_DDR)
+				} else {
+					memory = hbmInfo.Memory_size
+					memoryUsage = hbmInfo.Memory_usage
+					memoryUtilization = device.CalculateUtilization(memoryUsage, memory)
+					memoryUnhealthy = isDeviceUnhealthy(dev, dcmi.DEVICE_TYPE_HBM)
+				}
+			}
+
+			var (
+				coresUtilization uint32
+				temperature      uint32
+				powerUsage       uint32
+			)
+			{
+				utilHandler := dev.GetUtilizationRateV()
+				utilInfo, ret := utilHandler.V2()
+				if !ret.IsSuccess() {
+					utilInfo, ret = utilHandler.V1()
+					if !ret.IsSuccess() {
+						logger.V(3).Error(ret, "failed to get device cores utilization")
+					} else {
+						coresUtilization = utilInfo.Aicore_util
+					}
+				} else {
+					coresUtilization = utilInfo.Aicore_util
+				}
+
+				temp, ret := dev.GetTemperature()
+				if !ret.IsSuccess() {
+					logger.V(3).Error(ret, "failed to get device temperature")
+				} else if temp > 0 {
+					temperature = uint32(temp)
+				}
+
+				power, ret := dev.GetPowerInfo()
+				if !ret.IsSuccess() {
+					logger.V(3).Error(ret, "failed to get device power usage")
+				} else if power > 0 {
+					powerUsage = uint32(power) / 10 // 将以德瓦为单位的能量转换为瓦特。
+				}
+			}
+
+			grpList[0].Accelerators = append(
+				grpList[0].Accelerators,
+				device.AcceleratorMetrics{
+					ID:                uuid,
+					Memory:            memory,
+					MemoryUsage:       memoryUsage,
+					MemoryUtilization: memoryUtilization,
+					CoresUtilization:  coresUtilization,
+					Temperature:       temperature,
+					PowerUsage:        powerUsage,
+					Unhealthy:         memoryUnhealthy,
+				},
+			)
+		}
+	}
+
+	return grpList, nil
+}
+
 func (in *ascend) init() {
 	in.once.Do(func() {
 		if ret := in.dcmi.Init(in.logger); !ret.IsSuccess() {
@@ -354,7 +496,7 @@ func guessSocNameFromDeviceName(devName string) string {
 		return "Ascend310B1"
 	}
 	// if strings.Contains(devName, "310") {
-	// 	return "Ascend310"
+	//	return "Ascend310"
 	// }
 	if _910BRegex.MatchString(devName) {
 		return "Ascend910B1"
