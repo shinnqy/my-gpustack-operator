@@ -1,25 +1,21 @@
-// Per-Router serving observation: the operator side of Feature 2.
+// 按 Router 维度的服务观测：Feature 2 的 operator 侧实现。
 //
-// The two Rust routers expose a read-only membership view (the observer patches under
-// pack/llm-router). This file is the consumer: it parses that view schema-strictly, binds
-// each serving worker to the live Pod its address resolves to — at collection time, from
-// Kubernetes state, never from anything the router claims about identity — and aggregates
-// the bound views into the deployment's serving answer.
+// 两个 Rust router 暴露了只读的成员视图（即 pack/llm-router 下的 observer 补丁）。
+// 本文件作为消费端，会严格按 schema 解析该视图，并在采集时基于 Kubernetes 状态
+// （而非 router 自身声明的任何身份信息）将每个提供服务的 worker 绑定到其地址所解析的
+// 存活 Pod，最终将绑定后的视图聚合为部署的服务结果。
 //
-// THE THREE LAWS the spec puts on the answer, and where this file keeps them:
+// 规范对该结果施加的三项铁律及其在本文件中的落点：
 //
-//   - Direct per-process access: a view is always read from one named Router Pod, never
-//     sampled through the Router's Service; the caller passes the fetch, so who was asked
-//     is decided before a byte is read.
-//   - Identity at collection time: an endpoint's Pod UID comes from the live Pod object
-//     its address resolves to, with the Pod running and not terminating. A URL that
-//     resolves to nothing live is an indeterminate binding, and one indeterminate binding
-//     makes the whole view unusable — a number built on a partial binding would be a guess
-//     wearing a confirmation's clothes.
-//   - Never a fake zero: an unusable, stale, missing or disagreeing set of views is
-//     Unknown or NotConverged; NotConfigured means the deployment declares no Router at
-//     all; Confirmed — including the explicit zero — requires every view fresh, complete,
-//     generation-consistent per Router process, and agreeing.
+//   - 按进程直连访问：视图始终从指定的单个 Router Pod 读取，绝不通过 Router 的
+//     Service 采样；fetch 由调用方传入，因此请求目标在读取任何字节前便已确定。
+//   - 采集时绑定身份：端点的 Pod UID 来自其地址所解析的存活 Pod 对象，且该 Pod
+//     必须处于运行中且未处于终止状态。无法解析到任何存活对象的 URL 属于不确定绑定，
+//     只要存在一处不确定绑定就会导致整个视图不可用——基于部分绑定得出的数字不过是
+//     披着确认外衣的猜测。
+//   - 绝不伪造零值：不可用、过期、缺失或存在分歧的一组视图应判定为 Unknown 或
+//     NotConverged；NotConfigured 表示部署完全未声明 Router；Confirmed（包括
+//     明确的零值）则要求每个视图都新鲜、完整、在单个 Router 进程内代数一致，且彼此一致。
 package worker
 
 import (
@@ -45,12 +41,11 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/json"
 )
 
-// RouterObservedWorker is one worker entry of the observer payload. The observer's
-// selection fields are read from the same accessors the router's request path consults,
-// so `in_selection` is the request path's own answer to "would this worker receive a new
-// request".
-// RouterObservedSelection is the router's own answer, per worker, to "would this worker
-// receive a new request": the conjunction the request path evaluates.
+// RouterObservedWorker 表示 observer 载荷中的单个 worker 条目。observer 的选择
+// 字段读取自 router 请求路径所查询的同一组访问器，因此 `in_selection` 即为
+// 请求路径自身对“该 worker 是否会接收新请求”的回答。
+// RouterObservedSelection 是 router 按 worker 维度对“该 worker 是否会接收
+// 新请求”的自身回答，即请求路径所求值的合取条件。
 type RouterObservedSelection struct {
 	Registered  bool `json:"registered"`
 	Healthy     bool `json:"healthy"`
@@ -65,11 +60,10 @@ type RouterObservedWorker struct {
 	PodHint   string                  `json:"pod_hint"`
 	WorkerID  string                  `json:"worker_id"`
 	Selection RouterObservedSelection `json:"selection"`
-	// Lane and LastJob are the gateway's control-plane operational reads (its per-URL
-	// discovery lane and the last recorded control-plane job). They are PARSED so the
-	// strict decoder accepts the gateway's view as it is served, and never read beyond
-	// that: the binder and the aggregation take no input from them. LastJob stays raw
-	// because its shape is the gateway's JobStatus, not this contract.
+	// Lane 和 LastJob 是网关的控制面运行状态读取字段（按 URL 划分的发现通道以及
+	// 最近一次记录的控制面任务）。对它们进行解析仅为了让严格解码器能接受网关原样
+	// 提供的视图，除此之外不会进一步读取：绑定器与聚合逻辑不从这两个字段获取任何输入。
+	// LastJob 保留原始格式，因为其结构属于网关的 JobStatus，而非本契约的一部分。
 	Lane *struct {
 		Busy    bool `json:"busy"`
 		Waiting int  `json:"waiting"`
@@ -77,14 +71,13 @@ type RouterObservedWorker struct {
 	LastJob json.RawMessage `json:"last_job,omitempty"`
 }
 
-// RouterServingView is one parsed, schema-validated observer payload. The schema is
-// strict: an unknown field is a payload this operator does not understand, and a payload
-// it does not understand is not a view of anything. A missing router block is rejected
-// for the same reason — boot generation zero would make a restart indistinguishable from
-// a first boot.
+// RouterServingView 表示一条已解析且通过 schema 校验的 observer 载荷。其 schema
+// 非常严格：未知字段意味着该载荷无法被本 operator 理解，而无法理解的载荷不能作为
+// 任何有效视图。基于同样的原因，缺失 router 字段块也会被拒绝——启动代次为零会
+// 导致重启与首次启动无法区分。
 type RouterServingView struct {
-	// RouterPodUID is the identity of the Router Pod the view was read from, bound by
-	// the collector; it is not part of the wire payload the router serves.
+	// RouterPodUID 是读取该视图的 Router Pod 身份标识，由采集器进行绑定；它并非
+	// router 所提供的传输载荷的组成部分。
 	RouterPodUID         types.UID `json:"-"`
 	RouterBootGeneration uint64
 	RouterNowMS          uint64
@@ -92,10 +85,10 @@ type RouterServingView struct {
 	Workers              []RouterObservedWorker
 }
 
-// routerObservedSelectionWire carries the four selection booleans as pointers, so the decoder can
-// tell an absent field from an explicit false and a null from a value. A missing boolean used to
-// decode as false, which is the same value the router sends for a worker it has refused, so a
-// truncated or partial payload was indistinguishable from a refusal and confirmed a zero.
+// routerObservedSelectionWire 将四个选择布尔值作为指针携带，以便解码器区分缺失
+// 字段与显式的 false，以及 null 与有效值。此前缺失的布尔字段会解码为 false，而
+// 这与 router 拒绝某 worker 时发送的值相同，从而使截断或残缺的载荷无法与拒绝
+// 区分，并错误地确认了零值。
 type routerObservedSelectionWire struct {
 	Registered  *bool `json:"registered"`
 	Healthy     *bool `json:"healthy"`
@@ -103,8 +96,8 @@ type routerObservedSelectionWire struct {
 	InSelection *bool `json:"in_selection"`
 }
 
-// routerObservedWorkerWire is the on-the-wire worker. Selection is a pointer so a null or absent
-// selection block stays distinguishable from a complete one.
+// routerObservedWorkerWire 表示传输线上的 worker。Selection 采用指针类型，以便将
+// null 或缺失的 selection 块与完整块区分开来。
 type routerObservedWorkerWire struct {
 	URL       string                       `json:"url"`
 	Port      string                       `json:"port,omitempty"`
@@ -125,19 +118,17 @@ type routerObservationPayload struct {
 		NowMS          uint64 `json:"now_ms"`
 	} `json:"router"`
 	RegistryRevision uint64 `json:"registry_revision"`
-	// Workers is a pointer so an absent or null array stays distinguishable from an
-	// explicit one. Both routers serialize a non-Option vector, so the array is always
-	// on the wire; a payload without it states no membership, and reading that as an
-	// empty registry would confirm a zero for a router that is serving.
+	// Workers 采用指针类型，以便将缺失或 null 的数组与显式数组区分开来。两个 router
+	// 均序列化非 Option 的向量，因此传输载荷中始终存在该数组；不包含该数组的载荷
+	// 并未声明任何成员，若将其视为空注册表，就会对正在提供服务的 router 错误确认零值。
 	Workers *[]routerObservedWorkerWire `json:"workers"`
 }
 
-// parseRouterObservationView decodes one observer payload strictly. The decoder
-// disallows unknown fields, so a service that answers the endpoint with some other
-// document — the per-plugin debug-dump shapes the spec warns about — fails here instead
-// of parsing into an empty, confident-looking view. A view must also carry its workers
-// array explicitly: an explicit [] is a real empty registry and yields a valid zero,
-// while an omitted or null array is a payload that never said what it was serving.
+// parseRouterObservationView 严格解码单条 observer 载荷。解码器禁止未知字段，
+// 因此如果某个服务在该端点返回了其他文档（即规范中警示的按插件调试转储结构），
+// 会在这一步直接失败，而不会解析成一个看似可靠实则为空的视图。视图还必须显式携带
+// workers 数组：显式的 [] 表示真实的空注册表并产生有效的零值，而省略或为 null
+// 的数组则是从未说明其服务对象的载荷。
 func parseRouterObservationView(data []byte) (RouterServingView, error) {
 	var payload routerObservationPayload
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
@@ -152,8 +143,8 @@ func parseRouterObservationView(data []byte) (RouterServingView, error) {
 		return RouterServingView{}, fmt.Errorf("observer payload carries no workers array")
 	}
 
-	// A document with a second JSON value after the payload is not the payload. The decoder reads
-	// the first one and would otherwise ignore whatever followed.
+	// 在载荷之后还带有第二个 JSON 值的文档不属于合法载荷。解码器读取第一个值后，
+	// 若不加校验便会直接忽略后续内容。
 	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		return RouterServingView{}, fmt.Errorf("observer payload carries a trailing JSON value")
 	}
@@ -175,15 +166,13 @@ func parseRouterObservationView(data []byte) (RouterServingView, error) {
 	}, nil
 }
 
-// routerObservedWorkerOf converts one wire row, refusing anything that does not state its
-// selection completely.
+// routerObservedWorkerOf 转换单条传输行，并拒绝任何未完整声明其选择状态的数据。
 //
-// EVERY SELECTION BOOLEAN MUST BE PRESENT, NON-NULL AND BOOLEAN before a row means anything. The
-// reason is that the answer the protocol acts on is a zero, and a zero is a claim that the router
-// is serving nobody. A row that never said whether it is registered, healthy, open-circuited or in
-// selection has not said it is serving nobody, and reading its silence as consent is how an
-// incomplete payload confirms a zero for a router that is serving. An explicit false is the
-// opposite case and stays a refusal to serve, which is the router's own answer.
+// 所有选择布尔字段都必须存在、非 null 且为布尔类型，该行才具有语义。原因在于协议
+// 所依据的结果是零值，而零值声明 router 未向任何对象提供服务。若某一行从未说明
+// 其是否已注册、是否健康、是否熔断或是否处于选择集合中，就不能认为它声明了未提供服务；
+// 把这种沉默当作默认肯定，正是残缺载荷导致对正在服务的 router 错误确认零值的原因。
+// 显式的 false 则恰恰相反，代表 router 自身作出的拒绝服务答复。
 func routerObservedWorkerOf(wire routerObservedWorkerWire) (RouterObservedWorker, error) {
 	if wire.Selection == nil {
 		return RouterObservedWorker{}, fmt.Errorf("carries no selection")
@@ -206,9 +195,9 @@ func routerObservedWorkerOf(wire routerObservedWorkerWire) (RouterObservedWorker
 	}, nil
 }
 
-// routerObservedSelectionOf requires all four booleans to be stated. The exported selection keeps
-// plain bools because it is what the rest of the tree reads; presence is settled here, once, so
-// nothing downstream has to re-ask.
+// routerObservedSelectionOf 要求全部四个布尔字段均明确给出。导出的 selection 保留
+// 普通 bool 类型，供代码库其余部分读取；字段是否存在在此处一次性判定，下游无需
+// 再次检查。
 func routerObservedSelectionOf(wire routerObservedSelectionWire) (RouterObservedSelection, error) {
 	if wire.Registered == nil {
 		return RouterObservedSelection{}, fmt.Errorf("selection states no registered")
@@ -231,62 +220,57 @@ func routerObservedSelectionOf(wire routerObservedSelectionWire) (RouterObserved
 	}, nil
 }
 
-// ServingEndpoint is one bound serving worker: the view said it is in selection, and the
-// operator resolved that worker's address to a live Pod at collection time.
+// ServingEndpoint 表示一个已绑定的服务中 worker：视图声明其处于选择集合中，且
+// operator 在采集时已将该 worker 的地址解析到存活的 Pod。
 type ServingEndpoint struct {
 	PodUID types.UID
 	Member string
-	// Role and Rank come from the bound Pod's own workload identity: the component label the
-	// render stamps and the decimal member index. The observer's registry role and worker_id
-	// are registry identities and are never copied here, because a router can call an endpoint
-	// whatever it likes and the workload is the authority on what the endpoint is.
+	// Role 和 Rank 来源于所绑定 Pod 自身的工作负载身份：即渲染阶段写入的组件标签与
+	// 十进制成员索引。observer 注册表中的 role 和 worker_id 属于注册表身份，绝不会
+	// 复制到此处，因为 router 可以任意命名端点，而工作负载才是定义端点身份的权威来源。
 	Role string
 	Rank string
-	// Listener is the declared container port the bound URL targets. Virtual ranks that share
-	// one physical endpoint share this listener and the PodUID above, so counting distinct
-	// physical listeners by role folds them by construction.
+	// Listener 是所绑定 URL 指向的已声明容器端口。共享同一物理端点的虚拟 rank 会
+	// 共享该 listener 及上述 PodUID，因此按角色统计不同的物理 listener 本质上就能
+	// 将它们合并计数。
 	Listener int32
 	URL      string
 	Port     string
 	Serving  bool
 }
 
-// RouterServingObservation is one Router process's answer: the parsed view plus the
-// endpoints its serving workers bound to, or the error that makes the view unusable.
+// RouterServingObservation 是单个 Router 进程的观测结果：包含已解析的视图及其
+// 服务中 worker 绑定的端点列表，或者导致该视图不可用的错误。
 type RouterServingObservation struct {
 	View RouterServingView
-	// CollectedAt is when the operator read this view; freshness is judged against it,
-	// on the operator's clock, not the router's.
+	// CollectedAt 是 operator 读取该视图的时间；新鲜度依据此时间并按 operator 的时钟
+	// 进行判断，而非 router 的时钟。
 	CollectedAt time.Time
 	Bound       []ServingEndpoint
-	// RecentDispatch is the journal of workers this router recently dispatched to, bound to the
-	// same Pod identity as Bound and kept deliberately OUT of it. These workers are no longer in
-	// the selection, so folding them into Bound would raise the serving count for workers the
-	// router has already stopped selecting. The journal answers a different question, which only
-	// the retirement residual asks: did a dispatch reach this target recently enough that
-	// releasing it now would be releasing a member that may still be serving.
+	// RecentDispatch 是该 router 最近曾向其分发过请求的 worker 日志，绑定到与 Bound
+	// 相同的 Pod 身份，但刻意未合入 Bound 中。这些 worker 已不再处于选择集合内，
+	// 将其合并进 Bound 会虚高 router 已停止选择的 worker 的服务计数。该日志回答的是
+	// 另一个问题，仅退役残余检查会关注：最近是否有分发请求到达过该目标，以至于
+	// 现在释放它等同于释放一个可能仍在提供服务的成员。
 	RecentDispatch []ServingEndpoint
 	Err            error
 }
 
-// Empty reports a view that was never read. A transport failure produces an Empty
-// observation with an Err — the aggregation reads the Err, and Empty keeps an unread view
-// from being mistaken for a view of an empty registry.
+// Empty 报告视图是否从未被读取。传输失败会产生一个带有 Err 的 Empty 观测结果——
+// 聚合逻辑会读取 Err，而 Empty 可避免将未读视图误认为空注册表视图。
 func (o RouterServingObservation) Empty() bool {
 	return o.View.RouterBootGeneration == 0 && o.View.Workers == nil && o.Bound == nil
 }
 
-// observerURL is the endpoint the observer patches serve, on the router's existing
-// listener.
+// observerURL 是 observer 补丁在 router 现有监听端口上提供的端点路径。
 const observerURLPath = "/observer/endpoints"
 
-// modelDeploymentRouterObserverPort is the listener the owning profile serves the observer on.
+// modelDeploymentRouterObserverPort 返回所属 profile 提供 observer 服务的监听端口。
 //
-// llm-d attaches the observer to the admin handler it already runs, which is the management
-// listener where its metrics live. The other two profiles serve it on the request port their
-// Service already targets, so their contract is unchanged. The value is read from the profile
-// rather than discovered from a Pod, because a Pod port is what a container happens to have open
-// and not something a caller may read a view from.
+// llm-d 将 observer 挂载到其已有的管理处理器上，即指标所在的管理监听端口。
+// 另外两个 profile 则在各自 Service 已指向的请求端口上提供该端点，因此其契约
+// 保持不变。该端口值直接从 profile 读取而非通过 Pod 发现，因为 Pod 端口只是
+// 容器碰巧开放的端口，并非调用方可用于读取视图的约定端口。
 func modelDeploymentRouterObserverPort(profile string) int32 {
 	if profile == workercore.ModelDeploymentRouterLLMD {
 		return modelDeploymentRouterMetricsPort
@@ -295,45 +279,41 @@ func modelDeploymentRouterObserverPort(profile string) int32 {
 	return modelDeploymentRouterHTTPPort
 }
 
-// modelDeploymentObserverMaxBodyBytes caps one observer body. It is generous for a membership view
-// of a few hundred workers and small enough that a Router misbehaving cannot grow the response into
-// the reconciler's memory.
+// modelDeploymentObserverMaxBodyBytes 限制单个 observer 响应体的最大字节数。对于
+// 包含数百个 worker 的成员视图而言该上限足够宽松，同时又足够小，可防止异常
+// Router 的响应无限增长并耗尽 reconciler 的内存。
 const modelDeploymentObserverMaxBodyBytes = 4 << 20
 
-// modelDeploymentObservationBudget is the total time one collection may take, across every Router it
-// reads and the binding it does afterwards.
+// modelDeploymentObservationBudget 是单次采集所能消耗的总时间预算，涵盖所有
+// Router 的读取及其后的绑定过程。
 //
-// IT IS ONE BUDGET AND NOT ONE PER ROUTER. Each read already carries the caller's own deadline, but
-// a caller with no deadline gave none, and a deployment of several Routers multiplied that absence
-// into a pass whose length is the sum of however long each of them chose to take. Deriving the
-// total here means one collection is bounded whatever the caller passed and however many Routers
-// answered.
+// 这是单次总预算，而非每个 Router 各一份预算。每次读取虽自带调用方的截止时间，
+// 但无截止时间的调用方相当于未设限，在包含多个 Router 的部署中，这种无限制
+// 会叠加成总耗时等于各 Router 实际耗时之和的漫长过程。在此处派生总预算，意味着
+// 无论调用方传入何种上下文、也无论有多少个 Router 响应，单次采集的耗时始终有界。
 //
-// IT IS SHORTER THAN THE FRESHNESS IT HAS TO SURVIVE. A view collected right at the freshness limit
-// is stale by the time the aggregation judges it, so a read budget equal to the freshness would
-// collect answers the aggregator is obliged to refuse. The allowance below is the time discovery,
-// the last read and the binding take out of the window.
+// 该预算有意短于视图必须满足的新鲜度窗口。若视图恰在新鲜度临界点采集完成，到
+// 聚合逻辑校验时便已过期，因此与新鲜度等长的读取预算只会导致采集到的结果被聚合器
+// 拒绝。下方留出的余量即用于覆盖发现、最后一次读取以及绑定过程在时间窗口内的开销。
 const modelDeploymentObservationBudget = modelDeploymentServingFreshness - time.Second
 
-// modelDeploymentServingFetchTimeout bounds ONE read of a Router's view.
+// modelDeploymentServingFetchTimeout 限制单次读取 Router 视图的超时时间。
 //
-// IT IS SHORTER THAN THE COLLECTION'S BUDGET ON PURPOSE. A collection is a sum of its reads, so a
-// read that inherits only the collection's budget can spend all of it on one Router that never
-// answers and leave the other Routers nothing to read with. The collection's own budget still caps
-// the whole, and a caller's deadline that is earlier than this one still wins over both.
+// 该超时特意短于整次采集的总预算。一次采集由多次读取组成，若单次读取仅继承采集
+// 总预算，就可能在某个无响应的 Router 上耗尽全部预算，使其他 Router 无时间可用。
+// 采集自身的总预算仍限制整体上限，且早于此超时的调用方截止时间依然优先于两者。
 const modelDeploymentServingFetchTimeout = 2 * time.Second
 
-// modelDeploymentObservationContext derives the context ONE read runs under, so a caller that
-// supplied its own deadline keeps it and an unlimited caller still gets a finite one.
+// modelDeploymentObservationContext 派生单次读取所使用的上下文，使自带截止时间的
+// 调用方保留其限制，而无限制的调用方也能获得有限的超时控制。
 //
-// THE DEADLINE IT ADDS IS THE PER-FETCH ONE, not the collection's budget: this transport is
-// reachable on its own, and a read that waits for the whole collection's budget is a read that can
-// take the whole pass with it.
+// 它添加的是单次拉取的截止时间，而非整次采集的总预算：该传输层可被独立调用，
+// 若单次读取等待整个采集预算，就可能拖垮整轮采集流程。
 func modelDeploymentObservationContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, modelDeploymentServingFetchTimeout)
 }
 
-// modelDeploymentRouterObservationContext keeps collection within the active retirement budget.
+// modelDeploymentRouterObservationContext 将采集过程控制在当前有效的退役预算之内。
 func (r *ModelDeploymentReconciler) modelDeploymentRouterObservationContext(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (context.Context, context.CancelFunc) {
@@ -364,10 +344,9 @@ func (r *ModelDeploymentReconciler) modelDeploymentRouterObservationContext(
 
 type routerViewFetch func(ctx context.Context, url string) ([]byte, error)
 
-// collectRouterServingView reads one Router process's view through the passed fetch and
-// carries the Router Pod's UID as the view's identity. The fetch is a parameter so the
-// transport is the caller's decision — the production caller dials the Pod IP directly,
-// and a test stands in without a network.
+// collectRouterServingView 通过传入的 fetch 读取单个 Router 进程的视图，并携带
+// Router Pod 的 UID 作为该视图的身份标识。将 fetch 作为参数传入可使传输方式由
+// 调用方决定——生产环境调用方直接拨号连接 Pod IP，而测试则可在无网络环境下替代。
 func collectRouterServingView(
 	ctx context.Context, fetch routerViewFetch, routerPodUID types.UID,
 ) (RouterServingObservation, error) {
@@ -384,13 +363,12 @@ func collectRouterServingView(
 	return RouterServingObservation{View: parsed}, nil
 }
 
-// bindRouterObservationView resolves each serving worker's address to a live Pod and
-// returns the bound endpoints. THE VIEW IS ALL-OR-NOTHING: a serving worker whose address
-// resolves to nothing live, to more than one Pod, or only to a Pod that is terminating or
-// not running, is an indeterminate binding — the operator cannot say the worker serves,
-// and cannot say it does not, so the whole view is refused rather than counted with a gap.
-// Workers outside the selection are never bound and never refuse the view: they are the
-// workers the router itself already refused.
+// bindRouterObservationView 将每个服务中 worker 的地址解析到存活的 Pod，并返回
+// 绑定后的端点列表。该视图遵循“全有或全无”原则：只要存在一个服务中 worker 的地址
+// 无法解析到存活 Pod、解析到多个 Pod，或仅解析到处于终止中或非运行状态的 Pod，
+// 即构成不确定绑定——operator 既不能断言该 worker 在提供服务，也不能断言其未提供，
+// 因此会拒绝整个视图，而不会带着缺口进行统计。位于选择集合之外的 worker 不会被
+// 绑定，也不会导致视图被拒绝：它们本身就是 router 已经拒绝的 worker。
 func bindRouterObservationView(
 	view RouterServingView, pods []*corev1.Pod, journal bool,
 ) ([]ServingEndpoint, []ServingEndpoint, error) {
@@ -404,13 +382,13 @@ func bindRouterObservationView(
 	bound := make([]ServingEndpoint, 0)
 	dispatched := make([]ServingEndpoint, 0)
 	for _, worker := range view.Workers {
-		// A worker outside the selection is not counted as serving, whether or not it appears in
-		// the journal. The journal is separate evidence, not a promotion back into Bound.
+		// 无论是否出现在日志中，处于选择集合之外的 worker 都不会计入服务中数量。日志是
+		// 独立证据，不会将其重新提升回 Bound 集合。
 		inSelection := worker.Selection.InSelection
 
-		// The journal is asked only of the profile that publishes it. The other two publish the
-		// gateway's own last_job shape under that key, which this operator does not interpret, and
-		// a block this operator cannot read is a block it must not read as "no recent dispatch".
+		// 仅向发布日志的 profile 查询该日志。另外两个 profile 在同一键下发布网关自身的
+		// last_job 结构，本 operator 不对其进行解析；对于无法读取的字段块，绝不能将其
+		// 误读为“近期无分发”。
 		recent := false
 		if !inSelection && journal {
 			failure := error(nil)
@@ -422,22 +400,20 @@ func bindRouterObservationView(
 
 		endpoint, err := bindRouterObservationWorker(worker, byIP)
 		if err != nil {
-			// A SELECTABLE worker the operator cannot place is an indeterminate binding, and one
-			// indeterminate binding makes the whole view unusable: a number built on a partial
-			// binding would be a guess wearing a confirmation's clothes.
+			// 任何处于可选状态但 operator 无法定位的 worker 都属于不确定绑定，而只要存在
+			// 一处不确定绑定就会使整个视图不可用：基于部分绑定得出的数字只是披着确认外衣的猜测。
 			//
-			// A worker the router ITSELF already refused is different. It is not counted either
-			// way, so an unplaceable one contributes no evidence rather than a reason to refuse
-			// the view, and the view's own contradiction checks simply have nothing from it.
+			// router 自身已拒绝的 worker 则不同。无论如何它都不会被计入数量，因此无法
+			// 定位的此类 worker 只是不提供任何证据，而非拒绝整个视图的理由，视图自身的
+			// 矛盾检查也仅将其忽略。
 			if inSelection {
 				return nil, nil, err
 			}
 
-			// A JOURNAL ROW THAT CANNOT BE PLACED IS UNAVAILABLE EVIDENCE, NOT NO EVIDENCE. The
-			// dispatch journal is the only thing standing between a target with a recent dispatch
-			// and a member that may still be serving it, so a row whose member cannot be resolved
-			// has to fail closed: dropping it would read as a cleared journal and release a member
-			// on the strength of a row this operator could not place.
+			// 无法定位的日志条目属于不可用证据，而非“无证据”。分发日志是区分近期有分发
+			// 的目标与可能仍在处理该分发的成员的唯一依据，因此当某条日志对应的成员无法
+			// 解析时必须采取失效关闭策略：直接丢弃它会等效于日志已清空，从而依据一条
+			// operator 无法定位的记录过早释放成员。
 			if !inSelection && recent {
 				return nil, nil, err
 			}
@@ -445,10 +421,10 @@ func bindRouterObservationView(
 			continue
 		}
 
-		// BOTH SELECTIONS ARE KEPT, because the aggregate's only contradiction checks live on the
-		// union: a physical endpoint one router selects and another refuses, or one view both
-		// selects and refuses, is a disagreement that is invisible while the refused rows are
-		// dropped on the way in. The Serving flag below is what separates the two.
+		// 两种选择状态均予以保留，因为聚合逻辑唯一的矛盾检查建立在并集之上：若一个
+		// 物理端点被某个 router 选中却被另一个拒绝，或在同一视图中既被选中又被拒绝，
+		// 这种分歧如果在入口处就丢弃被拒绝的行便会无从察觉。下方的 Serving 标志用于
+		// 区分这两者。
 		bound = append(bound, endpoint)
 		if !inSelection && recent {
 			dispatched = append(dispatched, endpoint)
@@ -458,9 +434,9 @@ func bindRouterObservationView(
 	return bound, dispatched, nil
 }
 
-// bindRouterObservationWorker resolves one worker row to the live Pod its address names, and derives
-// the workload identity it is counted under. The address and the live Pod decide what it is; nothing
-// the registry says about the row contributes to that.
+// bindRouterObservationWorker 将单条 worker 记录解析为其地址所指代的存活 Pod，
+// 并推导出其计入统计时使用的工作负载身份。该身份完全由地址和存活 Pod 决定，
+// 注册表中关于该记录的任何声明均不参与其中。
 func bindRouterObservationWorker(
 	worker RouterObservedWorker, byIP map[string][]*corev1.Pod,
 ) (ServingEndpoint, error) {
@@ -498,28 +474,26 @@ func bindRouterObservationWorker(
 	}, nil
 }
 
-// modelDeploymentEndpointIdentity is the workload identity one bound endpoint is counted under. All
-// three fields come from the bound Pod's own rendered labels and ports, and every one of them is
-// required, because a count built on a partly-identified endpoint cannot be attributed to a member.
+// modelDeploymentEndpointIdentity 是单个已绑定端点在计数时使用的工作负载身份。
+// 全部三个字段均来自所绑定 Pod 自身渲染的标签和端口，且缺一不可，因为基于身份
+// 不完整的端点得到的计数无法归属到具体成员。
 type modelDeploymentEndpointIdentity struct {
 	role     string
 	rank     string
 	listener int32
 }
 
-// modelDeploymentEndpointIdentityOf reads that identity off the live Pod.
+// modelDeploymentEndpointIdentityOf 从存活 Pod 上读取该身份信息。
 //
-// THE OBSERVER'S OWN worker_id IS NOT A SOURCE HERE. It is an opaque native registry identity the
-// router mints for its own bookkeeping, and on a data-parallel member it enumerates VIRTUAL ranks
-// that all share ONE physical listener. Reading it as a member rank would turn one engine into as
-// many endpoints as it has shards, which is a number about the router's registry rather than about
-// the pool. The rank comes from the member-index label the render stamps, which is this operator's
-// own count of which member of its replica a Pod is.
+// 此处绝不采用 observer 自身的 worker_id。它是 router 为自身记账生成的不透明原生
+// 注册表标识，在数据并行成员上会枚举共享同一个物理监听端口的多个虚拟 rank。若将
+// 其当作 member rank 读取，就会把单个引擎拆分成与分片数相等的多个端点，这反映的是
+// router 注册表的数量而非资源池的真实状态。rank 来自渲染阶段打上的 member-index
+// 标签，它才代表本 operator 对 Pod 所属副本成员序号的定义。
 //
-// EACH FIELD IS VALIDATED RATHER THAN STORED, and an endpoint that carries none of them is refused
-// instead of counted. A missing role names no workload, a non-decimal rank is not the ordinal the
-// render writes, and a port the Pod never declared is not a listener it can be serving on: a count
-// that included any of them would be reporting something the Pod does not say about itself.
+// 每个字段都会经过校验而非直接存储，缺少其中任一字段的端点将被拒绝而不计入统计。
+// 缺失 role 无法指代工作负载，非十进制 rank 不是渲染写入的序号，Pod 未声明的端口
+// 也不是其可提供服务的监听端口：将这些包含进计数相当于上报了 Pod 自身并未声明的状态。
 func modelDeploymentEndpointIdentityOf(pod *corev1.Pod, urlPort string) (modelDeploymentEndpointIdentity, error) {
 	role := modelDeploymentPodRole(pod)
 	if role == "" {
@@ -534,9 +508,9 @@ func modelDeploymentEndpointIdentityOf(pod *corev1.Pod, urlPort string) (modelDe
 			"binding indeterminate: member %s carries no member rank", pod.Name,
 		)
 	}
-	// A MEMBER INDEX COUNTS FROM ZERO, so it is read as an unsigned decimal. ParseUint refuses a
-	// sign, a base prefix and any surrounding space, all of which are shapes the render never
-	// writes and all of which would be a different meaning read as this one.
+	// 成员索引从零开始计数，因此按无符号十进制整数解析。ParseUint 会拒绝正负号、
+	// 进制前缀以及前后空白字符，渲染逻辑绝不会写入这些格式，若误读则会产生截然
+	// 不同的语义。
 	if _, err := strconv.ParseUint(rank, 10, 32); err != nil {
 		return modelDeploymentEndpointIdentity{}, fmt.Errorf(
 			"binding indeterminate: member %s carries member rank %q rather than a decimal index",
@@ -554,9 +528,9 @@ func modelDeploymentEndpointIdentityOf(pod *corev1.Pod, urlPort string) (modelDe
 	return modelDeploymentEndpointIdentity{role: role, rank: rank, listener: listener}, nil
 }
 
-// modelDeploymentDeclaredListenerOf returns the declared container port the bound URL targets,
-// or 0 when the pod declares no such port. The declared port is the listener contract the render
-// wrote; a port the pod never declared is not a listener this operator can count.
+// modelDeploymentDeclaredListenerOf 返回所绑定 URL 指向的已声明容器端口；若 Pod
+// 未声明该端口则返回 0。已声明端口是渲染逻辑写入的监听契约，Pod 从未声明的端口
+// 不能作为本 operator 计数的监听端口。
 func modelDeploymentDeclaredListenerOf(pod *corev1.Pod, urlPort string) int32 {
 	port, err := strconv.Atoi(urlPort)
 	if err != nil {
@@ -573,18 +547,17 @@ func modelDeploymentDeclaredListenerOf(pod *corev1.Pod, urlPort string) int32 {
 	return 0
 }
 
-// recentDispatchFromLastJob reads the journal field the shipped llm-d observer writes.
+// recentDispatchFromLastJob 读取随附 llm-d observer 写入的日志字段。
 //
-// The producer omits last_job entirely for a worker it never dispatched to, so an absent block is
-// the absence of a recent dispatch rather than a missing required field. Requiring it would make
-// every untouched worker an error. A block that is present must carry recent_dispatch as a boolean,
-// because the producer emits it only to mark a dispatch. A block without it, or with it as anything
-// else, is a shape this operator does not understand, and it is refused rather than read as false:
-// a decoder default would turn a journal it could not read into a confirmed absence of a dispatch,
-// which is the one reading this field must never get.
+// 对于从未向其分发过请求的 worker，生成端会完全省略 last_job，因此缺失该字段块
+// 代表近期无分发，而非缺少必需字段；若强制要求该字段存在，会导致所有未处理过请求
+// 的 worker 均报错。当该字段块存在时，必须以布尔值形式携带 recent_dispatch，因为
+// 生成端仅在标记分发时才输出它。缺少该字段或字段类型不符均属于本 operator 无法
+// 理解的结构，将被拒绝而不会按 false 处理：解码器默认值会把无法读取的日志误判为
+// 已确认无分发，这是读取该字段时绝不允许出现的结果。
 //
-// A worker outside the selection with no journal block is left to the caller. The other two
-// routers publish the gateway's own last_job shape there, which this operator does not interpret.
+// 对于处于选择集合外且无日志块的 worker，由调用方自行处理。另外两个 router 在该
+// 字段下发布的是网关自身的 last_job 结构，本 operator 不对其进行解析。
 func recentDispatchFromLastJob(raw json.RawMessage) (bool, error) {
 	if len(raw) == 0 {
 		return false, nil
@@ -604,9 +577,9 @@ func recentDispatchFromLastJob(raw json.RawMessage) (bool, error) {
 	return *job.Recent, nil
 }
 
-// workerHost extracts the address portion of a worker URL: scheme-stripped, path-stripped.
-// The registry's URLs are `scheme://host:port`; a URL in an unexpected shape yields an
-// empty host, which the binder refuses rather than guesses past.
+// workerHost 提取 worker URL 中的地址部分（去除 scheme 与路径）。注册表中的
+// URL 格式为 `scheme://host:port`；非预期格式的 URL 会返回空 host，绑定器
+// 将直接拒绝而不会强行猜测。
 func workerHost(url string) string {
 	withoutScheme := url
 	if scheme, rest, found := strings.Cut(url, "://"); found {
@@ -621,137 +594,101 @@ func workerHost(url string) string {
 		return hostPort
 	}
 
-	// A host without a port is still an address; SplitHostPort's error for that shape is
-	// expected and the host itself is what the caller wants.
+	// 不带端口的 host 仍然是一个有效地址；SplitHostPort 对该格式返回错误符合预期，
+	// 调用方所需的正是 host 本身。
 	return host
 }
 
-// ServingAnswer is the Feature 2 answer in the Feature 5 wire's shape: a state always,
-// a value only when the state is Confirmed.
+// ServingAnswer 是 Feature 5 传输格式下的 Feature 2 结果：始终包含状态，仅当
+// 状态为 Confirmed 时才包含数值。
 type ServingAnswer struct {
 	State  workercore.ModelDeploymentServingState
 	Value  *int32
 	Reason string
-	// ByRole is the same union counted per workload role, over the very endpoints Value sums.
-	// It exists so a role's own status field is not filled with the deployment-wide number: a
-	// prefill role reporting "two" because a decode role has two serving endpoints is a status
-	// that reads as its own pool and is not. A role with no endpoint is an explicit zero, which
-	// is why the map is built for every role the union names and the reader supplies the rest.
+	// ByRole 是对 Value 所汇总的同一批端点按工作负载角色分别统计的并集计数。其存在
+	// 是为了避免用整个部署的总数填充单个角色自身的状态字段：若 decode 角色有两个
+	// 服务中端点而导致 prefill 角色上报“2”，就会让人误以为该数字属于 prefill 自己的
+	// 资源池。没有端点的角色对应显式的零值，因此该 map 会为并集中出现的每个角色
+	// 构建条目，其余部分由读取方补充。
 	ByRole map[string]int32
-	// Groups is the same collection read per GROUP rather than per deployment. The deployment-wide
-	// answer cannot tell two groups of one role apart, and a group whose view is partial has to be
-	// distinguishable from a group that is merely empty.
+	// Groups 是按 GROUP 而非按整个部署读取的同一份采集结果。部署级别的结果无法区分
+	// 同一角色下的两个 group，并且视图残缺的 group 必须能与仅仅为空的 group 区分开来。
 	Groups map[modelDeploymentGroupKey]modelDeploymentGroupServing
-	// Members is each member's carried facts as this collection read them, which is the fresh
-	// read and not the caller's cached Pod list.
+	// Members 记录本次采集读取到的各个成员所携带的事实信息，代表最新读取结果，
+	// 而非调用方缓存的 Pod 列表。
 	Members map[types.UID]modelDeploymentMemberServing
-	// CollectedAt is when the OLDEST evidence in this answer was read. The freshness of the whole
-	// answer is the freshness of its oldest evidence, so this is the instant the restore decision
-	// compares against the freshness window.
+	// CollectedAt 是此结果中最早一条证据被读取的时间。整个结果的新鲜度取决于其最早证据的新鲜度，因此恢复决策会将该时间与新鲜度窗口进行比较。
 	CollectedAt time.Time
 }
 
-// modelDeploymentGroupKey identifies one group: the role it belongs to, the replica ordinal it
-// occupies, and the CURRENT membership generation of that group.
+// modelDeploymentGroupKey 标识一个分组：所属角色、所占用的副本序号，以及该分组当前的成员代次。
 //
-// THE GENERATION IS THE GROUP'S CURRENT MEMBERSHIP AND NEVER THE MEMBERS THE ROUTER HAPPENED TO
-// LIST. A key built from the observed members would not match the group it belongs to on a partial
-// view, and the group would silently never get an answer -- the worst outcome here, because a
-// partial view is exactly where a confirmed serving count must not be published.
+// 该代次是分组当前的成员集合，而非 Router 恰好列出的成员。若根据观测到的成员构造键，在部分视图下将无法匹配其所属分组，从而导致该分组静默地永远得不到结果——这是最糟糕的情况，因为部分视图恰恰是不应发布已确认服务数量的时候。
 type modelDeploymentGroupKey struct {
 	Role       string
 	Ordinal    int
 	Generation modelDeploymentMembershipGeneration
 }
 
-// modelDeploymentGroupServing is what the operator knows about ONE group from the Router's view.
+// modelDeploymentGroupServing 表示从 Router 视图中了解到的单个分组的状况。
 //
-// THE COUNTS ARE TWO KINDS OF THING. Endpoints counts the ROUTER endpoints in selection for this
-// group, while Members and Expected count MEMBERS: an ordinary group of three members has one
-// expected endpoint and three members, and a count that conflated the two would publish a group of
-// three as three endpoints.
+// 这些计数代表两类不同的概念。Endpoints 统计被选中的该分组 Router 端点数量，而 Members 和 Expected 统计成员数量：一个包含三个成员的普通分组有一个预期端点和三个成员，如果将两者混淆，就会把一个三成员分组错误地发布为三个端点。
 type modelDeploymentGroupServing struct {
-	// SnapshotValid is whether this operator holds a fresh, complete and coherent observation of
-	// this group. It is the restoration gate's input, and it is NOT the confirmation.
+	// SnapshotValid 表示当前 operator 是否持有该分组新鲜、完整且一致的观测结果。它是恢复门控的输入，但本身不是确认状态。
 	SnapshotValid bool
-	// InvalidReason names why the snapshot is not valid, in words a reader can act on.
+	// InvalidReason 以便于排查的表述说明快照无效的原因。
 	InvalidReason string
-	// State is the serving state of this group.
+	// State 是该分组的服务状态。
 	State workercore.ModelDeploymentServingState
-	// Endpoints counts the Router endpoints in selection for this group.
+	// Endpoints 统计被选中的该分组 Router 端点数量。
 	Endpoints int32
-	// Members counts the group's current membership.
+	// Members 统计该分组当前的成员数量。
 	Members int32
-	// Expected counts the group's expected member count.
+	// Expected 统计该分组的预期成员数量。
 	Expected int32
-	// Retained is whether the group is ELIGIBLE AND UNCHANGED GENERATION: every answering member
-	// already carries the eligibility label, and the eligibility annotation on those members names
-	// the group's current complete membership generation.
+	// Retained 表示该分组是否同时具备资格且代次未变：每个应答成员均已带有资格标签，且这些成员上的资格注解标明了该分组当前完整的成员代次。
 	//
-	// IT IS THE ONE FACT THAT SEPARATES THE TWO CASES A STATUS HAS TO TELL APART. A retained group
-	// publishes Eligible while the observation is lost, and a group the barrier holds publishes
-	// AwaitingObservation, and a composite flag would collapse exactly that distinction.
+	// 这是区分状态必须分辨的两种情况的唯一事实。当观测丢失时，已保留的分组会发布 Eligible，而被屏障阻挡的分组会发布 AwaitingObservation；如果使用复合标志，恰恰会抹除这一区分。
 	Retained bool
-	// MemberNotReady says the fresh membership found a member of this group that is not ready.
+	// MemberNotReady 表示在最新成员列表中发现该分组存在未就绪的成员。
 	//
-	// IT IS A KNOWN FACT AND NOT A MISSING ONE, so a later uncertainty does not erase it: a
-	// collection that could not read the Router's view afterwards still knows that this member was
-	// not ready. The state has to name the leg that holds the group, and the reason that names the
-	// member travels with this fact.
+	// 这是一个已知事实而非缺失信息，因此后续的不确定性不会抹除它：即使之后的采集未能读取 Router 视图，系统仍然知道该成员当时未就绪。状态必须指明阻挡该分组的环节，而指明该成员的原因也会随此事实一同传递。
 	MemberNotReady bool
 }
 
-// modelDeploymentMemberServing is one member's carried facts as the collection read them.
+// modelDeploymentMemberServing 是采集时读取到的单个成员所携带的事实。
 //
-// THEY ARE READ FRESH, AT COLLECTION TIME, AND NOT FROM THE CALLER'S POD LIST. The caller's list is
-// the informer cache's view of the deployment, and a cached value that has fallen behind is not new
-// proof of anything: a retention decision built on it would keep a group eligible on the strength
-// of a label the API server no longer carries.
+// 这些信息是在采集时实时读取的，而非取自调用方传入的 Pod 列表。调用方的列表来自 informer 缓存对部署的视图，滞后的缓存值不能作为新的证明：基于它做出的保留决策可能会仅凭 API server 已不再携带的标签而维持分组的资格。
 type modelDeploymentMemberServing struct {
-	// Eligible is whether the member carried the eligibility label.
+	// Eligible 表示该成员是否带有资格标签。
 	Eligible bool
-	// Generation is the membership generation the eligibility annotation named, empty when the
-	// member carries no annotation.
+	// Generation 是资格注解中指定的成员代次；若成员未携带该注解，则为空。
 	Generation modelDeploymentMembershipGeneration
-	// Ready is whether the member reported ready in the fresh read.
+	// Ready 表示在实时读取中该成员是否报告为就绪。
 	//
-	// IT IS READ FRESH AND NOT FROM THE CALLER'S LIST, for the same reason the label is: the
-	// qualification's own readiness legs read the caller's list, and a list that is behind the API
-	// server cannot say that a member is ready. The fresh word is the one the collection is
-	// defined against, so it is the one that decides whether the group may be served.
+	// 它同样是实时读取而非取自调用方列表，原因与标签相同：资格判定的就绪分支读取的是调用方列表，而落后于 API server 的列表无法证明成员已经就绪。实时结果才是本次采集的判定依据，因此由它来决定该分组是否可以提供服务。
 	Ready bool
 }
 
-// modelDeploymentPassObservation is what ONE pass observed about the deployment's groups, and it is
-// the carrier every reader of a pass's answers shares.
+// modelDeploymentPassObservation 表示单轮协调对部署各分组的观测结果，也是所有读取该轮结果的消费者共享的载体。
 //
-// THE RESTORATION DECISION AND THE STATUS MUST READ THE SAME ONE. A second collection would be a
-// second answer about a second moment, and a fresh qualification would be a second verdict about a
-// second grouping of the same Pods, so a status could publish a verdict the labels were never
-// written from.
+// 恢复决策与状态更新必须读取同一份观测结果。第二次采集会得到针对另一个时刻的另一份结果，重新判定资格也会针对相同 Pod 的另一套分组得出另一份结论，从而导致状态发布出与标签写入依据不符的判定结果。
 type modelDeploymentPassObservation struct {
-	// Serving is the collected Router answer, with the per-group facts and the freshness instant.
+	// Serving 是采集到的 Router 结果，包含各分组的事实及新鲜度时间戳。
 	Serving ServingAnswer
-	// Qualifications is the whole-group answer the eligibility write acted on.
+	// Qualifications 是资格写入操作所依据的整组判定结果。
 	Qualifications []modelDeploymentInstanceQualification
-	// CollectiveMembers is the current membership of the deployment's logical group when the shape
-	// has one that is not a replica: the elastic collective's whole worker set.
+	// CollectiveMembers 是当部署拓扑包含非副本形态的逻辑分组时，该分组的当前成员列表，即弹性集合（elastic collective）的全部 worker 集合。
 	//
-	// IT IS EMPTY FOR EVERY OTHER SHAPE, and the status then publishes the replica groups alone.
-	// The consumer identifies the elastic role from the deployment, so this carries the members and
-	// no group of its own.
+	// 对于其他所有拓扑形态，该字段均为空，此时状态仅发布副本分组。消费方会从部署配置中识别弹性角色，因此这里只携带成员列表而不单独归组。
 	//
-	// IT IS THE ALREADY-FETCHED, OWNER-CHECKED LIST, so populating it costs no second fetch and no
-	// probe.
+	// 它是已拉取并经过属主校验的列表，因此填充该字段不会触发二次拉取或额外探测。
 	CollectiveMembers []corev1.Pod
 }
 
-// modelDeploymentServingUnobserved is the answer a path that made no observation publishes.
+// modelDeploymentServingUnobserved 构造未执行观测的路径所发布的默认结果。
 //
-// IT IS NOT THE ZERO VALUE, because the zero value's state is the empty string and that is not a
-// serving state at all: publishing it would tell a reader that the operator knows something it does
-// not. A deployment that declares no Router says so, and a deployment that declares one says that
-// this pass did not read it.
+// 它不能使用零值，因为零值的状态为空字符串，根本不是有效的服务状态：发布零值会误导读者认为 operator 掌握了某种确定信息。未声明 Router 的部署会明确表明未配置，而声明了 Router 的部署则会表明本轮未读取它。
 func modelDeploymentServingUnobserved(md *workercore.ModelDeployment, reason string) ServingAnswer {
 	if md.Spec.Router == nil {
 		return ServingAnswer{State: workercore.ModelDeploymentServingStateNotConfigured}
@@ -763,30 +700,19 @@ func modelDeploymentServingUnobserved(md *workercore.ModelDeployment, reason str
 	}
 }
 
-// modelDeploymentAnnotationKeyEndpointEligibleGeneration names the group's membership generation
-// under which a member's eligibility was established.
+// modelDeploymentAnnotationKeyEndpointEligibleGeneration 标记某成员确立资格时所处的分组成员代次。
 //
-// IT IS AN ANNOTATION AND NOT A LABEL, because the generation is the sorted member UID set joined
-// with slashes and a label value cannot hold a slash. Its absence means the member was never made
-// eligible, and a value that differs from the group's current generation means the generation
-// changed after the eligibility was established.
+// 它使用注解而非标签，因为代次是由排序后的成员 UID 集合用斜杠拼接而成的，而标签值不能包含斜杠。缺少该注解表示成员从未获得过资格，其值与分组当前代次不同则表示在确立资格后成员代次发生了变化。
 //
-// IT IS WRITTEN IN THE SAME PATCH AS THE ELIGIBILITY LABEL, so the two cannot disagree, and it is
-// per-Pod, so it is gone with the Pod that carried it.
+// 它与资格标签在同一次 patch 中写入，因此两者不会出现不一致；同时它绑定在单个 Pod 上，会随承载它的 Pod 一同销毁。
 const modelDeploymentAnnotationKeyEndpointEligibleGeneration = "modeldeployment." + systemname.LabelPrefix +
 	"endpoint-eligible-generation"
 
-// modelDeploymentServingFreshNow reports whether a collected answer is still inside the freshness
-// window at the moment of the decision that reads it.
+// modelDeploymentServingFreshNow 报告在读取该结果的决策执行时刻，已采集的结果是否仍处于新鲜度窗口内。
 //
-// THE RECHECK IS A COMPARISON AGAINST THE EXISTING CLOCK AND THE EXISTING WINDOW, and never a
-// second fetch: the answer was collected once, and reading the routers again would be a second
-// collection with a second budget and a second answer.
+// 该复检仅基于已有的时钟和既定窗口进行比较，绝不触发二次拉取：结果只采集一次，再次读取各个 Router 会成为伴随新预算与新结果的第二次采集。
 //
-// IT EXISTS BECAUSE THE WINDOW IS JUDGED ONCE, AT THE AGGREGATION, AND THE DECISION THAT USES THE
-// ANSWER MAY COME LATER. The label write that follows the collection is a sequence of API round
-// trips, one per changed member, and nothing bounds it: an answer judged fresh when it was
-// aggregated can be stale by the time the last member is written.
+// 之所以需要这一检查，是因为窗口在聚合时只评估一次，而使用该结果的决策可能稍后才发生。采集之后的标签写入是一系列针对每个变更成员的 API 往返请求，耗时没有上限：聚合时仍新鲜的结果，到最后一个成员写入完成时可能已经过期。
 func (r *ModelDeploymentReconciler) modelDeploymentServingFreshNow(answer ServingAnswer) bool {
 	if answer.CollectedAt.IsZero() {
 		return false
@@ -795,16 +721,13 @@ func (r *ModelDeploymentReconciler) modelDeploymentServingFreshNow(answer Servin
 	return r.modelDeploymentNow().Sub(answer.CollectedAt) <= modelDeploymentServingFreshness
 }
 
-// modelDeploymentPhysicalEndpoint is what the union counts: one declared listener on one Pod. Every
-// virtual row the router registers for that listener folds onto this one key.
+// modelDeploymentPhysicalEndpoint 是并集统计的基本单位：一个 Pod 上声明的一个监听器。Router 为该监听器注册的所有虚拟行都会折叠到这一个键上。
 type modelDeploymentPhysicalEndpoint struct {
 	podUID   types.UID
 	listener int32
 }
 
-// aggregateModelDeploymentServing is the Feature 2 state machine. `configured` is whether
-// the deployment declares a Router at all; `observations` are the collected per-process
-// answers; `freshness` is how long a collected view may keep informing the answer.
+// aggregateModelDeploymentServing 实现 Feature 2 的状态机。`configured` 表示部署是否声明了 Router；`observations` 是从各个进程采集到的结果；`freshness` 表示采集视图在多长时间内仍可作为有效依据。
 func aggregateModelDeploymentServing(
 	configured bool, observations []RouterServingObservation, freshness time.Duration,
 ) ServingAnswer {
@@ -818,17 +741,8 @@ func aggregateModelDeploymentServing(
 		}
 	}
 
-	// BOOT GENERATION IS A PER-PROCESS VALUE. Both routers document it as their process
-	// start time in milliseconds, so two independent replicas are EXPECTED to report
-	// different ones, and comparing one scalar across distinct processes made every
-	// multi-replica deployment permanently NotConverged — a stall that no amount of
-	// waiting clears, because the disagreement is normal rather than transient.
-	// Consistency is therefore asked one process at a time. The only disagreement that
-	// makes the answer dishonest is ONE process reporting two generations, which means a
-	// Router rolled mid-observation and the views describe different incarnations of it.
-	// Views that carry no identity cannot be placed in any process, so they share one
-	// group and are held against each other: dropping the check there would read a roll
-	// as convergence, and treating each as its own process would never compare anything.
+	// 启动代次（boot generation）是按进程区分的值。两个 Router 实现都将其定义为进程启动时间戳（毫秒），因此两个独立副本预期会报告不同的值；跨不同进程比较同一标量曾导致所有多副本部署永久处于 NotConverged 状态——无论等待多久都无法消除，因为这种差异是正常现象而非瞬态不一致。
+	// 因此一致性必须按单个进程分别校验。唯一会使结果失真的不一致是“同一个”进程报告了两个不同的代次，这意味着 Router 在观测期间发生了重启，各视图描述的是它的不同实例。对于未携带身份标识的视图，无法归属到具体进程，因此将它们归为同一组互相校验：若跳过该校验会把重启误判为收敛，而若将每个视图都当作独立进程则无法进行任何比较。
 	generationByRouter := map[types.UID]uint64{}
 	for _, observation := range observations {
 		if observation.Err != nil {
@@ -857,18 +771,9 @@ func aggregateModelDeploymentServing(
 		generationByRouter[routerUID] = generation
 	}
 
-	// The deduplicated union across views, with per-endpoint agreement checked as it
-	// forms. Views are never intersected (one lagging replica would zero the answer and
-	// hide exactly the leak the union exists to show) and never summed (the same endpoint
-	// seen by two replicas is one endpoint).
+	// 对各视图取去重后的并集，并在合并过程中逐端点校验一致性。视图绝不取交集（否则一个滞后的副本就会使结果归零，掩盖并集本应暴露的端点泄漏问题），也绝不直接相加（两个副本看到的同一个端点仍只是一个端点）。
 	//
-	// THE FOLD KEY IS THE PHYSICAL LISTENER, NOT THE ROW. One member's engine can appear in a
-	// view as several rows, because a data-parallel member registers one entry per virtual rank
-	// and they all share the single listener that member actually serves. Counting rows would
-	// report the router's registry size rather than the pool's serving members, so the rows that
-	// name one Pod and one declared port fold into one endpoint. The role is checked on the folded
-	// endpoint rather than added to the key, so two views that seat the same listener in
-	// different roles are caught as a contradiction instead of counted as two.
+	// 折叠键是物理监听器，而非视图行。单个成员的引擎可能在视图中表现为多行，因为数据并行成员会为每个虚拟 rank 注册一条记录，而它们共享该成员实际提供服务的同一个监听器。按行计数会反映 Router 的注册表大小而非资源池的服务成员数，因此指向同一 Pod 和同一声明端口的行会折叠为一个端点。角色校验是在折叠后的端点上进行的，而非加入折叠键中，这样当两个视图将同一监听器置于不同角色下时，会被识别为冲突，而不会被重复计为两个端点。
 	physical := map[modelDeploymentPhysicalEndpoint]ServingEndpoint{}
 	for _, observation := range observations {
 		for _, endpoint := range observation.Bound {
@@ -899,9 +804,7 @@ func aggregateModelDeploymentServing(
 		}
 	}
 
-	// THE GLOBAL COUNT AND THE PER-ROLE COUNTS COME FROM THE SAME FOLD, in one pass over it, so
-	// they cannot describe different pools. Counting the union twice would be two answers to one
-	// question, and they would drift the first time a role's endpoints changed.
+	// 全局计数与按角色计数均在同一次遍历中源自同一个折叠结果，因此它们不可能描述不同的资源池。对并集统计两次相当于对同一问题给出两个答案，一旦某角色的端点发生变化，两者就会出现偏差。
 	count := int32(0)
 	byRole := make(map[string]int32, len(physical))
 	for _, endpoint := range physical {
@@ -919,21 +822,12 @@ func aggregateModelDeploymentServing(
 	}
 }
 
-// modelDeploymentServingFreshness is how long a collected view keeps informing the
-// answer. It bounds how stale a router's picture of the pool may be while still being a
-// picture of the pool; past it the answer is Unknown rather than a number that outlived
-// its evidence.
+// modelDeploymentServingFreshness 定义采集视图能够持续作为有效结果依据的时长。它限制了 Router 对资源池的认知在仍被视作有效快照时允许滞后的程度；超过该时长后，结果将变为 Unknown，而不会继续使用已失去证据支撑的数值。
 const modelDeploymentServingFreshness = 15 * time.Second
 
-// defaultServingViewFetch is the production transport: a plain GET with a short timeout,
-// against the URL the caller built from the Router Pod's own IP — never the Router's
-// Service, which would sample one replica and silently drop the rest.
+// defaultServingViewFetch 是生产环境下的传输实现：向调用方基于 Router Pod 自身 IP 构造的 URL 发起带短超时的普通 GET 请求——绝不请求 Router 的 Service，因为那样只会采样到单个副本而静默遗漏其余副本。
 func defaultServingViewFetch(ctx context.Context, url string) ([]byte, error) {
-	// ONE READ IS BOUNDED ON ITS OWN, at the per-fetch deadline, and the caller's own context still
-	// governs it: the earlier of the two deadlines wins, and a canceled caller ends the request
-	// with it. Without that bound a request that inherits only the collection's budget waits for
-	// that whole budget on one Router that never answers, which is exactly the shape of a Router
-	// that has wedged.
+	// 单次读取有其独立的单次拉取超时上限，并同时受调用方 context 的约束：两者中较早到期的截止时间生效，调用方取消时请求也会随之终止。若没有这一独立上限，仅继承整轮采集预算的请求会在某个无响应的 Router 上耗尽全部预算，而这正是 Router 卡死时的典型表现。
 	requestCtx, cancel := modelDeploymentObservationContext(ctx)
 	defer cancel()
 
@@ -950,9 +844,7 @@ func defaultServingViewFetch(ctx context.Context, url string) ([]byte, error) {
 		return nil, fmt.Errorf("observer answered %s", response.Status)
 	}
 
-	// THE BODY IS READ UNDER A CAP, not to its end. An observer that never finishes writing would
-	// otherwise hold a reconcile open for as long as it liked, and the deadline above is the only
-	// thing standing between one Router and a pass that never returns.
+	// 响应体在上限限制下读取，而非无限制读到末尾。否则一个始终写不完数据的观测目标会无限期拖住 reconcile，而上述超时上限正是防止单个 Router 导致整轮处理永不返回的唯一防线。
 	body := io.LimitReader(response.Body, modelDeploymentObserverMaxBodyBytes+1)
 	raw, err := io.ReadAll(body)
 	if err != nil {
@@ -966,13 +858,9 @@ func defaultServingViewFetch(ctx context.Context, url string) ([]byte, error) {
 	return raw, nil
 }
 
-// observeModelDeploymentServing is the reconcile-time collection: discover the Router
-// Pods the deployment renders, read each one's view directly, bind, and aggregate. Every
-// failure on the way is a property of the answer, not a reconcile error — a Router that
-// cannot be read is an Unknown in the wire, which is what the spec asks the field to say.
+// observeModelDeploymentServing 执行 reconcile 期间的采集流程：发现部署渲染出的 Router Pods，直接读取每个 Pod 的视图，进行绑定并聚合。过程中的所有失败都作为返回结果的属性体现，而非作为 reconcile error 返回——无法读取的 Router 在协议中对应 Unknown，这正是规范要求该字段表达的语义。
 //
-// IT IS THE ONE COLLECTION OF A PASS. The status and the restoration gate read this answer and
-// nothing else, so the two cannot answer about different moments.
+// 这是单轮协调中唯一的一次采集。状态更新与恢复门控只读取这份结果，因此两者不会针对不同时刻给出结论。
 func (r *ModelDeploymentReconciler) observeModelDeploymentServing(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) ServingAnswer {
@@ -989,16 +877,11 @@ func (r *ModelDeploymentReconciler) observeModelDeploymentServing(
 			Reason: failure.reason,
 		}
 		if !failure.retainable || len(live) == 0 {
-			// NO FRESH MEMBERSHIP, OR THE FAILURE PROVED THAT SOMETHING MOVED. There is no fact to
-			// publish, and a fact is the only thing that can hold a group open.
+			// 没有最新成员信息，或者失败已经证明有成员发生变动。此时没有可发布的事实，而只有确定事实才能维持分组处于开启状态。
 			return answer
 		}
 
-		// THE GROUP FACTS ARE STILL PUBLISHED, because they are computed from the fresh membership
-		// rather than from the view, and a view that was never read is not what a group is judged
-		// on. The facts say Unknown and carry no confirmed count, and the retention they carry is
-		// the existing one: every answering member holds the eligibility label and the annotation
-		// on it names the group's current complete membership generation.
+		// 分组事实仍会照常发布，因为它们是根据最新成员列表而非 Router 视图计算得出的，未读取到的视图不作为评判分组的依据。这些事实会标记为 Unknown 且不携带已确认计数，其携带的保留状态沿用现有状态：即每个应答成员均持有资格标签，且标签上的注解指明该分组当前完整的成员代次。
 		answer.CollectedAt = failure.readAt
 		answer.Groups, answer.Members = modelDeploymentServingGroups(md, live, nil, answer)
 
@@ -1009,9 +892,7 @@ func (r *ModelDeploymentReconciler) observeModelDeploymentServing(
 	answer.CollectedAt = modelDeploymentServingOldest(observations)
 	answer.Groups, answer.Members = modelDeploymentServingGroups(md, live, observations, answer)
 
-	// THE PUBLIC CONFIRMATION IS FILTERED BY THE GROUP FACTS, AND THE RAW EVIDENCE IS NOT TOUCHED.
-	// The aggregate keeps its own semantics, because the retirement path reads them, and a group
-	// seen half is not a deployment confirmed.
+	// 对外公布的确认状态会按分组事实进行过滤，而原始证据保持不动。聚合结果保留其自身语义供下线（retirement）路径读取，只被看到一半的分组不能代表整个部署已获确认。
 	if answer.State == workercore.ModelDeploymentServingStateConfirmed {
 		for _, group := range answer.Groups {
 			if group.SnapshotValid {
@@ -1028,10 +909,9 @@ func (r *ModelDeploymentReconciler) observeModelDeploymentServing(
 	return answer
 }
 
-// modelDeploymentServingOldest is when the oldest evidence in the collection was read.
+// modelDeploymentServingOldest 返回本次采集中最早一条证据的读取时间。
 //
-// THE FRESHNESS OF AN ANSWER IS THE FRESHNESS OF ITS OLDEST EVIDENCE, so this is the instant the
-// restoration decision compares against the freshness window.
+// 结果的新鲜度取决于其最早证据的新鲜度，因此恢复决策会用该时间与新鲜度窗口进行比较。
 func modelDeploymentServingOldest(observations []RouterServingObservation) time.Time {
 	oldest := time.Time{}
 	for _, observation := range observations {
@@ -1046,12 +926,9 @@ func modelDeploymentServingOldest(observations []RouterServingObservation) time.
 	return oldest
 }
 
-// modelDeploymentServingGroups computes the per-group serving facts and the per-member carried
-// facts from the fresh membership and the collected views.
+// modelDeploymentServingGroups 根据最新成员列表和采集到的视图，计算每个分组的服务事实及每个成员携带的事实。
 //
-// THE MEMBERSHIP IS THE FRESH READ THE COLLECTION MADE, and the carried facts come with it: they
-// are read from the same objects the views were bound to, so a member that was relabelled between
-// the two reads cannot be counted as one that carried the label.
+// 所用成员列表是采集时实时读取的结果，成员携带的事实也一并从中获取：它们读自与视图绑定的同一批对象，因此两次读取之间被重新打标的成员不会被误计为当时已携带标签。
 func modelDeploymentServingGroups(
 	md *workercore.ModelDeployment,
 	live []*corev1.Pod,
@@ -1070,9 +947,7 @@ func modelDeploymentServingGroups(
 		}
 	}
 
-	// THE ENDPOINTS THE ROUTER HOLDS, PER MEMBER AND PER LISTENER. The fold is the physical
-	// listener for the reason the deployment-wide union uses it: one member's engine registers a
-	// row per virtual rank and they all share the one listener that member serves.
+	// 按成员和监听器记录 Router 持有的端点。这里按物理监听器折叠的原因与部署级并集相同：单个成员的引擎会为每个虚拟 rank 注册一行，而它们共享该成员提供服务的同一个监听器。
 	held := map[types.UID]map[int32]bool{}
 	for _, observation := range observations {
 		for _, endpoint := range observation.Bound {
@@ -1088,17 +963,11 @@ func modelDeploymentServingGroups(
 		pods = append(pods, *pod)
 	}
 
-	// THE COLLECTION'S OWN VERDICT GATES THE GROUP FACTS.
+	// 采集自身的判定结果会作为分组事实的门控。
 	//
-	// AN ANSWER THAT IS NOT CONFIRMED SAYS THE COLLECTION WAS INCOMPLETE: no view was read, one
-	// was unusable, one was stale, or two views disagreed. An incomplete collection proves NOTHING
-	// ABOUT WHAT THE ROUTER HOLDS, and the group facts are computed from the endpoints that were
-	// bound, so without this gate a Router that did not answer would read as a Router that holds
-	// nothing, and the group would restore on the strength of a read that never happened.
+	// 未达到 Confirmed 状态的结果表明采集不完整：可能没有读取到视图、某个视图不可用、某个视图已过期，或两个视图存在冲突。不完整的采集无法证明 Router 实际持有任何端点，而分组事实是基于已绑定端点计算的；若没有这一门控，无响应的 Router 会被误读为未持有任何端点，分组就会仅凭一次从未发生的读取而恢复服务。
 	//
-	// THE RETENTION FACT IS NOT GATED BY IT, because the retention is proved by the fresh
-	// membership rather than by the view: an already eligible group of the unchanged generation
-	// keeps what it has while the answer is lost, which is exactly what an unusable answer is.
+	// 保留事实不受此门控限制，因为保留状态由最新成员列表而非视图证明：在结果丢失期间，代次未变的已有资格分组仍会维持现有状态，这正是处理不可用结果时的预期行为。
 	unsound := answer.State != workercore.ModelDeploymentServingStateConfirmed
 	unsoundReason := answer.Reason
 
@@ -1110,10 +979,7 @@ func modelDeploymentServingGroups(
 		if unsound {
 			fact.SnapshotValid = false
 			fact.State = workercore.ModelDeploymentServingStateUnknown
-			// A KNOWN FACT IS NOT ERASED BY A LATER UNCERTAINTY. The collection read the fresh
-			// membership and found a member that is not ready, and that word is a fact about the
-			// group whatever the Router's view did afterwards. The collection's own reason keeps
-			// its own place: it is the answer's reason, and it names the collection.
+			// 已知事实不会被后续的不确定性抹除。采集读取了最新成员列表并发现存在未就绪成员，这一事实无论 Router 视图之后如何变化都成立。采集自身的原因仍保留在原处：即作为整体结果的原因，用于说明采集本身的情况。
 			if !fact.MemberNotReady {
 				fact.InvalidReason = unsoundReason
 			}
@@ -1124,11 +990,9 @@ func modelDeploymentServingGroups(
 	return groups, members
 }
 
-// modelDeploymentGroupFact is what one group looks like from the collected views.
+// modelDeploymentGroupFact 计算单个分组在采集视图中的表现。
 //
-// THE EXPECTED ENDPOINTS ARE THE ANSWERING SET, read from the shape helpers rather than
-// re-derived here: an ordinary group of three members has ONE expected endpoint and three members,
-// and a count that conflated the two would publish a group of three as three endpoints.
+// 预期端点数对应于应答集合，直接从拓扑辅助函数读取而非在此重新推导：一个三成员的普通分组有 1 个预期端点和 3 个成员，如果混淆两者，就会把三成员分组发布为三个端点。
 func modelDeploymentGroupFact(
 	md *workercore.ModelDeployment,
 	view modelDeploymentReplicaView,
@@ -1147,15 +1011,9 @@ func modelDeploymentGroupFact(
 		return fact
 	}
 
-	// A GROUP WITH A MEMBER THAT IS NOT READY IS NOT A GROUP THAT MAY BE SERVED, whatever the
-	// Router holds. The Router's view answers whether the Router is serving the group; readiness
-	// answers whether the group may be served at all, and the fresh membership is the freshest
-	// word on that.
+	// 包含未就绪成员的分组不允许提供服务，无论 Router 当前持有多少端点。Router 视图回答的是 Router 是否正在为该分组提供服务；而就绪状态回答的是该分组是否根本被允许提供服务，最新成员列表对此拥有最新发言权。
 	//
-	// NO ACCEPTANCE PATH OPENS FOR AN UNSAFE GROUP. Not the retention, and not the fresh restore
-	// either: a collection that read the whole answering set confirms the Router's view of the
-	// group, and a confirmation about a group that may not be served is not a confirmation that
-	// restores it. The count stays unconfirmed, because only a confirmation carries one.
+	// 对于不安全的分组，任何放行路径都不会开启。既不能保留，也不能作为新分组恢复：采集即使读取了完整的应答集合并确认了 Router 对该分组的视图，针对不允许提供服务的分组做出的确认也不能触发恢复。计数也保持未确认，因为只有有效的确认才能携带计数。
 	if reason, unsafe := modelDeploymentGroupUnsafe(view, members); unsafe {
 		fact.SnapshotValid = false
 		fact.State = workercore.ModelDeploymentServingStateUnknown
@@ -1180,11 +1038,7 @@ func modelDeploymentGroupFact(
 		expected[member.UID] = true
 	}
 
-	// THE RETENTION FACT: every answering member carries the eligibility label, and the eligibility
-	// annotation on those members names the group's CURRENT complete membership generation. It is
-	// proved by the fresh membership rather than by the view, so it is computed before the view is
-	// judged: a partial view is an observation loss about half the group, and the retention is
-	// exactly what carries an already-eligible group of an unchanged generation through one.
+	// 保留事实：每个应答成员均带有资格标签，且这些成员上的资格注解标明了该分组当前完整的成员代次。它由最新成员列表而非视图证明，因此会在评判视图之前计算：部分视图意味着对半个分组的观测丢失，而保留机制正是让代次未变的已有资格分组得以度过观测丢失的关键。
 	fact.Retained = true
 	for _, member := range answering {
 		carried, known := members[member.UID]
@@ -1195,7 +1049,7 @@ func modelDeploymentGroupFact(
 		}
 	}
 
-	// THE ENDPOINTS THE ROUTER HOLDS FOR THIS GROUP, against the ones it is expected to hold.
+	// 对比 Router 为该分组实际持有的端点与预期应持有的端点。
 	observed := make(map[types.UID]bool, len(view.Members))
 	endpoints := int32(0)
 	for _, member := range view.Members {
@@ -1211,13 +1065,10 @@ func modelDeploymentGroupFact(
 		}
 	}
 
-	// A GROUP WHOSE EXPECTED ENDPOINTS CANNOT BE JUDGED IS A GROUP WHOSE COMPLETENESS CANNOT BE
-	// JUDGED. The Router holds either every expected endpoint of the group or none of them: a
-	// partial view is a contradiction, and a group seen half is not a group seen.
+	// 无法判定预期端点的分组，其完整性也无法判定。Router 要么持有该分组的所有预期端点，要么一个都不持有：部分持有属于自相矛盾的状态，只看到一半的分组不能算作已完成观测。
 	switch {
 	case len(observed) == 0:
-		// A COHERENT ZERO IS NOT A FAULT. It says the Router is not serving this group, which is a
-		// fact about the Router and not a verdict on the group, and it does not block a restore.
+		// 一致的零值并非故障。它仅说明 Router 当前未向该分组分发流量，这是关于 Router 状态的事实而非对分组的否定判定，不会阻挡恢复流程。
 		fact.SnapshotValid = true
 		fact.State = workercore.ModelDeploymentServingStateConfirmed
 	case modelDeploymentSameMembers(observed, expected):
@@ -1242,15 +1093,14 @@ func modelDeploymentGroupFact(
 	return fact
 }
 
-// modelDeploymentGroupUnsafe reports whether a member of the group is not ready, and why.
+// modelDeploymentGroupUnsafe 报告分组中是否存在未就绪的成员以及原因。
 //
-// A GROUP WITH AN UNREADY MEMBER IS UNSAFE. A member that has not reported ready is not a member
-// the group may be served by, and its healthy sibling does not make it one.
+// 包含未就绪成员的分组是不安全的。尚未报告就绪的成员不能作为分组的服务提供方，
+// 其健康的同级成员也不能使其具备服务能力。
 //
-// THE FRESH MEMBERSHIP DECIDES, because the qualification's own readiness legs read the caller's
-// list. A list that is behind the API server cannot say that a member is ready, so it cannot close
-// a group the fresh read has found unsafe, and the fresh word is the one the collection is defined
-// against.
+// 由最新成员列表决定结果，因为准入资格自身的就绪检查读取的是调用方的列表。
+// 落后于 API server 的列表无法判定成员已就绪，因此不能关闭最新读取已判定为不安全的分组；
+// 本次收集正是基于最新读取结果定义的。
 func modelDeploymentGroupUnsafe(
 	view modelDeploymentReplicaView, members map[types.UID]modelDeploymentMemberServing,
 ) (string, bool) {
@@ -1270,11 +1120,10 @@ func modelDeploymentGroupUnsafe(
 	return "", false
 }
 
-// modelDeploymentSameMembers reports whether two member sets hold the same members.
+// modelDeploymentSameMembers 报告两个成员集合是否包含相同的成员。
 //
-// THE SETS ARE COMPARED AND NOT THE COUNTS, because a group of three whose Router holds one
-// follower and not the leader holds as many members as a group whose Router holds the leader
-// alone, and only the sets tell them apart.
+// 这里比较的是集合本身而非数量，因为对于一个三成员分组，若 Router 仅持有一个
+// follower 而非 leader，其成员数量与仅持有 leader 的分组相同，只有集合能将两者区分开。
 func modelDeploymentSameMembers(a, b map[types.UID]bool) bool {
 	if len(a) != len(b) {
 		return false
@@ -1288,51 +1137,46 @@ func modelDeploymentSameMembers(a, b map[types.UID]bool) bool {
 	return true
 }
 
-// modelDeploymentCollectionFailure is why a collection produced no answer, and what that failure
-// leaves the operator allowed to conclude.
+// modelDeploymentCollectionFailure 表示一次收集未能得出结果的原因，以及该失败允许
+// operator 得出的结论。
 //
-// THE CLASS IS THE POINT, AND THE REASON STRING CANNOT CARRY IT. A failure that proved nothing
-// about the group's identity leaves a group that was already qualified at its current generation
-// with what it has, and the serving answer says Unknown. A failure that proved that something
-// moved closes the group, because the group is no longer the group that was qualified.
+// 关键在于失败分类，而非 reason 字符串所能承载的信息。未能证明分组身份发生变化的失败，
+// 会让已在当前 generation 通过准入的分组保留现有状态，服务状态回答为 Unknown。
+// 而证明有对象发生变动的失败则会关闭分组，因为该分组已不再是此前通过准入的那个分组。
 //
-// A FAILURE THAT IS NOT RETAINABLE IS A CLOSED ONE. There is no third state, and a fact is the
-// only thing that can hold a group open: a group fact is published on a failure path only when it
-// is computed from a membership read that actually happened.
+// 不可保留的失败即视为关闭。不存在第三种状态，且只有事实才能维持分组处于开放状态：
+// 仅当分组事实是基于实际发生的成员列表读取计算得出时，才会在失败路径上发布。
 type modelDeploymentCollectionFailure struct {
 	reason string
-	// retainable says the failure proved nothing about the group's identity.
+	// retainable 表示该失败未能证明分组的身份发生变化。
 	retainable bool
-	// readAt is when the fresh membership was read. It is the instant a failure-path answer
-	// carries, because that membership is the only evidence such an answer holds.
+	// readAt 是读取最新成员列表的时间戳。它是失败路径回答所携带的时间点，
+	// 因为该成员列表是此类回答所持有的唯一证据。
 	readAt time.Time
 }
 
-// modelDeploymentGuardError says WHICH read of the guard failed, because the opening and the
-// closing guard do not treat their failures alike.
+// modelDeploymentGuardError 指明保护检查中的哪一次读取失败，因为起始保护与结束保护
+// 对失败的处理方式不同。
 //
-// THE OPENING GUARD BINDS THE PASS TO THE OBJECT IT WAS ASKED ABOUT, so a failure to read the
-// deployment's own identity closes every group. THE CLOSING GUARD IS A BOOKEND: its failure means
-// it proved nothing, which is not the same as proving that something moved.
+// 起始保护将本次过程绑定到所查询的对象，因此读取 deployment 自身身份失败会关闭所有分组。
+// 结束保护仅作为边界校验：它的失败意味着未能证明任何变动，这与证明有对象发生变动不同。
 type modelDeploymentGuardError struct {
 	reason string
-	// identity says the deployment's own identity could not be read.
+	// identity 表示无法读取 deployment 自身的身份信息。
 	identity bool
-	// routers says the Router processes could not be listed.
+	// routers 表示无法列出 Router 进程。
 	routers bool
-	// members says the membership could not be listed.
+	// members 表示无法列出成员列表。
 	members bool
 }
 
 func (f modelDeploymentGuardError) Error() string { return f.reason }
 
-// collectModelDeploymentRouterObservationsWithMembers is the collection and the fresh membership it
-// read.
+// collectModelDeploymentRouterObservationsWithMembers 执行收集并返回其读取的最新成员列表。
 //
-// THE MEMBERSHIP COMES BACK BECAUSE THE GROUP FACTS ARE COMPUTED AGAINST IT. The per-group facts
-// read the answering set and each member's carried label and annotation, and reading them from the
-// caller's Pod list instead would read the informer cache's view of the deployment: a cached value
-// that has fallen behind is not new proof that a member was ever eligible.
+// 必须一并返回成员列表，因为分组事实是基于它计算的。每个分组的事实都会读取响应集合
+// 以及各成员携带的 label 和 annotation；如果改从调用方的 Pod 列表读取，就会读到
+// informer 缓存中的 deployment 视图：已落后的缓存值不能作为成员曾经具备资格的新证据。
 func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWithMembers(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) ([]RouterServingObservation, []*corev1.Pod, modelDeploymentCollectionFailure) {
@@ -1344,14 +1188,12 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 		}
 	}
 
-	// THE FRESH MEMBERSHIP IS READ FIRST, AND READ ONCE.
+	// 首先读取最新成员列表，且仅读取一次。
 	//
-	// IT IS THE EVIDENCE THE RETENTION RESTS ON, so it is read before anything that can fail, and
-	// the opening guard takes it rather than listing the members a second time. The closing guard
-	// still lists them, because its whole purpose is to see whether they moved.
+	// 它是状态保留所依赖的证据，因此会在任何可能失败的步骤之前读取，起始保护直接复用该结果，
+	// 而不再重复列出成员。结束保护仍会重新列出成员，因为其全部目的就是检查成员是否发生变动。
 	//
-	// THE PASS IS STILL BOUNDED BY ONE BUDGET AND ONE ROUND TRIP: no read was added, and one was
-	// removed.
+	// 整个过程仍受单一超时预算和一次往返限制：未增加额外读取，反而减少了一次读取。
 	live, err := r.listFreshModelDeploymentPods(collectCtx, md)
 	if err != nil {
 		return nil, nil, modelDeploymentCollectionFailure{
@@ -1360,37 +1202,32 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 	}
 	readAt := r.modelDeploymentNow()
 
-	// THE COLLECTION IS BOUNDED BY THE LIVE OBJECTS, not by the snapshot this pass started
-	// from. The deployment and its membership are read through the uncached reader before and
-	// after the views are collected; a changed UID, generation, owner or membership means the
-	// views describe a pool this pass no longer sees, and confirmed absence from an earlier
-	// snapshot would be a lie about the current one.
-	// EVERY FRESH READ SHARES THE COLLECTION BUDGET. The bookends are part of this pass, and a
-	// guard read on the caller's own context could outlive the pass it is bounding.
+	// 本次收集以实时对象为边界，而非以本轮开始时的快照为边界。在收集视图前后，都会通过
+	// 非缓存 reader 读取 deployment 及其成员列表；UID、generation、owner 或成员列表发生
+	// 变化，意味着视图所描述的池已不再是本轮所见的对象，基于早期快照确认成员缺失
+	// 将导致对当前状态的误判。
+	// 每次实时读取都共享本次收集的预算。边界检查属于本轮过程的一部分，若使用调用方自身的
+	// context 执行保护读取，其生命周期可能会超出它所约束的收集过程。
 	//
-	// THE FIRST BOOKEND IS TAKEN BEFORE ANY DISCOVERY. It is the state the pass is defined
-	// against, so a Router that appears or a member that leaves after it is a change underneath
-	// this collection, which is exactly what the closing bookend is there to catch.
+	// 第一次边界检查在任何服务发现之前完成。它是本轮收集所依据的基准状态，因此在这之后
+	// 出现的新 Router 或离开的成员都属于收集期间的底层变更，而结束边界检查正是为了捕获此类变更。
 	before, guardFailure := r.snapshotModelDeploymentObservationGuard(collectCtx, md, live)
 	if guardFailure.reason != "" {
 		if guardFailure.identity {
-			// THE PASS COULD NOT BIND ITSELF TO THE OBJECT IT WAS ASKED ABOUT, so it can conclude
-			// nothing about any group in it.
+			// 本轮过程未能绑定到所查询的对象，因此无法对其中的任何分组得出结论。
 			return nil, nil, modelDeploymentCollectionFailure{reason: guardFailure.reason}
 		}
 
-		// THE ROUTERS COULD NOT BE LISTED. The group is not the Router, and the fresh membership
-		// is in hand, so the groups keep what they had.
+		// 无法列出 Router。分组不等同于 Router，且最新成员列表已在手，因此各分组保留原有状态。
 		return nil, live, modelDeploymentCollectionFailure{
 			reason:     guardFailure.reason,
 			retainable: true,
 			readAt:     readAt,
 		}
 	}
-	// THE FIRST BOOKEND IS ALSO COMPARED WITH THE CALLER. Two equal fresh snapshots are a fact
-	// about the two reads alone, so a caller holding a REPLACED deployment would see the same
-	// before and after and read its own stale object as an unchanged one. The caller's UID and
-	// generation are the claim this collection has to be about.
+	// 第一次边界检查还会与调用方传入的对象进行比对。两次一致的实时快照仅反映这两次读取本身，
+	// 若调用方持有的是已被替换的 deployment，其前后快照也会相同，从而把陈旧对象误判为未变更。
+	// 调用方的 UID 和 generation 才是本次收集必须围绕的事实依据。
 	if !before.matchesCaller(md) {
 		return nil, nil, modelDeploymentCollectionFailure{
 			reason: fmt.Sprintf(
@@ -1401,9 +1238,9 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 		}
 	}
 
-	// DISCOVERY READS LIVE. The Router processes this pass will bind are the ones the API server
-	// still holds, not the ones the watch last delivered: a Router that rolled between the cache
-	// and this read would otherwise be read at an address the collection can no longer prove.
+	// 发现阶段执行实时读取。本轮过程将绑定的 Router 进程必须是 API server 当前仍持有的实例，
+	// 而非 watch 上次推送的旧实例：否则在缓存更新与本次读取之间发生滚动更新的 Router，
+	// 其被读取的地址将无法由本次收集证实。
 	routerPods := &corev1.PodList{}
 	if err := r.APIReader.List(collectCtx, routerPods,
 		ctrlcli.InNamespace(md.Namespace),
@@ -1420,38 +1257,35 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 		}
 	}
 
-	// BINDING USES THE SAME FRESH OBJECTS, not the caller's list. The endpoints a view binds to
-	// are resolved against Pods this pass re-read, so a member that was replaced, relabelled or
-	// replaced in place since the caller listed them cannot be counted as the member it claims.
+	// 绑定过程使用同一份实时对象，而非调用方的列表。视图所绑定的端点会基于本轮重新读取的
+	// Pod 进行解析，因此自调用方列出成员后发生过替换、标签变更或原地替换的成员，
+	// 不会被算作其所声称的成员。
 	fetch := r.servingViewFetch
 	if fetch == nil {
 		fetch = defaultServingViewFetch
 	}
 
-	// The observer is served on the listener the owning profile already runs. llm-d serves it on
-	// its management listener, which is where its metrics and admin endpoints already are; the
-	// other two serve it on the request port their Service targets. The port comes from the
-	// profile, never from an arbitrary Pod port, because a Pod port is not a contract.
+	// observer 运行在所属 profile 已启用的监听器上。llm-d 将其挂载在管理监听器上，
+	// 该监听器同时承载 metrics 和管理端点；另外两种 profile 则挂载在对应 Service 所指向的
+	// 请求端口上。端口号始终来自 profile 定义，绝不取自任意 Pod 端口，因为 Pod 端口不构成契约。
 	port := modelDeploymentRouterObserverPort(md.Spec.Router.Name)
-	// The dispatch journal is read only from the profile that publishes it. The other two publish
-	// the gateway's own last_job shape under that key, which this operator does not interpret.
+	// 仅从发布分发日志（dispatch journal）的 profile 读取该日志。另外两种 profile 在同一
+	// 键下发布的是网关自身的 last_job 结构，本 operator 不对其进行解析。
 	journal := md.Spec.Router.Name == workercore.ModelDeploymentRouterLLMD
-	// The chain behind the Router processes is read once per collection, not once per process.
-	// It lives and dies with this pass, so the next one reads it again from the API server.
+	// Router 进程背后的属主链在每次收集时仅读取一次，而非每个进程读取一次。
+	// 该链仅在本次收集期间有效，下次收集会重新从 API server 读取。
 	owners := newRouterOwnerChain(r.APIReader)
 	observations := make([]RouterServingObservation, 0, len(routerPods.Items))
 	for i := range routerPods.Items {
 		routerPod := &routerPods.Items[i]
-		// A terminating Router process is still a running Router process: it holds an address
-		// and its observer still answers, and dropping it here would read a shutdown as a
-		// converged empty registry. Coverage ends only when the process loses its address.
+		// 正在终止中的 Router 进程仍属于运行中的 Router 进程：它仍持有地址且 observer 仍会响应，
+		// 若在此处将其忽略，会把关闭过程误判为已收敛的空注册表。只有当进程失去地址时，覆盖才结束。
 		if routerPod.Status.PodIP == "" {
 			continue
 		}
-		// The view is only about this deployment when the Pod's owning chain is: each Router
-		// process is verified live, through the uncached reader, to be controlled by a
-		// ReplicaSet owned by this deployment. A process whose chain is missing or unreadable
-		// holds the observation rather than narrowing it.
+		// 仅当 Pod 的属主链属于该 deployment 时，其视图才与该 deployment 相关：每个 Router
+		// 进程都会通过非缓存 reader 进行实时校验，确认其受控于该 deployment 所属的 ReplicaSet。
+		// 属主链缺失或无法读取的进程会阻塞本次观测，而非缩小观测范围。
 		if err := r.verifyRouterPodOwnership(collectCtx, md, routerPod, owners); err != nil {
 			observations = append(observations, RouterServingObservation{
 				Err: fmt.Errorf("router process %s is not verified for this deployment: %w",
@@ -1471,10 +1305,9 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 
 			continue
 		}
-		// Stamped per view, after that view's own read: one timestamp taken before the loop
-		// would age every later view by however long the earlier reads ran, and a slow first
-		// fetch could push the last view's recorded age to the freshness edge before the
-		// aggregate ever judged it. The freshness gate in the aggregate is unchanged.
+		// 在每个视图各自读取完成后单独打上时间戳：若在循环前统一取一个时间戳，后续每个视图
+		// 的记录耗时都会叠加上前面所有读取的耗时，一次较慢的首个请求就可能在聚合阶段判定前
+		// 把最后一个视图推向新鲜度边界。聚合逻辑中的新鲜度阈值保持不变。
 		observation.CollectedAt = r.modelDeploymentNow()
 		observation.Bound, observation.RecentDispatch, err = bindRouterObservationView(observation.View, live, journal)
 		if err != nil {
@@ -1491,13 +1324,12 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 		}
 	}
 
-	// THE CHAIN IS BOOKENDED, like the deployment's own identity above. The owners were read
-	// once and shared by every process, so this pass re-reads each of them and refuses the whole
-	// collection if one moved while the views were being read. Without it, sharing the read would
-	// have meant a reparent after the first process went unnoticed by every later one.
+	// 与上文 deployment 自身的身份检查一样，属主链也执行边界校验。由于属主对象只读取一次并
+	// 由所有进程共享，本轮会在最后重新读取每一个属主对象，若在读取视图期间有属主发生变动，
+	// 则拒绝整次收集。否则，共享读取会导致在第一个进程校验后发生的重挂父级变更被后续进程忽略。
 	//
-	// THE ROUTERS MOVING IS NOT THE GROUP MOVING, so this failure retains: the membership the
-	// groups are judged on did not move, and the serving answer says Unknown.
+	// Router 的变动不等于分组的变动，因此此类失败允许保留状态：用于判定分组的成员列表未动，
+	// 服务状态回答为 Unknown。
 	if err := owners.verify(collectCtx); err != nil {
 		return nil, live, modelDeploymentCollectionFailure{
 			reason: fmt.Sprintf("the routers' owning chain changed while the routers were being "+
@@ -1509,13 +1341,11 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 
 	after, guardFailure := r.snapshotModelDeploymentObservationGuard(collectCtx, md, nil)
 	if guardFailure.reason != "" {
-		// A KNOWN CHANGE DOMINATES A LATER UNCERTAINTY. The closing bookend may have read enough
-		// to prove that the deployment or the membership moved before a later read failed, and a
-		// read failure must not erase a change the same snapshot already proved.
+		// 已知的变更优先于后续的不确定性。结束边界检查可能在后续读取失败前就已经读到了足以
+		// 证明 deployment 或成员列表发生变动的信息，一次读取失败绝不能抹除同一快照已经证实的变更。
 		//
-		// ONLY THE FACTS THE CLOSING SNAPSHOT ACTUALLY READ ARE COMPARED. A snapshot that failed
-		// before it read the deployment knows nothing about it, and a snapshot that failed before it
-		// listed the members knows nothing about them.
+		// 仅比对结束快照实际读取到的事实。在读取 deployment 之前就失败的快照对其一无所知，
+		// 在列出成员之前就失败的快照对成员列表也一无所知。
 		if before.deploymentMoved(after) {
 			return nil, live, modelDeploymentCollectionFailure{
 				reason: fmt.Sprintf(
@@ -1535,8 +1365,7 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 			}
 		}
 
-		// THE CLOSING BOOKEND COULD NOT BE READ. It exists to prove that something moved, and it
-		// proved nothing.
+		// 无法读取结束边界快照。它的存在是为了证明有对象发生变动，而此次它未能证明任何变动。
 		return nil, live, modelDeploymentCollectionFailure{
 			reason:     guardFailure.reason,
 			retainable: true,
@@ -1567,11 +1396,11 @@ func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservationsWith
 	return observations, live, modelDeploymentCollectionFailure{}
 }
 
-// listFreshModelDeploymentPods reads the deployment's own Pods through the uncached reader.
+// listFreshModelDeploymentPods 通过非缓存 reader 读取 deployment 自身的 Pod。
 //
-// IT IS THE CACHED LISTING'S SHAPE WITH THE UNCACHED READER, and that is deliberate: the ownership
-// filter the cache applies is the one that decides which Pods this deployment may count at all, and
-// re-deriving it here would be a second answer to "which Pods are mine" that could drift from it.
+// 它刻意保持与缓存列表一致的过滤方式并改用非缓存 reader：缓存所应用的属主过滤规则
+// 决定了该 deployment 可以计入哪些 Pod，若在此处重新推导一套规则，就会对
+// “哪些 Pod 属于我”产生第二套可能与之偏离的判定标准。
 func (r *ModelDeploymentReconciler) listFreshModelDeploymentPods(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) ([]*corev1.Pod, error) {
@@ -1597,40 +1426,38 @@ func (r *ModelDeploymentReconciler) listFreshModelDeploymentPods(
 	return owned, nil
 }
 
-// modelDeploymentObservationGuard is the uncached identity this collection is bounded by: the
-// deployment's UID, generation and controlling owner, plus the member UIDs it currently has.
+// modelDeploymentObservationGuard 是本次收集所绑定的非缓存身份边界：包括 deployment 的
+// UID、generation 与控制属主，以及其当前拥有的成员 UID。
 type modelDeploymentObservationGuard struct {
 	deploymentUID string
 	generation    int64
 	ownerUIDs     string
 	memberUIDs    string
-	// memberFacts and routerFacts are the per-Pod identities the bindings acted on. They are
-	// separate strings rather than folded into memberUIDs so a failure names which of the two
-	// changed, and memberUIDs keeps answering the plain membership question.
+	// memberFacts 和 routerFacts 是绑定逻辑所依据的单 Pod 身份事实。将它们作为独立字符串
+	// 而非合并进 memberUIDs，是为了在失败时能明确指出两者中哪一个发生了变化，同时让
+	// memberUIDs 继续单纯回答成员集合问题。
 	memberFacts string
 	routerFacts string
-	// read records which of the facts above this snapshot actually read.
+	// read 记录了该快照实际读取到了上述哪些事实。
 	read modelDeploymentGuardRead
 }
 
-// modelDeploymentGuardRead records which parts of a guard snapshot were read.
+// modelDeploymentGuardRead 记录了保护快照中哪些部分已被成功读取。
 //
-// A SNAPSHOT THAT FAILED PART WAY THROUGH KNOWS SOME OF THEM. The facts it did read are facts, and
-// a snapshot that proved the deployment changed must not lose that proof because the membership
-// listing failed afterwards. The facts it never reached are unknown, and an unknown is not a value
-// that can be compared: a field that was never read is not a change.
+// 中途失败的快照仍掌握已读到的那部分信息。已经读取的事实就是确凿事实，若快照已证明
+// deployment 发生变更，绝不能因为随后的成员列表读取失败而丢失该证据。尚未读取到的
+// 部分则处于未知状态，而未知值无法参与比对：从未读取的字段不构成变更。
 type modelDeploymentGuardRead struct {
 	deployment bool
 	members    bool
 	routers    bool
 }
 
-// snapshotModelDeploymentObservationGuard reads that identity through the uncached reader.
+// snapshotModelDeploymentObservationGuard 通过非缓存 reader 读取上述身份边界。
 //
-// THE MEMBERS ARE PASSED IN when the caller has already read them, and listed here when it has
-// not. THE OPENING GUARD TAKES THE HOISTED MEMBERSHIP READ, so the membership is listed once per
-// collection and not twice; THE CLOSING GUARD LISTS THEM AGAIN, because its whole purpose is to
-// see whether they moved.
+// 当调用方已经读取成员列表时直接传入，否则在此处重新列出。起始保护会复用前置提升的
+// 成员读取结果，使每次收集在开头只列出一次而非两次；结束保护则会重新列出成员，
+// 因为其全部目的就是检查成员是否发生变动。
 func (r *ModelDeploymentReconciler) snapshotModelDeploymentObservationGuard(
 	ctx context.Context, md *workercore.ModelDeployment, members []*corev1.Pod,
 ) (modelDeploymentObservationGuard, modelDeploymentGuardError) {
@@ -1651,9 +1478,8 @@ func (r *ModelDeploymentReconciler) snapshotModelDeploymentObservationGuard(
 	}
 	sort.Strings(ownerUIDs)
 
-	// THE DEPLOYMENT'S OWN FACTS ARE KNOWN FROM HERE ON, and they stay known when a later read
-	// fails. A snapshot that proved the deployment changed must not lose that proof because the
-	// membership or the Router listing failed afterwards.
+	// 从此处起 deployment 自身的事实已确定，且在后续读取失败时依然保持已知。
+	// 已证明 deployment 发生变更的快照，绝不能因为随后的成员或 Router 列表读取失败而丢失该证据。
 	guard.deploymentUID = string(live.UID)
 	guard.generation = live.Generation
 	guard.ownerUIDs = strings.Join(ownerUIDs, ",")
@@ -1686,16 +1512,14 @@ func (r *ModelDeploymentReconciler) snapshotModelDeploymentObservationGuard(
 			owned = append(owned, *members[i])
 		}
 	}
-	// EVERY FACT A BINDING ACTED ON IS IN THE BOOKEND, not only the membership. A member that kept
-	// its UID while its controlling owner, its role, its member rank or the listener it declares
-	// changed is a different member wearing the same name, and a UID-only comparison would read it
-	// as unchanged and confirm absence about it.
+	// 绑定逻辑所依赖的每一项事实都包含在边界校验中，而不仅仅是成员身份。如果一个成员
+	// 保留了原有 UID，但其控制属主、角色、成员序号或声明的监听器发生了变化，它实际上已是
+	// 顶着相同名字的另一个成员；仅比对 UID 会将其误判为未变化，进而错误地确认其缺失。
 	//
-	// The identity labels above are a prefilter, so the controller reference is confirmed here the
-	// same way listFreshModelDeploymentPods confirms it. A Pod that carries the labels but is not
-	// owned by this deployment is not a fact any binding can act on, and keeping it out is what makes
-	// the guard describe exactly the set the bindings read: otherwise one such Pod's churn refuses the
-	// whole collection over a member this deployment does not have.
+	// 上述身份标签只是预过滤条件，因此这里会采用与 listFreshModelDeploymentPods 相同的方式
+	// 确认 controller reference。携带这些标签但不属于当前 deployment 的 Pod 不是任何绑定
+	// 逻辑可依赖的事实，将其排除在外才能使保护快照精确描述绑定逻辑所读取的集合：
+	// 否则此类无关 Pod 的抖动会因一个本不属于当前 deployment 的成员而导致整次收集被拒绝。
 	memberUIDs := make([]string, 0, len(owned))
 	memberFacts := make([]string, 0, len(owned))
 	for i := range owned {
@@ -1705,14 +1529,14 @@ func (r *ModelDeploymentReconciler) snapshotModelDeploymentObservationGuard(
 	sort.Strings(memberUIDs)
 	sort.Strings(memberFacts)
 
-	// THE MEMBERSHIP'S FACTS ARE KNOWN FROM HERE ON, and they stay known when the Router listing
-	// fails. A member that left under the collection is a change the collection already proved.
+	// 从此处起成员列表的事实已确定，且在 Router 列表读取失败时依然保持已知。
+	// 收集期间离开的成员属于本次收集已经证实的变更。
 	guard.memberUIDs = strings.Join(memberUIDs, ",")
 	guard.memberFacts = strings.Join(memberFacts, ";")
 	guard.read.members = true
 
-	// The Router processes are read under the same snapshot for the same reason: a process that
-	// lost its address or changed owner is no longer the process this pass read.
+	// 出于同样原因，Router 进程也在同一快照中读取：失去地址或更换属主的进程
+	// 已不再是本轮过程此前读取到的进程。
 	routers := &corev1.PodList{}
 	if err := r.APIReader.List(ctx, routers,
 		ctrlcli.InNamespace(md.Namespace),
@@ -1741,20 +1565,18 @@ func (r *ModelDeploymentReconciler) snapshotModelDeploymentObservationGuard(
 	return guard, modelDeploymentGuardError{}
 }
 
-// identityMoved reports whether the deployment's own identity or the membership moved between two
-// bookends.
+// identityMoved 报告两次边界检查之间 deployment 自身身份或成员列表是否发生变动。
 //
-// THE ROUTER PROCESSES ARE NOT PART OF IT. A collection whose routers were reparented or replaced
-// describes a different set of processes, but the group's members did not move, and the retention
-// is proved by the fresh membership rather than by the view.
+// Router 进程不包含在内。即使收集到的 Router 发生重挂父级或替换而指向另一组进程，
+// 分组自身的成员并未变动，且状态保留由最新成员列表而非视图来证明。
 func (g modelDeploymentObservationGuard) identityMoved(other modelDeploymentObservationGuard) bool {
 	return g.deploymentMoved(other) || g.membersMoved(other)
 }
 
-// deploymentMoved reports whether the deployment's own identity moved between two snapshots.
+// deploymentMoved 报告两个快照之间 deployment 自身的身份是否发生变动。
 //
-// ONLY THE FACTS BOTH SNAPSHOTS READ. A snapshot that failed before the deployment was read knows
-// nothing about it, and an unknown is not a change: it is the absence of one.
+// 仅比对两个快照都已读取到的事实。在读取 deployment 之前就失败的快照对其一无所知，
+// 而未知不代表发生了变更：它意味着没有可确认的变更。
 func (g modelDeploymentObservationGuard) deploymentMoved(other modelDeploymentObservationGuard) bool {
 	if !g.read.deployment || !other.read.deployment {
 		return false
@@ -1765,11 +1587,11 @@ func (g modelDeploymentObservationGuard) deploymentMoved(other modelDeploymentOb
 		g.ownerUIDs != other.ownerUIDs
 }
 
-// membersMoved reports whether the membership moved between two snapshots.
+// membersMoved 报告两个快照之间成员列表是否发生变动。
 //
-// ONLY THE FACTS BOTH SNAPSHOTS READ, for the same reason as deploymentMoved. A closing snapshot
-// that failed before it listed the members knows nothing about them, and a closing snapshot that
-// read them knows them even if the Router listing failed afterwards.
+// 出于与 deploymentMoved 相同的原因，仅比对两个快照都已读取到的事实。在列出成员之前
+// 就失败的结束快照对成员列表一无所知；而已经读取到成员列表的结束快照，即使随后的
+// Router 列表读取失败，依然掌握成员信息。
 func (g modelDeploymentObservationGuard) membersMoved(other modelDeploymentObservationGuard) bool {
 	if !g.read.members || !other.read.members {
 		return false
@@ -1778,31 +1600,27 @@ func (g modelDeploymentObservationGuard) membersMoved(other modelDeploymentObser
 	return g.memberUIDs != other.memberUIDs || g.memberFacts != other.memberFacts
 }
 
-// matchesCaller reports whether the first uncached read is still the object the caller passed in.
+// matchesCaller 报告首次非缓存读取到的对象是否仍与调用方传入的对象一致。
 //
-// A CACHED OBJECT IS A CLAIM ABOUT THE PAST, and this collection is defined against what the
-// deployment is now. The caller's copy can be from a pass that started before a replacement, and
-// comparing only the two fresh snapshots would accept it, because both reads would agree on the
-// replacement and the disagreement is between the caller and both of them.
+// 缓存对象反映的是过去的状态，而本次收集是针对 deployment 的当前状态定义的。
+// 调用方持有的副本可能来自对象被替换前启动的轮次；若仅比对前后两次实时快照，
+// 它们都会一致反映替换后的新对象从而放行，而真正的分歧存在于调用方副本与这两次读取之间。
 func (g modelDeploymentObservationGuard) matchesCaller(md *workercore.ModelDeployment) bool {
 	return g.deploymentUID == string(md.UID) && g.generation == md.Generation
 }
 
-// modelDeploymentMemberFact is the identity a binding about this Pod would have read: its own UID,
-// its controlling owner as an identity, the workload role and member rank it declares, the
-// listeners it declares, whether it is running, and whether it is terminating. Two snapshots that
-// carry the same fact describe the same member; two that differ describe a member that moved.
+// modelDeploymentMemberFact 是关于该 Pod 的绑定逻辑所读取的身份事实：包括其自身 UID、
+// 作为身份标识的控制属主、声明的 workload 角色与成员序号、声明的监听器、是否正在运行，
+// 以及是否正在终止。持有相同事实的两个快照描述的是同一个成员；事实不同则表明成员已发生变动。
 //
-// THE READINESS IS PART OF THE FACT, because a member that stopped reporting ready is a member
-// that moved: it is no longer a member the group may be served by, and a member the group's
-// qualification admitted on an earlier readiness is not the member it admitted. The phase alone
-// does not say it, because a member whose readiness probe fails stays Running.
+// 就绪状态也是该事实的一部分，因为不再报告就绪的成员即视为发生了变动：它不再是可为分组
+// 提供服务的成员，而此前凭早先就绪状态准入的成员也已不再是当时准入的状态。仅靠 Pod phase
+// 无法体现这一点，因为 readiness 探针失败的成员仍会保持 Running。
 //
-// THE ELIGIBILITY LABEL AND THE GENERATION ANNOTATION ARE PART OF THE FACT, because the collection
-// now consumes them: the retention rule reads them to decide whether a group is eligible and
-// unchanged generation, and a fact that left them out would let a label or an annotation change
-// under the collection without the collection noticing. The member index above is the ordinal, and
-// it is here for the same reason.
+// 资格 label 和 generation annotation 同样属于该事实的一部分，因为收集过程现在会消费它们：
+// 保留规则通过读取它们来判定分组是否具备资格且 generation 未变；若事实中遗漏了它们，
+// 收集期间发生的 label 或 annotation 变更就会被忽略。上文中的 member index 即序数，
+// 出于同样原因也包含在此处。
 func modelDeploymentMemberFact(pod *corev1.Pod) string {
 	owner := "none"
 	if ref := meta.GetControllerOf(pod); ref != nil {
@@ -1832,28 +1650,24 @@ func modelDeploymentMemberFact(pod *corev1.Pod) string {
 	}, "|")
 }
 
-// routerOwnerChain holds the OWNING objects one collection verified, and only that
-// collection's.
+// routerOwnerChain 保存单次收集已校验的属主对象，且仅限本次收集使用。
 //
-// A Pod's controlling chain is immutable for the lifetime of that Pod, so every Router process
-// seated in one ReplicaSet verifies the same two objects. Reading them once per collection
-// instead of once per process turns a cost that grew with the replica count into a constant
-// one, and it is safe to do so HERE and nowhere else: verify re-reads every one of them before
-// the collection ends, so the answers were given against a chain that provably did not move
-// while the collection was running.
+// Pod 的控制链在其生命周期内不可变，因此位于同一 ReplicaSet 下的每个 Router 进程
+// 校验的都是相同的两个对象。将其改为每次收集读取一次而非每个进程读取一次，
+// 可以把随副本数线性增长的开销降为常数级；而且仅在此处这样做才是安全的：verify 会在
+// 收集结束前重新读取每一个属主对象，从而保证校验结论所依据的属主链在收集期间确未发生变动。
 //
-// IT IS NOT A PROCESS-LIFETIME CACHE. It is built by the collection, used by it and discarded
-// with it. A reparented owner, a replaced owner and a same-name replacement are all read afresh
-// by the next collection, and a same-name replacement is refused inside this one.
+// 这不是进程级生命周期缓存。它由单次收集构建、使用并随之销毁。重挂父级的属主、
+// 被替换的属主以及同名重建的对象在下一次收集时都会重新读取，而本次收集期间的同名替换
+// 则会被拒绝。
 type routerOwnerChain struct {
 	reader      ctrlcli.Reader
 	replicaSets map[ctrlcli.ObjectKey]*appsv1.ReplicaSet
 	deployments map[ctrlcli.ObjectKey]*appsv1.Deployment
 }
 
-// newRouterOwnerChain opens the per-collection record of what the chain's objects are, read
-// through the uncached reader because a cached answer is the snapshot this collection is
-// defined against.
+// newRouterOwnerChain 初始化每次收集的属主链对象记录，通过非缓存 reader 读取，
+// 因为本收集过程并不以缓存快照作为依据。
 func newRouterOwnerChain(reader ctrlcli.Reader) routerOwnerChain {
 	return routerOwnerChain{
 		reader:      reader,
@@ -1862,8 +1676,8 @@ func newRouterOwnerChain(reader ctrlcli.Reader) routerOwnerChain {
 	}
 }
 
-// replicaSet reads one ReplicaSet through the uncached reader, once per collection. Every
-// process asking for the same ReplicaSet gets the object this collection verified.
+// replicaSet 通过非缓存 reader 读取指定 ReplicaSet，每次收集仅读取一次。
+// 所有查询同一 ReplicaSet 的进程都会得到本次收集已校验的同一个对象。
 func (c routerOwnerChain) replicaSet(
 	ctx context.Context, key ctrlcli.ObjectKey,
 ) (*appsv1.ReplicaSet, error) {
@@ -1879,8 +1693,7 @@ func (c routerOwnerChain) replicaSet(
 	return replicaSet, nil
 }
 
-// deployment reads one Deployment through the uncached reader, once per collection, under the
-// same rule as replicaSet.
+// deployment 通过非缓存 reader 读取指定 Deployment，每次收集仅读取一次，规则与 replicaSet 相同。
 func (c routerOwnerChain) deployment(
 	ctx context.Context, key ctrlcli.ObjectKey,
 ) (*appsv1.Deployment, error) {
@@ -1896,14 +1709,12 @@ func (c routerOwnerChain) deployment(
 	return deployment, nil
 }
 
-// verify re-reads every object this collection judged a chain by, and reports the first one that
-// moved underneath it. A ReplicaSet or Deployment replaced, recreated or reparented while the
-// collection was running describes a chain the processes behind it were not verified against,
-// and confirming an observation from it would be confirming about an owner nobody re-checked.
+// verify 重新读取本次收集用于判定属主链的每一个对象，并报告第一个在收集期间发生变动的
+// 对象。在收集运行期间发生替换、重建或重挂父级的 ReplicaSet 或 Deployment，意味着
+// 其背后的进程并非基于当前属主链完成校验，若确认其观测结果，就相当于对未经复核的属主作出确认。
 //
-// THE COST IS CONSTANT IN THE PROCESS COUNT: two reads to share the chain and two to prove it
-// did not move, whatever the number of Router processes, where each process verified its own
-// chain and spent two reads on the owners.
+// 该开销相对于进程数量是常数级的：无论有多少个 Router 进程，只需两次读取共享属主链，
+// 再用两次读取证明其未变动；而此前每个进程都需要独立校验属主链并消耗两次属主读取。
 func (c routerOwnerChain) verify(ctx context.Context) error {
 	for key, verified := range c.replicaSets {
 		fresh := new(appsv1.ReplicaSet)
@@ -1915,9 +1726,9 @@ func (c routerOwnerChain) verify(ctx context.Context) error {
 			return fmt.Errorf("the router process's ReplicaSet %q was replaced while the routers "+
 				"were being observed", key.Name)
 		}
-		// IDENTITY AND OWNER, as for the Deployment below: the two move independently, and a
-		// ReplicaSet reparented to another ModelDeployment keeps its UID while the chain every
-		// process was verified against names the old owner.
+		// 与下文的 Deployment 一样，同时检查身份与属主：两者会独立变化，若一个 ReplicaSet 被
+		// 重挂父级到另一个 ModelDeployment，它会保留原有 UID，而此前所有进程校验所依据的属主链
+		// 指向的仍是旧属主。
 		if ownerIdentity(fresh) != ownerIdentity(verified) {
 			return fmt.Errorf("the router process's ReplicaSet %q changed owner while the routers "+
 				"were being observed", key.Name)
@@ -1929,9 +1740,9 @@ func (c routerOwnerChain) verify(ctx context.Context) error {
 			return fmt.Errorf("the router process's Deployment %q could not be re-read uncached: %w",
 				key.Name, err)
 		}
-		// IDENTITY AND OWNER, because they move independently: a Deployment deleted and recreated
-		// under the same name keeps its name and loses its UID, and one reparented to another
-		// ModelDeployment keeps its UID and loses the owner this collection verified.
+		// 需同时校验身份与属主，因为二者会独立变化：同名删除并重建的 Deployment 会保留名称
+		// 但失去原 UID，而被重新挂载到另一个 ModelDeployment 下的 Deployment 会保留 UID 但
+		// 失去本次采集所验证的属主。
 		if fresh.UID != verified.UID {
 			return fmt.Errorf("the router process's Deployment %q was replaced while the routers "+
 				"were being observed", key.Name)
@@ -1945,8 +1756,8 @@ func (c routerOwnerChain) verify(ctx context.Context) error {
 	return nil
 }
 
-// ownerIdentity is one object's controlling owner at full identity, or the word none when it has
-// no controller. Two reads carrying the same owner identity are the same owner.
+// ownerIdentity 返回对象控制属主的完整身份标识，若无控制器则返回 none。
+// 两次读取具有相同的属主身份即表示同一属主。
 func ownerIdentity(obj ctrlcli.Object) string {
 	ref := meta.GetControllerOf(obj)
 	if ref == nil {
@@ -1958,22 +1769,20 @@ func ownerIdentity(obj ctrlcli.Object) string {
 	}, "/")
 }
 
-// verifyRouterPodOwnership checks the live controlling-owner chain of one Router process: the Pod
-// is controlled by a ReplicaSet that still exists with that identity, and that ReplicaSet is
-// controlled by this deployment. The read goes through the uncached reader, because a cached
-// answer is the snapshot this collection is defined against.
+// verifyRouterPodOwnership 校验单个 Router 进程的实时控制属主链：该 Pod 由仍以
+// 对应身份存在的 ReplicaSet 控制，且该 ReplicaSet 由当前部署控制。读取通过无缓存
+// reader 进行，因为缓存结果是本次采集所依据的快照。
 //
-// THE POD IS READ FOR EVERY PROCESS, WHILE THE OWNERS ARE READ ONCE PER COLLECTION. That split
-// is deliberate. The Pod is the object this collection is about, so a replaced one has to be
-// seen here and now; the owners behind it are one shared chain whose identity each process then
-// checks against its own Pod's claim, so one read answers every process asking.
+// 每个进程都会读取一次 Pod，而属主链每次采集仅读取一次。这一划分是刻意为之的。
+// Pod 是本次采集直接针对的对象，因此必须在此刻实时察觉其是否已被替换；而其背后的
+// 属主是一条共享链路，每个进程只需将自身 Pod 声明的引用与该共享链路的身份比对即可，
+// 因此一次读取便可响应所有进程的校验。
 func (r *ModelDeploymentReconciler) verifyRouterPodOwnership(
 	ctx context.Context, md *workercore.ModelDeployment, pod *corev1.Pod, owners routerOwnerChain,
 ) error {
-	// THE POD ITSELF IS RE-READ. The object handed in came from a listing, and a listing is a
-	// snapshot; this check is the one that says the chain is live, so it may not be answered from
-	// a copy of the Pod taken before the collection started. A Router that was adopted or
-	// replaced since that listing is only visible here.
+	// 重新读取 Pod 本身。传入的对象来自列表查询（即一份快照）；此处的校验用于确认属主链
+	// 处于实时有效状态，因此不能使用采集开始前获取的 Pod 副本作答。列表查询之后被接管
+	// 或替换的 Router 只能在此处被观测到。
 	live := new(corev1.Pod)
 	if err := r.APIReader.Get(ctx, ctrlcli.ObjectKeyFromObject(pod), live); err != nil {
 		return fmt.Errorf("the router process could not be re-read uncached: %w", err)
@@ -1995,14 +1804,14 @@ func (r *ModelDeploymentReconciler) verifyRouterPodOwnership(
 	if err != nil {
 		return fmt.Errorf("the router process's ReplicaSet could not be read uncached: %w", err)
 	}
-	// THE IDENTITY CHECK IS NOT THE READ. The Pod's own owner reference is this process's claim
-	// about its chain, and it is compared to the owner this collection verified for every
-	// process, so a Pod pointing at a chain this collection never read is refused here.
+	// 身份校验并非读取操作本身。Pod 自身的 owner reference 是该进程对其属主链的声明，
+	// 会与本次采集为所有进程验证过的属主进行比对，因此指向本次采集从未读取过的属主链
+	// 的 Pod 会在此处被拒绝。
 	if replicaSet.UID != ref.UID {
 		return fmt.Errorf("the router process's ReplicaSet changed identity during observation")
 	}
-	// The chain continues through the workload Deployment the ReplicaSet scales, and ends at
-	// this deployment: kind, API version and identity at every hop.
+	// 该属主链经由 ReplicaSet 所扩缩的工作负载 Deployment 向上延伸，并止步于当前部署：
+	// 每一跳都需校验 kind、API version 与身份标识。
 	deploymentRef := meta.GetControllerOf(replicaSet)
 	if deploymentRef == nil {
 		return fmt.Errorf("the router process's ReplicaSet has no controlling Deployment")
@@ -2033,9 +1842,9 @@ func (r *ModelDeploymentReconciler) verifyRouterPodOwnership(
 	return nil
 }
 
-// applyModelDeploymentServing writes the observed answer onto every role's serving field.
-// An empty answer is the unobserved default and leaves the status exactly as the status
-// builder wrote it, which keeps the status derivation itself free of observation concerns.
+// applyModelDeploymentServing 将观测结果写入每个角色的 serving 字段。
+// 空结果表示未观测的默认状态，会原样保留状态构建器生成的状态，从而使状态推导
+// 逻辑本身与观测细节解耦。
 func applyModelDeploymentServing(
 	status *workercore.ModelDeploymentStatus, answer ServingAnswer,
 ) {
@@ -2046,17 +1855,16 @@ func applyModelDeploymentServing(
 		status.Roles[i].Endpoints.Serving = workercore.ModelDeploymentServingStatus{
 			State: answer.State,
 		}
-		// ONLY A CONFIRMED ANSWER CARRIES A NUMBER. Unknown, NotConverged and NotConfigured all
-		// state that no count was established, and the API carries that as an absent value: a
-		// zero written into a state that never measured anything is a measurement of zero, which
-		// is the false zero this whole path exists to refuse.
+		// 只有已确认（Confirmed）的结果才携带数值。Unknown、NotConverged 和 NotConfigured
+		// 均表示未能确立计数，API 中以缺省值表达这一语义：若向从未测量的状态写入零，
+		// 会被误读为测得零值，而整条路径正是为了杜绝这种虚假的零值。
 		if answer.State != workercore.ModelDeploymentServingStateConfirmed {
 			continue
 		}
-		// A ROLE WITH NO ENDPOINT IN THE UNION IS ZERO, not the deployment's total. The count is
-		// read from the answer's own per-role map, and a role the map does not name has none, so
-		// the field says what this role is serving rather than what the deployment is. The value
-		// is per role and is a copy, so two roles never share one addressable count.
+		// 并集中没有端点的角色对应计数为零，而非整个部署的总数。计数从结果自身的按角色
+		// 映射表中读取，映射表中未列出的角色即表示没有端点，因此该字段反映的是该角色
+		// 当前正在服务的数量，而非整个部署的数量。每个角色的值均为独立副本，不会出现两个
+		// 角色共享同一可寻址计数的情况。
 		roleValue := answer.ByRole[status.Roles[i].Name]
 		status.Roles[i].Endpoints.Serving.Value = &roleValue
 	}

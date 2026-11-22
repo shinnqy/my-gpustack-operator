@@ -15,12 +15,9 @@ import (
 	"gpustack.ai/gpustack/pkg/webhook"
 )
 
-// ModelStoreBindingWebhook validates a v1alpha1.ModelStoreBinding.
+// ModelStoreBindingWebhook 用于校验 v1alpha1.ModelStoreBinding。
 //
-// It is validating only. What it holds is what a schema cannot: the existence of every store the
-// grant names, the positivity of a quota written as a quantity string, and the immutability that
-// keeps a grant from being re-pointed or shrunk under consumption that admission already waved
-// through.
+// 该 Webhook 仅执行校验，负责检查 schema 无法覆盖的约束：授权引用的每个 store 均存在、以数量字符串表示的配额为正值，以及不可变性约束——防止授权在准入已放行占用的情况下被重新指向或缩减配额。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="modelstorebindings",scope="Namespaced"
@@ -44,10 +41,9 @@ var (
 	_ webhook.ReceiveDeletionUpdate           = (*ModelStoreBindingWebhook)(nil)
 )
 
-// ReceiveDeletionUpdate keeps this webhook validating updates to a Binding that is being deleted.
+// ReceiveDeletionUpdate 使本 Webhook 在 Binding 处于删除过程中时仍继续校验其更新。
 //
-// The freeze is worth most in exactly that window: a grant edited while it is being taken away is
-// the shape an audit reads afterwards.
+// 冻结约束恰恰在删除窗口期最为关键：在授权被收回的同时对其进行编辑，正是事后审计需要排查的情况。
 func (r *ModelStoreBindingWebhook) ReceiveDeletionUpdate() {}
 
 func (r *ModelStoreBindingWebhook) ValidateCreate(
@@ -57,7 +53,7 @@ func (r *ModelStoreBindingWebhook) ValidateCreate(
 
 	errs := validateModelStoreBindingSpec(binding)
 	if len(errs) == 0 {
-		// The cross-object questions are asked only once the object's own shape holds.
+		// 仅当对象自身结构合法时，才执行跨对象校验。
 		errs = append(errs, r.validateModelStoreRefsExist(ctx, binding)...)
 	}
 	if len(errs) > 0 {
@@ -75,9 +71,7 @@ func (r *ModelStoreBindingWebhook) ValidateUpdate(
 	errs := validateModelStoreBindingSpec(newBinding)
 	errs = append(errs, validateModelStoreBindingImmutable(oldBinding, newBinding)...)
 	if len(errs) == 0 && modelStoreRefsMoved(oldBinding, newBinding) {
-		// Re-read only when the grant moved onto stores it had not named. storeRefs is immutable, so
-		// this branch is unreachable for now — the guard exists so that if immutability ever
-		// narrows, the existence check comes back with it rather than silently staying away.
+		// 仅当授权指向了此前未引用的 store 时才重新读取检查。由于 storeRefs 当前不可变，该分支暂不可达——保留此保护是为了在未来放宽不可变限制时能自动恢复存在性校验，而不是静默跳过。
 		errs = append(errs, r.validateModelStoreRefsExist(ctx, newBinding)...)
 	}
 	if len(errs) > 0 {
@@ -90,12 +84,11 @@ func (r *ModelStoreBindingWebhook) ValidateUpdate(
 func (r *ModelStoreBindingWebhook) ValidateDelete(
 	_ context.Context, _ runtime.Object,
 ) (ctrladmission.Warnings, error) {
-	// Taking a grant away is always allowed: the namespace's prefetches lose their basis and the
-	// accounting controller reports them, which is the honest answer to a revoked grant.
+	// 收回授权始终是被允许的：对应 Namespace 的 prefetch 将失去授权依据并由记账控制器上报，这如实反映了授权被撤销后的状态。
 	return nil, nil
 }
 
-// validateModelStoreBindingSpec holds every rule answerable from the object alone.
+// validateModelStoreBindingSpec 包含仅依据对象自身即可判定的所有校验规则。
 func validateModelStoreBindingSpec(binding *workercore.ModelStoreBinding) field.ErrorList {
 	specPath := field.NewPath("spec")
 
@@ -108,8 +101,7 @@ func validateModelStoreBindingSpec(binding *workercore.ModelStoreBinding) field.
 		}
 	}
 
-	// A budget of zero would grant a cache and refuse every prefetch with one message: the state
-	// it would allow does not work, so it does not pass.
+	// 配额为零意味着授予了缓存权限却会以同一报错拒绝所有 prefetch：这种被允许的状态无法正常工作，因此不予通过。
 	if binding.Spec.Quota.Bytes.Sign() <= 0 {
 		errs = append(errs, field.Invalid(specPath.Child("quota", "bytes"), binding.Spec.Quota.Bytes.String(),
 			"must be greater than 0: it is the byte budget every prefetch of this namespace draws on"))
@@ -118,11 +110,7 @@ func validateModelStoreBindingSpec(binding *workercore.ModelStoreBinding) field.
 	return errs
 }
 
-// validateModelStoreBindingImmutable holds the grant still. The two exceptions are the growth
-// paths: allowPinned false→true widens a grant without moving it, and a quota increase funds more
-// of the same. A quota DECREASE is refused even though no byte has moved yet, because the
-// accounting counts what prefetches are PROJECTED to hold, and retroactively making an admitted
-// prefetch over budget reads as an operator error the operator did not make.
+// validateModelStoreBindingImmutable 保持授权配置稳定不变，仅允许两条扩容路径：allowPinned 从 false 变为 true 可在不迁移授权的情况下放宽权限，而调高配额可提供更多同类资源。即使尚未产生实际数据占用，调低配额也会被拒绝，因为记账统计的是 prefetch 预计占用的容量，若事后导致已准入的 prefetch 超出预算，会表现为操作员并未犯下的操作错误。
 func validateModelStoreBindingImmutable(old, next *workercore.ModelStoreBinding) field.ErrorList {
 	specPath := field.NewPath("spec")
 
@@ -141,7 +129,7 @@ func validateModelStoreBindingImmutable(old, next *workercore.ModelStoreBinding)
 			fmt.Sprintf("cannot shrink: prefetches admitted against %s would turn over budget by an "+
 				"edit; grow the budget instead when the namespace needs more", old.Spec.Quota.Bytes.String())))
 	case cmp == 0:
-		// Unmoved, which is the ordinary update (a status write or a no-op resubmit).
+		// 授权未发生变更，属于常规更新（如 status 写入或无实际变更的重新提交）。
 	}
 
 	if modelStoreBindingAllowsPinned(old) && !modelStoreBindingAllowsPinned(next) {
@@ -153,13 +141,12 @@ func validateModelStoreBindingImmutable(old, next *workercore.ModelStoreBinding)
 	return errs
 }
 
-// modelStoreBindingAllowsPinned is the effective allowPinned, nil reading as the false default.
+// modelStoreBindingAllowsPinned 返回生效的 allowPinned 值，nil 视为默认值 false。
 func modelStoreBindingAllowsPinned(binding *workercore.ModelStoreBinding) bool {
 	return binding.Spec.AllowPinned != nil && *binding.Spec.AllowPinned
 }
 
-// validateModelStoreRefsExist refuses a grant naming a store that does not exist: a Binding over a
-// ghost store would report Ready and refuse every prefetch with a message about the ghost.
+// validateModelStoreRefsExist 拒绝引用不存在 store 的授权：基于不存在 store 的 Binding 会报告 Ready，却在每次 prefetch 时因找不到该 store 而拒绝请求。
 func (r *ModelStoreBindingWebhook) validateModelStoreRefsExist(
 	ctx context.Context, binding *workercore.ModelStoreBinding,
 ) field.ErrorList {
@@ -169,13 +156,11 @@ func (r *ModelStoreBindingWebhook) validateModelStoreRefsExist(
 
 	for i, ref := range binding.Spec.StoreRefs {
 		if ref.Name == "" {
-			continue // already reported by the shape check
+			continue // 结构校验已报告该错误
 		}
 		err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: ref.Name}, new(workercore.ModelStore))
 		if kerrors.IsNotFound(err) {
-			// storeRefs is immutable and the check is failurePolicy=Fail, so a cache a beat behind
-			// would permanently reject a grant over a store that exists. Re-read uncached before
-			// refusing.
+			// storeRefs 不可变且校验策略为 failurePolicy=Fail，因此缓存哪怕滞后一拍都会永久拒绝指向已存在 store 的授权。在拒绝前先绕过缓存重新读取确认。
 			err = r.APIReader.Get(ctx, ctrlcli.ObjectKey{Name: ref.Name}, new(workercore.ModelStore))
 		}
 		switch {
@@ -191,7 +176,7 @@ func (r *ModelStoreBindingWebhook) validateModelStoreRefsExist(
 	return errs
 }
 
-// modelStoreRefsMoved reports whether the update named a store list it had not named before.
+// modelStoreRefsMoved 报告本次更新是否指定了此前未包含的 store 列表。
 func modelStoreRefsMoved(old, next *workercore.ModelStoreBinding) bool {
 	return !slices.EqualFunc(old.Spec.StoreRefs, next.Spec.StoreRefs,
 		func(a, b workercore.ModelStoreBindingStoreReference) bool { return a.Name == b.Name })

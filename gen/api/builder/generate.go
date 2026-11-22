@@ -60,7 +60,7 @@ func Generate(c Config) error {
 
 	internalAPIs := append(slices.Clone(c.APIs), c.ExtensionAPIs...)
 
-	// Execute conversion-gen.
+	// 执行 conversion-gen。
 	if len(internalAPIs) > 0 {
 		klog.Info("executing conversion-gen")
 
@@ -95,7 +95,7 @@ func Generate(c Config) error {
 		klog.Info("executed conversion-gen")
 	}
 
-	// Execute deepcopy-gen.
+	// 执行 deepcopy-gen。
 	if len(internalAPIs) > 0 {
 		klog.Info("executing deepcopy-gen")
 
@@ -120,7 +120,7 @@ func Generate(c Config) error {
 		klog.Info("executed deepcopy-gen")
 	}
 
-	// Execute register-gen.
+	// 执行 register-gen。
 	if len(internalAPIs) > 0 {
 		klog.Info("executing register-gen")
 
@@ -145,16 +145,11 @@ func Generate(c Config) error {
 		klog.Info("executed register-gen")
 	}
 
-	// Execute go-to-protobuf.
+	// 执行 go-to-protobuf。
 	if len(internalAPIs) > 0 {
 		klog.Info("executing go-to-protobuf")
 
-		// The proto message markers are not produced any more. The upstream generator
-		// used to write a second file holding the empty ProtoMessage markers behind a
-		// build tag, and it used to remove that file when the markers went away. It
-		// now does neither, so a checked-in copy would survive as an orphan that no
-		// longer matches the API types. The stale copy is removed before the run, so
-		// that a generator which emits the file again would simply write it afresh.
+		// 不再生成 proto message 标记。上游生成器过去会在构建标签下写入另一个\n// 包含空 ProtoMessage 标记的文件，并在标记消失时删除该文件。现在它\n// 两者都不再执行，因此已签入的副本会作为孤立文件残留，不再与 API 类型\n// 匹配。运行前会先移除过时副本，以便在生成器再次输出该文件时直接\n// 重新写入。
 		for i := range internalAPIs {
 			protomessageFile := filepath.Join(
 				c.ProjectDir,
@@ -189,7 +184,7 @@ func Generate(c Config) error {
 		klog.Info("executed go-to-protobuf")
 	}
 
-	// Execute crd-gen.
+	// 执行 crd-gen。
 	if len(c.APIs) > 0 {
 		klog.Info("executing crd-gen")
 
@@ -214,7 +209,7 @@ func Generate(c Config) error {
 		klog.Info("executed crd-gen")
 	}
 
-	// Execute apireg-gen.
+	// 执行 apireg-gen。
 	if len(c.ExtensionAPIs) > 0 {
 		klog.Info("executing apireg-gen")
 
@@ -239,9 +234,9 @@ func Generate(c Config) error {
 		klog.Info("executed apireg-gen")
 	}
 
-	// Execute openapi-gen.
+	// 执行 openapi-gen。
 	if len(internalAPIs) > 0 {
-		// Grouped internal APIs with their group.
+		// 按组归类的内部 API。
 		groupedInternalAPIs := make(map[string][]string)
 		for _, api := range internalAPIs {
 			g := path.Dir(api)
@@ -295,20 +290,16 @@ func Generate(c Config) error {
 
 	clientPackageDir := path.Join(c.ProjectDir, strings.TrimPrefix(c.ClientPackage, c.Project))
 
-	// Allow expansion interfaces,
-	// we don't remove the whole clientset anymore.
-	// See https://github.com/kubernetes/community/blob/main/contributors/devel/sig-api-machinery/generating-clientset.md.
-	// _ = os.RemoveAll(path.Join(clientPackageDir, c.ClientsName))
+	// 允许扩展接口，\n// 不再删除整个 clientset。\n// 参见 https://github.com/kubernetes/community/blob/main/contributors/devel/sig-api-machinery/generating-clientset.md。\n// _ = os.RemoveAll(path.Join(clientPackageDir, c.ClientsName))
 	allAPIs := append(slices.Clone(internalAPIs), c.ExternalAPIs...)
 
-	// Execute applyconfiguration-gen.
+	// 执行 applyconfiguration-gen。
 	applyConfigPkg := path.Join(c.ClientPackage, c.ClientsName, "applyconfiguration")
 	{
 		klog.Info("executing applyconfiguration-gen")
 
 		applygenExternalConfig := map[typesv2.Name]string{ // nolint:lll
-			// Always include the applyconfigurations we've generated in client-go.
-			// They are sufficient for the vast majority of use cases.
+			// 始终包含在 client-go 中生成的 applyconfiguration。\n// 它们足以满足绝大多数使用场景。
 			{Package: "k8s.io/apimachinery/pkg/apis/meta/v1", Name: "Condition"}:                "k8s.io/client-go/applyconfigurations/meta/v1",
 			{Package: "k8s.io/apimachinery/pkg/apis/meta/v1", Name: "DeleteOptions"}:            "k8s.io/client-go/applyconfigurations/meta/v1",
 			{Package: "k8s.io/apimachinery/pkg/apis/meta/v1", Name: "LabelSelector"}:            "k8s.io/client-go/applyconfigurations/meta/v1",
@@ -349,7 +340,7 @@ func Generate(c Config) error {
 		return ss
 	}()
 
-	// Execute client-gen.
+	// 执行 client-gen。
 	clientsetPkg := path.Join(c.ClientPackage, c.ClientsName, c.ClientSetName)
 	{
 		klog.Info("executing client-gen")
@@ -401,7 +392,7 @@ func Generate(c Config) error {
 		klog.Info("executed client-gen")
 	}
 
-	// Execute lister-gen.
+	// 执行 lister-gen。
 	listerPkg := path.Join(c.ClientPackage, c.ClientsName, "listers")
 	{
 		klog.Info("executing lister-gen")
@@ -429,7 +420,7 @@ func Generate(c Config) error {
 		klog.Info("executed lister-gen")
 	}
 
-	// Execute informer-gen.
+	// 执行 informer-gen。
 	informerPkg := path.Join(c.ClientPackage, c.ClientsName, "informers")
 	{
 		klog.Info("executing informer-gen")

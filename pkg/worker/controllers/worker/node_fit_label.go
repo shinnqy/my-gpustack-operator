@@ -28,20 +28,11 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/mapx"
 )
 
-// NodeFitLabelReconciler keeps the fit labels on a managed Node, derived from the same-named Devices
-// ledger: per accelerator model, the largest free units on any one card that can serve a logical
-// slice, and the number of cards that can still grant an ownership share.
+// NodeFitLabelReconciler 维护受管 Node 上的适配标签（fit label），其值派生自同名的 Devices 账本：按加速器型号统计单张卡上可提供给逻辑切片的最大剩余容量，以及仍可授予独占共享份额（ownership share）的卡数量。
 //
-// Kueue's topology-aware scheduling places a Workload from a node's summed capacity, so on a node
-// whose free room is spread over cards none of which fits, it places the Workload there, the
-// node-devices check answers Retry, and it places it there again. The Workload webhook pins a slice
-// or shared request to these labels through a required node affinity in the Workload's PodSet
-// template, which TAS honors, so a fragmented node is skipped instead.
+// Kueue 的拓扑感知调度（TAS）根据节点的汇总容量放置 Workload，因此对于剩余空间分散在多张卡上但单张卡均不足以容纳的节点，TAS 仍会将 Workload 放到该节点，随后 node-devices 检查返回 Retry，接着 TAS 又会再次放到该节点。Workload webhook 通过在 Workload 的 PodSet 模板中添加硬性节点亲和性（required node affinity），将切片或共享请求绑定到这些适配标签上，而 TAS 会遵循该亲和性，从而跳过碎片化的节点。
 //
-// Both values use the node-devices check's own per-card predicates, so for a single Pod asking for
-// one card the label admits a node exactly when the check would. They filter only; nothing is
-// charged against them. A value is written only when it changes, after a dedup window on ledger
-// events, so the cost is at most one Node metadata patch per allocation or release burst.
+// 两个标签值均复用 node-devices 检查自身的单卡判定条件，因此对于请求单张卡的单个 Pod，标签允许调度的节点与检查放行的节点完全一致。它们仅用于过滤，不参与任何资源扣减。仅当数值发生变化时才会写入，并结合账本事件的去重时间窗口，因此每次批量分配或释放最多只产生一次 Node 元数据 patch。
 type NodeFitLabelReconciler struct {
 	Client ctrlcli.Client
 }
@@ -51,27 +42,24 @@ var _ ctrlreconcile.Reconciler = (*NodeFitLabelReconciler)(nil)
 func (r *NodeFitLabelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := ctrllog.FromContext(ctx)
 
-	// Fetch. Read-only (the label patch below targets a fresh Node object), so the deep copy is
-	// skipped.
+	// 获取 Node。后续只读不改（下方的标签 patch 针对新建的 Node 对象），因此跳过深拷贝。
 	nd := new(core.Node)
 	err := r.Client.Get(ctx, req.NamespacedName, nd, ctrlcli.UnsafeDisableDeepCopy)
 	if err != nil {
-		// A deleted Node has nothing left to reconcile.
+		// 已删除的 Node 无需再进行调谐。
 		if err = ctrlcli.IgnoreNotFound(err); err != nil {
 			logger.Error(err, "fetch node")
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Skip if deleted.
+	// 若已删除则跳过。
 	if nd.DeletionTimestamp != nil {
 		logger.V(3).Info("skip deleted node")
 		return ctrl.Result{}, nil
 	}
 
-	// Fetch the same-named Devices ledger. A missing one yields no fit labels, which removes any
-	// stale ones, so a node without a ledger is skipped by every pinned request, as the
-	// node-devices check would hold it.
+	// 获取同名的 Devices 账本。缺失账本时不生成任何适配标签，从而清除所有陈旧标签，使所有带有标签亲和性约束的请求都会跳过无账本的节点，与 node-devices 检查的拦截行为一致。
 	devs := new(workercore.Devices)
 	err = r.Client.Get(ctx, ctrlcli.ObjectKey{Name: nd.Name}, devs, ctrlcli.UnsafeDisableDeepCopy)
 	if err != nil {
@@ -89,8 +77,7 @@ func (r *NodeFitLabelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	data := json.ShouldMarshal(map[string]any{
 		"metadata": map[string]any{"labels": labelPatch},
 	})
-	// Patch a fresh Node object rather than nd: the merge-patch response is decoded back into the
-	// target, and nd was read without a deep copy.
+	// 对新建的 Node 对象而非 nd 执行 patch：merge-patch 的响应会被解码回目标对象，而 nd 读取时未做深拷贝。
 	patchNode := &core.Node{ObjectMeta: meta.ObjectMeta{Name: nd.Name}}
 	err = r.Client.Patch(ctx, patchNode, ctrlcli.RawPatch(types.MergePatchType, data))
 	if err != nil {
@@ -101,8 +88,7 @@ func (r *NodeFitLabelReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
-// desiredFitLabels returns the fit labels a node should carry: none for an unmanaged node or one
-// without a ledger, otherwise those its ledger yields.
+// desiredFitLabels 返回节点应携带的适配标签：对于未受管或没有账本的节点返回空，否则返回由其账本推导出的标签。
 func desiredFitLabels(nd *core.Node, devs *workercore.Devices) map[string]string {
 	if devs == nil || !kubemeta.IsLabeled(nd, systemname.ManagedLabelKey, "true") {
 		return nil
@@ -110,11 +96,7 @@ func desiredFitLabels(nd *core.Node, devs *workercore.Devices) map[string]string
 	return fitLabelsOf(devs)
 }
 
-// fitLabelsOf derives the fit labels from a Devices ledger, one pair per "<manufacturer>-<id>"
-// group, joining each allocation on the status side with its capability on the spec side by
-// accelerator ID, as the node-devices check does. A group with no card of a population emits no
-// key for it; one whose cards are all full emits "0". A card holding its full count of logical
-// slices is full for the sliced key however much memory it has left, since it takes no further slice.
+// fitLabelsOf 从 Devices 账本推导出适配标签，每个 "<manufacturer>-<id>" 分组生成一对标签，并像 node-devices 检查一样通过加速器 ID 将 status 侧的分配记录与 spec 侧的能力规格关联起来。某类型群体若没有对应加速卡，则不为该类型输出键；若所有卡均已满，则输出 "0"。即使某张卡还有剩余显存，只要其持有的逻辑切片数已达上限，对于切片键而言也视作已满，因为它无法再承载更多切片。
 func fitLabelsOf(devs *workercore.Devices) map[string]string {
 	capByID := make(map[string]workercore.AcceleratorStatus)
 	for gi := range devs.Spec.Groups {
@@ -149,8 +131,7 @@ func fitLabelsOf(devs *workercore.Devices) map[string]string {
 				}
 			}
 		}
-		// A key built from a group ID that is not valid label grammar is skipped: it would make the
-		// whole Node patch invalid, and no pin can name it either.
+		// 若基于分组 ID 构造的键不符合标签语法规范则跳过：否则会导致整个 Node patch 非法，且任何亲和性约束也无法引用它。
 		aKey := acceleratorKeyOf(g.Manufacturer, g.ID)
 		if key := nodefeature.FitSlicedMaxFreeUnitsLabelKey(aKey); sliceable && nodefeature.IsFitLabelKey(key) {
 			out[key] = strconv.FormatInt(int64(maxFreeUnits), 10)
@@ -162,9 +143,7 @@ func fitLabelsOf(devs *workercore.Devices) map[string]string {
 	return out
 }
 
-// buildFitLabelPatch returns the metadata.labels merge patch converging a node's fit labels onto
-// desired: a changed or missing value is set, and a fit label absent from desired is removed. It
-// names no label that is not a fit label, and returns nil when nothing differs.
+// buildFitLabelPatch 返回用于将节点的适配标签收敛到 desired 状态的 metadata.labels merge patch：新增或变更的值会被设置，不在 desired 中的适配标签会被移除。该 patch 不会涉及任何非适配标签，且在无任何差异时返回 nil。
 func buildFitLabelPatch(desired, current map[string]string) map[string]any {
 	patch := make(map[string]any)
 	for k, v := range desired {
@@ -186,8 +165,7 @@ func buildFitLabelPatch(desired, current map[string]string) map[string]any {
 	return patch
 }
 
-// nodeFitLabelNodeUpdated reports whether a Node update can move its desired fit labels or undo
-// them: the managed mark changed, or someone else rewrote a fit label.
+// nodeFitLabelNodeUpdated 报告 Node 的更新是否可能改变其期望适配标签或破坏已有标签：例如受管标记发生变化，或他人改写了适配标签。
 func nodeFitLabelNodeUpdated(oldNd, newNd *core.Node) bool {
 	if newNd.DeletionTimestamp != nil {
 		return false
@@ -196,9 +174,7 @@ func nodeFitLabelNodeUpdated(oldNd, newNd *core.Node) bool {
 		!maps.Equal(nodefeature.FilterFitLabels(oldNd.Labels), nodefeature.FilterFitLabels(newNd.Labels))
 }
 
-// fitSignatureChanged reports whether a Devices change moved any fit label value. Most allocations
-// move a card's remaining units without moving the largest one or crossing a share boundary, and
-// those do not reconcile the node.
+// fitSignatureChanged 报告 Devices 的变更是否改变了任何适配标签的值。大多数分配操作只会减少某张卡的剩余容量而不会改变最大值或跨越共享份额边界，这类变更不会触发节点调谐。
 func fitSignatureChanged(oldDevs, newDevs *workercore.Devices) bool {
 	return !maps.Equal(fitLabelsOf(oldDevs), fitLabelsOf(newDevs))
 }
@@ -213,9 +189,9 @@ func (r *NodeFitLabelReconciler) SetupController(_ context.Context, opts control
 		For(
 			&core.Node{},
 			ctrlbuilder.WithPredicates(
-				// Trigger reconciliation when a Node is:
-				// - created.
-				// - updated if its managed mark or one of its fit labels changed.
+				// 当 Node 满足以下条件时触发调谐：
+				// - 被创建。
+				// - 被更新且其受管标记或任一适配标签发生变化。
 				ctrlpredicate.Funcs{
 					DeleteFunc: func(ctrlevent.DeleteEvent) bool {
 						return false
@@ -227,16 +203,14 @@ func (r *NodeFitLabelReconciler) SetupController(_ context.Context, opts control
 			),
 		).
 		Watches(
-			// A ledger change moves the fit labels without touching the Node, so enqueue the
-			// name-identical node. The 3s dedup window coalesces an allocation burst into one patch.
+			// 账本变更会改变适配标签而不会修改 Node 本身，因此需要入队同名节点。3 秒的去重窗口可将一次突发分配合并为单次 patch。
 			&workercore.Devices{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
 				dedupWindow,
 				r.enqueueNodeWhenDevicesChanged,
 			),
-			// A create or a delete always reconciles, whatever the ledger's own mark: the node's
-			// mark is what decides its labels, and a deleted ledger must take its labels with it.
+			// 无论账本自身的标记如何，创建或删除事件始终触发调谐：节点自身的标记决定了它应携带哪些标签，而被删除的账本也必须一并带走其对应的标签。
 			ctrlbuilder.WithPredicates(ctrlpredicate.Funcs{
 				UpdateFunc: func(e ctrlevent.UpdateEvent) bool {
 					return fitDevicesUpdated(e.ObjectOld.(*workercore.Devices), e.ObjectNew.(*workercore.Devices))
@@ -246,16 +220,12 @@ func (r *NodeFitLabelReconciler) SetupController(_ context.Context, opts control
 		Complete(r)
 }
 
-// fitDevicesUpdated reports whether a Devices update must reconcile its node's fit labels: its fit
-// values moved, or the managed mark itself flipped. The node's own mark decides whether it carries
-// labels, so a value change counts whatever the ledger's mark. The Device Manager creates a ledger
-// before the mark is synced onto it, and syncing the mark moves no fit value, so without the flip a
-// node could wait for its first labels until an unrelated allocation.
+// fitDevicesUpdated 报告 Devices 的更新是否需要调谐其对应节点的适配标签：即适配值发生变化，或受管标记本身发生翻转。节点是否携带标签由节点自身的标记决定，因此无论账本标记如何，适配值变化都会触发；此外，Device Manager 会在受管标记同步到账本之前就先创建账本，而同步标记本身不会改变适配值，因此如果不监听标记翻转，节点就可能一直等到发生无关分配时才拿到初始标签。
 func fitDevicesUpdated(oldDevs, newDevs *workercore.Devices) bool {
 	return isManagedDevices(oldDevs) != isManagedDevices(newDevs) || fitSignatureChanged(oldDevs, newDevs)
 }
 
-// enqueueNodeWhenDevicesChanged maps a changed Devices ledger to its name-identical Node.
+// enqueueNodeWhenDevicesChanged 将发生变更的 Devices 账本映射为同名的 Node 入队请求。
 func (r *NodeFitLabelReconciler) enqueueNodeWhenDevicesChanged(
 	ctx context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {

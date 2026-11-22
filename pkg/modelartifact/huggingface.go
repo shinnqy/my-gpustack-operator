@@ -13,57 +13,51 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/json"
 )
 
-// DefaultHuggingFaceMaxEntries bounds the tree entries, files and directories together, one
-// resolution reads. It is far above any model repository and keeps a pathological one from holding
-// a reconcile and the Hub's rate limit for thousands of pages.
+// DefaultHuggingFaceMaxEntries 限制单次解析读取的目录树条目数（文件与目录总和）。
+// 该上限远高于任何正常模型仓库，可防止异常仓库拖慢调谐循环并耗尽 Hub 的速率配额。
 const DefaultHuggingFaceMaxEntries = 100000
 
-// huggingFaceMaxResponseBytes bounds one response body. A tree page of a thousand entries is a few
-// hundred kilobytes.
+// huggingFaceMaxResponseBytes 限制单个响应体的大小。包含一千个条目的目录树分页只有几百 KB。
 const huggingFaceMaxResponseBytes = 16 << 20
 
-// huggingFaceCommitPattern is the shape of a full commit, which is what the revision endpoint
-// answers for every revision it accepts.
+// huggingFaceCommitPattern 是完整 commit 的格式，revision 端点对所有可接受的 revision 均返回此格式。
 var huggingFaceCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// huggingFaceMaskedOID is how a gated repository answers an LFS file's SHA-256 to a caller that
-// has not been granted access, while answering the tree itself with 200.
+// huggingFaceMaskedOID 是受限仓库对未获授权调用方返回 LFS 文件 SHA-256 时的掩码值，
+// 而目录树本身仍返回 200。
 var huggingFaceMaskedOID = strings.Repeat("*", 64)
 
-// HuggingFace resolves Hugging Face repositories.
+// HuggingFace 用于解析 Hugging Face 仓库。
 //
-// Every method takes the token rather than holding one, so a client is shared across namespaces
-// without ever carrying a namespace's credential beyond one call.
+// 每个方法都显式接收 token 而非在实例中持有，以便客户端在多个 Namespace 之间共享，
+// 且绝不会在单次调用之外保留某个 Namespace 的凭据。
 type HuggingFace struct {
-	// Endpoint is the Hub's base URL, e.g. "https://huggingface.co".
+	// Endpoint 是 Hub 的基础 URL，例如 "https://huggingface.co"。
 	Endpoint string
-	// Client sends the requests; see NewHTTPClient.
+	// Client 发送请求；参见 NewHTTPClient。
 	Client *http.Client
-	// MaxEntries bounds the tree entries of one resolution. Zero uses
-	// DefaultHuggingFaceMaxEntries.
+	// MaxEntries 限制单次解析的目录树条目数。为零时使用 DefaultHuggingFaceMaxEntries。
 	MaxEntries int
 }
 
-// Resolution is what resolving a repository at a revision produced.
+// Resolution 是按指定 revision 解析仓库后的产物。
 type Resolution struct {
-	// Commit is the full 40-character commit the revision resolved to.
+	// Commit 是 revision 所解析到的完整 40 位 commit。
 	Commit string
-	// Manifest is the canonical manifest of every file at Commit.
+	// Manifest 是 Commit 下所有文件的规范清单。
 	Manifest Manifest
 }
 
-// Filter is an artifact's allow and ignore patterns; see FilterEntries. The zero value selects
-// every file.
+// Filter 是制品的 allow 和 ignore 过滤模式；参见 FilterEntries。零值表示选择所有文件。
 type Filter struct {
 	Allow  []string
 	Ignore []string
 }
 
-// Resolve resolves revision to a commit and builds the manifest of the files at it that filter
-// selects.
+// Resolve 将 revision 解析为 commit，并构建由 filter 选中的该 commit 下文件的清单。
 //
-// It uses the revision endpoint rather than the refs endpoint because only the former peels an
-// annotated tag to the commit it points at; the latter answers the tag object.
+// 它使用 revision 端点而非 refs 端点，因为只有前者会将附注标签（annotated tag）解引用到其指向的 commit；
+// 后者返回的是标签对象本身。
 func (h *HuggingFace) Resolve(ctx context.Context, repository, revision, token string, filter Filter) (Resolution, error) {
 	var info struct {
 		SHA string `json:"sha"`
@@ -86,9 +80,8 @@ func (h *HuggingFace) Resolve(ctx context.Context, repository, revision, token s
 	return Resolution{Commit: info.SHA, Manifest: manifest}, nil
 }
 
-// ListManifest builds the manifest of the files at commit that filter selects, from every page of
-// the tree listing. A node recomputes an artifact's manifest this way, with the credential of the
-// Pod that mounts it, and compares the digest with the one the controller published.
+// ListManifest 从目录树列表的所有分页中构建 commit 下由 filter 选中的文件清单。
+// 节点会使用挂载该制品的 Pod 的凭据以这种方式重新计算清单，并将摘要与控制器发布的摘要进行比对。
 func (h *HuggingFace) ListManifest(ctx context.Context, repository, commit, token string, filter Filter) (Manifest, error) {
 	entries, err := h.listTree(ctx, repository, commit, token)
 	if err != nil {
@@ -110,7 +103,7 @@ func (h *HuggingFace) ListManifest(ctx context.Context, repository, commit, toke
 	return manifest, nil
 }
 
-// huggingFaceTreeEntry is one entry of a tree listing.
+// huggingFaceTreeEntry 是目录树列表中的一个条目。
 type huggingFaceTreeEntry struct {
 	Type string `json:"type"`
 	OID  string `json:"oid"`
@@ -122,9 +115,8 @@ type huggingFaceTreeEntry struct {
 	} `json:"lfs"`
 }
 
-// listTree reads every page of the recursive tree at commit. The model-info endpoint's siblings
-// are not used: that list is not paginated, and huggingface_hub itself stops trusting it above a
-// thousand files.
+// listTree 读取 commit 下递归目录树的所有分页。不使用 model-info 端点的 siblings 字段：
+// 该列表不支持分页，且 huggingface_hub 本身在文件超过一千个后也不再信任该列表。
 func (h *HuggingFace) listTree(ctx context.Context, repository, commit, token string) ([]ManifestEntry, error) {
 	limit := h.MaxEntries
 	if limit <= 0 {
@@ -172,8 +164,7 @@ func (h *HuggingFace) listTree(ctx context.Context, repository, commit, token st
 	return entries, nil
 }
 
-// huggingFaceManifestEntry turns a tree entry into a manifest entry, and reports false for a
-// directory.
+// huggingFaceManifestEntry 将树条目转换为清单条目，并在条目为目录时返回 false。
 func huggingFaceManifestEntry(e huggingFaceTreeEntry) (ManifestEntry, bool, error) {
 	switch e.Type {
 	case "directory":
@@ -200,10 +191,10 @@ func huggingFaceManifestEntry(e huggingFaceTreeEntry) (ManifestEntry, bool, erro
 	return ManifestEntry{Path: e.Path, Size: e.Size, Digest: DigestSHA256 + ":" + e.LFS.OID}, true, nil
 }
 
-// nextPage returns the URL a Link header names as rel="next", or "" when it names none.
+// nextPage 返回 Link 响应头中标记为 rel="next" 的 URL；若未指定则返回 ""。
 //
-// A next page on another host is refused rather than followed: the token travels with every page,
-// and pagination is not a reason to send it anywhere but the configured endpoint.
+// 指向其他主机的下一页链接会被拒绝而非跟随：token 会随每一页请求发送，
+// 分页不应成为将 token 发送到已配置端点之外任何地址的理由。
 func (h *HuggingFace) nextPage(link string) (string, error) {
 	for part := range strings.SplitSeq(link, ",") {
 		target, params, ok := strings.Cut(strings.TrimSpace(part), ";")
@@ -231,8 +222,8 @@ func (h *HuggingFace) nextPage(link string) (string, error) {
 	return "", nil
 }
 
-// ValidToken reports whether the Hub accepts token at all. A token the Hub rejects is silently
-// ignored on a public repository, so this is the only way such a mistake becomes visible.
+// ValidToken 报告 Hub 是否接受该 token。Hub 会静默忽略公开仓库上的无效 token，
+// 因此这是发现此类错误配置的唯一途径。
 func (h *HuggingFace) ValidToken(ctx context.Context, token string) (bool, error) {
 	resp, err := h.do(ctx, http.MethodGet, h.apiURL("whoami-v2"), token, false)
 	if err != nil {
@@ -250,13 +241,11 @@ func (h *HuggingFace) ValidToken(ctx context.Context, token string) (bool, error
 	}
 }
 
-// Revalidate checks that token can still read the repository at commit: a HEAD of one file, with
-// redirects not followed. The revision and tree endpoints cannot answer this, because a gated
-// repository answers both with 200 to a caller that has no access.
+// Revalidate 检查 token 在指定 commit 下是否仍可读取该仓库：对单个文件发起不跟随重定向的 HEAD 请求。
+// revision 和 tree 端点无法回答此问题，因为对于无权访问的调用方，受限（gated）仓库对这两个端点仍会返回 200。
 //
-// The file is the first file by path at the commit's root, read from one page of the root
-// listing, so the check costs two requests whatever the repository's size. A root holding no file
-// falls back to the first file of the recursive listing.
+// 目标文件取自该 commit 根目录一页列表中的首个文件（按路径），因此无论仓库规模多大，该检查仅需两次请求。
+// 若根目录不含文件，则回退到递归列表中的首个文件。
 func (h *HuggingFace) Revalidate(ctx context.Context, repository, commit, token string) error {
 	var page []huggingFaceTreeEntry
 	if err := h.getJSON(ctx, h.apiURL("models", repository, "tree", commit), token, &page); err != nil {
@@ -306,8 +295,8 @@ func (h *HuggingFace) apiURL(segments ...string) string {
 	escaped := make([]string, 0, len(segments)+1)
 	escaped = append(escaped, strings.TrimSuffix(h.Endpoint, "/"), "api")
 	for i, s := range segments {
-		// A repository keeps its owner separator; every other segment, a revision above all, is
-		// one path segment whatever it contains.
+		// 仓库保留其所有者分隔符；其余每个分段（尤其是 revision）无论包含何种字符，
+		// 均作为单个路径分段处理。
 		if i == 1 && segments[0] == "models" {
 			escaped = append(escaped, escapeRepository(s))
 			continue
@@ -347,8 +336,7 @@ func (h *HuggingFace) getJSON(ctx context.Context, target, token string, into an
 	return decodeHuggingFaceBody(resp, into)
 }
 
-// do sends one request. A transport failure is SourceUnavailable; the caller classifies the
-// status code.
+// do 发送一次请求。传输层失败归类为 SourceUnavailable；状态码由调用方分类处理。
 func (h *HuggingFace) do(ctx context.Context, method, target, token string, noRedirect bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, target, nil)
 	if err != nil {
@@ -368,8 +356,8 @@ func (h *HuggingFace) do(ctx context.Context, method, target, token string, noRe
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// The URL is the only part of a transport error that names the request, and it carries no
-		// credential; the error is rebuilt so nothing else of the request can ride along.
+		// URL 是传输层错误中唯一包含请求信息的部分，且不携带凭据；
+		// 这里重建错误，以确保请求的其他信息不会随错误一同传出。
 		return nil, sourceErrorf(ReasonSourceUnavailable, "%s %s: %v", method, target, unwrapURLError(err))
 	}
 
@@ -405,13 +393,13 @@ func decodeHuggingFaceBody(resp *http.Response, into any) error {
 	return nil
 }
 
-// classifyHuggingFace maps a non-success answer onto a reason, as measured against the Hub:
+// classifyHuggingFace 根据 Hub 的实测响应将非成功响应映射为对应原因：
 //
-//   - 404 with X-Error-Code RevisionNotFound is a revision the repository does not have.
-//   - 401 (with or without an error code), 403, any other 404 and X-Error-Code GatedRepo are
-//     AccessDenied. A repository that does not exist and a private repository the caller cannot
-//     read answer the same 401 without a token, so the message does not guess which.
-//   - Anything else, 5xx and 429 among it, is SourceUnavailable.
+//   - 404 且 X-Error-Code 为 RevisionNotFound 表示仓库不存在该 revision。
+//   - 401（无论是否携带错误码）、403、其他 404 以及 X-Error-Code 为 GatedRepo 均归类为
+//     AccessDenied。未提供 token 时，不存在的仓库与调用方无权读取的私有仓库均返回相同的 401，
+//     因此错误信息不做猜测区分。
+//   - 其余情况（包括 5xx 和 429）均归类为 SourceUnavailable。
 func classifyHuggingFace(resp *http.Response, what string) error {
 	code := resp.Header.Get("X-Error-Code")
 	switch {

@@ -1,10 +1,10 @@
 package args
 
-// Args holds the options of the apireg-gen generator.
+// Args 保存 apireg-gen 生成器的选项。
 type Args struct {
-	// OutputFile is the name of the generated file, including the ".go" suffix.
+	// OutputFile 是生成文件的名称，包含 ".go" 后缀。
 	OutputFile string
 
-	// GoHeaderFile is the path to the boilerplate file that heads the generated file.
+	// GoHeaderFile 是位于生成文件开头的样板文件路径。
 	GoHeaderFile string
 }

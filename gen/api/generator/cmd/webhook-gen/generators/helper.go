@@ -49,8 +49,7 @@ var (
 	)
 )
 
-// reflectType reflects the type into a WebhookTypeDefinition,
-// according to the given package.
+// reflectType 根据给定的包将类型反射为\n// WebhookTypeDefinition。
 func reflectType(t *types.Type) *WebhookTypeDefinition {
 	if t == nil {
 		return nil
@@ -60,7 +59,7 @@ func reflectType(t *types.Type) *WebhookTypeDefinition {
 		WithName("$").
 		WithValues("gen", "webhook-gen", "type", t.String())
 
-	// Collect type markers.
+	// 收集类型标记。
 	//
 	// +k8s:webhook-gen:validating:group=,version=,resource=,scope=,failurePolicy=,sideEffects=,matchPolicy=,timeoutSeconds=
 	// +k8s:webhook-gen:validating:subResources=
@@ -271,8 +270,7 @@ func reflectType(t *types.Type) *WebhookTypeDefinition {
 				grp = wh.Rules[0].APIGroups[0]
 			}
 			if grp == "" {
-				// The empty APIGroup denotes the Kubernetes core API group;
-				// name it "core" so the webhook name has no empty segment.
+				// 空 APIGroup 表示 Kubernetes core API 组；\n// 将其命名为 "core"，以避免 Webhook 名称中出现空片段。
 				grp = "core"
 			}
 			if len(wh.Rules[0].APIVersions) != 0 {
@@ -282,9 +280,7 @@ func reflectType(t *types.Type) *WebhookTypeDefinition {
 			klow = strings.ToLower(stringx.Singularize(wh.Rules[0].Resources[0]))
 			wh.Name = fmt.Sprintf("%s.%s.%s.%s", pre, grp, ver, klow)
 			if namePrefix != "" {
-				// Insert the prefix after the leading "validate"/"mutate" segment, not before
-				// it: the serving path is derived from this name, and the aggregated apiserver
-				// only authorizes paths that start with "/validate-"/"/mutate-".
+				// 将前缀插入在开头的 "validate"/"mutate" 片段之后，而非之前：\n// 服务路径由此名称派生，而聚合 APIServer 仅对以\n// "/validate-"/"/mutate-" 开头的路径进行鉴权。
 				wh.Name = fmt.Sprintf("%s.%s.%s.%s.%s", pre, namePrefix, grp, ver, klow)
 			}
 			td.Validating = wh
@@ -487,8 +483,7 @@ func reflectType(t *types.Type) *WebhookTypeDefinition {
 				grp = wh.Rules[0].APIGroups[0]
 			}
 			if grp == "" {
-				// The empty APIGroup denotes the Kubernetes core API group;
-				// name it "core" so the webhook name has no empty segment.
+				// 空 APIGroup 表示 Kubernetes core API 组；\n// 将其命名为 "core"，以避免 Webhook 名称中出现空片段。
 				grp = "core"
 			}
 			if len(wh.Rules[0].APIVersions) != 0 {
@@ -498,9 +493,7 @@ func reflectType(t *types.Type) *WebhookTypeDefinition {
 			klow = strings.ToLower(stringx.Singularize(wh.Rules[0].Resources[0]))
 			wh.Name = fmt.Sprintf("%s.%s.%s.%s", pre, grp, ver, klow)
 			if namePrefix != "" {
-				// Insert the prefix after the leading "validate"/"mutate" segment, not before
-				// it: the serving path is derived from this name, and the aggregated apiserver
-				// only authorizes paths that start with "/validate-"/"/mutate-".
+				// 将前缀插入在开头的 "validate"/"mutate" 片段之后，而非之前：\n// 服务路径由此名称派生，而聚合 APIServer 仅对以\n// "/validate-"/"/mutate-" 开头的路径进行鉴权。
 				wh.Name = fmt.Sprintf("%s.%s.%s.%s.%s", pre, namePrefix, grp, ver, klow)
 			}
 			td.Mutating = wh
@@ -518,7 +511,7 @@ const (
 	webhookGenMarker = "+k8s:webhook-gen:"
 )
 
-// collectMarkers collects markers from the given comment lines.
+// collectMarkers 从给定注释行中收集标记。
 func collectMarkers(comments []string, into map[string][]string) {
 	for _, line := range comments {
 		line = strings.TrimSpace(line)

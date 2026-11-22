@@ -18,41 +18,34 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kvcache/mooncake"
 )
 
-// isolation is what the stamp records about a Pod's declared reuse domain.
+// isolation 记录了标记（stamp）中关于 Pod 所声明的复用域的信息。
 //
-// It carries no judgement about whether isolation results. Whether an injected tenant takes effect
-// depends on the engine build, which this project does not check. What was done about the tenant is
-// recorded by the renderer, which knows.
+// 它不对隔离是否实际生效做任何判断。注入的租户是否生效取决于引擎构建版本，本项目不做检查。
+// 对租户所做的处理由了解情况的渲染器负责记录。
 type isolation struct {
-	// Domain is the reuse identity the Binding declared. Empty only for an object that never went
-	// through Binding admission, where the domain is required.
+	// Domain 是 Binding 声明的复用标识。仅当对象从未经过 Binding 准入时才为空，经过准入时该字段为必填。
 	Domain string
 }
 
-// resolution is everything Default needs after reading the cluster: what to render, and what to say
-// about the isolation it is not delivering.
+// resolution 包含 Default 在读取集群后所需的全部信息：要渲染的内容，以及关于其未提供隔离的说明。
 type resolution struct {
 	Input     inject.Input
 	Isolation isolation
 }
 
-// resolve reads the Pod's annotations and the objects they name, and returns what to render.
+// resolve 读取 Pod 的注解及其命名的对象，并返回需要渲染的内容。
 //
-// The reads are cached-first with a non-cached retry, because a Pod created in the same breath as its
-// Binding is the ordinary case and the informer may simply not hold it yet. Only a NotFound from the
-// second read is a refusal: a timeout, an RBAC denial or a 5xx says nothing about whether the object
-// exists, and this webhook runs with failurePolicy Fail, so reporting one of them as "not found" would
-// make a cluster outage read as a typo in the manifest.
+// 读取采用缓存优先、无缓存重试的策略，因为 Pod 与其 Binding 同时创建是常见场景，informer 可能尚未同步到该对象。
+// 仅当第二次读取返回 NotFound 时才视为拒绝：超时、RBAC 拒绝或 5xx 错误并不能说明对象是否存在，而此 Webhook
+// 以 failurePolicy Fail 运行，若将这类错误报告为“未找到”，就会使集群故障被误读为清单中的拼写错误。
 func (r *PodKVCacheWebhook) resolve(ctx context.Context, pod *core.Pod) (*resolution, error) {
 	if err := checkAnnotationVocabulary(pod); err != nil {
 		return nil, err
 	}
 
-	// The message says what refusing this key does and does not buy, because the shape invites the
-	// stronger reading. "The store accepts whatever tenant a client sends" was the earlier wording
-	// and it is wrong HERE: a tenant is forwarded only against a master reporting a tenant ledger
-	// (checkQuotaLedger), and such a master refuses a name absent from it. Overstating the store's
-	// permissiveness and overstating the Binding's authority are the same error in two directions.
+	// 该消息说明了拒绝此键的作用与局限，因为这种形式容易让人做出更强硬的解读。“Store 接受客户端发送的任意租户”
+	// 是早期的表述，但在此处并不准确：只有当 master 报告存在租户账本（checkQuotaLedger）时才会转发租户，而这样的
+	// master 会拒绝账本中不存在的名称。高估 Store 的宽松度与高估 Binding 的权限是两个方向上的同一类错误。
 	if _, ok := pod.Annotations[KVCacheDomainAnnotationKey]; ok {
 		return nil, fmt.Errorf("annotation %q is not accepted: the reuse domain comes from the "+
 			"KVCachePoolBinding and only from there, so that every domain this operator provisions has "+
@@ -97,9 +90,8 @@ func (r *PodKVCacheWebhook) resolve(ctx context.Context, pod *core.Pod) (*resolu
 			"address to point %q at; retry once the pool reports one", pool.Name, engine)
 	}
 
-	// The match refuses an unsupported transport and a mixed pool whose unconstrained engine
-	// could install only one of its offers. Both are binding failures, so this Pod is refused
-	// here at admission rather than started with a client that cannot reach some segments.
+	// 该匹配会拒绝不支持的传输协议，以及无约束引擎只能安装其中一种传输选项的混合池。两者均属于绑定失败，因此
+	// 在准入阶段即拒绝该 Pod，而不是启动一个无法访问部分分段的客户端。
 	offers := mooncake.MemberProtocols(backend)
 	if err := inject.ValidateBindingTransport(engine, offers); err != nil {
 		return nil, err
@@ -115,10 +107,9 @@ func (r *PodKVCacheWebhook) resolve(ctx context.Context, pod *core.Pod) (*resolu
 	}
 
 	return &resolution{
-		// The reuse domain goes to the renderer only while the master can hold it apart: a master
-		// with no tenant ledger collapses every tenant name into its default one, so forwarding the
-		// domain would claim an isolation the store does not deliver. The stamp below keeps the
-		// DECLARED domain either way, and TenantInjected records which of the two happened.
+		// 仅当 master 能够区分各个租户时，才会将复用域传递给渲染器：没有租户账本的 master 会将所有租户名称归并到
+		// 其默认租户中，此时转发复用域相当于宣称了 Store 实际并不提供的隔离能力。下方的标记无论如何都会保留声明的
+		// 复用域，而 TenantInjected 则记录了实际执行的是哪种情况。
 		Input: inject.Input{
 			Engine: engine,
 			Role:   role,
@@ -135,9 +126,8 @@ func (r *PodKVCacheWebhook) resolve(ctx context.Context, pod *core.Pod) (*resolu
 	}, nil
 }
 
-// injectableDomain is the reuse domain a Pod is configured with: the Binding's own name while the
-// master separates tenants, and empty when it does not — an empty domain renders no tenant identity
-// at all, which is the only configuration a ledger-less master can serve honestly.
+// injectableDomain 是 Pod 配置中使用的复用域：当 master 隔离租户时为 Binding 自身的名称，不隔离时为空 ——
+// 空复用域完全不渲染租户标识，这也是无账本 master 唯一能够如实服务的配置。
 func injectableDomain(
 	binding *workercore.KVCachePoolBinding,
 	backend *workercore.KVCacheBackend,
@@ -149,9 +139,8 @@ func injectableDomain(
 	return binding.Spec.Domain.Name
 }
 
-// resolveManufacturer selects the one vLLM runtime variant whose connector differs. This affects
-// rendering only: ModelDeployment role admission remains conservative across its possible variants,
-// because that path has no corresponding author declaration.
+// resolveManufacturer 选择唯一一个连接器存在差异的 vLLM 运行时变体。这仅影响渲染：ModelDeployment 角色准入
+// 在其可能的变体之间保持保守策略，因为该路径没有对应的作者声明。
 func resolveManufacturer(engine inject.Engine, annotations map[string]string) (inject.Engine, error) {
 	manufacturer, declared := annotations[KVCacheManufacturerAnnotationKey]
 	if !declared {
@@ -169,17 +158,14 @@ func resolveManufacturer(engine inject.Engine, annotations map[string]string) (i
 	return inject.EngineVLLMAscend, nil
 }
 
-// resolveBinding reads the Binding the Pod names, in the Pod's OWN namespace. There is no
-// cross-namespace form: a Binding is where a namespace's grant is provisioned and accounted, so
-// honoring a namespaced value would let a Pod draw on another namespace's grant by naming it.
+// resolveBinding 在 Pod 自身的 Namespace 中读取 Pod 所指定的 Binding。不存在跨 Namespace 的形式：Binding 是
+// 分配和计量某个 Namespace 授权的位置，因此若接受带 Namespace 的值，就会允许 Pod 通过指定名称来支取其他
+// Namespace 的授权。
 //
-// Provisioned and accounted, NOT enforced. The store is reached over a Service any Pod can dial, and
-// nothing derives a credential from this object. The injection path overwrites its tenant environment
-// variable from the Binding, but a workload that reaches the store without that path can still name a
-// domain it knows. Calling a
-// Binding an authorization point would claim a boundary this stack does not have. What it does bound
-// is which names exist at all: a multi-tenant master refuses one absent from its ledger, so an
-// unregistered name is not a way around a ceiling. Tracked as #168.
+// 这里是“分配与计量”，而非“强制鉴权”。Store 通过任意 Pod 均可拨号的 Service 访问，且不会基于该对象派生任何凭证。
+// 注入路径会使用 Binding 覆盖其租户环境变量，但绕过该路径访问 Store 的工作负载仍可指定其知晓的任意域。将
+// Binding 称为鉴权点意味着宣称了当前技术栈并不具备的边界。它真正能够限定的是哪些名称存在：多租户 master 会
+// 拒绝其账本中不存在的名称，因此未注册的名称无法绕过配额上限。问题跟踪见 #168。
 func (r *PodKVCacheWebhook) resolveBinding(
 	ctx context.Context, pod *core.Pod,
 ) (*workercore.KVCachePoolBinding, error) {
@@ -194,29 +180,22 @@ func (r *PodKVCacheWebhook) resolveBinding(
 			KVCacheBindingAnnotationKey, name)
 	}
 
-	// Existence is all this checks, and the Binding's readiness deliberately is not. A Binding whose
-	// reconcile has not finished has not registered its tenant with the master yet, so an engine that
-	// forwards one gets TENANT_NOT_REGISTERED - and then stops getting it, because the reconciler
-	// converges and the same Pod's later writes succeed. The cost is an interval without caching that
-	// heals itself.
+	// 此处仅检查对象是否存在，刻意不检查 Binding 的就绪状态。尚未完成 reconcile 的 Binding 还未向 master 注册
+	// 其租户，因此转发该租户的引擎会收到 TENANT_NOT_REGISTERED —— 随后就会停止收到该错误，因为 reconciler
+	// 最终会收敛，同一 Pod 后续的写入也会成功。代价只是存在一段无缓存的窗口期，但系统会自行恢复。
 	//
-	// A refusal does not heal. It is not retried, so a deployment created in the same breath as its
-	// Binding - the ordinary case - would simply fail. Trading a permanent failure for a temporary
-	// degradation is the wrong direction.
+	// 准入拒绝则不会自愈。准入不会自动重试，因此与 Binding 同时创建的 Deployment（常见场景）将直接失败。用永久性
+	// 失败来换取避免短暂降级是错误的方向。
 	//
-	// The division of labor that follows: PERMANENT loss is refused, TEMPORARY non-convergence is
-	// admitted and left to heal. F4b is the permanent side - a pool whose ledger cannot be answered
-	// for stays that way until somebody acts, and no amount of waiting fixes it. The one answer that
-	// is neither permanent nor temporary - a master observed to hold no ledger at all - is a declared
-	// topology rather than a loss, and is admitted without a tenant identity.
+	// 由此确立的分工原则是：永久性丢失予以拒绝，临时性未收敛予以放行并等待自愈。F4b 属于永久性的一侧 —— 账本
+	// 无法得到响应的池在有人干预前会一直处于该状态，再怎么等待也无法修复。唯一既非永久也非临时的答复 —— 观察到
+	// master 完全不持有账本 —— 属于一种已声明的拓扑而非故障丢失，因此不带租户标识予以准入。
 	//
-	// Read live rather than through r.get. That helper falls back to the APIReader only on NotFound, so
-	// it repairs a cache that is missing an object but not one that is holding a stale copy of it - and
-	// the deletion check below reads exactly the field a stale copy is most likely to be behind on.
+	// 此处直接实时读取而不经过 r.get。该辅助方法仅在遇到 NotFound 时才回退到 APIReader，因此它能修复缓存缺失
+	// 对象的情况，却无法修复缓存持有陈旧副本的情况 —— 而下方的删除检查恰恰读取的是陈旧副本最可能滞后的字段。
 	//
-	// Informer lag is not a knife-edge: after a watch reconnect it is seconds, which is long enough for
-	// a Binding deleted moments ago to still read as live and admit a Pod that can never write. The
-	// pool and the backend keep using r.get: nothing about them is judged on a field this young.
+	// Informer 延迟并非毫秒级临界：在 watch 重连后延迟可达数秒，足以让片刻前刚被删除的 Binding 仍被读为存活
+	// 状态，从而放行一个永远无法写入的 Pod。池与后端则继续使用 r.get：它们没有任何判断依赖如此时效敏感的字段。
 	binding := &workercore.KVCachePoolBinding{}
 	key := ctrlcli.ObjectKey{Namespace: pod.Namespace, Name: name}
 	if err := r.APIReader.Get(ctx, key, binding); err != nil {
@@ -229,12 +208,10 @@ func (r *PodKVCacheWebhook) resolveBinding(
 		return nil, fmt.Errorf("get kv cache pool binding %q in namespace %q: %w",
 			name, pod.Namespace, err)
 	}
-	// A Binding under deletion is still returned by Get, and admitting against one is the permanent
-	// side of the division of labor above rather than the temporary one: the pool reconciler is
-	// removing that domain from the ledger, and once it is gone every write from this Pod fails with
-	// TENANT_NOT_REGISTERED. Waiting does not heal it, and nothing walks it back - a plain Pod does
-	// not appear in the Binding's status.usedBy, so the finalizer that protects declared consumers
-	// does not see this one at all.
+	// 处于删除中的 Binding 仍会被 Get 返回，而基于它进行准入属于上述分工中永久性的一侧而非临时性的一侧：池的
+	// reconciler 正在从账本中移除该域，一旦移除，此 Pod 的每次写入都会因 TENANT_NOT_REGISTERED 而失败。等待
+	// 不会使其恢复，也没有机制会回滚该删除 —— 普通 Pod 不会出现在 Binding 的 status.usedBy 中，因此保护已声明
+	// 消费者的 finalizer 根本看不到这个 Pod。
 	if !binding.GetDeletionTimestamp().IsZero() {
 		return nil, fmt.Errorf("annotation %q names KVCachePoolBinding %q, which is being deleted: "+
 			"its reuse domain is being withdrawn from the pool's ledger, so a Pod admitted against "+
@@ -245,8 +222,7 @@ func (r *PodKVCacheWebhook) resolveBinding(
 	return binding, nil
 }
 
-// resolvePool follows the Binding to its pool. The pool is cluster-scoped, so the reference carries no
-// namespace and there is none to check.
+// resolvePool 顺着 Binding 查找其所属的池。池是集群作用域的资源，因此引用中不携带 Namespace，也无需检查 Namespace。
 func (r *PodKVCacheWebhook) resolvePool(
 	ctx context.Context, binding *workercore.KVCachePoolBinding,
 ) (*workercore.KVCachePool, error) {
@@ -262,11 +238,10 @@ func (r *PodKVCacheWebhook) resolvePool(
 	return pool, nil
 }
 
-// resolveBackend follows the pool to the backend that supplies the transport.
+// resolveBackend 顺着池查找提供传输能力的后端。
 //
-// The pool's webhook admits exactly one backend name, so the first entry is the one. An empty list is
-// still handled: an object that never went through that webhook would otherwise panic here, and a
-// mutating webhook is the wrong place to find out.
+// 池的 Webhook 只允许恰好一个后端名称，因此第一项即目标后端。此处仍会处理空列表的情况：否则未经该 Webhook
+// 准入的对象会在此处 panic，而变更型（mutating）Webhook 并不是暴露此类问题的合适位置。
 func (r *PodKVCacheWebhook) resolveBackend(
 	ctx context.Context, pool *workercore.KVCachePool,
 ) (*workercore.KVCacheBackend, error) {
@@ -287,21 +262,17 @@ func (r *PodKVCacheWebhook) resolveBackend(
 	return backend, nil
 }
 
-// checkQuotaLedger is F4b: a pool whose master cannot answer for its tenant ledger keeps new Pods
-// off it, while a pool whose master is DECLARED or OBSERVED to hold none is joined without a
-// tenant identity.
+// checkQuotaLedger 实现 F4b 检查：如果池的 master 无法对其租户账本做出响应，则阻止新 Pod 加入该池；而如果池
+// 的 master 被声明或观察到不持有任何账本，则在不携带租户标识的情况下加入。
 //
-// The two False answers are split because they call for opposite actions. MultiTenancyDisabled is
-// a configuration fact — a single-tenant topology, which the master serves honestly once no
-// tenant is forwarded — so the Pod proceeds and the renderer drops the domain. Every other False
-// is a master that should hold a ledger and did not answer: injecting there would turn one master
-// outage into silent, unisolated writes, so it stays a refusal. Absent and Unknown are waits, and
-// treating either as "on" would be reading an admission of ignorance as an answer.
+// 两种 False 响应被分开处理，因为它们需要采取相反的动作。MultiTenancyDisabled 是一项配置事实 —— 即单租户
+// 拓扑，只要不转发租户，master 就能如实提供服务 —— 因此 Pod 继续放行，渲染器会丢弃该域。其他所有 False
+// 都意味着本应持有账本的 master 未能响应：此时若继续注入，就会把一次 master 故障变成静默且无隔离的写入，因此
+// 必须保持拒绝。Absent 和 Unknown 代表等待状态，将其中任一状态视为“已开启”都等同于把表示未知的声明当作肯定答复。
 //
-// The MultiTenancyDisabled branch stamps rather than refuses because the degradation this gate
-// once stood against is refused earlier now: turning multi-tenancy off under a claimed backend is
-// forbidden at backend admission, so a ledger-less pool met here is a topology its operator
-// declared, not a fault that crept in.
+// MultiTenancyDisabled 分支选择放行标记而非拒绝，是因为该关卡过去防范的退化场景如今已在更早阶段被拒绝：在已
+// 被认领的后端下关闭多租户在后端准入阶段即被禁止，因此在这里遇到的无账本池是运维人员明确声明的拓扑，而非悄悄
+// 渗入的故障。
 func (r *PodKVCacheWebhook) checkQuotaLedger(pool *workercore.KVCachePool) error {
 	condition := workerctrl.KVCachePoolConditionQuotaLedgerAvailable
 
@@ -315,26 +286,22 @@ func (r *PodKVCacheWebhook) checkQuotaLedger(pool *workercore.KVCachePool) error
 			"retry once it settles", pool.Name, condition)
 	case condition.IsFalse(pool) &&
 		condition.GetReason(pool) != workerctrl.KVCachePoolReasonMultiTenancyDisabled:
-		// The controller's own message is carried through rather than restated. False has more than
-		// one cause, and an error asserting "its master holds no tenant ledger" sends an operator to
-		// reconfigure multi-tenancy during what may be an outage - a message naming the wrong cause
-		// is worse than one naming none.
+		// 直接透传控制器自身的错误消息，而非重新措辞。False 状态有多种原因，若断言“其 master 未持有租户账本”，可能会
+		// 误导运维人员在实际上是集群故障期间去重新配置多租户 —— 指出错误原因的提示比未指明原因的提示更糟糕。
 		return fmt.Errorf("pool %q reports %s as False (%s): %s",
 			pool.Name, condition, condition.GetReason(pool), condition.GetMessage(pool))
 	}
 	return nil
 }
 
-// get reads one object, cache first and API server second.
+// get 读取单个对象，优先读取缓存，其次读取 API server。
 //
-// The second read is CONSISTENT, deliberately. Its whole purpose is to tell an informer that has not
-// caught up from an object that truly does not exist, and only a NotFound from it becomes a refusal -
-// so a stale answer would produce exactly the outcome the fallback exists to prevent. An earlier
-// revision passed WithoutQuorum, which sets resourceVersion=0 and explicitly permits an answer from
-// behind: a Binding created moments before its Pod could still read as absent, and that Pod would be
-// rejected permanently, since admission is never retried.
+// 第二次读取是有意采用强一致读取的。其全部目的就是区分尚未追平的 informer 与真正不存在的对象，且只有第二次读取
+// 返回 NotFound 时才会导致拒绝 —— 因此陈旧的响应恰恰会引发该回退机制本要防止的结果。早期版本曾传入
+// WithoutQuorum，它会设置 resourceVersion=0 并显式允许返回滞后数据：在 Pod 之前片刻创建的 Binding 仍可能
+// 被读为不存在，导致该 Pod 被永久拒绝，因为准入永远不会被重试。
 //
-// The cost is a quorum read on the miss path only, which is already the exceptional one.
+// 代价仅是在缓存未命中的路径上执行一次 quorum 读取，而这本就是极少数异常路径。
 func (r *PodKVCacheWebhook) get(ctx context.Context, key ctrlcli.ObjectKey, obj ctrlcli.Object) error {
 	err := r.Client.Get(ctx, key, obj)
 	if err == nil || !kerrors.IsNotFound(err) {
@@ -343,8 +310,8 @@ func (r *PodKVCacheWebhook) get(ctx context.Context, key ctrlcli.ObjectKey, obj 
 	return r.APIReader.Get(ctx, key, obj)
 }
 
-// acceptedAnnotations is every kvcache.gpustack.ai/ key a Pod's author may set. The domain key is
-// deliberately absent: it has its own refusal, with its own reason.
+// acceptedAnnotations 包含 Pod 作者可以设置的所有 kvcache.gpustack.ai/ 键。刻意排除了 domain 键：
+// 它有独立的拒绝逻辑和独立的拒绝原因。
 var acceptedAnnotations = []string{
 	KVCacheBindingAnnotationKey,
 	KVCacheEngineAnnotationKey,
@@ -354,13 +321,11 @@ var acceptedAnnotations = []string{
 	KVCacheLaunchArgsForwardedAnnotationKey,
 }
 
-// checkAnnotationVocabulary refuses a key in this webhook's namespace that it does not accept.
+// checkAnnotationVocabulary 拒绝此 Webhook 命名空间前缀下所有不被接受的键。
 //
-// A typo is the case this exists for. Silently ignoring "kvcache.gpustack.ai/bindng" would leave the
-// Pod with no Binding at all, and the symptom - a container that starts fine and caches nothing - is
-// invisible from outside. The two keys this webhook WRITES are refused by the same rule for a
-// different reason: they are the record of what was decided, and a submitted value would be a forged
-// one.
+// 该检查主要针对拼写错误。静默忽略 "kvcache.gpustack.ai/bindng" 会导致 Pod 完全没有关联 Binding，而其表现
+// 症状 —— 容器正常启动却没有任何缓存效果 —— 从外部很难察觉。此 Webhook 写入的两个键也按同一规则被拒绝，但原因
+// 不同：它们是决策结果的记录，外部提交的值属于伪造值。
 func checkAnnotationVocabulary(pod *core.Pod) error {
 	prefix := "kvcache." + systemname.LabelPrefix
 	for key := range pod.Annotations {

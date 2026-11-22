@@ -5,6 +5,6 @@ import (
 )
 
 type (
-	// MetaObject is the interface for the object with metadata.
+	// MetaObject 是带有元数据的对象接口。
 	MetaObject = ctrlcli.Object
 )

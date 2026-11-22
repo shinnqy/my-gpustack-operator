@@ -8,45 +8,40 @@ import (
 	"gpustack.ai/gpustack/pkg/systemname"
 )
 
-// The fit labels publish, per node and per accelerator model, how much one card of that model can
-// still give. They exist so a scheduler that reads only a node's summed capacity, as Kueue's
-// topology-aware scheduling does, can still skip a node whose free room is spread over cards none of
-// which fits a request. They filter only: nothing is ever charged against them.
+// fit 标签按节点与加速卡型号发布该型号单卡仍可提供的最大余量。设置这些标签是为了让仅读取节点
+// 总容量的调度器（例如 Kueue 的拓扑感知调度）能够跳过那些虽然总余量足够但分散在多张卡上、
+// 单卡均无法满足请求的节点。它们仅用于过滤：不会对其执行任何资源扣减。
 //
-// The model is the name part of the key, so the key is valid for any accelerated device key, which
-// is at most 63 characters; a "<aKey>.<suffix>" name would not be. The domains are their own, apart
-// from the "feature." and "acceleratable." prefixes other controllers watch, so a value that moves
-// on every allocation wakes none of them.
+// 型号位于键的名称部分，因此对于长度不超过 63 个字符的任意加速设备键均合法；若采用
+// "<aKey>.<suffix>" 的命名方式则可能超出限制。其域名独立于其他控制器监听的 "feature." 和
+// "acceleratable." 前缀，从而确保每次分配引起的标签值变化不会唤醒这些控制器。
 const (
-	// FitLabelDomainSuffix ends the domain of every fit label.
+	// FitLabelDomainSuffix 是所有 fit 标签域名的后缀。
 	FitLabelDomainSuffix = "fit." + systemname.LabelPrefix
 
-	// _FitSlicedMaxFreeUnitsLabelPrefix prefixes the largest free units on any one card that can
-	// serve a logical slice and still has a free slot for one.
+	// _FitSlicedMaxFreeUnitsLabelPrefix 是如下标签键的前缀：记录可提供逻辑切分且仍有空闲槽位的
+	// 任意单卡上的最大空闲单元数。
 	_FitSlicedMaxFreeUnitsLabelPrefix = "sliced-max-free-units." + FitLabelDomainSuffix
-	// _FitSharedFreeCardsLabelPrefix prefixes the number of cards that can serve a whole-card
-	// family and still have a free ownership share.
+	// _FitSharedFreeCardsLabelPrefix 是如下标签键的前缀：记录可服务整卡共享系列且仍有空闲
+	// 归属份额的加速卡数量。
 	_FitSharedFreeCardsLabelPrefix = "shared-free-cards." + FitLabelDomainSuffix
 )
 
-// FitSlicedMaxFreeUnitsLabelKey returns the label key carrying the largest free units on any one
-// card of the accelerator model aKey ("<manufacturer>-<id>") that can serve a logical slice and still
-// has a free slot for one.
+// FitSlicedMaxFreeUnitsLabelKey 返回对应标签键，用于记录加速卡型号 aKey（"<manufacturer>-<id>"）中
+// 可提供逻辑切分且仍有空闲槽位的任意单卡上的最大空闲单元数。
 func FitSlicedMaxFreeUnitsLabelKey(aKey string) string {
 	return _FitSlicedMaxFreeUnitsLabelPrefix + aKey
 }
 
-// FitSharedFreeCardsLabelKey returns the label key carrying the number of cards of the accelerator
-// model aKey ("<manufacturer>-<id>") that can serve a whole-card family and still have a free
-// ownership share.
+// FitSharedFreeCardsLabelKey 返回对应标签键，用于记录加速卡型号 aKey（"<manufacturer>-<id>"）中
+// 可服务整卡共享系列且仍有空闲归属份额的加速卡数量。
 func FitSharedFreeCardsLabelKey(aKey string) string {
 	return _FitSharedFreeCardsLabelPrefix + aKey
 }
 
-// IsFitLabelKey reports whether key is one of the two fit label keys, with a non-empty model, and
-// is a valid label key. A model taken from an administrator's InstanceType or a Devices ledger is not
-// checked against label-key grammar anywhere else, and a key built from a malformed one would make
-// the Node patch or the node affinity carrying it invalid, so callers skip such a key instead.
+// IsFitLabelKey 判断 key 是否为两种 fit 标签键之一、包含非空型号且符合合法标签键语法。
+// 从管理员配置的 InstanceType 或 Devices 台账中取得的型号在其他位置未经过标签键语法校验，
+// 若由格式非法的型号构造键名，会导致携带该键的 Node 补丁或节点亲和性配置无效，因此调用方会跳过此类键。
 func IsFitLabelKey(key string) bool {
 	for _, prefix := range []string{_FitSlicedMaxFreeUnitsLabelPrefix, _FitSharedFreeCardsLabelPrefix} {
 		if aKey, ok := strings.CutPrefix(key, prefix); ok && aKey != "" {
@@ -56,8 +51,8 @@ func IsFitLabelKey(key string) bool {
 	return false
 }
 
-// EqualIgnoringFitLabels reports whether two label maps are equal once every fit label is left out
-// of both, so a watcher can ignore a Node update that moved only fit labels.
+// EqualIgnoringFitLabels 判断在忽略双方所有 fit 标签后两个标签映射是否相等，从而让监听方
+// 能够忽略仅变动了 fit 标签的 Node 更新事件。
 func EqualIgnoringFitLabels(a, b map[string]string) bool {
 	for k, av := range a {
 		if IsFitLabelKey(k) {
@@ -78,7 +73,7 @@ func EqualIgnoringFitLabels(a, b map[string]string) bool {
 	return true
 }
 
-// FilterFitLabels returns the fit labels of a label map.
+// FilterFitLabels 返回标签映射中的 fit 标签。
 func FilterFitLabels(labels map[string]string) map[string]string {
 	out := make(map[string]string)
 	for k, v := range labels {

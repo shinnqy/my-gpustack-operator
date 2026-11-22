@@ -22,8 +22,8 @@ func init() {
 	}
 }
 
-// ProxyFromEnvironment is similar to http.ProxyFromEnvironment,
-// but it also respects the NO_PROXY environment variable.
+// ProxyFromEnvironment 与 http.ProxyFromEnvironment 类似，
+// 但同样遵循 NO_PROXY 环境变量。
 func ProxyFromEnvironment(r *http.Request) (*url.URL, error) {
 	if ip := net.ParseIP(r.URL.Hostname()); ip != nil {
 		for i := range noProxies {

@@ -17,72 +17,67 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/mathx"
 )
 
-// grantLogger records the one refusal a caller cannot see in the result: an accelerator two
-// containers of a Pod were separately granted, which yields no figures of its own.
+// grantLogger 记录调用方无法在结果中直接看到的一种拒绝情形：同一 Pod 的两个容器
+// 分别被授予了同一个加速器，该情形自身不会产生任何指标数值。
 var grantLogger = klog.Background().WithName("instance-accelerator-metrics")
 
-// acceleratorKey identifies one GRANT across the manufacturers a Pod can hold at once: a device ID
-// is unique to its own manufacturer's library and to nothing beyond it.
+// acceleratorKey 在一个 Pod 可同时持有的多个厂商之间唯一标识一次授权：设备 ID 仅在
+// 各自厂商的驱动库内唯一，跨厂商则不具备唯一性。
 type acceleratorKey struct {
 	manufacturer string
 	deviceID     string
 
-	// partitionID separates two hardware partitions of ONE card, which are two grants and must be
-	// two entries — the entry list is keyed by id, and a partition names itself, so the two are
-	// distinguishable there. It is empty in every other mode: a logical slice has no identity of its
-	// own, so two slices of one card would collide on that key and cannot be two entries at all.
+	// partitionID 用于区分同一张卡上的两个硬件分区，它们属于两次授权且必须对应两条记录——
+	// 记录列表按 id 键控，而每个分区都有自己的名称，因此二者在此可被区分。在所有其他模式下
+	// 该字段均为空：逻辑切分片没有独立标识，因此同一张卡上的两个切分片会在该键上冲突，
+	// 根本无法作为两条独立记录存在。
 	partitionID string
 }
 
-// acceleratorGrant is what one Pod was granted on one accelerator, as the allocation recorded it,
-// and the container that holds it. The container is what the producer's records are keyed by, so the
-// grant and the measurement are two halves of one record rather than two lookups that could
-// disagree.
+// acceleratorGrant 表示一个 Pod 在单个加速器上获得的授权（按分配记录所载）以及
+// 持有该授权的容器。采集端记录按容器建索引，因此授权与度量数据实际上是同一条记录的
+// 两半，而不是两次可能不一致的独立查找。
 type acceleratorGrant struct {
 	container string
 	mode      workercore.DeviceAllocationMode
 
-	// partitionID is the partition this grant holds, as the allocation recorded it, and empty in
-	// every other mode. It names the entry even when nothing could measure the partition, which is
-	// what keeps two unmeasurable partitions of one card from collapsing onto one identifier.
+	// partitionID 是按分配记录所载的该授权所持有的分区，在所有其他模式下为空。即使无法对
+	// 分区进行度量，它仍会标识该条目，从而避免同一张卡上两个无法度量的分区混为同一个标识符。
 	partitionID string
 
-	// allocatedUnits is the normalized per-accelerator units the allocation charged against the card,
-	// on the basis nodefeature.ResourceMaxUnits defines — the same memory-anchored basis admission
-	// counted credits on. It is what a logical slice's memory quota is folded back out of.
+	// allocatedUnits 是本次分配按照 nodefeature.ResourceMaxUnits 定义的基准记在该卡上的
+	// 归一化单卡单元数——与准入阶段计算额度所用的基于显存锚定的基准一致。逻辑切分片的
+	// 显存配额正是由此折算出来的。
 	allocatedUnits int32
 
-	// coresCapPercent is the share of the WHOLE card's compute a logical slice is capped at, read
-	// from whoever enforced it: the container's own compute request. It is the denominator the
-	// measured share is restated against, and never a figure folded out of the units above, because a
-	// logical slice's compute and memory budgets are independent — a container may hold a tenth of the
-	// VRAM and half the compute.
+	// coresCapPercent 是逻辑切分片所受限的整卡算力占比上限，直接读取自其实际执行方：
+	// 容器自身的算力请求。它是将实测占比重新折算的基准分母，而绝不能从上方的 units 中
+	// 推算，因为逻辑切分片的算力预算与显存预算是相互独立的——容器可能持有十分之一的显存
+	// 与一半的算力。
 	coresCapPercent uint32
 
-	// ambiguous marks a grant two of the Pod's containers were separately given — the same whole
-	// card, or the same partition of one. One entry cannot carry two grants, and picking or summing
-	// them would report a quota nobody was granted.
+	// ambiguous 标记同一个 Pod 内两个容器各自获得的重复授权——即同一张整卡或同一张卡的
+	// 同一个分区。单条记录无法承载两次授权，而任选其一或求和都会上报一个实际无人获得的配额。
 	ambiguous bool
 }
 
-// AcceleratorGrants indexes what one Pod was granted on each accelerator it holds, so that a surface
-// reporting its figures can state them in the Instance's own terms.
+// AcceleratorGrants 按加速器索引单个 Pod 获得的各项授权，以便上报其指标的接口能够
+// 以 Instance 自身的视角来表述这些数值。
 //
-// It is built once per Pod and asked per accelerator, because the Pod-wide allocation view the
-// accelerator list is filtered by cannot say which container holds which grant — and the producer's
-// records are keyed by container.
+// 它按 Pod 构建一次并按加速器查询，因为过滤加速器列表所用的 Pod 级分配视图无法
+// 说明哪个容器持有哪项授权——而采集端的记录是按容器建索引的。
 //
-// It lives here, beside the quota arithmetic, because both surfaces reporting these figures make the
-// same joins: the metrics subresource per request, and the device manager's exporter per scrape. Two
-// implementations would agree today and drift on the cases neither exercises — an accelerator two
-// containers carved, a partition that named itself, a compute share restated against its cap.
+// 它放在此处紧邻配额计算逻辑，是因为上报这些指标的两个出口都执行相同的关联操作：
+// 按请求触发的 metrics 子资源，以及按抓取周期触发的 device manager exporter。两套
+// 独立实现今天或许一致，但在双方各自未覆盖的边缘情况上终会偏离——例如被两个容器
+// 切分的加速器、自带标识的分区，以及按上限折算的算力占比。
 type AcceleratorGrants struct {
 	podUID string
 	grants map[acceleratorKey]acceleratorGrant
 }
 
-// NewAcceleratorGrants indexes the Pod's allocations by accelerator, reading each logical slice's
-// compute cap off the container it was enforced on.
+// NewAcceleratorGrants 按加速器索引 Pod 的分配信息，并从执行限制的容器上读取每个
+// 逻辑切分片的算力上限。
 func NewAcceleratorGrants(pod *core.Pod, allocations deviceplugin.PodAllocations) *AcceleratorGrants {
 	grants := &AcceleratorGrants{
 		podUID: string(pod.UID),
@@ -92,15 +87,15 @@ func NewAcceleratorGrants(pod *core.Pod, allocations deviceplugin.PodAllocations
 	for container, allocation := range allocations {
 		for _, grp := range allocation.Devices.Groups {
 			for _, accelerator := range grp.Accelerators {
-				// Visibility grants no resources at all: it lets one container see the devices a
-				// SIBLING was granted. Indexing it would make every such Pod look like two containers
-				// claiming one card, and the sibling that really holds it is indexed here already.
+				// Visibility 模式完全不授予任何资源：它只是让一个容器能够看到同 Pod 兄弟容器所获授的
+				// 设备。将其纳入索引会让这类 Pod 看起来像是两个容器争抢同一张卡，而真正持有该设备的
+				// 兄弟容器已经在此被索引过了。
 				if accelerator.Mode == workercore.DeviceAllocationModeVisibility {
 					continue
 				}
 
-				// A partition is keyed by itself, so two containers holding two partitions of one
-				// card are two grants rather than one contested card.
+				// 分区以自身 ID 为键，因此分别持有同一张卡上两个分区的两个容器会记为两项授权，而不会被
+				// 当作存在争抢的同一张卡。
 				partitionID := ""
 				if accelerator.Mode == workercore.DeviceAllocationModePartitioned {
 					partitionID = accelerator.AllocatedPhysicalID
@@ -137,34 +132,31 @@ func NewAcceleratorGrants(pod *core.Pod, allocations deviceplugin.PodAllocations
 	return grants
 }
 
-// Resolve reports what the Instance holds on one accelerator, in the Instance's own terms: what the
-// allocation granted as the totals, what the producer measured of that grant as the used figures, and
-// the mode that produced both.
+// Resolve 以 Instance 自身的视角上报其在单个加速器上持有的资源情况：将分配所授予的
+// 资源作为总量，将采集端针对该项授权实测的结果作为已用量，并附带产生这两者的分配模式。
 //
-// ONE ENTRY PER GRANT, NOT PER CARD. A card serves one grant in every mode but Partitioned, where the
-// Instance may hold several of its partitions at once — one per container — and each is its own grant
-// with its own identity, capacity and usage. Collapsing those onto the parent card would report one
-// tenant of a card as if it were the card.
+// 每项授权对应一条记录，而非每张卡一条。除 Partitioned 模式外，一张卡在所有模式下都只
+// 服务于一项授权；而在 Partitioned 模式下，Instance 可能同时持有同一张卡的多个分区
+// （每个容器一个），每个分区都是各自独立的授权，拥有独立的标识、容量和用量。将它们合并到
+// 父级物理卡上，相当于把卡上的某个租户当作整张卡来上报。
 //
-// An Instance holding the whole device reads the device's own figures, because the device is the
-// grant. One holding a carved share reads the share's quota and the share's measured usage, and
-// reads NO memory or compute figure at all where that measurement could not be taken — the device's
-// would count every other tenant on the card, which is the one substitution this whole feature
-// exists to refuse. The whole-device readings that are not resource usage — temperature, power draw
-// and health — are reported in every mode, because a share of a card has none of its own.
+// 持有整张设备的 Instance 直接读取设备自身的指标，因为整张设备就是该授权。持有切分份额的
+// Instance 则读取该份额的配额与实测用量，在无法取得该份额测量值时则完全不读取任何显存或
+// 算力数值——设备级指标会包含同卡上的所有其他租户，而杜绝这种替代正是整个特性的存在意义。
+// 非资源用量的整卡读数（温度、功耗与健康状态）在所有模式下都会上报，因为卡上的切分份额本身
+// 没有独立的这类读数。
 //
-// The measured figures come from the section verbatim, absence and zero alike: the section holds that
-// decision so both surfaces reporting these figures make it identically. A section that cannot answer
-// for this accelerator at all — a producer predating slice reporting, a schema it does not know, an
-// accelerator it did not cover — leaves them absent, which is the honest claim: the grant is still
-// known, and nothing measured the usage.
+// 实测数值原样来自 section，无论缺失还是为零：由 section 统一持有这一判断，确保上报
+// 这些指标的两个出口表现完全一致。若 section 完全无法回答该加速器的数据（例如采集端版本
+// 早于切分片上报、无法识别的 schema 或未覆盖该加速器），则将这些数值留空，这才是最诚实的
+// 表达：授权本身仍已知，但没有任何来源测得其用量。
 func (g *AcceleratorGrants) Resolve(
 	section *detector.MonitorSliceSection,
 	manufacturer string,
 	card *device.AcceleratorMetrics,
 ) []worker.InstanceAcceleratorMetrics {
-	// Ordered by the partition each grant holds, so a scrape and a subresource read of one Pod list
-	// its entries the same way twice running. Every mode but Partitioned yields exactly one.
+	// 按每项授权所持有的分区排序，从而使同一 Pod 的定时抓取与子资源读取每次输出的条目顺序一致。
+	// 除 Partitioned 模式外，每种模式均只产生恰好一条记录。
 	keys := make([]acceleratorKey, 0, 1)
 	for key := range g.grants {
 		if key.manufacturer == manufacturer && key.deviceID == card.ID {
@@ -172,9 +164,9 @@ func (g *AcceleratorGrants) Resolve(
 		}
 	}
 	if len(keys) == 0 {
-		// The accelerator list is filtered by this Pod's own allocation, so nothing it carries should
-		// miss the index. One that does is an accelerator nobody can say the Instance's share of, and
-		// the device's figures are not that share — so the entry names the card and measures nothing.
+		// 加速器列表已按该 Pod 自身的分配信息过滤，因此其中不应有索引未命中的项。若确实发生
+		// 未命中，说明没有任何一方能确定 Instance 在该加速器上的份额，而设备级数值并不代表该份额——
+		// 因此条目仅保留该卡的标识而不包含任何度量值。
 		return []worker.InstanceAcceleratorMetrics{cardEntry(card)}
 	}
 	slices.SortFunc(keys, func(a, b acceleratorKey) int {
@@ -188,7 +180,7 @@ func (g *AcceleratorGrants) Resolve(
 	return entries
 }
 
-// resolveGrant answers for one grant on one card.
+// resolveGrant 解析单张加速卡上的单次分配授权。
 func (g *AcceleratorGrants) resolveGrant(
 	section *detector.MonitorSliceSection,
 	manufacturer string,
@@ -198,9 +190,9 @@ func (g *AcceleratorGrants) resolveGrant(
 	entry := cardEntry(card)
 	entry.Mode = grant.mode.String()
 
-	// A partition names itself even when nothing could measure it: the allocation recorded which one
-	// this is, and reporting it under the parent card's identifier would put two partitions of one
-	// card on one identifier — which the entry list, keyed by id, cannot carry.
+	// 即使无法采集指标，硬件分区也会自行命名：分配记录已标明具体分区，若按父卡的
+	// 标识符上报，会将同一张卡的两个分区归到同一个标识符下，而以 id 为键的条目列表
+	// 无法区分这种情况。
 	if grant.partitionID != "" {
 		entry.ID = grant.partitionID
 	}
@@ -223,10 +215,9 @@ func (g *AcceleratorGrants) resolveGrant(
 		figures = measured
 	}
 
-	// A hardware partition names and sizes ITSELF: the driver read both off the partition's own
-	// handle, so the capacity comes from the producer rather than from the allocation, and the
-	// driver's own naming wins over the recorded one where it answered. A logical slice has neither —
-	// it is a quota carved out of the card the entry is already reported under.
+	// 硬件分区自行命名并确定容量：驱动直接从分区自身的句柄读取这两项信息，因此容量
+	// 来自数据采集端而非分配记录，且在驱动返回命名时优先采用驱动自身的命名。
+	// 逻辑切片则两者皆无，它是从当前条目所属加速卡上切分出来的配额。
 	if figures.ID != "" {
 		entry.ID = figures.ID
 	}
@@ -243,8 +234,8 @@ func (g *AcceleratorGrants) resolveGrant(
 	return entry
 }
 
-// cardEntry is the part of an entry that comes from the whole card in every mode: its identity as a
-// starting point, and the readings a share of a card has none of its own.
+// cardEntry 构造在所有模式下均来自整卡的条目基础部分：以其标识作为起点，
+// 并包含共享分片自身无法单独测量的读数。
 func cardEntry(card *device.AcceleratorMetrics) worker.InstanceAcceleratorMetrics {
 	return worker.InstanceAcceleratorMetrics{
 		ID:                 card.ID,
@@ -254,9 +245,9 @@ func cardEntry(card *device.AcceleratorMetrics) worker.InstanceAcceleratorMetric
 	}
 }
 
-// carvedAllocationMode reports whether an allocation holds a share of an accelerator rather than the
-// whole of it. Shared is not carved: it grants the device to several holders with no quota between
-// them, so the device's figures are the only ones its holder has.
+// carvedAllocationMode 返回一次分配是否仅持有加速卡的一部分而非整卡。
+// Shared 不属于切分模式：它将设备同时授予多个持有者且彼此之间没有配额限制，
+// 因此设备的整卡指标就是其持有者仅有的指标。
 func carvedAllocationMode(mode workercore.DeviceAllocationMode) bool {
 	switch mode {
 	case workercore.DeviceAllocationModeSliced, workercore.DeviceAllocationModePartitioned:
@@ -265,16 +256,14 @@ func carvedAllocationMode(mode workercore.DeviceAllocationMode) bool {
 	return false
 }
 
-// slicedMemoryTotalMiB folds a logical slice's allocated units back into MiB, inverting the fold that
-// produced them (nodefeature.MemoryMibToUnits) so the reported total cannot disagree with the quota
-// that was granted. A record claiming more than a whole card is held at the whole card, the same
-// bound the device plugin applies when it writes one.
+// slicedMemoryTotalMiB 将逻辑切片分配的单位数还原为 MiB，作为生成该单位数的
+// nodefeature.MemoryMibToUnits 的逆运算，使上报的总量不会与实际授予的配额不一致。
+// 若记录声明超过整卡容量，则上限截断为整卡容量，这与 DevicePlugin 写入记录时的边界一致。
 //
-// A GRANTED QUOTA NEVER FOLDS BACK TO NOTHING. The units are a fraction of a fixed scale, so a small
-// enough slice of a large enough card divides to zero — a 1 MiB request on an 80 GiB card is granted
-// 19 of 1,600,000 units, which fold back to 0 MiB. Zero is not a small quota here but the absence of
-// one, so the smallest quota this can report is 1 MiB. Only an allocation that charged nothing, or a
-// card whose capacity never reached this pass, has no quota to state — and then it states none.
+// 已授予的配额绝不会还原为零。单位数按固定比例划分，因此在大容量加速卡上足够小的切片
+// 相除后可能得到零——例如在 80 GiB 卡上请求 1 MiB 会被授予 1,600,000 单位中的 19 单位，
+// 还原后为 0 MiB。此处 0 并不表示极小配额，而是表示没有配额，因此可上报的最小配额为 1 MiB。
+// 仅当分配未计费，或卡容量未能传递到此阶段时，才视为无配额可上报并保持缺失。
 func slicedMemoryTotalMiB(units int32, cardMemoryMiB uint64) *uint64 {
 	if units <= 0 || cardMemoryMiB == 0 {
 		return nil
@@ -285,9 +274,8 @@ func slicedMemoryTotalMiB(units int32, cardMemoryMiB uint64) *uint64 {
 	return ptr.To(max(uint64(units)*cardMemoryMiB/nodefeature.ResourceMaxUnits, 1))
 }
 
-// utilizationPercent states a Used/Total pair as a percentage, and states none where either half is
-// missing. It is computed from the two figures published beside it rather than taken from any
-// source of its own, so the three can never disagree.
+// utilizationPercent 将一对 Used/Total 数值表示为百分比，若任一端缺失则返回 nil。
+// 该值直接根据一同发布的两个数值计算，而非取自独立来源，从而确保三者始终一致。
 func utilizationPercent(usedMiB, totalMiB *uint64) *uint32 {
 	if usedMiB == nil || totalMiB == nil || *totalMiB == 0 {
 		return nil
@@ -295,16 +283,13 @@ func utilizationPercent(usedMiB, totalMiB *uint64) *uint32 {
 	return ptr.To(device.CalculateUtilization(*usedMiB, *totalMiB))
 }
 
-// ownCoresUtilizationPercent restates a measured share of the WHOLE card as a share of the holder's
-// own compute allowance, which is what makes one field mean one thing in every mode: a slice capped
-// at a fifth of a card and saturating that fifth reads 100 here, exactly as an Instance saturating a
-// whole card does.
+// ownCoresUtilizationPercent 将测得的整卡算力占比换算为占持有者自身算力配额的比例，
+// 从而使同一字段在所有模式下具有一致含义：例如限制为整卡五分之一且跑满该配额的切片，
+// 此处读数为 100，与跑满整卡的 Instance 完全一致。
 //
-// The quotient rounds UP for the reason every other conversion in this package does: the
-// manufacturers measure the card in whole percent, so a small cap makes the numerator coarse, and
-// flooring would publish a slice that is measurably busy as one doing nothing. A cap of the whole
-// card — which is what a slice requesting no compute budget is granted — passes the figure through
-// untouched.
+// 该商向上取整，原因与本包中所有其他换算一致：厂商以整数百分比度量整卡利用率，
+// 较小的算力上限会使分子粒度变粗，向下取整可能将明显忙碌的切片发布为毫无负载。
+// 若上限为整卡（即切片未请求算力预算时授予的默认值），则原样透传该数值。
 func ownCoresUtilizationPercent(measuredPercent *uint32, capPercent uint32) *uint32 {
 	if measuredPercent == nil {
 		return nil
@@ -315,12 +300,11 @@ func ownCoresUtilizationPercent(measuredPercent *uint32, capPercent uint32) *uin
 	return ptr.To(uint32(mathx.CeilDiv(uint64(*measuredPercent)*100, uint64(capPercent)))) // nolint: gosec
 }
 
-// slicedCoresCapPercentOf reads the compute cap the allocator enforced on one container of the Pod,
-// from the request it was granted. A container the Pod spec no longer carries, and one requesting no
-// compute budget, are capped at the whole card — which is what the allocator itself applies.
+// slicedCoresCapPercentOf 从 Pod 某个容器获批的请求中读取分配器对其施加的算力上限。
+// 若容器已不在 Pod spec 中，或未请求算力预算，则上限视为整卡——这与分配器本身的策略一致。
 //
-// It answers only for a logical slice. That default is why: a hardware partition makes no compute
-// request, so reading one for it would cap every partition at the whole card.
+// 该函数仅针对逻辑切片返回有效计算结果。上述默认值正是原因所在：硬件分区不发起
+// 算力请求，若为其读取请求值，就会把每个分区都按整卡上限处理。
 func slicedCoresCapPercentOf(
 	pod *core.Pod, container, manufacturer string, mode workercore.DeviceAllocationMode,
 ) uint32 {
@@ -329,10 +313,9 @@ func slicedCoresCapPercentOf(
 	}
 	resName := nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(manufacturer)
 
-	// All three container lists, because an allocation is recorded for whichever kind of container
-	// holds it and the default for a container this search misses is the WHOLE CARD — so a search
-	// narrower than the allocations it reads would publish a cap nobody granted. The attribution
-	// index and the started-container gate walk the same three for the same reason.
+	// 遍历全部三类容器列表，因为分配记录可能属于任意类型的容器，且查找未命中时的默认值
+	// 为整卡上限——如果查找范围窄于所读取的分配记录，就会发布一个从未授予过的上限。
+	// 归属索引与已启动容器检查出于同样原因也遍历这三类容器。
 	ctr := &core.Container{}
 	for _, containers := range [][]core.Container{pod.Spec.Containers, pod.Spec.InitContainers} {
 		if i := slices.IndexFunc(containers, func(c core.Container) bool {

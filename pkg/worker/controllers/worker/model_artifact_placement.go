@@ -28,8 +28,8 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// The reasons WeightsReady carries while a deployment's weights are not available. Every one of
-// them holds the deployment's Pods back, and none of them touches a Pod that already runs.
+// 当 deployment 的权重不可用时 WeightsReady 所携带的 reason。其中每一项都会阻止创建新的 Pod，
+// 但均不会影响已在运行的 Pod。
 const (
 	modelWeightsReasonNotApplicable    = "NotApplicable"
 	modelWeightsReasonArtifactNotFound = "ArtifactNotFound"
@@ -46,23 +46,22 @@ const (
 	modelWeightsReasonMaterializing    = "Materializing"
 	modelWeightsReasonMaterializeFail  = "MaterializationFailed"
 
-	// modelArtifactNoProvisioner is the provisioner a static local-volume class names.
+	// modelArtifactNoProvisioner 是静态本地卷 StorageClass 所指定的 provisioner 名称。
 	modelArtifactNoProvisioner = "kubernetes.io/no-provisioner"
 )
 
-// modelArtifactWeights is what a consumer's weights resolved to on one pass.
+// modelArtifactWeights 表示单次调谐中消费端权重的解析结果。
 type modelArtifactWeights struct {
-	// Render is how the weights reach the engine. It is nil while the artifact has never resolved,
-	// and then nothing about the consumer's Pods can be rendered at all.
+	// Render 描述权重如何交付给推理引擎。在 artifact 从未完成解析前为 nil，此时消费端的 Pod
+	// 无法进行任何渲染。
 	Render *ModelDeploymentArtifactRender
-	// Affinity is the bound PV's required node affinity, added to every Pod at creation.
+	// Affinity 是已绑定 PV 的强制节点亲和性，会在创建每个 Pod 时注入。
 	Affinity *core.NodeSelector
-	// Status is the echo written to the consumer's status, nil until the artifact resolved.
+	// Status 是回写到消费端 status 中的权重状态摘要，在 artifact 解析完成前为 nil。
 	Status *workercore.ModelDeploymentModelStatus
-	// KVIdentity is the weight identity a KV store's keys are prefixed with; see
-	// modelArtifactKVIdentity.
+	// KVIdentity 是 KV 存储键所使用的权重身份前缀；参见 modelArtifactKVIdentity。
 	KVIdentity string
-	// Blocked says new Pods must not be created, for Reason and Message.
+	// Blocked 表示因 Reason 和 Message 所述原因不得创建新的 Pod。
 	Blocked bool
 	Reason  string
 	Message string
@@ -72,24 +71,22 @@ func blockedModelArtifactWeights(reason, message string) *modelArtifactWeights {
 	return &modelArtifactWeights{Blocked: true, Reason: reason, Message: message}
 }
 
-// modelArtifactDeliveryMode is the delivery Setting as a ModelDeployment's reconcile reads it. It is
-// a variable so a test can choose a delivery without a Settings store.
+// modelArtifactDeliveryMode 是 ModelDeployment 调谐时读取的交付模式 Setting。将其定义为变量，
+// 以便测试无需 Settings 存储即可指定交付方式。
 //
-// The read goes to the API server rather than the informer cache: this value is the way out for a
-// deployment the delivery holds, and a stalled informer would otherwise freeze that way out — every
-// periodic recheck would re-read the same frozen value.
+// 此处直接从 API server 而非 informer 缓存读取：该值是因交付策略而被阻塞的 deployment 解除阻塞
+// 的唯一出口，若 informer 停滞不前，这一出口将被冻结——每次定期复查都会读到同一个过时的值。
 var modelArtifactDeliveryMode = func(ctx context.Context) string {
 	return settings.ModelArtifactDeliveryMode.ShouldValueFromRemote(ctx)
 }
 
-// resolveModelArtifactWeights reads the artifact a consumer references and, for a claim, where
-// the claim lets its Pods run. pods is how many Pods would mount the weights at once, which is
-// what a claim that is not shared cannot serve beyond one. nodeOnly says the consumer has no engine
-// to download a hub artifact, so node delivery is its only one whatever the delivery Setting says.
+// resolveModelArtifactWeights 读取消费端引用的 artifact，并在来源为 claim 时确定该 claim 允许
+// Pod 运行的位置。pods 表示同时挂载该权重的 Pod 数量，非共享访问模式的 claim 无法同时服务超过
+// 一个 Pod。nodeOnly 表示消费端没有可自行下载 hub artifact 的推理引擎，因此无论交付 Setting 如何
+// 配置，都只能使用节点交付模式。
 //
-// NOTHING HERE IS A REFUSAL. Every state that stops new Pods is one that changes by itself or by
-// a user creating something, so the consumer waits and says why, and its Pods are created the pass
-// after the state clears.
+// 此处没有任何拒绝操作。所有阻止创建新 Pod 的状态都会自行变化或随着用户创建相应资源而改变，
+// 因此消费端只需等待并说明原因，待状态解除后的下一次调谐即可创建 Pod。
 func resolveModelArtifactWeights(
 	ctx context.Context, cli ctrlcli.Reader, namespace, name string, pods int, nodeOnly bool,
 ) (*modelArtifactWeights, error) {
@@ -118,17 +115,16 @@ func resolveModelArtifactWeights(
 			Path:      source.PersistentVolumeClaim.Path,
 		}
 	case source.Image != nil:
-		// The image is delivered whole by kubelet, wherever the Pod lands: no node affinity, no
-		// plugin, no filter, and nothing to size. The reference in the immutable spec is the only
-		// content identity, so the resolved status is claim-shaped and the KV identity falls back
-		// to the artifact's UID.
+		// 镜像由 kubelet 完整拉取交付，无论 Pod 调度到哪个节点：无需节点亲和性、无需插件、无需文件
+		// 过滤，也无需计算容量大小。不可变 spec 中的引用即为唯一的内容标识，因此已解析状态采用与
+		// claim 相同的形态，且 KV 身份回退为 artifact 的 UID。
 		w.Render = &ModelDeploymentArtifactRender{
 			Delivery:       workercore.ModelDeploymentModelDeliveryImage,
 			ImageReference: source.Image.Reference,
 		}
 	case source.HuggingFace != nil, source.ModelScope != nil:
-		// The two hubs differ in the endpoints they are resolved against and the environment an
-		// engine download reads; delivery, placement and every digest-keyed behavior are shared.
+		// 两个 hub 仅在解析所用的端点以及引擎下载读取的环境变量上有所不同；交付方式、调度放置以及
+		// 所有基于摘要的行为均为共用。
 		hub, kind := source.HuggingFace, modelDeploymentHubHuggingFace
 		endpoint := settings.ModelArtifactHuggingFaceEndpoint.ShouldValue(ctx)
 		if hub == nil {
@@ -186,8 +182,8 @@ func resolveModelArtifactWeights(
 			return nil, err
 		}
 	case workercore.ModelDeploymentModelDeliveryNode:
-		// Node delivery needs the plugin. Whether it is installed is a runtime fact admission cannot
-		// see for a value seeded from the environment or a plugin removed later, so the consumer waits.
+		// 节点交付模式依赖该 CSI 插件。若配置值来自环境变量预设或插件在之后被移除，准入阶段无法得知
+		// 插件是否已安装这一运行时事实，因此消费端在此等待。
 		switch err := cli.Get(ctx, ctrlcli.ObjectKey{Name: modelstore.DriverName}, new(storage.CSIDriver)); {
 		case kerrors.IsNotFound(err):
 			w.Blocked, w.Reason = true, modelWeightsReasonNodeUnavailable
@@ -198,17 +194,16 @@ func resolveModelArtifactWeights(
 			return nil, fmt.Errorf("read the CSIDriver %s: %w", modelstore.DriverName, err)
 		}
 	case workercore.ModelDeploymentModelDeliveryEngine:
-		// An engine chooses its own files and its cache is sized to the filtered total, so a filter
-		// could only be honored by the node.
+		// 推理引擎会自行决定下载哪些文件，且缓存容量也是按过滤后的总大小计算的，因此文件过滤条件只能由
+		// 节点交付模式来履行。
 		if len(ma.Spec.AllowPatterns) > 0 || len(ma.Spec.IgnorePatterns) > 0 {
 			w.Blocked, w.Reason = true, modelWeightsReasonFilterNeedsNode
 			w.Message = fmt.Sprintf("ModelArtifact %q selects files with allow or ignore patterns, which only node "+
 				"delivery honors: set model-artifact-delivery-mode to Node", name)
 			break
 		}
-		// An anchor is an assertion the engine cannot keep: it downloads by repository and revision
-		// and cannot verify what it fetched against the digest, and an Expected identity has no
-		// commit to pin the revision with at all.
+		// 锚点是一项推理引擎无法保证的断言：引擎按仓库和版本修订号下载，无法针对摘要校验拉取的内容，
+		// 且基于 ExpectedDigest 的身份根本没有可用于固定版本的 commit。
 		if ma.Spec.ExpectedDigest != "" {
 			w.Blocked, w.Reason = true, modelWeightsReasonAnchorNeedsNode
 			message := fmt.Sprintf("ModelArtifact %q carries expectedDigest, and an engine downloads by "+
@@ -224,13 +219,13 @@ func resolveModelArtifactWeights(
 	return w, nil
 }
 
-// placeModelArtifactClaim decides where a claim lets its Pods run, and whether it lets them run.
+// placeModelArtifactClaim 决定 claim 允许其 Pod 在何处运行，以及是否允许其运行。
 //
-// KUEUE'S TOPOLOGY-AWARE SCHEDULING DOES NOT READ A POD'S VOLUMES. A claim bound to a PV with node
-// affinity was measured to fail silently without this: TAS assigned another node, the Pod stayed
-// Pending forever, and its Workload stayed Admitted holding quota with nothing on it saying why.
-// With the PV's required node affinity on the Pod, TAS honors it, and when that node is full the
-// Workload waits before quota and admits itself once room appears.
+// KUEUE 的拓扑感知调度（TAS）不会读取 Pod 的卷配置。实测表明，若不做此处理，绑定到带有节点
+// 亲和性 PV 的 claim 会静默失败：TAS 会将 Pod 分配到其他节点，导致 Pod 永久处于 Pending，
+// 其 Workload 则维持 Admitted 状态并持续占用配额，且没有任何信息说明原因。将 PV 的强制节点
+// 亲和性添加到 Pod 后，TAS 便会遵守该约束；当该节点资源已满时，Workload 会在分配配额前
+// 等待，并在出现空余资源后自行准入。
 func placeModelArtifactClaim(
 	ctx context.Context, cli ctrlcli.Reader, namespace, claimName string, pods int, w *modelArtifactWeights,
 ) error {
@@ -275,8 +270,7 @@ func placeModelArtifactClaim(
 			return err
 		}
 		if dynamic {
-			// The provisioner creates the volume on the node the first Pod is assigned, so the
-			// assignment decides the binding rather than the other way round.
+			// provisioner 会在首个 Pod 被调度到的节点上创建卷，因此是由调度结果决定卷绑定，而非相反。
 			return nil
 		}
 	}
@@ -291,13 +285,12 @@ func placeModelArtifactClaim(
 	return nil
 }
 
-// modelArtifactClaimBindsOnFirstPod reports whether a pending claim is provisioned for the node its
-// first consumer is assigned: WaitForFirstConsumer with a provisioner that creates volumes.
+// modelArtifactClaimBindsOnFirstPod 报告处于 Pending 状态的 claim 是否会在首个消费端 Pod 被调度后
+// 在对应节点上动态创建：即使用 WaitForFirstConsumer 且配有可创建卷的 provisioner。
 //
-// A class without a provisioner is the usual static local-volume class, and it is treated as
-// unbound: TAS picks a node first, and the binder then looks for a matching PV on that node alone,
-// so a node without one would bring back the silent Pending that holds quota. That reading is
-// inferred from the binding order, not measured.
+// 没有 provisioner 的 StorageClass 通常是静态本地卷类，这里按未绑定处理：TAS 会先选定节点，
+// 随后卷绑定器仅在该节点上查找匹配的 PV，因此若该节点上不存在可用的 PV，就会再次出现占用
+// 配额却静默卡在 Pending 的问题。这一判断是从绑定顺序推断得出的，尚未经过实测验证。
 func modelArtifactClaimBindsOnFirstPod(ctx context.Context, cli ctrlcli.Reader, pvc *core.PersistentVolumeClaim) (bool, error) {
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
 		return false, nil
@@ -314,9 +307,8 @@ func modelArtifactClaimBindsOnFirstPod(ctx context.Context, cli ctrlcli.Reader, 
 		sc.Provisioner != modelArtifactNoProvisioner, nil
 }
 
-// injectModelArtifactAffinity adds a PV's required node affinity to a Pod's own, as an AND: the
-// Pod's terms and the PV's are crossed, so a node satisfies the result only when it satisfies one
-// term of each.
+// injectModelArtifactAffinity 将 PV 的强制节点亲和性与 Pod 自身的节点亲和性以逻辑与（AND）合并：
+// 对 Pod 的条件项和 PV 的条件项做笛卡尔积，使节点必须同时满足双方各自至少一个条件项才算匹配。
 func injectModelArtifactAffinity(pod *core.Pod, required *core.NodeSelector) {
 	if required == nil || len(required.NodeSelectorTerms) == 0 {
 		return
@@ -346,8 +338,8 @@ func injectModelArtifactAffinity(pod *core.Pod, required *core.NodeSelector) {
 	na.RequiredDuringSchedulingIgnoredDuringExecution = &core.NodeSelector{NodeSelectorTerms: crossed}
 }
 
-// resolveModelDeploymentWeights resolves the weights spec.model.artifactRef names, or nil for a
-// deployment naming none.
+// resolveModelDeploymentWeights 解析 spec.model.artifactRef 所指定的权重；若 deployment 未指定
+// artifactRef，则返回 nil。
 func (r *ModelDeploymentReconciler) resolveModelDeploymentWeights(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (*modelArtifactWeights, error) {
@@ -356,7 +348,7 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentWeights(
 		return nil, nil
 	}
 
-	// Every Pod of every role mounts a claim, the take-over tier's included.
+	// 每个角色的每个 Pod 都会挂载一个 claim，包含接管层级（take-over tier）。
 	pods := 0
 	for i := range md.Spec.Roles {
 		pods += int(md.Spec.Roles[i].Replicas) * modelDeploymentRoleSize(&md.Spec.Roles[i])
@@ -365,14 +357,13 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentWeights(
 	return resolveModelArtifactWeights(ctx, r.Client, md.Namespace, name, pods, false)
 }
 
-// observeModelDeploymentWeights writes status.model and the WeightsReady condition. nodeModels is
-// what each replica Pod's node reports about the digest, by node name, for node delivery.
+// observeModelDeploymentWeights 写入 status.model 和 WeightsReady condition。nodeModels 按节点名记录
+// 每个副本 Pod 所在节点针对该摘要上报的节点分发状态。
 //
-// THE CONDITION IS DERIVED FROM POD CONDITIONS AND NODE STATUS, NEVER FROM EVENTS. A claim's or a
-// node-delivered artifact's weights are there once kubelet has mounted the Pod's volumes, which
-// PodReadyToStartContainers reports, and until then the node's NodeModelStore says whether it is
-// materializing them or failed to; an engine download is complete only once the engine serves,
-// because the engine reports no progress of its own.
+// 该 condition 仅根据 Pod 的 condition 与节点状态推导，绝不依赖 Event。对于 claim 或节点分发的制品，
+// 一旦 kubelet 挂载完 Pod 的卷（由 PodReadyToStartContainers 上报），即表示权重已就绪；在此之前，
+// 由节点上的 NodeModelStore 说明正在准备权重还是准备失败。对于引擎自行下载，只有当引擎开始提供服务时
+// 才视为下载完成，因为引擎自身不会上报下载进度。
 func observeModelDeploymentWeights(
 	holder *workercore.ModelDeployment, pods []core.Pod, weights *modelArtifactWeights,
 	nodeModels map[string]*workercore.NodeModelStoreModel,
@@ -448,8 +439,8 @@ func observeModelDeploymentWeights(
 	}
 }
 
-// modelArtifactNodeModels reads what each Pod's node reports about digest, by node name. A node
-// without a NodeModelStore, or one not listing the digest, has no entry.
+// modelArtifactNodeModels 按节点名读取每个 Pod 所在节点关于指定摘要的上报信息。没有 NodeModelStore
+// 或未列出该摘要的节点不会出现在结果中。
 func modelArtifactNodeModels(
 	ctx context.Context, cli ctrlcli.Reader, pods []core.Pod, digest string,
 ) (map[string]*workercore.NodeModelStoreModel, error) {
@@ -491,8 +482,8 @@ func modelDeploymentPodVolumesMounted(pod *core.Pod) bool {
 	return false
 }
 
-// modelDeploymentMainContainerReady reads the engine's own container rather than the Pod: the Pod's
-// readiness also waits on a routing sidecar, which says nothing about the download.
+// modelDeploymentMainContainerReady 检查引擎主容器而非整个 Pod 的就绪状态：Pod 的就绪状态还会等待
+// 路由 sidecar，而该 sidecar 与权重下载进度无关。
 func modelDeploymentMainContainerReady(pod *core.Pod) bool {
 	for _, c := range pod.Status.ContainerStatuses {
 		if c.Name == modelDeploymentMainContainerName {
@@ -503,8 +494,8 @@ func modelDeploymentMainContainerReady(pod *core.Pod) bool {
 	return false
 }
 
-// modelDeploymentEvictionNote returns the kubelet's own message of the first evicted replica Pod,
-// or "". An eviction's reason survives only on the Pod: the container's logs go with it.
+// modelDeploymentEvictionNote 返回首个被驱逐的副本 Pod 中 kubelet 记录的原始消息，若无则返回 ""。
+// 驱逐原因仅保留在 Pod 对象上，容器日志会随容器一并丢失。
 func modelDeploymentEvictionNote(pods []core.Pod) string {
 	for i := range pods {
 		if pods[i].Status.Reason == "Evicted" && pods[i].Status.Message != "" {
@@ -515,12 +506,12 @@ func modelDeploymentEvictionNote(pods []core.Pod) string {
 	return ""
 }
 
-// mapModelDeploymentArtifact enqueues the deployments in the artifact's namespace referencing it.
+// mapModelDeploymentArtifact 将该制品所在 Namespace 中引用它的 ModelDeployment 加入调谐队列。
 func (r *ModelDeploymentReconciler) mapModelDeploymentArtifact(ctx context.Context, obj ctrlcli.Object) []ctrlreconcile.Request {
 	return r.modelDeploymentsReferencing(ctx, obj.GetNamespace(), obj.GetName())
 }
 
-// mapModelDeploymentClaim enqueues the deployments whose artifact is the claim.
+// mapModelDeploymentClaim 将制品指向该 claim 的 ModelDeployment 加入调谐队列。
 func (r *ModelDeploymentReconciler) mapModelDeploymentClaim(ctx context.Context, obj ctrlcli.Object) []ctrlreconcile.Request {
 	artifacts := new(workercore.ModelArtifactList)
 	if err := r.Client.List(ctx, artifacts, ctrlcli.InNamespace(obj.GetNamespace())); err != nil {
@@ -537,8 +528,7 @@ func (r *ModelDeploymentReconciler) mapModelDeploymentClaim(ctx context.Context,
 	return r.modelDeploymentsReferencing(ctx, obj.GetNamespace(), names...)
 }
 
-// mapModelDeploymentNodeModelStore enqueues the node-delivered deployments whose digest the node
-// lists.
+// mapModelDeploymentNodeModelStore 将节点列出了对应摘要且采用节点分发的 ModelDeployment 加入调谐队列。
 func (r *ModelDeploymentReconciler) mapModelDeploymentNodeModelStore(ctx context.Context, obj ctrlcli.Object) []ctrlreconcile.Request {
 	nms, ok := obj.(*workercore.NodeModelStore)
 	if !ok || len(nms.Status.Models) == 0 {
@@ -564,11 +554,11 @@ func (r *ModelDeploymentReconciler) mapModelDeploymentNodeModelStore(ctx context
 	return reqs
 }
 
-// nodeModelStoreModelsChanged passes a NodeModelStore update only when its models changed. A
-// deployment reads nothing else from the node, and the capacity and conditions move during every
-// download without changing what any deployment sees.
+// nodeModelStoreModelsChanged 仅在 NodeModelStore 的 models 发生变化时才放行更新事件。
+// ModelDeployment 不会从节点读取其他字段，而容量与 conditions 在每次下载过程中都会频繁变化，
+// 但并不会影响任何 ModelDeployment 看到的结果。
 func nodeModelStoreModelsChanged() ctrlpredicate.Predicate {
-	// A download's progress moves on every threshold the node writes, and no deployment reads it.
+	// 节点每次写入阈值时下载进度都会更新，而没有任何 ModelDeployment 会读取该进度。
 	return ctrlpredicate.Funcs{
 		UpdateFunc: func(e ctrlevent.UpdateEvent) bool {
 			o, okOld := e.ObjectOld.(*workercore.NodeModelStore)
@@ -578,7 +568,7 @@ func nodeModelStoreModelsChanged() ctrlpredicate.Predicate {
 	}
 }
 
-// modelsWithoutProgress is the node's entries with the download progress left out.
+// modelsWithoutProgress 返回节点的模型条目列表，并剔除其中的下载进度字段。
 func modelsWithoutProgress(nms *workercore.NodeModelStore) []workercore.NodeModelStoreModel {
 	models := make([]workercore.NodeModelStoreModel, len(nms.Status.Models))
 	for i, m := range nms.Status.Models {
@@ -589,18 +579,16 @@ func modelsWithoutProgress(nms *workercore.NodeModelStore) []workercore.NodeMode
 	return models
 }
 
-// mapModelDeploymentDelivery enqueues every deployment on an artifact. Which delivery a hub artifact
-// takes, and whether it can be delivered at all, follow the delivery Setting and the plugin's
-// CSIDriver, and neither changes any deployment's own object: without this a deployment waiting on
-// NodeDeliveryUnavailable or FilterNeedsNodeDelivery stays waiting after the fix, and a switch of
-// delivery rolls nothing until something unrelated wakes each deployment.
+// mapModelDeploymentDelivery 将所有引用制品的 ModelDeployment 加入调谐队列。Hub 制品采用哪种分发方式
+// 以及是否能够分发，取决于分发 Setting 与插件的 CSIDriver，而这两者都不会修改任何 ModelDeployment
+// 自身的对象。若无此映射，因 NodeDeliveryUnavailable 或 FilterNeedsNodeDelivery 而阻塞的部署在
+// 条件修复后会一直等待，切换分发方式也不会触发滚动更新，直到有其他无关事件唤醒它们。
 //
-// The error is returned rather than logged away: the wake-up this mapping produces is the only
-// signal a held deployment gets, so a failed list must reach a caller that retries it.
+// 此处选择返回 error 而非仅记录日志：该映射产生的唤醒是受阻部署收到的唯一信号，因此列表查询失败必须
+// 传递给能够触发重试的调用方。
 //
-// The list reads through the API reader rather than the cache, for the same reason the delivery
-// value itself is read from the API server: a stalled informer serves a frozen list with no error,
-// which no retry can tell from "nothing to wake".
+// 列表查询直接通过 API reader 而非缓存读取，原因与直接从 API server 读取分发配置相同：停滞的
+// informer 会无报错地返回冻结的旧列表，导致重试逻辑无法区分“确实没有需要唤醒的对象”与“缓存过期”。
 func (r *ModelDeploymentReconciler) mapModelDeploymentDelivery(ctx context.Context, _ ctrlcli.Object) ([]ctrlreconcile.Request, error) {
 	mds := new(workercore.ModelDeploymentList)
 	if err := r.APIReader.List(ctx, mds); err != nil {
@@ -616,34 +604,32 @@ func (r *ModelDeploymentReconciler) mapModelDeploymentDelivery(ctx context.Conte
 	return reqs, nil
 }
 
-// modelDeploymentDeliveryRecheck is how often a deployment held by the delivery is looked at again
-// without an event.
+// modelDeploymentDeliveryRecheck 是因分发问题而受阻的 ModelDeployment 在无事件触发时重新检查的时间间隔。
 const modelDeploymentDeliveryRecheck = time.Minute
 
-// settingsReadDelay is how long after a Settings change a deployment is looked at again: past the
-// Settings read cache, so the pass reads the new value rather than the cached one.
+// settingsReadDelay 是 Settings 变更后重新检查 ModelDeployment 的延迟时间：需超过 Settings 读缓存的
+// 有效期，以确保该轮调谐读到新值而非缓存值。
 const settingsReadDelay = setting.ReadCacheTTL + 5*time.Second
 
-// deliveryChangeRetryDelay is how long after a failed delivery mapping the mapping runs again: a
-// failed list must not drop the wake-up, and the wait keeps a persistent failure from spinning.
+// deliveryChangeRetryDelay 是分发映射失败后重新执行映射的等待时间：列表查询失败绝不能丢弃唤醒信号，
+// 而该等待时间可避免持续失败时出现空转。
 const deliveryChangeRetryDelay = 10 * time.Second
 
-// deliveryChangeMapFunc maps a delivery change — the delivery Setting or the plugin's CSIDriver —
-// to the deployments it may unblock.
+// deliveryChangeMapFunc 将分发相关的变更（分发 Setting 或插件的 CSIDriver）映射到其可能解除阻塞的
+// ModelDeployment。
 type deliveryChangeMapFunc func(context.Context, ctrlcli.Object) ([]ctrlreconcile.Request, error)
 
-// deliveryChangeHandler enqueues what the mapping returns once the handler's delay has passed. A
-// mapping that fails is retried rather than dropped: the wake-up is the only signal a held
-// deployment gets.
+// deliveryChangeHandler 在经过设定的延迟后，将映射函数返回的对象加入队列。映射失败时会重试而非丢弃：
+// 该唤醒是受阻部署能收到的唯一信号。
 type deliveryChangeHandler struct {
 	mapFn deliveryChangeMapFunc
 	delay time.Duration
-	// retrying coalesces the retries of concurrent failures: the mapping covers every deployment
-	// whatever its source object, so one pending retry speaks for all of them.
+	// retrying 用于合并并发失败的重试请求：无论触发的源对象是什么，映射都会覆盖全部 ModelDeployment，
+	// 因此一个待执行的重试即可代表所有失败。
 	retrying atomic.Bool
 }
 
-// enqueueDeliveryChange enqueues what mapFn returns for a delivery change once delay has passed.
+// enqueueDeliveryChange 在经过 delay 后，将 mapFn 针对分发变更返回的请求加入队列。
 func enqueueDeliveryChange(mapFn deliveryChangeMapFunc, delay time.Duration) ctrlhandler.EventHandler {
 	return &deliveryChangeHandler{mapFn: mapFn, delay: delay}
 }
@@ -660,8 +646,7 @@ func (h *deliveryChangeHandler) add(ctx context.Context, obj ctrlcli.Object, q w
 	}
 }
 
-// retryLater re-runs the mapping after a wait and enqueues the result at once, the delay having been
-// spent on the wait.
+// retryLater 在等待一段时间后重新执行映射，并立即将结果入队，因为延迟已在等待过程中消耗。
 func (h *deliveryChangeHandler) retryLater(ctx context.Context, obj ctrlcli.Object, q workqueue.TypedRateLimitingInterface[ctrlreconcile.Request]) {
 	if !h.retrying.CompareAndSwap(false, true) {
 		return
@@ -722,24 +707,21 @@ func (r *ModelDeploymentReconciler) modelDeploymentsReferencing(
 	return reqs
 }
 
-// modelArtifactKVIdentityDigits is how many hexadecimal digits of the digest the identity keeps:
-// 128 bits, far beyond any collision among the artifacts sharing one store tenant, at 34 characters
-// on every key.
+// modelArtifactKVIdentityDigits 指定标识中保留摘要的十六进制位数：共 128 位，远足以避免共享同一
+// 存储租户的制品发生冲突，且每个键上占用 34 个字符。
 const modelArtifactKVIdentityDigits = 32
 
-// modelArtifactKVIdentity is the weight identity a deployment's KV store keys carry: "m-" and the
-// leading digits of the manifest digest for a hub artifact, whose content has an address, or of the
-// SHA-256 of the artifact's UID for a claim, whose content has none. Deployments with one identity
-// share blocks; deployments with two never do.
+// modelArtifactKVIdentity 生成部署的 KV 存储键所携带的权重标识：对于内容可寻址的 Hub 制品，格式为
+// "m-" 加上 manifest 摘要的前缀位数；对于无内容地址的 claim，格式为 "m-" 加上制品 UID 的 SHA-256
+// 前缀位数。标识相同的部署会共享块，标识不同的部署则永不共享。
 //
-// A CLAIM'S IDENTITY IS THE ARTIFACT, NOT WHAT THE CLAIM HOLDS, so replacing the files under one
-// artifact keeps the identity and new deployments would hit blocks computed from the old files. New
-// weights on a claim are a new ModelArtifact, and the documentation says so.
+// claim 的标识绑定的是 ModelArtifact 本身，而非 claim 中的实际内容；因此若在同一制品下替换文件，
+// 标识不会变化，新部署可能会命中基于旧文件计算的块。文档中也明确说明，claim 上的新权重应创建新的
+// ModelArtifact。
 //
-// The result holds no "@", "_" or ":", the separators the engines join their keys with.
+// 返回结果中不包含 "@"、"_" 或 ":"，这些字符是引擎用来拼接键的分隔符。
 //
-// The artifact must be resolved: a Hugging Face artifact has no identity before its digest, and
-// falling back to the UID would render a wrong one rather than none.
+// 制品必须已解析完成：Hugging Face 制品在获得摘要之前没有标识，若回退到 UID 会生成错误的标识而非空值。
 func modelArtifactKVIdentity(ma *workercore.ModelArtifact) string {
 	hexDigits := strings.TrimPrefix(ma.Status.Resolved.ManifestDigest, modelartifact.DigestSHA256+":")
 	if ma.Status.Resolved.ManifestDigest == "" {

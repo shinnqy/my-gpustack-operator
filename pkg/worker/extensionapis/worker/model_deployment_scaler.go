@@ -13,11 +13,10 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// ModelDeploymentScalerHandler exposes the v1 view of a v1alpha1.ModelDeploymentScaler.
+// ModelDeploymentScalerHandler 暴露 v1alpha1.ModelDeploymentScaler 的 v1 视图。
 //
-// A scaler holds a binding on its target, so its writes are rarer than those of a deployment,
-// and it serves no subresource of its own: what it observes, it records in its status, and the
-// metrics it reads belong to the target's pods.
+// scaler 持有对其目标的绑定，因此写入频率低于部署本身，且不提供自有子资源：
+// 它将观测结果记录在自身 status 中，而读取的指标属于目标的 Pod。
 type ModelDeploymentScalerHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations

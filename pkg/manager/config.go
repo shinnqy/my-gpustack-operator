@@ -36,12 +36,12 @@ type Config struct {
 	KubeLeaderLease           time.Duration
 	KubeLeaderRenewTimeout    time.Duration
 
-	// Internal assigned fields.
-	// Override these fields before call Apply.
+	// 内部赋值字段。
+	// 在调用 Apply 之前覆写这些字段。
 	WebhookServer webserver.Server
-	// CacheByObject narrows what the informer cache watches per object type. A component whose
-	// RBAC covers one namespace or one object must say so here, or its informer's cluster-wide
-	// list is refused and the cache never syncs.
+	// CacheByObject 按对象类型缩小 informer 缓存的监听范围。若组件的 RBAC 权限仅覆盖
+	// 单个 Namespace 或单个对象，必须在此声明，否则其 informer 发起的集群级 list 请求
+	// 会被拒绝，导致缓存永远无法完成同步。
 	CacheByObject map[ctrlcli.Object]ctrlcache.ByObject
 }
 
@@ -50,25 +50,25 @@ func (c *Config) Apply(ctx context.Context) (*Manager, error) {
 	ctrl.SetLogger(klog.Background().V(3).WithName("ctrl"))
 
 	ctrlMgrOpts := ctrl.Options{
-		// General.
+		// 通用配置。
 		GracefulShutdownTimeout: ptr.To(30 * time.Second),
 		Scheme:                  scheme.Scheme,
 		Logger:                  klog.Background().WithName("ctrlmgr"),
 
-		// Context.
+		// 上下文配置。
 		BaseContext: func() context.Context {
 			return ctx
 		},
 
-		// Mapper.
+		// Mapper 配置。
 		MapperProvider: func(config *rest.Config, _ *http.Client) (kmeta.RESTMapper, error) {
 			// 显式传入已有的 HTTP client，让 discovery 和对象请求复用连接。
 			return ctrlapiutil.NewDynamicRESTMapper(config, c.LoopbackKubeHTTPClient)
 		},
 
-		// Client.
+		// 客户端配置。
 		Client: ctrlcli.Options{
-			// Reuse http client.
+			// 复用 HTTP 客户端。
 			HTTPClient: c.LoopbackKubeHTTPClient,
 		},
 		NewClient: func(config *rest.Config, options ctrlcli.Options) (ctrlcli.Client, error) {
@@ -76,27 +76,27 @@ func (c *Config) Apply(ctx context.Context) (*Manager, error) {
 			return ctrlcli.NewWithWatch(config, options)
 		},
 
-		// Cache.
+		// 缓存配置。
 		Cache: ctrlcache.Options{
-			// Reuse http client.
+			// 复用 HTTP 客户端。
 			HTTPClient: c.LoopbackKubeHTTPClient,
 			// informer 按这个周期重新同步；ByObject 限定各类对象的监听范围。
 			SyncPeriod: ptr.To(c.InformerCacheResyncPeriod),
 			ByObject:   c.CacheByObject,
 		},
 
-		// Controller.
+		// 控制器配置。
 		Controller: ctrlcfg.Controller{
-			// How long we should wait for the watching cache to be synced before controller starts.
+			// 控制器启动前等待监听缓存完成同步的超时时间。
 			CacheSyncTimeout: 2 * time.Minute,
-			// Recover from panic.
+			// 从 panic 中恢复。
 			RecoverPanic: ptr.To(true),
-			// NB(thxCode): make controllers run with leader election by default,
-			// this configuration does not affect the manager leader election.
+			// NB(thxCode): 默认启用控制器的 leader election，
+			// 此配置不影响 manager 本身的 leader election。
 			NeedLeaderElection: ptr.To(true),
 		},
 
-		// Controller manager leader election.
+		// Controller manager 的 leader election 配置。
 		LeaderElectionReleaseOnCancel: true,
 		LeaderElectionNamespace:       systemname.NamespaceName,
 		LeaderElectionID:              c.KubeLeaderElectionID,
@@ -105,17 +105,17 @@ func (c *Config) Apply(ctx context.Context) (*Manager, error) {
 		RenewDeadline:                 ptr.To(c.KubeLeaderRenewTimeout),
 		RetryPeriod:                   ptr.To(2 * time.Second),
 
-		// Disable default webhook server.
+		// 禁用默认 Webhook 服务器。
 		WebhookServer: c.WebhookServer,
-		// Disable default metrics service.
+		// 禁用默认指标服务。
 		Metrics: ctrlmetricsrv.Options{BindAddress: "0"},
-		// Disable default healthcheck service.
+		// 禁用默认健康检查服务。
 		HealthProbeBindAddress: "0",
-		// Disable default profiling service.
+		// 禁用默认性能分析服务。
 		PprofBindAddress: "0",
 	}
 
-	// Create controller manager and wrap it.
+	// 创建 controller manager 并对其进行包装。
 	var ctrlManager CtrlManager
 	{
 		rawCtrlManager, err := ctrl.NewManager(rest.CopyConfig(&c.LoopbackKubeRestConfig), ctrlMgrOpts)

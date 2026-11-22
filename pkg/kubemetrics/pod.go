@@ -8,24 +8,20 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// HasStartedContainer reports whether any container of the pod has ever started.
+// HasStartedContainer 返回 Pod 中是否曾有任何容器启动过。
 //
-// It is the gate both surfaces apply before measuring anything. An Instance none of whose
-// containers has started consumes nothing, so its usage is zero by reasoning rather than by
-// measurement, and reading the kubelet, the metrics API and every device manager for it spends
-// three requests to learn that — or to serve another tenant's figures as its own.
+// 这是两个采集入口在读取任何指标前共用的前置检查。若 Instance 没有任何容器启动过，
+// 则其资源消耗在逻辑上即为零而无需实际测量；此时再去请求 kubelet、metrics API
+// 和各个 DeviceManager，不仅会白白发出三次请求，还可能把其他租户的数据误当作它的。
 //
-// The predicate is "has started", NOT "is ready". A pod can be running with a failing readiness
-// probe, an unready sidecar, or a termination already begun while its main container holds
-// accelerator memory; reporting zero for it would fabricate an idle measurement. For the same
-// reason every trace a container leaves counts — a restart, a previous termination, an init or
-// ephemeral container running — because each of those can only open the gate, which is the
-// direction that never invents a measurement.
+// 判断条件是“已启动”，而非“已就绪”。Pod 可能正处于就绪探针失败、sidecar 未就绪
+// 或已开始终止的状态，而其主容器仍持有加速卡显存；此时上报零值等于捏造空闲状态。
+// 基于同样原因，容器留下的任何运行痕迹都算数——包括重启、先前终止、正在运行的 init 容器
+// 或临时容器——因为这些状态只会放行检查，而放行方向永远不会凭空编造指标。
 //
-// A nil pod has started nothing. That is a caller holding an Instance and no pod of its own:
-// stopped, unscheduled, or carrying only a previous incarnation's pod. It takes the same
-// closed-gate answer as a pod that has not started yet, so the gate has one answer rather than
-// two.
+// nil Pod 视为没有任何容器启动过。这对应调用方持有 Instance 但尚未拥有对应 Pod 的情况：
+// 例如已停止、未调度，或仅残留上一代 Pod。它与尚未启动的 Pod 返回相同的未通过结果，
+// 从而使该检查保持单一语义。
 func HasStartedContainer(pod *core.Pod) bool {
 	if pod == nil {
 		return false
@@ -44,9 +40,8 @@ func HasStartedContainer(pod *core.Pod) bool {
 	return false
 }
 
-// containerStarted reports whether one container status shows a container that has run at some
-// point, whether or not it is running now: a container that has already exited held whatever it
-// held, and a container waiting to be restarted has run before.
+// containerStarted 返回单个容器状态是否表明该容器曾运行过（无论当前是否在运行）：
+// 已退出的容器曾持有过资源，而等待重启的容器此前也已运行过。
 func containerStarted(cs *core.ContainerStatus) bool {
 	switch {
 	case cs.State.Running != nil, cs.State.Terminated != nil:
@@ -59,18 +54,15 @@ func containerStarted(cs *core.ContainerStatus) bool {
 	return ptr.Deref(cs.Started, false)
 }
 
-// NewUnstartedSample returns the sample of an Instance none of whose containers has started: the
-// declared totals, and every measured figure present and zero.
+// NewUnstartedSample 返回没有任何容器启动过的 Instance 的采样样本：包含声明的总量上限，
+// 且所有实测指标均显式置为零。
 //
-// Zero here is a measurement, not a default. Nothing has started, so nothing exists that could
-// have consumed anything — which is exactly the claim a present zero makes, and the reason this
-// path takes no reading at all.
+// 此处的零代表实测结果而非默认值。由于没有任何容器启动，不存在任何可能消耗资源的实体——
+// 这正是显式零值所表达的语义，也是该路径完全不执行采集的原因。
 //
-// The totals come from the pod's container limits when there is a pod, and from the Instance's
-// own spec.resources when there is not; the two agree for the same declaration, because both
-// funnel through the same rounding arithmetic. A caller with neither — an Instance declaring no
-// resources — gets zero totals, which reads as "no declared ceiling" exactly as an unlimited
-// container does.
+// 若存在 Pod，总量取自 Pod 的容器 limits；否则取自 Instance 自身的 spec.resources。
+// 两者对同一资源声明的结果一致，因为都经过相同的取整逻辑。若调用方两者皆无
+// （即未声明资源的 Instance），则总量为 0，其语义与未设置限制的容器相同，均表示“未声明上限”。
 func NewUnstartedSample(
 	pod *core.Pod,
 	resources *workercore.InstanceResources,

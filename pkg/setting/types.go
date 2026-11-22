@@ -16,7 +16,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/funcx"
 )
 
-// Prop represents the properties of a setting, which can be a combination of editable, private and sensitive.
+// Prop 表示配置项的属性，可以是 editable、private 和 sensitive 的组合。
 type Prop uint8
 
 const (
@@ -26,29 +26,29 @@ const (
 )
 
 type (
-	// Setting represents a server setting, which has a name, description, default value, admission function and properties.
+	// Setting 表示服务端配置项，包含名称、描述、默认值、准入校验函数以及属性。
 	Setting struct {
 		name        string
 		description string
 		defVal      string
-		// envName is the environment variable read during registration, or empty when none.
+		// envName 是注册期间读取的环境变量名称；若未使用环境变量则为空。
 		envName string
-		// declared reports whether envName was present during registration, including an empty value.
+		// declared 表示注册期间 envName 是否存在（包括其值为空的情况）。
 		declared bool
 		admit    Admission
 		props    Prop
 	}
 
-	// IndexFunc is a function type that takes a setting name and returns the corresponding setting and a boolean indicating whether the setting exists.
+	// IndexFunc 是一个函数类型，接收配置项名称并返回对应的 Setting 及表示该配置项是否存在的布尔值。
 	IndexFunc = func(name string) (Setting, bool)
 )
 
-// Name returns the name of the setting.
+// Name 返回设置项的名称。
 func (s Setting) Name() string {
 	return s.name
 }
 
-// Description returns the description of the setting.
+// Description 返回设置项的描述。
 func (s Setting) Description() string {
 	return s.description
 }
@@ -57,26 +57,26 @@ func (s Setting) DefaultValue() string {
 	return s.defVal
 }
 
-// Editable returns true if the setting is editable.
+// Editable 在设置项可编辑时返回 true。
 func (s Setting) Editable() bool {
 	return s.props&PropEditable == PropEditable
 }
 
-// Sensitive returns true if the setting is sensitive.
+// Sensitive 在设置项为敏感项时返回 true。
 func (s Setting) Sensitive() bool {
 	return s.props&PropSensitive == PropSensitive
 }
 
-// Private returns true if the setting is private.
+// Private 在设置项为私有项时返回 true。
 func (s Setting) Private() bool {
 	return s.props&PropPrivate == PropPrivate
 }
 
-// Configure configures the value of the setting.
+// Configure 配置设置项的值。
 func (s Setting) Configure(ctx context.Context, newVal string) error {
 	lpCli := system.LoopbackKubeClient.Get()
 
-	// Update.
+	// 更新。
 	eSec := &core.Secret{
 		ObjectMeta: meta.ObjectMeta{
 			Namespace: DelegatedSecretNamespace,
@@ -89,14 +89,14 @@ func (s Setting) Configure(ctx context.Context, newVal string) error {
 			oldVal = string(aSec.Data[s.name])
 		}
 		if admitErr := s.admit(ctx, oldVal, newVal); admitErr != nil {
-			// NB(thxCode): Skip update if the new value is invalid.
+			// NB(thxCode): 如果新值无效，则跳过更新。
 			return nil, false, admitErr
 		}
 		if oldVal == newVal {
-			// Skip update if the new value is the same as the old value.
+			// 如果新值与旧值相同，则跳过更新。
 			return nil, true, nil
 		}
-		// Update the value of the setting.
+		// 更新设置项的值。
 		aSec.Data[s.name] = []byte(newVal)
 		return aSec, false, nil
 	}
@@ -111,22 +111,21 @@ func (s Setting) Configure(ctx context.Context, newVal string) error {
 	return nil
 }
 
-// ReadCacheTTL is how long a read setting value is served from the cache: a change reaches a reader
-// at most this long after it was stored.
+// ReadCacheTTL 是读取设置值时从缓存提供服务的时长：变更在保存后最多经过此时间即可到达读取方。
 const ReadCacheTTL = 30 * time.Second
 
-// _Cache is a cache for the values of settings,
-// which is used to reduce the number of API calls to the Kubernetes API server.
+// _Cache 是设置项值的缓存，
+// 用于减少对 Kubernetes API server 的 API 调用次数。
 var _Cache = cache.New(ReadCacheTTL, cache.NoExpiration)
 
-// ValueFromRemote returns the value of the setting by directly accessing the delegated secret in Kubernetes API server,
-// which is used for remote access and does not involve the controller-runtime client cache.
+// ValueFromRemote 通过直接访问 Kubernetes API server 中的托管 Secret 返回设置项的值，
+// 用于远程访问且不经过 controller-runtime 客户端缓存。
 //
-// This is useful for scenarios when the controller-runtime client cache has not been synced yet,
-// or when we want to bypass the cache for some reason.
-// However, it may have performance implications and should be used with caution.
+// 这适用于 controller-runtime 客户端缓存尚未同步完成，
+// 或因某些原因需要绕过缓存的场景。
+// 但这可能会带来性能影响，应谨慎使用。
 //
-// If the value is not found in the delegated secret, it returns the default value of the setting.
+// 如果在托管 Secret 中未找到该值，则返回设置项的默认值。
 func (s Setting) ValueFromRemote(ctx context.Context) (string, error) {
 	if val, found := _Cache.Get(s.name); found {
 		return val.(string), nil
@@ -151,17 +150,17 @@ func (s Setting) ValueFromRemote(ctx context.Context) (string, error) {
 	return ret, nil
 }
 
-// ShouldValueFromRemote returns the value of the setting from remote without error.
+// ShouldValueFromRemote 从远程返回设置项的值并忽略 error。
 func (s Setting) ShouldValueFromRemote(ctx context.Context) string {
 	return funcx.NoError(s.ValueFromRemote(ctx))
 }
 
-// ValueBoolFromRemote returns the boolean value of the setting, reading from remote (see
-// ValueFromRemote). Prefer this over comparing ShouldValueFromRemote to a literal "true": the bool
-// admission (AllowBool) accepts any strconv.ParseBool form ("1"/"TRUE"/...), so it mirrors ValueBool.
+// ValueBoolFromRemote 从远程读取并返回设置项的布尔值（参见 ValueFromRemote）。
+// 相比将 ShouldValueFromRemote 与字面量 "true" 比较，更推荐使用此方法：布尔准入校验
+// （AllowBool）接受任意 strconv.ParseBool 形式（"1"/"TRUE"/...），因此它与 ValueBool 保持一致。
 func (s Setting) ValueBoolFromRemote(ctx context.Context) (bool, error) {
-	// ValueFromRemote returns the setting's default in valStr even on error, so parse valStr
-	// unconditionally to honor the "default on not found" contract; surface the fetch error alongside.
+	// 即使发生 error，ValueFromRemote 也会在 valStr 中返回设置项的默认值，因此无条件解析 valStr
+	// 以遵循“未找到时使用默认值”的契约，同时一并返回获取时的 error。
 	valStr, err := s.ValueFromRemote(ctx)
 	b, perr := strconv.ParseBool(valStr)
 	if err != nil {
@@ -170,14 +169,14 @@ func (s Setting) ValueBoolFromRemote(ctx context.Context) (bool, error) {
 	return b, perr
 }
 
-// ShouldValueBoolFromRemote returns the boolean value of the setting from remote without error.
+// ShouldValueBoolFromRemote 从远程返回设置项的布尔值并忽略 error。
 func (s Setting) ShouldValueBoolFromRemote(ctx context.Context) bool {
 	return funcx.NoError(s.ValueBoolFromRemote(ctx))
 }
 
-// Value returns the value of the setting.
+// Value 返回设置项的值。
 //
-// If the value is not found in the delegated secret, it returns the default value of the setting.
+// 如果在托管 Secret 中未找到该值，则返回设置项的默认值。
 func (s Setting) Value(ctx context.Context) (string, error) {
 	if val, found := _Cache.Get(s.name); found {
 		return val.(string), nil
@@ -210,21 +209,20 @@ func (s Setting) Value(ctx context.Context) (string, error) {
 	return ret, nil
 }
 
-// ShouldValue returns the value of the setting without error.
+// ShouldValue 返回设置项的值并忽略 error。
 func (s Setting) ShouldValue(ctx context.Context) string {
 	return funcx.NoError(s.Value(ctx))
 }
 
-// ValueBool returns the boolean value of the setting.
+// ValueBool 返回设置项的布尔值。
 //
-// A failed read falls back to the setting's default, not to false, and the read error is returned
-// alongside it. Callers read through ShouldValueBool, which drops the error, so false would turn a
-// single failed read into the "off" behavior of every setting that defaults to on, and the
-// reconcile that read it would write that behavior back. A caller for which a read error must mean
-// false, such as a gate that grants access, checks the error itself.
+// 读取失败时会回退到设置项的默认值而非 false，并将读取 error 一并返回。
+// 调用方通常通过 ShouldValueBool 读取并丢弃 error，如果返回 false，单次读取失败就会让
+// 所有默认开启的设置项变成“关闭”行为，且读取它的 reconcile 会将该行为写回。
+// 若调用方要求读取错误必须视为 false（例如授予访问权限的门控），应自行检查该 error。
 func (s Setting) ValueBool(ctx context.Context) (bool, error) {
-	// Value returns the default in valStr on error, so parse it unconditionally, as
-	// ValueBoolFromRemote does.
+	// Value 在出错时会在 valStr 中返回默认值，因此与 ValueBoolFromRemote 一样
+	// 对其进行无条件解析。
 	valStr, err := s.Value(ctx)
 	b, perr := strconv.ParseBool(valStr)
 	if err != nil {
@@ -233,15 +231,15 @@ func (s Setting) ValueBool(ctx context.Context) (bool, error) {
 	return b, perr
 }
 
-// ShouldValueBool returns the boolean value of the setting without error.
+// ShouldValueBool 返回设置项的布尔值并忽略 error。
 func (s Setting) ShouldValueBool(ctx context.Context) bool {
 	return funcx.NoError(s.ValueBool(ctx))
 }
 
 type Settings map[string]Setting
 
-// New creates a new setting with the given name, description, properties, initializer and admissions,
-// and registers it in the settings map.
+// New 根据给定的名称、描述、属性、初始化器和准入校验器创建新的设置项，
+// 并将其注册到 settings 映射中。
 func (h Settings) New(
 	name, description string, props Prop,
 	init Initializer, admits ...Admission,
@@ -260,8 +258,8 @@ func (h Settings) New(
 	return s
 }
 
-// NewEditable creates a new editable setting with the given name, description, initializer and admissions.
-// This setting is editable on UI, and its value can be modified by users, but it is not hidden on UI and logs.
+// NewEditable 根据给定的名称、描述、初始化器和准入校验器创建新的可编辑设置项。
+// 该设置项可在 UI 上编辑并由用户修改其值，但不会在 UI 和日志中隐藏。
 func (h Settings) NewEditable(
 	name, description string,
 	init Initializer, admits ...Admission,
@@ -272,7 +270,7 @@ func (h Settings) NewEditable(
 	)
 }
 
-// Index returns the setting with the given name.
+// Index 返回指定名称的设置项。
 func (h Settings) Index(name string) (Setting, bool) {
 	s, ok := h[name]
 	return s, ok

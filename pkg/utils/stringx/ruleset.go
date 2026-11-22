@@ -32,18 +32,18 @@ func init() {
 	}
 }
 
-// Pluralize returns the plural form of a word.
+// Pluralize 返回单词的复数形式。
 func Pluralize(word string) string {
 	return globalRuleset.Pluralize(word)
 }
 
-// Singularize returns the singular form of a word.
+// Singularize 返回单词的单数形式。
 func Singularize(word string) string {
 	return globalRuleset.Singularize(word)
 }
 
-// CamelizeDownFirst is the same as Camelize but with first lowercase char,
-// "IDRef" -> "idRef.
+// CamelizeDownFirst 与 Camelize 相同，但首字母小写，
+// "IDRef" -> "idRef"。
 func CamelizeDownFirst(word string) string {
 	words := strings.Split(globalRuleset.Underscore(word), "_")
 
@@ -66,8 +66,8 @@ func CamelizeDownFirst(word string) string {
 	return Join("", words...)
 }
 
-// Decamelize converts camel-case words to space-split words, "DinoParty" -> "Dino Party".
-// If lowercase is true, convert the first letter of each word to lowercase, "DinoParty" -> "dino party".
+// Decamelize 将驼峰式单词转换为空格分隔的单词，如 "DinoParty" -> "Dino Party"。
+// 如果 lowercase 为 true，则将每个单词的首字母转换为小写，如 "DinoParty" -> "dino party"。
 func Decamelize(s string, lowercase bool) string {
 	var (
 		b          strings.Builder
@@ -91,17 +91,17 @@ func Decamelize(s string, lowercase bool) string {
 	return b.String()
 }
 
-// Underscore returns the string in snake case, "BigBen" -> "big_ben".
+// Underscore 返回蛇形命名（snake case）的字符串，如 "BigBen" -> "big_ben"。
 func Underscore(word string) string {
 	return globalRuleset.Underscore(word)
 }
 
-// UnderscoreUpper is the same as Underscore but with all uppercase char.
+// UnderscoreUpper 与 Underscore 相同，但所有字符均为大写。
 func UnderscoreUpper(word string) string {
 	return strings.ToUpper(Underscore(word))
 }
 
-// Capitalize returns the string with first uppercase letter.
+// Capitalize 返回首字母大写的字符串。
 func Capitalize(word string) string {
 	return globalRuleset.Capitalize(word)
 }

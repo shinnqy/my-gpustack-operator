@@ -15,28 +15,25 @@ import (
 )
 
 const (
-	// nodeModelStoreKubeletRefresh is how often a node's kubelet thresholds are read again. They
-	// change only with a kubelet restart, and a read that finds them unchanged writes nothing.
+	// nodeModelStoreKubeletRefresh 是重新读取节点 kubelet 阈值的时间间隔。这些阈值仅在 kubelet 重启时才会变化，且读取发现未变化时不会触发写入。
 	nodeModelStoreKubeletRefresh = 30 * time.Minute
-	// nodeModelStoreKubeletRetry is how soon a node whose kubelet could not be read is tried again:
-	// a brief unreachability heals at the next retry rather than the next refresh.
+	// nodeModelStoreKubeletRetry 是未能读取到节点 kubelet 时重试的等待时间：短暂的不可达会在下一次重试时恢复，而不必等到下一次常规刷新。
 	nodeModelStoreKubeletRetry = time.Minute
-	// nodeModelStoreKubeletTimeout bounds one read, so a node whose kubelet does not answer delays
-	// its spec's other fields by no more than this.
+	// nodeModelStoreKubeletTimeout 限制单次读取的超时时间，使 kubelet 无响应的节点
+	// 对其 spec 中其他字段的延迟不超过该时长。
 	nodeModelStoreKubeletTimeout = 5 * time.Second
 )
 
-// kubeletReading is a node's last successful read of its kubelet thresholds.
+// kubeletReading 表示节点最近一次成功读取到的 kubelet 阈值。
 type kubeletReading struct {
 	thresholds *workercore.NodeModelStoreKubelet
 	readTime   time.Time
 }
 
-// kubeletThresholds returns the node's kubelet thresholds for its spec: the last reading while it is
-// younger than the refresh, a new reading otherwise. A failed read keeps the last reading, or the
-// value the object already carries after a worker restart, so a kubelet that does not answer for a
-// moment does not flip the node's cap to kubelet's defaults and back — and reports false, so the
-// caller tries again sooner than the refresh. A nil thresholds means none was ever read.
+// kubeletThresholds 返回用于节点 spec 的 kubelet 阈值：若距上次读取尚未超过刷新周期则返回上次读数，
+// 否则执行新的读取。读取失败时会保留上次读数，或在 worker 重启后保留对象中已携带的值，
+// 从而避免 kubelet 短暂无响应导致节点上限在 kubelet 默认值与实际值之间来回跳变；同时返回 false，
+// 以便调用方在早于刷新周期时重试。thresholds 为 nil 表示从未成功读取过。
 func (r *NodeModelStoreReconciler) kubeletThresholds(
 	ctx context.Context, node string, current *workercore.NodeModelStoreKubelet,
 ) (thresholds *workercore.NodeModelStoreKubelet, read bool) {
@@ -67,7 +64,7 @@ func (r *NodeModelStoreReconciler) kubeletThresholds(
 	return thresholds, true
 }
 
-// forgetKubelet drops a node's reading once its object is gone.
+// forgetKubelet 在节点对应的对象被移除后丢弃该节点的读数。
 func (r *NodeModelStoreReconciler) forgetKubelet(node string) {
 	r.kubeletMu.Lock()
 	defer r.kubeletMu.Unlock()
@@ -81,7 +78,7 @@ func (r *NodeModelStoreReconciler) now() time.Time {
 	return time.Now()
 }
 
-// readKubelet reads the node's thresholds within nodeModelStoreKubeletTimeout.
+// readKubelet 在 nodeModelStoreKubeletTimeout 时间内读取节点的阈值。
 func (r *NodeModelStoreReconciler) readKubelet(ctx context.Context, node string) (*workercore.NodeModelStoreKubelet, error) {
 	ctx, cancel := context.WithTimeout(ctx, nodeModelStoreKubeletTimeout)
 	defer cancel()
@@ -97,9 +94,9 @@ func (r *NodeModelStoreReconciler) readKubelet(ctx context.Context, node string)
 	return readKubeletConfigz(ctx, cli.CoreV1().RESTClient(), node)
 }
 
-// readKubeletConfigz reads the node's effective kubelet configuration through the API server's node
-// proxy. configz is what kubelet enforces: its flags, configuration file and drop-ins merged. It is
-// served while kubelet's debugging handlers are enabled, their default.
+// readKubeletConfigz 通过 API server 的节点代理读取节点生效的 kubelet 配置。
+// configz 反映的是 kubelet 实际执行的配置，即命令行标志、配置文件与 drop-in 片段合并后的结果。
+// 只要启用了 kubelet 的调试处理器（默认启用），该接口即可提供服务。
 func readKubeletConfigz(ctx context.Context, core rest.Interface, node string) (*workercore.NodeModelStoreKubelet, error) {
 	raw, err := core.Get().
 		Resource("nodes").Name(node).SubResource("proxy").Suffix("configz").
@@ -111,7 +108,7 @@ func readKubeletConfigz(ctx context.Context, core rest.Interface, node string) (
 	return decodeKubeletConfigz(raw)
 }
 
-// decodeKubeletConfigz takes the thresholds the model cache's cap needs out of a configz answer.
+// decodeKubeletConfigz 从 configz 响应中提取模型缓存上限所需的阈值。
 func decodeKubeletConfigz(raw []byte) (*workercore.NodeModelStoreKubelet, error) {
 	var z struct {
 		KubeletConfig *struct {

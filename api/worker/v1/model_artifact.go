@@ -7,12 +7,11 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// ModelArtifact is the v1 view of a model's weights: where they come from and where they are.
+// ModelArtifact 是模型权重的 v1 视图：权重来自何处以及当前位于何处。
 //
-// It proxies the v1alpha1 resource for every verb and serves the progress subresource. IT HAS NO
-// WRITABLE STATUS SUBRESOURCE: the proxy writes with the worker's identity, and the status guard
-// admits exactly that identity to a ModelArtifact's status, which mounts are authorized by. The status
-// is read through the object.
+// 它对所有 verb 代理到底层 v1alpha1 资源，并提供 progress 子资源。它没有可写的
+// STATUS 子资源：代理使用 worker 身份写入，而 status 守卫仅允许该身份写入
+// ModelArtifact 的 status，挂载授权正是依据该 status 进行。status 通过主对象读取。
 //
 // +genclient
 // +genclient:noStatus
@@ -22,7 +21,7 @@ type ModelArtifact workercore.ModelArtifact
 
 var _ runtime.Object = (*ModelArtifact)(nil)
 
-// ModelArtifactList holds the list of ModelArtifacts.
+// ModelArtifactList 保存 ModelArtifact 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelArtifactList struct {

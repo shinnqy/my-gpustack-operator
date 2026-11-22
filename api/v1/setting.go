@@ -5,12 +5,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// Setting is the schema for gpustack.ai.
+// Setting 是 gpustack.ai 的结构定义。
 //
-// The namespace is the system namespace, which means the Setting is system-scoped.
+// 其所在 Namespace 为系统 Namespace，这意味着 Setting 为系统作用域资源。
 //
-// Underhood, a Setting is mapping to a key-value pair of a Kubernetes Secret,
-// and the Setting's name is the same as the Secret's data key.
+// 在底层，Setting 映射到 Kubernetes Secret 中的一个键值对，
+// 且 Setting 的名称与该 Secret 的 data 键名相同。
 //
 // +genclient
 // +genclient:onlyVerbs=get,list,watch,apply,update,patch
@@ -26,37 +26,37 @@ type Setting struct {
 
 var _ runtime.Object = (*Setting)(nil)
 
-// SettingSpec defines the desired state of Setting.
+// SettingSpec 定义了 Setting 的期望状态。
 type SettingSpec struct {
-	// Value contains the configuration data,
-	// it is provided as a write-only input field.
+	// Value 包含配置数据，
+	// 作为只写输入字段提供。
 	Value *string `json:"value,omitempty" protobuf:"bytes,1,opt,name=value"`
 }
 
-// SettingStatus defines the observed state of Setting.
+// SettingStatus 定义了 Setting 的观测状态。
 type SettingStatus struct {
-	// Description is the description of the settings.
+	// Description 是该设置的描述信息。
 	Description string `json:"description,omitempty" protobuf:"bytes,1,opt,name=description"`
 
-	// Editable indicates whether the setting is editable on UI.
+	// Editable 指示该设置是否可在 UI 上编辑。
 	Editable bool `json:"editable" protobuf:"varint,2,name=editable"`
 
-	// Sensitive indicates whether the setting is sensitive.
+	// Sensitive 指示该设置是否为敏感信息。
 	Sensitive bool `json:"sensitive" protobuf:"varint,3,name=sensitive"`
 
-	// Value is the current value of the setting,
-	// it is provided as a read-only output field.
+	// Value 是该设置的当前值，
+	// 作为只读输出字段提供。
 	//
-	// "(sensitive)" returns if the setting is sensitive.
+	// 若该设置为敏感信息，则返回 "(sensitive)"。
 	Value string `json:"value" protobuf:"bytes,4,name=value"`
-	// Value_ is the shadow of the Value,
-	// it is provided for system processing only.
+	// Value_ 是 Value 的影子字段，
+	// 仅供系统内部处理使用。
 	//
-	// DO NOT EXPOSE.
+	// 请勿对外暴露。
 	Value_ string `json:"-"`
 }
 
-// SettingList holds the list of Setting.
+// SettingList 保存 Setting 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type SettingList struct {

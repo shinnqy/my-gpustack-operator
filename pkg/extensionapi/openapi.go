@@ -2,10 +2,10 @@ package extensionapi
 
 import "k8s.io/kube-openapi/pkg/common"
 
-// OpenAPIDefinitionGetter is a function type that returns a map of OpenAPI definitions.
+// OpenAPIDefinitionGetter 是返回 OpenAPI 定义映射的函数类型。
 type OpenAPIDefinitionGetter = func(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition
 
-// MergeOpenAPIDefinitionsGetter merges multiple OpenAPIDefinitionGetter into one.
+// MergeOpenAPIDefinitionsGetter 将多个 OpenAPIDefinitionsGetter 合并为一个。
 func MergeOpenAPIDefinitionsGetter(getters ...OpenAPIDefinitionGetter) OpenAPIDefinitionGetter {
 	return func(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {
 		ret := getters[0](ref)

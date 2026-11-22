@@ -27,31 +27,31 @@ import (
 )
 
 type (
-	// Client is a Helm client.
+	// Client 是一个 Helm 客户端。
 	Client struct {
-		// getter is the Kubernetes REST client getter.
+		// getter 是 Kubernetes REST 客户端获取器。
 		getter genericclioptions.RESTClientGetter
-		// defaultNamespace is the name of default Kubernetes Namespace, which to place the release info.
+		// defaultNamespace 是存放 release 信息的默认 Kubernetes Namespace 名称。
 		defaultNamespace string
-		// Timeout is the timeout of the action.
+		// Timeout 是操作的超时时间。
 		timeout time.Duration
 	}
 
-	// ClientOption is a function to set the configuration of the Client.
+	// ClientOption 是用于配置 Client 的函数。
 	ClientOption func(*Client)
 )
 
-// WithDefaultNamespace returns a ClientOption to set the name of default Kubernetes Namespace,
-// which to place the release info.
+// WithDefaultNamespace 返回一个 ClientOption，用于设置存放 release 信息的
+// 默认 Kubernetes Namespace 名称。
 func WithDefaultNamespace(namespace string) func(*Client) {
 	return func(c *Client) {
 		c.defaultNamespace = namespace
 	}
 }
 
-// NewClient creates a new Helm configuration from a Kubernetes rest.Config.
+// NewClient 根据 Kubernetes rest.Config 创建一个新的 Helm 配置。
 //
-// The given defaultNamespace is used to place the release info.
+// 给定的 defaultNamespace 用于存放 release 信息。
 func NewClient(restCfg rest.Config, opts ...ClientOption) (*Client, error) {
 	restCfg.ContentType = runtime.ContentTypeJSON
 	c := &Client{
@@ -66,21 +66,20 @@ func NewClient(restCfg rest.Config, opts ...ClientOption) (*Client, error) {
 	return c, nil
 }
 
-// DefaultNamespace returns the name of default Kubernetes Namespace,
-// which to place the release info.
+// DefaultNamespace 返回存放 release 信息的默认 Kubernetes Namespace 名称。
 func (c *Client) DefaultNamespace() string {
 	return c.defaultNamespace
 }
 
-// KubeClientSet returns the Kubernetes clientset.
+// KubeClientSet 返回 Kubernetes clientset。
 func (c *Client) KubeClientSet() kubernetes.Interface {
 	conf, _ := c.getter.ToRESTConfig()
 	return kubernetes.NewForConfigOrDie(conf)
 }
 
-// Install installs the given chart, and returns the values.
+// Install 安装指定的 chart，并返回其 values。
 //
-// If the release has been found, it will be done.
+// 如果对应的 release 已存在，则直接视为完成。
 func (c *Client) Install(ctx context.Context, chart *Chart, overrideNamespace ...string) (helmchartutil.Values, error) {
 	next := func(r *helmrelease.Release) NextStepType {
 		return c.nextStep(ctx, r, chart)
@@ -88,7 +87,7 @@ func (c *Client) Install(ctx context.Context, chart *Chart, overrideNamespace ..
 	return c.InstallWith(ctx, chart, next, overrideNamespace...)
 }
 
-// nextStep decides what to do with an already-found release of the given chart.
+// nextStep 决定如何处理已找到的指定 chart 的 release。
 func (c *Client) nextStep(ctx context.Context, r *helmrelease.Release, chart *Chart) NextStepType {
 	switch r.Info.Status {
 	case helmrelease.StatusDeployed, helmrelease.StatusSuperseded:
@@ -110,36 +109,35 @@ func (c *Client) nextStep(ctx context.Context, r *helmrelease.Release, chart *Ch
 		}
 		return NextStepDone
 	case helmrelease.StatusPendingInstall, helmrelease.StatusPendingUpgrade, helmrelease.StatusPendingRollback:
-		// A pending record is either an operation still in flight or what a process killed
-		// mid-flight left behind, and repairing the first would corrupt what it is doing.
-		// ExclusiveAccess is what tells the two apart; without it the only evidence is age,
-		// and a record younger than the action's own timeout may still belong to a peer.
+		// pending 记录要么对应仍在进行中的操作，要么是中途被终止的进程遗留下来的，
+		// 修复前者会破坏正在执行的操作。
+		// ExclusiveAccess 用于区分这两种情况；没有它时唯一的依据只有记录的存活时间，
+		// 而存在时间短于操作自身超时时间的记录仍可能属于其他并发进程。
 		if !chart.ExclusiveAccess && time.Since(r.Info.LastDeployed.Time) <= c.timeout {
 			return NextStepRequeue
 		}
 
-		// An abandoned pending-install is the one pending state Helm cannot act on at all:
-		// its own name check refuses every later install while the record stands, and no
-		// action removes it. So the record goes, and the release installs afresh.
+		// 被遗弃的 pending-install 是唯一一种 Helm 完全无法直接处理的 pending 状态：
+		// 只要该记录存在，Helm 的名称检查就会拒绝后续所有安装请求，且没有任何操作能将其清除。
+		// 因此需要删除该记录，然后重新安装该 release。
 		if r.Info.Status == helmrelease.StatusPendingInstall {
 			return _NextStepDiscard
 		}
 
-		// An abandoned upgrade/rollback under upgrade-only repair: discard the pending
-		// record, which returns the release to its newest earlier revision, and the loop
-		// converges with an upgrade from there. Rolling back instead would re-apply that
-		// revision's manifest, deleting every object the pending operation had already
-		// adopted — the CRDs taken over from a legacy release included — which is the
-		// wedge RepairViaUpgradeOnly exists to avoid. Others keep the reinstall behavior.
+		// 仅通过升级修复（upgrade-only repair）模式下被遗弃的 upgrade/rollback：
+		// 丢弃该 pending 记录，使 release 回到最新的历史版本，随后循环会从该版本通过升级完成收敛。
+		// 如果改为回滚，则会重新应用该历史版本的清单，从而删除 pending 操作已经接管的所有对象
+		// （包括从旧 release 接管的 CRD），这正是 RepairViaUpgradeOnly 要避免的僵局。
+		// 其他情况则保留重新安装的行为。
 		if chart.RepairViaUpgradeOnly {
 			return _NextStepDiscard
 		}
 
 		return _NextStepInstall
 	default:
-		// A bad-status release (e.g. failed) is normally reinstalled, but that
-		// uninstall can deadlock charts whose finalized CRs pin Helm-managed CRDs.
-		// RepairViaUpgradeOnly repairs it with an upgrade instead — see the field doc.
+		// 处于异常状态（例如 failed）的 release 通常会重新安装，但卸载操作可能会使
+		// 带有 finalizer 的 CR 所固定的 Helm 托管 CRD 发生死锁。
+		// RepairViaUpgradeOnly 改为通过升级来修复此类 release，参见该字段的文档注释。
 		if chart.RepairViaUpgradeOnly {
 			return NextStepUpgrade
 		}
@@ -147,7 +145,7 @@ func (c *Client) nextStep(ctx context.Context, r *helmrelease.Release, chart *Ch
 	}
 }
 
-// NextStepType is the type of the next step.
+// NextStepType 是下一步操作的类型。
 type NextStepType uint8
 
 const (
@@ -159,20 +157,19 @@ const (
 	_NextStepDiscard
 )
 
-// NextStepConditionFunc is a function to determine what to do next by the given release.
+// NextStepConditionFunc 是根据给定 release 决定下一步操作的函数。
 type NextStepConditionFunc func(release *helmrelease.Release) (next NextStepType)
 
-// InstallWith installs the given chart with the given condition function.
+// InstallWith 使用给定的条件函数安装指定的 chart。
 //
-// The condition function is used to determine what to do next by the given release,
-// which only calls when the release has been found.
+// 条件函数用于根据给定 release 决定下一步操作，仅在找到该 release 时才会被调用。
 func (c *Client) InstallWith(
 	ctx context.Context,
 	chart *Chart,
 	next NextStepConditionFunc,
 	overrideNamespace ...string,
 ) (helmchartutil.Values, error) {
-	// Validate.
+	// 校验。
 	if err := chart.Validate(); err != nil {
 		return nil, fmt.Errorf("validate chart: %w", err)
 	}
@@ -180,13 +177,13 @@ func (c *Client) InstallWith(
 		return nil, errors.New("next is required")
 	}
 
-	// Create config.
+	// 创建配置。
 	namespace := c.defaultNamespace
 	if len(overrideNamespace) > 0 {
 		namespace = overrideNamespace[0]
 	}
 	{
-		// Ensure the namespace exists, otherwise Helm will fail to create the release.
+		// 确保 Namespace 存在，否则 Helm 将无法创建 release。
 		_, err := kubeclientset.Create(
 			ctx,
 			c.KubeClientSet().CoreV1().Namespaces(),
@@ -206,7 +203,7 @@ func (c *Client) InstallWith(
 		return nil, fmt.Errorf("create helm config: %w", err)
 	}
 
-	// Get release.
+	// 获取 release。
 	g := helmaction.NewGet(config)
 	r, err := g.Run(chart.Release)
 	if err != nil && !errors.Is(err, helmdriver.ErrReleaseNotFound) {
@@ -216,11 +213,10 @@ func (c *Client) InstallWith(
 	return c.converge(ctx, config, chart, next, namespace, r)
 }
 
-// converge runs the next-step loop of InstallWith from an already-read release record — nil
-// when there is none: it decides, acts, and re-reads until the release reports done, and
-// returns the merged values then. It stands apart from InstallWith, which builds the
-// namespace and the action configuration from a live cluster, so the loop itself can run
-// against an in-memory Helm storage in tests.
+// converge 从已读取的 release 记录（不存在时为 nil）开始运行 InstallWith 的下一步循环：
+// 它先决策、执行操作，然后重新读取，直到 release 报告完成，届时返回合并后的 values。
+// 它与 InstallWith 分离（InstallWith 负责从真实集群构建 Namespace 和操作配置），
+// 以便在测试中让该循环直接基于内存中的 Helm 存储运行。
 func (c *Client) converge(
 	ctx context.Context,
 	config *helmaction.Configuration,
@@ -233,21 +229,18 @@ func (c *Client) converge(
 	g := helmaction.NewGet(config)
 	var err error
 
-	// forceUpgrade turns a Done that follows a discarded pending upgrade/rollback into one
-	// upgrade: the revision beneath such a record can read as current (same chart version
-	// and values) while the killed operation only half-applied its manifest. It fires once —
-	// a Done after that upgrade means the release has truly converged.
+	// forceUpgrade 将丢弃被遗弃的 pending upgrade/rollback 后紧接着的 Done 转换为一次升级：
+	// 该记录之下的历史版本在版本和 values 上可能看起来已是最新，但被终止的操作其实只应用了一半清单。
+	// 该标志仅触发一次：在这次升级之后的 Done 才表示 release 真正收敛。
 	forceUpgrade := false
 	for {
 		n := _NextStepInstall
 		if r != nil {
 			n = next(r)
 			if forceUpgrade {
-				// Fire once, and consume only when an upgrade actually fires: a Done
-				// that follows a discarded record becomes the upgrade, and an upgrade
-				// the release already needed (the usual version change) serves the same
-				// purpose, so the flag must not survive either. A requeue fires nothing,
-				// so it keeps the flag for the iteration that does.
+				// 仅触发一次，且仅在真正执行升级时消费该标志：丢弃记录后紧接着的 Done 会转为升级，
+				// 而 release 本身就需要执行的升级（常见的版本变更）也能达到同样目的，因此两者之后都不应保留该标志。
+				// requeue 不会执行任何操作，因此会保留该标志直到真正执行升级的那一轮迭代。
 				if n == NextStepDone {
 					n = NextStepUpgrade
 				}
@@ -259,9 +252,8 @@ func (c *Client) converge(
 
 		switch n {
 		case NextStepRequeue:
-			// Requeue. Waiting on the context rather than sleeping through it: this arm is
-			// the one that waits out a peer, and a caller that has been told to stop must
-			// not go on waiting under a lock it may no longer hold.
+			// 重新入队。此处基于 ctx 等待而非直接休眠：该分支负责等待并发进程完成，
+			// 一旦调用方被通知停止，就不能在可能已失去锁的情况下继续等待。
 			logger.Info("requeueing")
 			select {
 			case <-ctx.Done():
@@ -273,11 +265,10 @@ func (c *Client) converge(
 				return nil, fmt.Errorf("helm get: release %s: %w", chart.Release, err)
 			}
 		case _NextStepDiscard:
-			// Drop the abandoned revision record and re-evaluate. Helm has no action for
-			// this: an install refuses the name while the record stands, a rollback has no
-			// deployed revision to return to, and an uninstall would tear down whatever the
-			// dead process did manage to create. Only this revision goes, so a release that
-			// carries earlier ones converges on the newest of those instead of installing.
+			// 丢弃被遗弃的版本记录并重新评估。Helm 对此没有现成的操作：
+			// 记录存在时安装会因名称冲突被拒绝，回滚没有可用的已部署版本可回退，
+			// 而卸载则会拆毁死掉的进程好不容易创建出的资源。
+			// 只删除当前这一条版本记录，这样如果 release 还有更早的版本，就会基于其中最新的版本收敛，而不是从头安装。
 			logger.Info("discarding the abandoned release revision")
 			forceUpgrade = r.Info.Status != helmrelease.StatusPendingInstall
 			if _, err := config.Releases.Delete(chart.Release, r.Version); err != nil {
@@ -288,7 +279,7 @@ func (c *Client) converge(
 				return nil, fmt.Errorf("helm get: release %s: %w", chart.Release, err)
 			}
 		case NextStepUpgrade:
-			// Upgrade.
+			// 升级。
 			logger.Info("upgrading")
 			u := c.newUpgrade(config, chart)
 			ch, err := chart.Load(ctx, config)
@@ -305,7 +296,7 @@ func (c *Client) converge(
 			}
 			logger.Infof("upgraded: %s", r.Info.Status.String())
 		case NextStepReinstall:
-			// Uninstall.
+			// 卸载。
 			logger.Info("uninstalling")
 			ui := helmaction.NewUninstall(config)
 			ui.Timeout = c.timeout
@@ -317,18 +308,17 @@ func (c *Client) converge(
 			if err != nil {
 				return nil, fmt.Errorf("helm uninstall: release %s: %w", chart.Release, err)
 			}
-			// IgnoreNotFound reports a release that was not there as no response and no error,
-			// which is the one case there is nothing to say about.
+			// IgnoreNotFound 在 release 不存在时会返回 nil 响应且不返回 error，
+			// 这种情况下无需输出任何信息。
 			if ur != nil {
 				logger.Infof("uninstalled: %s", ur.Info)
 			}
-			// Nothing of this release is left, so what follows is a first install. Each case
-			// of a switch is its own block, so the install below would otherwise still be
-			// handed the release read before the uninstall.
+			// 该 release 已不复存在，因此接下来执行的是首次安装。
+			// switch 的每个 case 都是独立作用域，若不将 r 置为 nil，下面的安装分支仍会拿到卸载前读取的 release。
 			r = nil
 			fallthrough
 		case _NextStepInstall:
-			// Install.
+			// 安装。
 			logger.Info("installing")
 			i := c.newInstall(config, chart, namespace, r)
 			ch, err := chart.Load(ctx, config)
@@ -350,16 +340,14 @@ func (c *Client) converge(
 	}
 }
 
-// newInstall builds the install action for a release, given whatever release record was
-// found for it — nil when there is none.
+// newInstall 根据已找到的 release 记录（不存在时为 nil）构建 release 的安装操作。
 //
-// A first install is not atomic. Atomic implies Wait, so an atomic install blocks until
-// every workload the chart deploys is Ready; a process killed inside that wait — the
-// container's startup probe gives up long before the Helm timeout — strands a
-// pending-install record that no later attempt can get past. Nothing is serving yet on a
-// first install, so there is no revision for a rollback to return to and no reason to
-// block: it applies and returns, and a release left failed is repaired by the upgrade path
-// on the next pass. Installing over a release that does exist stays atomic.
+// 首次安装不启用 atomic。atomic 隐含 Wait，这会导致原子安装阻塞直到 chart 部署的所有工作负载都变为 Ready；
+// 若进程在等待期间被终止（容器的启动探针往往远早于 Helm 超时时间就判定失败），
+// 就会留下一个后续任何尝试都无法越过的 pending-install 记录。
+// 首次安装时尚未有任何服务在运行，因此没有可回滚的旧版本，也没有理由阻塞：
+// 直接应用并返回即可，若留下 failed 状态的 release，下一轮会通过升级路径修复。
+// 在已有 release 上覆盖安装则保持 atomic。
 func (c *Client) newInstall(
 	config *helmaction.Configuration,
 	chart *Chart,
@@ -376,20 +364,17 @@ func (c *Client) newInstall(
 	return i
 }
 
-// newUpgrade builds the upgrade action for a release.
+// newUpgrade 构建 release 的升级操作。
 //
-// It is always atomic: an upgrade acts on a live release, so a failed one must be rolled
-// back to the revision that was serving before it.
+// 它始终启用 atomic：升级作用于运行中的 release，因此失败时必须回滚到此前正在服务的版本。
 //
-// It patches, and never replaces. Helm's force option replaces each object with the rendered
-// manifest — a read of the live object followed by a write of the whole of it — which
-// concedes two properties this chart depends on. The write is versioned on that read, so it
-// holds only for as long as nothing else writes the same object; and it carries only what the
-// chart renders, so it drops whatever a controller put there. The bundled Kueue owns both
-// ends of that: it runs its own cert controller, and the chart renders its CRDs with no
-// caBundle for the controller to fill in. A patch leaves a field the chart never rendered
-// where it stands and needs no version to hold, so the upgrade converges whether or not Kueue
-// is reconciling those CRDs at the time.
+// 它只做 patch，绝不做 replace。Helm 的 force 选项会用渲染出的清单替换每个对象，
+// 即先读取线上对象，再整体回写，这会破坏当前 chart 依赖的两个特性。
+// 首先，该写入绑定了读取时的资源版本，只有在没有其他方修改同一对象时才能成功；
+// 其次，它只包含 chart 渲染出的内容，会丢弃控制器写入该对象的字段。
+// 内置的 Kueue 在这两方面都有涉及：它运行着自己的证书控制器，且 chart 渲染其 CRD 时不包含
+// 由该控制器填充的 caBundle。使用 patch 会保留 chart 未渲染的字段，且无需依赖资源版本保持不变，
+// 因此无论 Kueue 当时是否正在调谐这些 CRD，升级都能顺利收敛。
 func (c *Client) newUpgrade(config *helmaction.Configuration, chart *Chart) *helmaction.Upgrade {
 	u := helmaction.NewUpgrade(config)
 	u.Timeout = c.timeout
@@ -400,13 +385,13 @@ func (c *Client) newUpgrade(config *helmaction.Configuration, chart *Chart) *hel
 	return u
 }
 
-// createConfig creates a new Helm action configuration.
+// createConfig 创建一个新的 Helm 操作配置。
 func (c *Client) createConfig(namespace string) (*helmaction.Configuration, error) {
 	logger := klog.Background().WithName("helm")
 
-	// Initialize.
+	// 初始化。
 	//
-	// NB(thxCode): borrowed from helm.sh/helm/cmd/helm/helm.go
+	// NB(thxCode): 借鉴自 helm.sh/helm/cmd/helm/helm.go
 	var config helmaction.Configuration
 	cd := "secret"
 	cdl := func(format string, v ...any) {
@@ -417,9 +402,9 @@ func (c *Client) createConfig(namespace string) (*helmaction.Configuration, erro
 		return nil, err
 	}
 
-	// Refill the registry client.
+	// 填充 registry 客户端。
 	//
-	// NB(thxCode): borrowed from helm.sh/helm/cmd/helm/root.go
+	// NB(thxCode): 借鉴自 helm.sh/helm/cmd/helm/root.go
 	ropts := []helmregistry.ClientOption{
 		helmregistry.ClientOptDebug(true),
 		helmregistry.ClientOptEnableCache(true),

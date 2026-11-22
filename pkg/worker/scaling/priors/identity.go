@@ -6,20 +6,17 @@ import (
 	"gpustack.ai/gpustack/pkg/nodefeature"
 )
 
-// UnspecifiedRevision is the revision an identity that pinned no weight commit carries.
+// UnspecifiedRevision 是未固定权重提交的标识所携带的 revision 值。
 //
-// It is a named value and not an empty field, because an empty field says a record carries
-// nothing while a named value says the source made a statement about what it did not pin.
+// 它使用具名值而非空字段，因为空字段表示记录未提供信息，而具名值则表明数据源明确说明了未固定提交。
 const UnspecifiedRevision = "unspecified"
 
-// quantizationAliases maps a quantization spelling to its canonical token.
+// quantizationAliases 将量化拼写形式映射到其规范标记。
 //
-// The table is closed, because a spelling the table does not carry is one this operator cannot
-// vouch for, and an unvouched recipe is not the recipe a measurement ran under.
+// 该映射表是封闭的，因为未收录的拼写是本 operator 无法担保的格式，而未经担保的配方并非测量运行时所采用的配方。
 //
-// The keys are normalized spellings, so "fp8_e4m3" and "fp8-e4m3" reach the same entry.
-// "w8a8-fp8" is kept apart from "w8a8", because a weight-only eight-bit recipe and an eight-bit
-// floating point recipe are different recipes.
+// 键采用规范化拼写，因此 "fp8_e4m3" 和 "fp8-e4m3" 会命中同一条目。
+// "w8a8-fp8" 与 "w8a8" 保持区分，因为仅权重量化的 8 位方案与 8 位浮点方案属于不同的量化配方。
 var quantizationAliases = map[string]string{
 	"fp8":         "fp8",
 	"fp8-e4m3":    "fp8",
@@ -42,14 +39,11 @@ var quantizationAliases = map[string]string{
 	"gptq":        "gptq",
 }
 
-// acceleratorSpecs maps an accelerator family to what is known about it without being told.
+// acceleratorSpecs 将加速器系列映射到无需显式声明即可推断的已知属性。
 //
-// The keys are the family names of pkg/nodefeature, so a name the accelerator table resolves
-// names one accelerator and no two.
+// 键为 pkg/nodefeature 中的系列名称，因此加速器表解析出的名称唯一对应一种加速器。
 //
-// The memory and the form factor are defaults and not facts, because a deployment states its own
-// memory and a source states its own form factor. The default only fills a field the record left
-// empty.
+// 显存容量和形态规格（form factor）仅为默认值而非绝对事实，因为部署会自行声明显存容量，数据源也会自行声明形态规格。默认值仅用于填充记录中留空的字段。
 var acceleratorSpecs = map[string]struct {
 	memoryGB   int
 	formFactor string
@@ -68,15 +62,11 @@ var acceleratorSpecs = map[string]struct {
 	"nvidia-a100-40gb": {memoryGB: 40, formFactor: "SXM"},
 }
 
-// canonicalModelNames maps a public benchmark's internal model id to the
-// verified Hugging Face repository that holds the model.
+// canonicalModelNames 将公开基准测试的内部模型 ID 映射到存放该模型的已验证 Hugging Face 仓库。
 //
-// IT EXISTS BECAUSE A BENCHMARK NAMES A MODEL BY A SHORT ID and a deployment
-// names it by its repository, and the catalog has to name the one model both
-// spell.
+// 基准测试通常使用短 ID 命名模型，而部署则使用仓库名命名，因此需要该映射让 catalog 统一标识双方指向的同一个模型。
 //
-// THE KEYS ARE LOWERCASED, because the ids are written in one case and looked
-// up in another.
+// 键均为小写，因为写入与查询时所使用的大小写可能不同。
 var canonicalModelNames = map[string]string{
 	"dsr1":        "deepseek-ai/DeepSeek-R1-0528",
 	"dsv4":        "deepseek-ai/DeepSeek-V4-Pro",
@@ -94,14 +84,11 @@ var canonicalModelNames = map[string]string{
 	"gptoss120b":  "openai/gpt-oss-120b",
 }
 
-// CanonicalModelName returns the canonical name of a model.
+// CanonicalModelName 返回模型的规范名称。
 //
-// IT MAPS THE SHORT IDS A PUBLIC BENCHMARK PUBLISHES, because a measurement of
-// "dsr1" is a measurement of one model and the catalog has to name that model
-// the way a deployment names it.
+// 它会映射公开基准测试发布的短 ID，因为针对 "dsr1" 的测量对应于特定模型，catalog 必须按部署所用的方式命名该模型。
 //
-// IT KEEPS A REPOSITORY NAME AS IT IS, because a repository already names the
-// model it holds.
+// 它会原样保留仓库名称，因为仓库名称本身已唯一标识其包含的模型。
 func CanonicalModelName(name string) string {
 	trimmed := strings.TrimSpace(name)
 	if canonical, known := canonicalModelNames[strings.ToLower(trimmed)]; known {
@@ -110,13 +97,11 @@ func CanonicalModelName(name string) string {
 	return trimmed
 }
 
-// CanonicalQuantization returns the canonical token of a quantization.
+// CanonicalQuantization 返回量化格式的规范标记。
 //
-// It folds the spellings that name the same recipe, because "bfloat16" and "bf16" name one recipe
-// and a comparison of two spellings says nothing about the weights behind them.
+// 它会将指向同一配方的不同拼写合并，因为 "bfloat16" 和 "bf16" 表示同一配方，仅比较拼写差异无法反映其背后的权重类型。
 //
-// It leaves an unknown spelling alone, because a recipe this operator cannot name is not a recipe
-// it may fold into another one.
+// 它会原样保留未知拼写，因为本 operator 无法识别的配方不应被合并到其他配方中。
 func CanonicalQuantization(quantization string) string {
 	key := normalizeSpelling(quantization)
 	if canonical, found := quantizationAliases[key]; found {
@@ -125,17 +110,13 @@ func CanonicalQuantization(quantization string) string {
 	return key
 }
 
-// NormalizeHardwareIdentity returns the canonical form of a hardware identity.
+// NormalizeHardwareIdentity 返回硬件标识的规范形式。
 //
-// It resolves the accelerator through the accelerator table of pkg/nodefeature, because the same
-// accelerator reaches a catalog under a product line name and under a part number.
+// 它通过 pkg/nodefeature 的加速器表解析加速器型号，因为同一款加速器可能分别以产品线名称和部件号进入 catalog。
 //
-// It fills an empty memory and an empty form factor from the canonical accelerator, because an
-// accelerator this operator knows states its own memory and form factor. A field the record states
-// is kept, because the record states the one the deployment has.
+// 当显存和形态规格为空时，它会根据规范加速器信息进行填充，因为本 operator 已知的加速器具有固定的显存和形态规格；若记录中已声明这些字段则予以保留，以部署实际声明为准。
 //
-// It leaves an unknown accelerator alone, because an accelerator this operator cannot name is not
-// one it may fold into another one.
+// 它会原样保留未知加速器，因为本 operator 无法识别的加速器不应被合并到其他型号中。
 func NormalizeHardwareIdentity(identity HardwareIdentity) HardwareIdentity {
 	identity.Accelerator = strings.TrimSpace(identity.Accelerator)
 	family := nodefeature.ResolveAcceleratorFamily(identity.Accelerator)
@@ -156,13 +137,11 @@ func NormalizeHardwareIdentity(identity HardwareIdentity) HardwareIdentity {
 	return identity
 }
 
-// EngineFamily returns the serving engine family an image belongs to.
+// EngineFamily 返回镜像所属的服务引擎系列。
 //
-// It is empty when the image names no known family, because an image this operator cannot place
-// is not one it may match against a deployment.
+// 若镜像未指明任何已知系列，则返回空字符串，因为本 operator 无法归类的镜像不应与部署进行匹配。
 //
-// It reads the image and not the tag, because the family is what the image carries and a tag or a
-// digest says nothing about it.
+// 它仅解析镜像名称而不看 tag，因为引擎系列由镜像本身决定，tag 或摘要无法体现这一点。
 func EngineFamily(image string) string {
 	name := strings.ToLower(image)
 	switch {
@@ -175,10 +154,9 @@ func EngineFamily(image string) string {
 	}
 }
 
-// canonicalRevision returns the canonical form of a revision.
+// canonicalRevision 返回 revision 的规范形式。
 //
-// It names the unpinned revision, because a record that pins no commit says so when it says
-// "unspecified" and says nothing when it says nothing.
+// 它会为未固定提交的 revision 赋予明确名称，因为记录标明 "unspecified" 表示明确未固定提交，而留空则未作任何说明。
 func canonicalRevision(revision string) string {
 	revision = strings.TrimSpace(revision)
 	if revision == "" {
@@ -187,19 +165,17 @@ func canonicalRevision(revision string) string {
 	return revision
 }
 
-// RevisionMatches says whether two revisions agree.
+// RevisionMatches 判断两个 revision 是否一致。
 //
-// It accepts an unpinned revision on either side, because a source that pinned no weight commit
-// and a deployment that pinned none are the same statement.
+// 任意一侧为未固定 revision 时均视为匹配，因为数据源未固定权重提交与部署未固定提交在语义上一致。
 func RevisionMatches(want, got string) bool {
 	want, got = canonicalRevision(want), canonicalRevision(got)
 	return want == got || want == UnspecifiedRevision || got == UnspecifiedRevision
 }
 
-// TokenizerMatches says whether two tokenizer identities agree.
+// TokenizerMatches 判断两个 tokenizer 标识是否一致。
 //
-// It accepts an unpinned tokenizer on either side, because a source that named no tokenizer
-// served the model with the model's own.
+// 任意一侧为未指定 tokenizer 时均视为匹配，因为未指定 tokenizer 的数据源默认使用模型自带的 tokenizer 提供服务。
 func TokenizerMatches(want, got string) bool {
 	want, got = strings.TrimSpace(want), strings.TrimSpace(got)
 	if want == "" || got == "" {
@@ -208,10 +184,9 @@ func TokenizerMatches(want, got string) bool {
 	return want == got || want == UnspecifiedRevision || got == UnspecifiedRevision
 }
 
-// ModelNameMatches says whether two model names name the same model.
+// ModelNameMatches 判断两个模型名称是否指向同一模型。
 //
-// The organization is optional on one side only, because a name that is the suffix of two
-// different models names neither of them.
+// 仅允许单侧省略组织名，因为若一个短名称同时是两个不同模型的后缀，则无法唯一确定所指模型。
 func ModelNameMatches(want, got string) bool {
 	want, got = CanonicalModelName(want), CanonicalModelName(got)
 	if want == "" || got == "" {
@@ -229,7 +204,7 @@ func ModelNameMatches(want, got string) bool {
 	return false
 }
 
-// modelBareName returns the part of a model name after its organization.
+// modelBareName 返回模型名称中除去组织名之后的部分。
 func modelBareName(name string) string {
 	if _, bare, found := strings.Cut(name, "/"); found {
 		return bare
@@ -237,10 +212,9 @@ func modelBareName(name string) string {
 	return name
 }
 
-// normalizeSpelling returns the comparable form of a spelling.
+// normalizeSpelling 返回拼写形式的可比较规范格式。
 //
-// It lowercases the spelling and unifies the separators, because "FP8_E4M3" and "fp8-e4m3" name
-// one recipe.
+// 它将拼写转为小写并统一分隔符，因为 "FP8_E4M3" 和 "fp8-e4m3" 表示同一配方。
 func normalizeSpelling(spelling string) string {
 	spelling = strings.ToLower(strings.TrimSpace(spelling))
 	spelling = strings.ReplaceAll(spelling, "_", "-")

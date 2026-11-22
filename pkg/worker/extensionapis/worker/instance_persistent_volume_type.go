@@ -37,10 +37,10 @@ const (
 	_InstancePersistentVolumeTypeKind     = "InstancePersistentVolumeType"
 )
 
-// InstancePersistentVolumeTypeHandler handles v1.InstancePersistentVolumeType objects.
+// InstancePersistentVolumeTypeHandler 处理 v1.InstancePersistentVolumeType 对象。
 //
-// InstancePersistentVolumeTypeHandler maps the v1.InstancePersistentVolumeType to a Kubernetes StorageClass,
-// which is named as the InstancePersistentVolumeType's name.
+// InstancePersistentVolumeTypeHandler 将 v1.InstancePersistentVolumeType 映射到 Kubernetes StorageClass，
+// 该 StorageClass 与 InstancePersistentVolumeType 同名。
 type InstancePersistentVolumeTypeHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -53,7 +53,7 @@ func (h *InstancePersistentVolumeTypeHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &storage.StorageClass{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -66,10 +66,10 @@ func (h *InstancePersistentVolumeTypeHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_InstancePersistentVolumeTypeResource)
 
-	// Create table convertor to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 的输出。
 	tc, err := extensionapi.NewJSONPathTemplateTableConvertor(
 		extensionapi.RenderColumn("Type", func(t *worker.InstancePersistentVolumeType) string {
 			switch {
@@ -102,11 +102,11 @@ func (h *InstancePersistentVolumeTypeHandler) SetupHandler(
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储。
 	h.ObjectInfo = &worker.InstancePersistentVolumeType{}
 	h.CurdOperations = extensionapi.WithCurd(tc, h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 
@@ -134,7 +134,7 @@ func (h *InstancePersistentVolumeTypeHandler) Destroy() {}
 func (h *InstancePersistentVolumeTypeHandler) OnCreate(ctx context.Context, obj runtime.Object, opts ctrlcli.CreateOptions) (runtime.Object, error) {
 	instPVType := obj.(*worker.InstancePersistentVolumeType)
 
-	// Validate.
+	// 校验。
 	if instPVType.Spec.NFS == nil && instPVType.Spec.S3 == nil {
 		return nil, kerrors.NewBadRequest("one of NFS and S3 must be specified")
 	}
@@ -191,7 +191,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnCreate(ctx context.Context, obj 
 		}
 	}
 
-	// Default.
+	// 设置默认值。
 	switch {
 	case instPVType.Spec.NFS != nil:
 		if len(instPVType.Spec.NFS.MountOptions) == 0 {
@@ -221,25 +221,25 @@ func (h *InstancePersistentVolumeTypeHandler) OnCreate(ctx context.Context, obj 
 		}
 	}
 
-	// Create.
+	// 创建。
 	stgCls := convertStorageClassFromInstancePersistentVolumeType(instPVType)
 	err := h.Client.Create(ctx, stgCls)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create asset.
+	// 创建关联资源。
 	if instPVType.Spec.S3 != nil {
 		eSec := getInstancePersistentVolumeTypeSourceS3AccessData(instPVType)
 		kubemeta.ControlOnWithoutBlock(eSec, stgCls, worker.SchemeGroupVersionKind(_InstancePersistentVolumeTypeKind))
 		secAlignFn := func(aSec *core.Secret) (_ *core.Secret, skip bool, err error) {
 			skip = true
-			// Update data.
+			// 更新数据。
 			if !kubemeta.DeepEqual(aSec.Data, eSec.Data) {
 				aSec.Data = eSec.Data
 				skip = false
 			}
-			// Update owner reference.
+			// 更新属主引用。
 			if !kubemeta.IsControlledBy(aSec, stgCls) {
 				kubemeta.ControlOnWithoutBlock(aSec, stgCls, worker.SchemeGroupVersionKind(_InstancePersistentVolumeTypeKind))
 				skip = false
@@ -262,7 +262,7 @@ func (h *InstancePersistentVolumeTypeHandler) NewList() runtime.Object {
 }
 
 func (h *InstancePersistentVolumeTypeHandler) OnList(ctx context.Context, opts ctrlcli.ListOptions) (runtime.Object, error) {
-	// List.
+	// 列出。
 	stgClsList := new(storage.StorageClassList)
 	err := h.APIReader.List(ctx, stgClsList,
 		convertStorageClassListOptsFromInstancePersistentVolumeTypeListOpts(opts))
@@ -270,13 +270,13 @@ func (h *InstancePersistentVolumeTypeHandler) OnList(ctx context.Context, opts c
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	instPVTypeList := convertInstancePersistentVolumeTypeListFromStorageClassList(stgClsList)
 	return instPVTypeList, nil
 }
 
 func (h *InstancePersistentVolumeTypeHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) (watch.Interface, error) {
-	// Watch.
+	// 监听。
 	uw, err := h.Client.(ctrlcli.WithWatch).Watch(ctx, new(core.SecretList),
 		convertStorageClassListOptsFromInstancePersistentVolumeTypeListOpts(opts))
 	if err != nil {
@@ -292,31 +292,31 @@ func (h *InstancePersistentVolumeTypeHandler) OnWatch(ctx context.Context, opts 
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 上下文取消。
 				return
 			case <-dw.StopChan():
-				// Stop by downstream.
+				// 由下游停止。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 由上游关闭。
 					return
 				}
 
-				// Nothing to do.
+				// 无需处理。
 				if e.Object == nil {
 					c <- e
 					continue
 				}
 
-				// Type assert.
+				// 类型断言。
 				stgCls, ok := e.Object.(*storage.StorageClass)
 				if !ok {
 					c <- e
 					continue
 				}
 
-				// Process bookmark.
+				// 处理 Bookmark 事件。
 				if e.Type == watch.Bookmark {
 					systemmeta.UnnoteResource(stgCls)
 					e.Object = &worker.InstancePersistentVolumeType{ObjectMeta: stgCls.ObjectMeta}
@@ -324,18 +324,18 @@ func (h *InstancePersistentVolumeTypeHandler) OnWatch(ctx context.Context, opts 
 					continue
 				}
 
-				// Convert.
+				// 转换。
 				instPVType := convertInstancePersistentVolumeTypeFromStorageClass(stgCls)
 				if instPVType == nil {
 					continue
 				}
 
-				// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+				// 若未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 				if !instancePersistentVolumeTypeMatchFieldSelector(opts, instPVType) {
 					continue
 				}
 
-				// Dispatch.
+				// 分发。
 				e.Object = instPVType
 				c <- e
 			}
@@ -346,7 +346,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnWatch(ctx context.Context, opts 
 }
 
 func (h *InstancePersistentVolumeTypeHandler) OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (runtime.Object, error) {
-	// Get.
+	// 获取。
 	stgCls := &storage.StorageClass{
 		ObjectMeta: meta.ObjectMeta{
 			Name: key.Name,
@@ -357,7 +357,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnGet(ctx context.Context, key typ
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	instPVType := convertInstancePersistentVolumeTypeFromStorageClass(stgCls)
 	if instPVType == nil {
 		return nil, kerrors.NewNotFound(worker.Resource(_InstancePersistentVolumeTypeResource), key.Name)
@@ -371,7 +371,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnUpdate(
 ) (runtime.Object, error) {
 	instPVType, instPVTypeOld := obj.(*worker.InstancePersistentVolumeType), oldObj.(*worker.InstancePersistentVolumeType)
 
-	// Validate.
+	// 校验。
 	if instPVType.Spec.NFS != nil && instPVTypeOld.Spec.NFS == nil {
 		return nil, field.Forbidden(
 			field.NewPath("spec.nfs"), "cannot update to nfs from non-nfs",
@@ -431,7 +431,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnUpdate(
 		}
 	}
 
-	// Update.
+	// 更新。
 	oldStgCls := new(storage.StorageClass)
 	err := h.APIReader.Get(ctx, ctrlcli.ObjectKeyFromObject(instPVType), oldStgCls,
 		ctrlclix.WithoutQuorum)
@@ -449,7 +449,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnUpdate(
 			"description": instPVType.Spec.Description,
 		})
 	case instPVType.Spec.S3 != nil:
-		// Update asset.
+		// 更新关联资源。
 		eSec := getInstancePersistentVolumeTypeSourceS3AccessData(instPVType)
 		kubemeta.ControlOnWithoutBlock(eSec, oldStgCls, worker.SchemeGroupVersionKind(_InstancePersistentVolumeTypeKind))
 		_, err := kubeclientset.UpdateWithCtrlClient(ctx, h.Client, eSec,
@@ -457,7 +457,7 @@ func (h *InstancePersistentVolumeTypeHandler) OnUpdate(
 		if err != nil {
 			return nil, kerrors.NewInternalError(fmt.Errorf("update s3 access secret: %w", err))
 		}
-		// Update other.
+		// 更新其他字段。
 		systemmeta.NoteResource(stgCls, _InstancePersistentVolumeTypeResource, map[string]string{
 			"displayName": instPVType.Spec.DisplayName,
 			"description": instPVType.Spec.Description,
@@ -481,13 +481,13 @@ func (h *InstancePersistentVolumeTypeHandler) OnUpdate(
 func (h *InstancePersistentVolumeTypeHandler) OnDelete(ctx context.Context, obj runtime.Object, opts ctrlcli.DeleteOptions) error {
 	instPVType := obj.(*worker.InstancePersistentVolumeType)
 
-	// Delete.
+	// 删除。
 	stgCls := &storage.StorageClass{ObjectMeta: instPVType.ObjectMeta}
 	return h.Client.Delete(ctx, stgCls)
 }
 
 func convertStorageClassListOptsFromInstancePersistentVolumeTypeListOpts(in ctrlcli.ListOptions) (out *ctrlcli.ListOptions) {
-	// Add necessary label selector.
+	// 添加必要的标签选择器。
 	if lbs := systemmeta.GetResourcesLabelSelectorOfType(_InstancePersistentVolumeTypeResource); in.LabelSelector == nil {
 		in.LabelSelector = lbs
 	} else {
@@ -510,7 +510,7 @@ func convertStorageClassFromInstancePersistentVolumeType(instPVType *worker.Inst
 	case instPVType.Spec.NFS != nil:
 		stgCls.Provisioner = kuberess.CSIProvisionerNFS
 
-		// Parameters.
+		// 参数。
 		stgCls.Parameters["server"] = instPVType.Spec.NFS.Server
 		stgCls.Parameters["share"] = instPVType.Spec.NFS.Share
 		if instPVType.Spec.NFS.SubDirectory != "" {
@@ -520,7 +520,7 @@ func convertStorageClassFromInstancePersistentVolumeType(instPVType *worker.Inst
 			stgCls.Parameters["mountPermissions"] = instPVType.Spec.NFS.MountPermissions
 		}
 
-		// MountOptions.
+		// 挂载选项。
 		stgCls.MountOptions = instPVType.Spec.NFS.MountOptions
 
 		systemmeta.NoteResource(stgCls, _InstancePersistentVolumeTypeResource, map[string]string{
@@ -531,7 +531,7 @@ func convertStorageClassFromInstancePersistentVolumeType(instPVType *worker.Inst
 	case instPVType.Spec.S3 != nil:
 		stgCls.Provisioner = kuberess.CSIProvisionerS3
 
-		// Parameters.
+		// 参数。
 		stgCls.Parameters["mounter"] = instPVType.Spec.S3.Mounter
 		stgCls.Parameters["options"] = strings.Join(instPVType.Spec.S3.MountOptions, " ")
 		if instPVType.Spec.S3.Bucket != "" {
@@ -630,7 +630,7 @@ func convertInstancePersistentVolumeTypeListFromStorageClassList(stgClsList *sto
 			continue
 		}
 
-		// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+		// 若未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 		if !instancePersistentVolumeTypeMatchFieldSelector(ctrlcli.ListOptions{}, instPVType) {
 			continue
 		}

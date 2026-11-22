@@ -24,32 +24,26 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// WorkloadWebhook pins node-delivered weights to nodes with a registered model-manager plugin. It
-// also pins an accelerator request to nodes whose fit labels show that one card can still host it,
-// so Kueue's topology-aware scheduling skips a node whose free room is spread over cards none of
-// which fits.
+// WorkloadWebhook 将需要节点分发权重的 PodSet 固定到已注册 model-manager 插件的节点上。同时，它还将加速器请求
+// 固定到那些 fit 标签显示单卡仍可容纳该请求的节点上，使 Kueue 的拓扑感知调度跳过那些虽然总空闲空间足够、但
+// 分散在多张卡上且没有任何单卡能满足要求的节点。
 //
-// Per PodSet, a logical slice of U units per card requires the sliced-max-free-units label to be
-// greater than U-1, and a shared request of N >= 2 cards requires the shared-free-cards label to be
-// greater than N-1. The expression is ANDed into every required node-selector term of the PodSet
-// template. TAS reads that template's affinity; the Pod and its owner's template never carry it,
-// because Kueue copies only labels, annotations, a nodeSelector, tolerations and scheduling gates
-// onto them. That matters: the kubelet re-admits a running Pod against current node labels when it
-// restarts, and a fit label always falls below the threshold once the Pod holds its card.
+// 对每个 PodSet 而言，每卡 U 个单位的逻辑切片要求 sliced-max-free-units 标签大于 U-1，而 N >= 2 张卡的
+// 共享请求要求 shared-free-cards 标签大于 N-1。该表达式会以 AND 关系加入到 PodSet 模板的每一个必需
+// node-selector term 中。TAS 会读取该模板的亲和性；Pod 及其属主的模板本身绝不携带该亲和性，因为 Kueue
+// 只会向它们复制标签、注解、nodeSelector、tolerations 和调度门控。这一点至关重要：kubelet 在运行中的 Pod
+// 重启时会根据当前节点标签重新准入，而一旦 Pod 占用了加速卡，fit 标签的值必定会跌破阈值。
 //
-// The plugin pin applies to a PodSet with the model-manager CSI volume, independently of the
-// workload-fit-affinity setting. A plugin that unregisters after placement can still leave the Pod
-// waiting for a mount; the deployment's WeightsReady condition reports that wait.
+// 对带有 model-manager CSI 卷的 PodSet 应用插件固定，与 workload-fit-affinity 设置无关。若插件在调度后
+// 注销，仍可能导致 Pod 等待挂载；Deployment 的 WeightsReady 条件会报告该等待状态。
 //
-// Kueue may serve other tenants, so a fit pin applies only when its LocalQueue points
-// at a ClusterQueue carrying the operator's InstanceType mark and a same-named InstanceType names
-// an accelerator group. A missing link or failed read leaves that fit pin out; it does not affect
-// the plugin pin. The webhook never denies, and without the fit pin the node-devices check still
-// holds a request placed on a node that cannot host it.
+// Kueue 可能同时服务于其他租户，因此仅当 Workload 的 LocalQueue 指向带有本 operator 的 InstanceType 标记
+// 的 ClusterQueue，且同名 InstanceType 指定了加速器组时，才会应用 fit 固定。链路缺失或读取失败只会跳过 fit
+// 固定，不影响插件固定。该 Webhook 永远不会拒绝请求；即使没有 fit 固定，node-devices 检查仍会拦截被放置到
+// 无法容纳它的节点上的请求。
 //
-// An UPDATE is acted on only while the old Workload holds no quota reservation. Kueue rebuilds a
-// suspended job's Workload spec in place, which would drop the pins, and it lets PodSets change only
-// under that same condition.
+// 仅当旧 Workload 未持有配额预留时，才会在 UPDATE 时执行操作。Kueue 会就地重建挂起任务的 Workload spec（这
+// 会清除上述固定条件），而它也仅在相同条件下才允许变更 PodSets。
 //
 // nolint: lll
 // +k8s:webhook-gen:mutating:group="kueue.x-k8s.io",version="v1beta2",resource="workloads",scope="Namespaced"
@@ -68,7 +62,7 @@ func (r *WorkloadWebhook) SetupWebhook(_ context.Context, opts webhook.SetupOpti
 
 var _ ctrladmission.Defaulter[runtime.Object] = (*WorkloadWebhook)(nil)
 
-// fitPin is one PodSet's per-Pod demand, which Default turns into node-affinity expressions.
+// fitPin 表示单个 PodSet 的单 Pod 需求，Default 会将其转换为节点亲和性表达式。
 type fitPin struct {
 	podSet      int
 	slicedUnits int32
@@ -109,8 +103,8 @@ func (r *WorkloadWebhook) Default(ctx context.Context, obj runtime.Object) error
 		return nil
 	}
 
-	// An administrator's InstanceType may name a group that is not label grammar; a key built from it
-	// would make the affinity invalid, so such a Workload is left unpinned.
+	// 管理员创建的 InstanceType 可能指定了不符合标签语法的加速器组名称；由此构造的键会使亲和性无效，因此
+	// 这类 Workload 保持不固定。
 	slicedKey, sharedKey := nodefeature.FitSlicedMaxFreeUnitsLabelKey(group), nodefeature.FitSharedFreeCardsLabelKey(group)
 	if !nodefeature.IsFitLabelKey(slicedKey) || !nodefeature.IsFitLabelKey(sharedKey) {
 		logger.Info("accelerator group is not a valid label key part, leaving the workload unpinned", "group", group)
@@ -128,7 +122,7 @@ func (r *WorkloadWebhook) Default(ctx context.Context, obj runtime.Object) error
 	return nil
 }
 
-// nodeDeliveryPodSets returns the PodSets whose inline CSI volume needs the model-manager plugin.
+// nodeDeliveryPodSets 返回其内联 CSI 卷需要 model-manager 插件的 PodSet 索引列表。
 func nodeDeliveryPodSets(wl *kueue.Workload) []int {
 	var indexes []int
 	for i := range wl.Spec.PodSets {
@@ -142,9 +136,8 @@ func nodeDeliveryPodSets(wl *kueue.Workload) []int {
 	return indexes
 }
 
-// fitPinsOf returns the PodSets of a Workload that ask for a fit pin, with their per-Pod demand.
-// A shared request of one card needs none: the node's summed shared capacity already counts only
-// cards that can still grant a share.
+// fitPinsOf 返回 Workload 中需要 fit 固定的 PodSet 及其单 Pod 需求。
+// 单卡的共享请求不需要此固定：节点汇总的共享容量本身就只统计仍能分配出共享份额的加速卡。
 func fitPinsOf(wl *kueue.Workload) []fitPin {
 	var pins []fitPin
 	for i := range wl.Spec.PodSets {
@@ -156,9 +149,8 @@ func fitPinsOf(wl *kueue.Workload) []fitPin {
 	return pins
 }
 
-// oldWorkloadHoldsQuota reports whether the request is an UPDATE of a Workload that already holds a
-// quota reservation, whose PodSets Kueue no longer lets change. A context carrying no admission
-// request is treated as a CREATE.
+// oldWorkloadHoldsQuota 报告当前请求是否为对已持有配额预留的 Workload 的 UPDATE（Kueue 不再允许变更此类
+// Workload 的 PodSets）。不携带准入请求的上下文会被视为 CREATE。
 func oldWorkloadHoldsQuota(ctx context.Context) (bool, error) {
 	req, reqErr := ctrladmission.RequestFromContext(ctx)
 	if reqErr == nil && req.Operation == admissionv1.Update {
@@ -171,10 +163,9 @@ func oldWorkloadHoldsQuota(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// acceleratorGroup follows the queue chain this operator builds, from the Workload's LocalQueue to a
-// ClusterQueue carrying the InstanceType mark and on to the same-named InstanceType, and returns
-// that InstanceType's accelerator group. It returns an empty group when any link is missing or is
-// not this operator's.
+// acceleratorGroup 沿着本 operator 构建的队列链，从 Workload 的 LocalQueue 查找到带有 InstanceType 标记的
+// ClusterQueue，再找到同名的 InstanceType，并返回该 InstanceType 的加速器组。当任意一环缺失或不属于本
+// operator 时返回空字符串。
 func (r *WorkloadWebhook) acceleratorGroup(ctx context.Context, wl *kueue.Workload) (string, error) {
 	namespace := wl.Namespace
 	if req, err := ctrladmission.RequestFromContext(ctx); err == nil && req.Namespace != "" {
@@ -201,12 +192,12 @@ func (r *WorkloadWebhook) acceleratorGroup(ctx context.Context, wl *kueue.Worklo
 	return it.Spec.AcceleratorGroup, nil
 }
 
-// requireNodeExpression requires the node label key to be greater than need-1, ANDed into every
-// required node-selector term of spec, or as the only term when there is none.
+// requireNodeExpression 要求节点标签 key 的值大于 need-1，并将其以 AND 关系加入到 spec 的每一个必需
+// node-selector term 中；若不存在任何 term，则将其作为唯一的 term。
 //
-// An empty term, and a required selector that already exists with no term, are left alone: each
-// matches no node, and adding the expression would make it match some. An expression already present, the same key, operator and value, is not added twice, and any
-// other expression is kept, so a stricter requirement someone wrote on the same key still holds.
+// 空的 term 以及已存在但没有任何 term 的必需选择器都会保持原样：它们各自都不匹配任何节点，添加表达式反而会
+// 使之开始匹配节点。若已有键、操作符和值均相同的表达式，则不重复添加，同时保留其他已有表达式，以确保针对
+// 同一键设置的更严格要求依然有效。
 func requireNodeExpression(spec *core.PodSpec, key string, need int32) {
 	requireNodeRequirement(spec, core.NodeSelectorRequirement{
 		Key:      key,
@@ -229,7 +220,7 @@ func requireNodeRequirement(spec *core.PodSpec, pin core.NodeSelectorRequirement
 		spec.Affinity.NodeAffinity = &core.NodeAffinity{}
 	}
 	na := spec.Affinity.NodeAffinity
-	// Terms are ORed, so the pin joins every one of them; a template requiring nothing gets one term.
+	// 各个 term 之间是 OR 关系，因此该固定条件需要加入每一个 term；未设置任何要求的模板会获得一个新的 term。
 	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil {
 		na.RequiredDuringSchedulingIgnoredDuringExecution = &core.NodeSelector{
 			NodeSelectorTerms: []core.NodeSelectorTerm{{MatchExpressions: []core.NodeSelectorRequirement{pin}}},

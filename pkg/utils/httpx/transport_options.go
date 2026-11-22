@@ -33,7 +33,7 @@ func TransportOptions() *TransportOption {
 	}
 }
 
-// WithoutProxy disables the proxy.
+// WithoutProxy 禁用代理。
 func (o *TransportOption) WithoutProxy() *TransportOption {
 	if o == nil || o.transport == nil {
 		return o
@@ -42,7 +42,7 @@ func (o *TransportOption) WithoutProxy() *TransportOption {
 	return o
 }
 
-// WithoutInsecureVerify skips the insecure verify.
+// WithoutInsecureVerify 跳过 TLS 证书校验。
 func (o *TransportOption) WithoutInsecureVerify() *TransportOption {
 	if o == nil || o.transport == nil {
 		return o
@@ -51,7 +51,7 @@ func (o *TransportOption) WithoutInsecureVerify() *TransportOption {
 	return o
 }
 
-// WithTLSClientConfig sets the tls.Config.
+// WithTLSClientConfig 设置 tls.Config。
 func (o *TransportOption) WithTLSClientConfig(config *tls.Config) *TransportOption {
 	if o == nil || o.transport == nil {
 		return o

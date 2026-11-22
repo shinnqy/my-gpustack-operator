@@ -1,32 +1,28 @@
-// Package kvcache holds what is true of a KVCacheBackend whatever implementation backs it.
+// Package kvcache 包含与具体后端实现无关、对所有 KVCacheBackend 均成立的逻辑。
 //
-// It is deliberately small, and that is the point of the split rather than an accident of it: almost
-// everything a kv cache backend does — the process it runs, the flags it takes, the routes it serves,
-// the metrics it publishes — is a fact about one implementation. Those live in the sub-package for
-// that implementation, today only mooncake. What stays here is what a second implementation would
-// answer identically: how an object rendered for a backend is labeled, and how the image a backend
-// declares resolves to a pull policy.
+// 本包有意保持精简，这正是拆分的初衷而非偶然：KVCacheBackend 的几乎所有行为——
+// 它运行的进程、接收的参数标志、提供的路由、发布的指标——都是特定实现的属性。
+// 这些内容位于对应实现的子包中，目前只有 mooncake。留在这里的是第二种实现也会
+// 给出相同回答的内容：如何为某个后端渲染出的对象打标签，以及后端声明的镜像如何
+// 解析为拉取策略。
 //
-// Nothing here dispatches on `spec.type`, and no interface abstracts over implementations. There is
-// exactly one, the API admits exactly one value, and an abstraction drawn against a single case would
-// be drawn in the wrong place. The package boundary is where the second one gets added; it is not a
-// seam already built for it.
+// 此处既不按 spec.type 分发，也没有跨实现抽象的接口。当前只有唯一一种实现，
+// API 也只允许唯一一个值，针对单个用例抽取的抽象必定画在错误的位置。包边界就是
+// 日后添加第二种实现的位置，而不是一个预先为它铺设好的接缝。
 package kvcache
 
 const (
-	// ResourceType is what every object rendered for a backend is noted as, and ResourceNoteBackend
-	// is the note carrying which backend it belongs to.
+	// ResourceType 是为后端渲染的每个对象所标记的资源类型，ResourceNoteBackend
+	// 是记录该对象所属后端的注解键。
 	//
-	// They are exported because the reconciler's watches read them: a Deployment changing anywhere
-	// in the cluster is filtered down to this operator's own by the type, and then mapped back to
-	// the backend to re-enqueue by the note. Without that pair, the watch would either wake on
-	// every Deployment in the cluster or need a label selector that duplicates what the note
-	// already says.
+	// 将它们导出是因为协调器的 watch 会读取它们：集群中任意位置发生变更的 Deployment
+	// 会先按类型过滤出本 Operator 自己的对象，再通过该注解映射回需要重新入队的后端。
+	// 若没有这一对常量，watch 要么会在集群中的每一个 Deployment 上被唤醒，要么需要一个
+	// 重复表达注解含义的标签选择器。
 	//
-	// They sit HERE rather than beside the renderers that stamp them because they say nothing about
-	// which implementation rendered the object — a watch filters by them before it knows or cares.
-	// Under an implementation package, the backend reconciler would have to import that one
-	// implementation to answer a question that has nothing to do with it.
+	// 它们放在这里而非写在打标渲染器旁边，是因为它们与具体由哪种实现渲染该对象无关——
+	// watch 甚至在知晓或关心具体实现之前就按它们进行过滤。如果放在某个实现子包下，
+	// 后端协调器就不得不为了回答一个与该实现毫无关系的问题而导入该实现包。
 	ResourceType        = "kvcachebackends"
 	ResourceNoteBackend = "backend"
 )

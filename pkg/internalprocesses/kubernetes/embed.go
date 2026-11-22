@@ -25,12 +25,11 @@ import (
 
 var embeddedKubeConfigPath = filepath.Join(clientcmd.RecommendedConfigDir, "k3s.yaml")
 
-// Embedded represents the embedded Kubernetes cluster,
-// which driven by k3s.
+// Embedded 表示由 k3s 驱动的嵌入式 Kubernetes 集群。
 type Embedded struct{}
 
 func (Embedded) Start(ctx context.Context) error {
-	// Validate if run as privileged.
+	// 校验是否以特权模式运行。
 	if !system.IsRunningAsPrivileged() {
 		if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
 			return errors.New(`require "securityContext.privileged" feature of gpustack pod`)
@@ -39,16 +38,16 @@ func (Embedded) Start(ctx context.Context) error {
 		return errors.New(`require "--privileged" flag to run gpustack container`)
 	}
 
-	// NB(thxCode): With cgroup v2,
-	// in order to nest gpustack multiple times,
-	// we need to create specific cgroup for k3s.
+	// NB(thxCode): 在 cgroup v2 下，
+	// 为了能够多次嵌套运行 gpustack，
+	// 我们需要为 k3s 创建专用的 cgroup。
 	cgroupRoot := "/"
 
-	// Enable nested cgroup v2,
-	// ref to https://github.com/moby/moby/issues/43093.
+	// 启用嵌套 cgroup v2，
+	// 参考 https://github.com/moby/moby/issues/43093。
 	if osx.ExistsFile("/sys/fs/cgroup/cgroup.controllers") {
-		// Move the processes from the root group to the /init group,
-		// otherwise writing subtree_control fails with EBUSY.
+		// 将进程从根组移动到 /init 组，
+		// 否则写入 subtree_control 会因 EBUSY 而失败。
 		if !osx.ExistsFile("/sys/fs/cgroup/init/cgroup.procs") {
 			err := osx.Copy(
 				"/sys/fs/cgroup/cgroup.procs",
@@ -58,7 +57,7 @@ func (Embedded) Start(ctx context.Context) error {
 				return fmt.Errorf("error moving processes to root init group: %w", err)
 			}
 		}
-		// Enable controllers to allow nesting.
+		// 启用控制器以允许嵌套。
 		err := osx.Copy(
 			"/sys/fs/cgroup/cgroup.controllers",
 			"/sys/fs/cgroup/cgroup.subtree_control",
@@ -76,16 +75,16 @@ func (Embedded) Start(ctx context.Context) error {
 			return fmt.Errorf("error enabling root group controllers: %w", err)
 		}
 
-		// Calculate specific cgroup root.
+		// 计算特定的 cgroup 根目录。
 		cgroupRoot = "/k3s-" + stringx.SumByFNV64a(system.PrimarySubnet.Get())
 
-		// Create specific cgroup root.
+		// 创建特定的 cgroup 根目录。
 		err = os.Mkdir(path.Join("/sys/fs/cgroup", cgroupRoot), 0o755)
 		if err != nil && !os.IsExist(err) {
 			return fmt.Errorf("error creating cgroup: %w", err)
 		}
 
-		// Enable controllers to run k3s.
+		// 启用运行 k3s 所需的控制器。
 		err = osx.Copy(
 			"/sys/fs/cgroup/cgroup.subtree_control",
 			path.Join("/sys/fs/cgroup", cgroupRoot, "cgroup.subtree_control"),
@@ -109,8 +108,8 @@ func (Embedded) Start(ctx context.Context) error {
 		k3sServerDataDir = filepath.Join(k3sDataDir, "server")
 	)
 
-	// Link air-gapped image to k3s agent data directory,
-	// e.g. /etc/gpustack/k3s/agent/images -> /var/lib/gpustack/operator/k3s/agent/images.
+	// 将离线镜像链接到 k3s agent 数据目录，
+	// 例如 /etc/gpustack/k3s/agent/images -> /var/lib/gpustack/operator/k3s/agent/images。
 	if imgConfDir := system.SubConfDir("k3s", "agent", "images"); osx.ExistsDir(imgConfDir) {
 		k3sAgentImageDir := filepath.Join(k3sDataDir, "agent", "images")
 		err := osx.Link(
@@ -124,9 +123,9 @@ func (Embedded) Start(ctx context.Context) error {
 		}
 	}
 
-	// Reset server database.
+	// 重置服务端数据库。
 	if osx.ExistsDir(filepath.Join(k3sServerDataDir, "db", "etcd")) {
-		_ = os.Remove(filepath.Join(k3sServerDataDir, "db", "reset-flag")) // Clean reset flag.
+		_ = os.Remove(filepath.Join(k3sServerDataDir, "db", "reset-flag")) // 清理重置标记。
 
 		cmdArgs := []string{
 			"server",
@@ -156,23 +155,23 @@ func (Embedded) Start(ctx context.Context) error {
 		"--kube-apiserver-arg=service-node-port-range=30000-30100",
 	}
 
-	// NB(thxCode): With embedded cluster,
-	// in order to avoid the conflict with the default cluster CIDR when running in Kubernetes cluster,
-	// we need to adjust the embedded cluster CIDR.
+	// NB(thxCode): 对于嵌入式集群，
+	// 为避免在 Kubernetes 集群中运行时与默认集群 CIDR 冲突，
+	// 需要调整嵌入式集群的 CIDR。
 	if v := system.PrimarySubnet.Get(); v != "" {
 		sn := netx.MustIPv4FromCIDR(v)
-		cls := sn.Next().Next() // Offset 2 positions to get cluster CIDR.
-		svc := cls.Next()       // Offset 1 position of cluster CIDR to get service CIDR.
+		cls := sn.Next().Next() // 偏移 2 个位置以获取集群 CIDR。
+		svc := cls.Next()       // 在集群 CIDR 基础上偏移 1 个位置以获取服务 CIDR。
 		cmdArgs = append(cmdArgs,
 			"--cluster-cidr="+cls.String(),
 			"--service-cidr="+svc.String())
 
-		// NB(thxCode): At present, it's impossible to reset the PodCIDR of a joined Kubernetes Node,
-		// even the `--cluster-reset` introduced by k3s.
-		// Embedded Kubernetes cluster is for demonstration purpose,
-		// we never guarantee it for production using.
-		// In order to restart from the mutable networking env,
-		// we compare with the previous cluster CIDR here to determine erasing the data directory or not.
+		// NB(thxCode): 目前无法重置已加入 Kubernetes Node 的 PodCIDR，
+		// 即便使用 k3s 引入的 `--cluster-reset` 也不行。
+		// 嵌入式 Kubernetes 集群仅用于演示目的，
+		// 不保证可用于生产环境。
+		// 为了能在可变的网络环境中重启，
+		// 此处将其与先前的集群 CIDR 进行比较，以决定是否清除数据目录。
 		clsFp := filepath.Join(k3sServerDataDir, "cluster.cidr")
 		if osx.ExistsFile(clsFp) {
 			bs, _ := os.ReadFile(clsFp)

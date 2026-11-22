@@ -15,16 +15,14 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
 )
 
-// modelDeploymentDeclaresEncode reports whether the deployment declares an Encode role, which is
-// what makes it an encoder/prefill/decode deployment and brings the rules below to bear. A
-// deployment without one keeps every rule it had.
+// modelDeploymentDeclaresEncode 报告部署是否声明了 Encode role；一旦声明，即构成
+// encoder/prefill/decode 部署并触发下列规则。未声明该 role 的部署仍沿用原有全部规则。
 func modelDeploymentDeclaresEncode(md *workercore.ModelDeployment) bool {
 	return modelDeploymentRoleIndexOfKind(md, workercore.ModelDeploymentRoleKindEncode) != -1
 }
 
-// modelDeploymentRoleIndexOfKind returns where the one role of this kind sits, or -1 when the
-// deployment declares none. The index is what a refusal lands on, because it is the field the user
-// wrote.
+// modelDeploymentRoleIndexOfKind 返回该类型唯一 role 所在的索引位置，若部署未声明则返回 -1。
+// 拒绝错误会定位到该索引，因为它是用户实际编写的字段。
 func modelDeploymentRoleIndexOfKind(
 	md *workercore.ModelDeployment, kind workercore.ModelDeploymentRoleKind,
 ) int {
@@ -37,10 +35,9 @@ func modelDeploymentRoleIndexOfKind(
 	return -1
 }
 
-// modelDeploymentRoleClaimMount returns the additionalVolumes entry that mounts a claim, and whether
-// the role mounts one at all. One is enough to compare against: a role that mounts two claims
-// reaches no single shared directory, and the rule that refuses it is the one that refuses the
-// encoder's and the prefiller's mounts disagreeing.
+// modelDeploymentRoleClaimMount 返回挂载声明（claim）的 additionalVolumes 条目，以及该 role 是否挂载了声明。
+// 只需取出一个即可用于比对：挂载两个声明的 role 无法形成单一共享目录，
+// 拒绝这种情况的正是校验编码器与预填充器挂载配置不一致的规则。
 func modelDeploymentRoleClaimMount(
 	role *workercore.ModelDeploymentRole,
 ) (*workercore.ModelDeploymentAdditionalVolume, bool) {
@@ -53,7 +50,7 @@ func modelDeploymentRoleClaimMount(
 	return nil, false
 }
 
-// modelDeploymentRouterName returns the router the deployment names, or the empty string.
+// modelDeploymentRouterName 返回部署指定的路由器名称，若未指定则返回空字符串。
 func modelDeploymentRouterName(md *workercore.ModelDeployment) string {
 	if md.Spec.Router == nil {
 		return ""
@@ -62,17 +59,14 @@ func modelDeploymentRouterName(md *workercore.ModelDeployment) string {
 	return md.Spec.Router.Name
 }
 
-// validateModelDeploymentEPD holds every rule that applies only to a deployment declaring an Encode
-// role. A deployment without one returns nothing, which is what keeps the rendering of every other
-// shape unchanged.
+// validateModelDeploymentEPD 汇总仅适用于声明了 Encode role 的部署的所有规则。
+// 未声明该 role 的部署不会返回任何错误，从而保证其他形态的渲染保持不变。
 //
-// IT RUNS ON EVERY CREATE AND EVERY UPDATE, with no held-access exemption for an object stored
-// before these rules. The exemption other late rules here carry exists because an object was stored
-// while the rule did not exist, and refusing its later edits would strand it. No such object exists
-// here: an Encode role was refused at admission until this rule admitted one, so the first object
-// to reach these rules is the first that can satisfy them. Re-checking on every update is also what
-// stops an edit moving an admitted deployment off the matrix, since the platform, the engine and
-// the router are all re-read from the object as submitted.
+// 该校验在每次创建和每次更新时都会运行，不对这些规则出现前已存储的对象提供豁免。
+// 其他后增规则之所以保留豁免，是因为当时规则尚不存在而对象已入库，拒绝其后续编辑会导致对象卡死。
+// 此处不存在此类历史对象：在这些规则准入之前，Encode role 本就会被准入阶段拒绝，因此第一个到达这里的对象
+// 必然已经能够满足这些规则。在每次更新时重新检查，也能防止编辑操作将已准入的部署移出支持矩阵，
+// 因为平台、引擎和路由器都会根据提交的对象重新读取。
 func (r *ModelDeploymentWebhook) validateModelDeploymentEPD(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (field.ErrorList, error) {
@@ -87,8 +81,7 @@ func (r *ModelDeploymentWebhook) validateModelDeploymentEPD(
 		return nil, err
 	}
 	if len(platformErrs) > 0 {
-		// The matrix is read by platform, so a platform that could not be settled leaves nothing to
-		// look up and reporting a second refusal about it would only restate the first.
+		// 支持矩阵按平台检索，因此未能确定平台时就无从查表，再报告第二条相关错误只是重复第一条的内容。
 		return append(errs, platformErrs...), nil
 	}
 
@@ -100,9 +93,8 @@ func (r *ModelDeploymentWebhook) validateModelDeploymentEPD(
 		))), nil
 	}
 
-	// The gap check above has already refused every combination this cannot answer for, so the row
-	// is here. The second return is stated rather than dropped, because discarding it would leave a
-	// future edit moving the gap check without noticing it had stopped guaranteeing the row.
+	// 上方的缺口检查已经拒绝了所有无法适配的组合，因此此处必然能取到行。
+	// 显式保留第二个返回值而非丢弃，是为了防止未来修改将缺口检查移走时，未察觉它已不再保证该行存在。
 	row, admitted := workerctrl.ModelDeploymentEPDRowFor(router, md.Spec.Engine.Name, platform)
 	if !admitted {
 		return append(errs, field.Invalid(field.NewPath("spec", "engine", "name"),
@@ -118,12 +110,10 @@ func (r *ModelDeploymentWebhook) validateModelDeploymentEPD(
 	return errs, nil
 }
 
-// validateModelDeploymentEPDShape holds the rules about the three roles and the fields around them
-// that need nothing but the object.
+// validateModelDeploymentEPDShape 存放仅依赖对象本身即可判定的三个 role 及其周边字段规则。
 //
-// AT MOST ONE ROLE OF EACH KIND is already refused above, by the rule that refuses a repeated
-// non-Server kind, and so is Encode beside a Server role. What is left here is the pair the rule
-// cannot see: an Encode role on its own, with nothing to hand its output to.
+// 每种类型最多一个 role 已在上方由禁止重复非 Server 类型的规则拒绝，Encode 与 Server 并存的情况亦然。
+// 此处补充的是该规则看不到的组合：单独存在一个 Encode role，却没有任何下游 role 可以承接其输出。
 func validateModelDeploymentEPDShape(md *workercore.ModelDeployment) field.ErrorList {
 	var errs field.ErrorList
 
@@ -131,10 +121,8 @@ func validateModelDeploymentEPDShape(md *workercore.ModelDeployment) field.Error
 	encodeIdx := modelDeploymentRoleIndexOfKind(md, workercore.ModelDeploymentRoleKindEncode)
 	encodePath := rolesPath.Index(encodeIdx).Child("kind")
 
-	// The encoder has a reader and nothing else. A deployment holding an Encode role and no
-	// Prefill would have the encoder produce embeddings that no role consumes; one with no Decode
-	// would have no consumer of the prefiller's output either, which is the prefill/decode half this
-	// shape exists to extend.
+	// 编码器只有一个读取方。部署若包含 Encode role 却没有 Prefill，编码器生成的嵌入向量将没有任何 role 消费；
+	// 若没有 Decode，则预填充器的输出同样没有消费者，而这正是该形态所要扩展的 prefill/decode 链路。
 	for _, kind := range []workercore.ModelDeploymentRoleKind{
 		workercore.ModelDeploymentRoleKindPrefill, workercore.ModelDeploymentRoleKindDecode,
 	} {
@@ -179,9 +167,9 @@ func validateModelDeploymentEPDShape(md *workercore.ModelDeployment) field.Error
 	return errs
 }
 
-// modelDeploymentEPDSiblingReason states why a role kind has to be declared beside the Encode role.
-// Each kind carries its own sentence, because one sentence covering both explains the prefiller in
-// the breath of a missing decoder and leaves the reader working out which half is being reported.
+// modelDeploymentEPDSiblingReason 说明为何必须与 Encode role 同时声明某种 role 类型。
+// 每种类型都有各自独立的提示语，因为合用一句话会在提示缺少解码器时同时提及预填充器，
+// 让读者自己去分辨究竟缺少了哪一半。
 func modelDeploymentEPDSiblingReason(kind workercore.ModelDeploymentRoleKind) string {
 	if kind == workercore.ModelDeploymentRoleKindPrefill {
 		return "the encoder produces embeddings that only a prefiller reads"
@@ -191,7 +179,7 @@ func modelDeploymentEPDSiblingReason(kind workercore.ModelDeploymentRoleKind) st
 		workercore.ModelDeploymentRoleKindDecode)
 }
 
-// validateModelDeploymentEPDEncodeShape holds the rules about the Encode role alone.
+// validateModelDeploymentEPDEncodeShape 存放仅针对 Encode role 本身的规则。
 func validateModelDeploymentEPDEncodeShape(md *workercore.ModelDeployment, encodeIdx int) field.ErrorList {
 	var errs field.ErrorList
 
@@ -217,9 +205,9 @@ func validateModelDeploymentEPDEncodeShape(md *workercore.ModelDeployment, encod
 			)))
 	}
 
-	// External data parallelism moves the members that answer a request outside the engine process,
-	// which the operator discovers from the Nodes after admission. The encoder has no such question:
-	// it produces embeddings rather than answers, and its output is addressed by one replica.
+	// 外部数据并行（external data parallelism）会将响应请求的成员移至引擎进程之外，
+	// 由 Operator 在准入后从 Node 中发现。编码器不存在这一问题：
+	// 它生成的是嵌入向量而非最终响应，其输出由单个副本寻址。
 	status := workerctrl.ReadModelDeploymentRoleParallelism(md.Spec.Engine.Name, role)
 	if status.LoadBalance == workercore.ModelDeploymentLoadBalanceExternal ||
 		status.LoadBalance == workercore.ModelDeploymentLoadBalanceHybrid {
@@ -233,14 +221,11 @@ func validateModelDeploymentEPDEncodeShape(md *workercore.ModelDeployment, encod
 	return errs
 }
 
-// modelDeploymentEPDPlatform returns the one accelerator platform every role runs on, and the
-// refusals that stopped it from settling on one.
+// modelDeploymentEPDPlatform 返回所有 role 运行所在的唯一加速卡平台，以及阻止确定平台的拒绝错误列表。
 //
-// THE PLATFORM IS READ FROM EACH ROLE'S INSTANCE TYPE rather than declared, because a role names a
-// type and the type is what reports its manufacturer. A mixed answer is refused rather than resolved,
-// since the connector and the transfer protocol both follow the accelerator and one deployment
-// cannot run the same leg on two of them. An empty manufacturer is the not-yet-synced state, not a
-// platform of its own, and is refused the same way.
+// 平台从每个 role 的 InstanceType 中读取而非直接声明，因为 role 指定了类型，而类型上报了厂商信息。
+// 混合平台的结果会被拒绝而非自行折中，因为连接器和传输协议都跟随加速卡类型，单个部署无法在两条腿上同时混用两种平台。
+// 厂商信息为空代表尚未同步的状态，而非一种独立平台，因此同样予以拒绝。
 func (r *ModelDeploymentWebhook) modelDeploymentEPDPlatform(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (string, field.ErrorList, error) {
@@ -311,30 +296,26 @@ func (r *ModelDeploymentWebhook) modelDeploymentEPDPlatform(
 	return platform, errs, nil
 }
 
-// validateModelDeploymentEPDSideChannelPort refuses an encoder whose own HTTP port is the port its
-// side channel needs.
+// validateModelDeploymentEPDSideChannelPort 拒绝自身 HTTP 端口与其侧信道所需端口冲突的 encoder。
 //
-// THE COLLISION IS BETWEEN TWO WRITERS IN ONE CONTAINER. An NIXL producer binds a ZMQ ROUTER socket
-// on the side-channel port in the same container that serves HTTP, so an encoder serving there puts
-// the engine's own server on the socket the consumers dial for embeddings. One of the two loses the
-// bind, and which one is not decided here -- the symptoms land as a leg that never starts or a
-// consumer that connects to an HTTP server, with nothing in either log naming the collision.
+// 冲突发生在同一容器内的两个监听方之间。NIXL 生产者在提供 HTTP 服务的同一容器内绑定
+// 侧信道端口上的 ZMQ ROUTER socket，因此若 encoder 在该端口提供服务，引擎自身的服务端
+// 就会占据 consumer 用于获取 embeddings 的 socket。两者必有一方绑定失败，且哪一方
+// 失败并不确定——表现为一个阶段始终无法启动，或 consumer 连上了 HTTP 服务，且双方
+// 日志中都不会点明端口冲突。
 //
-// BOTH SPELLINGS ARE REFUSED, because a role can name its serving port two ways and the render
-// honors either one. A declared `ports` entry is what the operator renders into the engine's
-// --port, and it takes precedence: a role declaring a port is held to the first of them
-// (`modelDeploymentTargetPort`), so a role may pass --port AND declare one. Reading only the flag
-// would leave the declared spelling unguarded, and the refusal would name a number the render does
-// not use.
+// 两种写法都会被拒绝，因为一个 role 有两种指定服务端口的方式，而渲染逻辑两种都会采纳。
+// 显式声明的 `ports` 条目是 operator 渲染到引擎 --port 参数中的值，且优先级更高：
+// 声明了端口的 role 会被固定使用其中的第一个端口（`modelDeploymentTargetPort`），
+// 而 role 仍可能同时传入 --port 并声明端口。若只检查启动参数，就会放过声明字段的写法，
+// 导致拒绝报错时指向一个渲染阶段根本不会使用的端口号。
 //
-// ONLY THE NETWORK ROW CAN COLLIDE, because the side channel is what the network connector renders.
-// The shared-directory row carries its embeddings through a mounted path and binds no second socket,
-// so its encoder is free to serve on that number. This rule therefore stays beside the matrix rather
-// than joining `modelDeploymentRouterReservedPorts`, which is vendor-blind by construction and would
-// have to over-claim the shared row.
+// 只有网络传输行可能发生冲突，因为侧信道仅由网络 connector 渲染。
+// 共享目录行通过挂载路径传递 embeddings，不会绑定第二个 socket，因此其 encoder 可以
+// 自由使用该端口。故此规则保留在矩阵校验旁，而不并入按设计对厂商无感知的
+// `modelDeploymentRouterReservedPorts`，以免误伤共享目录行。
 //
-// A ROLE NAMING NEITHER SERVES ON THE DEFAULT, which is not this number, so there is nothing to
-// refuse.
+// 两者均未指定时 role 会使用默认端口，该端口不是此侧信道端口，因此无需拒绝。
 func validateModelDeploymentEPDSideChannelPort(
 	md *workercore.ModelDeployment, row workerctrl.ModelDeploymentEPDRow,
 ) field.ErrorList {
@@ -358,8 +339,8 @@ func validateModelDeploymentEPDSideChannelPort(
 		))}
 	}
 
-	// The declared set is read first because it is the one the render prefers: where a role
-	// declares a port, the flag is held to it rather than consulted.
+	// 优先读取显式声明的端口集合，因为渲染逻辑优先采用它：只要 role 声明了端口，
+	// 启动参数就会受其约束而不再被单独采信。
 	var errs field.ErrorList
 	for _, port := range role.Ports {
 		if port.Port == inject.VLLMECSideChannelPort {
@@ -376,14 +357,14 @@ func validateModelDeploymentEPDSideChannelPort(
 	return errs
 }
 
-// validateModelDeploymentEPDSharedVolume refuses an encoder leg that the two roles cannot both read.
+// validateModelDeploymentEPDSharedVolume 拒绝无法同时被两个 role 读取的 encoder 链路。
 //
-// THE THREE FIELDS ARE COMPARED TOGETHER because the connector is told one directory and both roles
-// have to arrive at the same one. The claim alone is not enough: two roles can mount one claim at
-// two sub-paths and reach two directories, and the encoder's file lands in one of them.
+// 这三个字段需要一并比较，因为 connector 只会被告知一个目录路径，两个 role 必须最终
+// 指向同一目录。仅比较声明名称（claim）还不够：两个 role 可能将同一个 claim 挂载到
+// 不同的子路径下，从而指向两个不同的目录，而 encoder 写入的文件只会落在其中之一。
 //
-// The encoder's own mount is refused read-only, because the encoder writes the embeddings it is
-// asked for and a read-only mount makes that write fail at run time rather than at admission.
+// encoder 自身的挂载禁止设为只读，因为 encoder 需要写入被请求的 embeddings，只读挂载
+// 会导致写入在运行时失败，而非在准入阶段被拦截。
 func validateModelDeploymentEPDSharedVolume(
 	md *workercore.ModelDeployment, row workerctrl.ModelDeploymentEPDRow,
 ) field.ErrorList {
@@ -393,9 +374,9 @@ func validateModelDeploymentEPDSharedVolume(
 	encodeIdx := modelDeploymentRoleIndexOfKind(md, workercore.ModelDeploymentRoleKindEncode)
 	prefillIdx := modelDeploymentRoleIndexOfKind(md, workercore.ModelDeploymentRoleKindPrefill)
 
-	// The rule reads two roles, so it has nothing to compare when either is missing or when the
-	// encoder is not the single instance this row describes. The shape rules above have already
-	// refused both, and a second refusal here would name the same missing role twice.
+	// 该规则需要读取两个 role，因此当任一 role 缺失或 encoder 并非此行所描述的
+	// 单实例时，没有可供比较的对象。上方的形态规则已经拒绝了这两种情况，在此再次拒绝
+	// 只会对同一个缺失的 role 重复报错。
 	if prefillIdx < 0 || md.Spec.Roles[encodeIdx].ReplicaSize != 1 {
 		return nil
 	}
@@ -432,11 +413,11 @@ func validateModelDeploymentEPDSharedVolume(
 	}
 
 	for _, mismatch := range []struct {
-		// name is the field the two roles have to spell the same way.
+		// name 是两个 role 必须保持拼写一致的字段名。
 		name string
-		// value is what the encoder's own entry carries there.
+		// value 是 encoder 自身条目在该字段上的取值。
 		value string
-		// equal reports whether the two entries agree on it.
+		// equal 报告两个条目在该字段上是否一致。
 		equal bool
 	}{
 		{
@@ -462,12 +443,12 @@ func validateModelDeploymentEPDSharedVolume(
 	return errs
 }
 
-// modelDeploymentEPDVolumeMismatchField returns the field a shared-mount mismatch is reported on.
+// modelDeploymentEPDVolumeMismatchField 返回报告共享挂载不匹配时对应的字段路径。
 //
-// THE FIELD THE USER MUST FIX IS NOT THE SAME FOR THE THREE MISMATCHES, so each one is looked up
-// rather than named: the claim name lives under the source that carries it and the two mount fields
-// sit beside it, exactly as the claim-source rule above spells them. Landing all three on one field
-// sends an edit to a field that is already correct, and leaves the field that is wrong unmentioned.
+// 在这三种不匹配情况下用户需要修改的字段各不相同，因此需逐一查找而非硬编码单个名称：
+// claim 名称位于承载它的卷源之下，而另外两个挂载字段位于其旁，与上方 claim 源规则的
+// 结构一致。若把三种错误都报在同一个字段上，会误导用户去修改本就正确的字段，而漏掉
+// 真正出错的字段。
 func modelDeploymentEPDVolumeMismatchField(volumesPath *field.Path, name string) *field.Path {
 	if name == "claimName" {
 		return volumesPath.Child("persistentVolumeClaim", "claimName")

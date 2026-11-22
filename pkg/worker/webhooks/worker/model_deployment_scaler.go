@@ -22,75 +22,65 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/scaling/priors"
 )
 
-// The values a scaler starts from when the object leaves them out.
+// 当对象省略对应字段时，scaler 所使用的初始默认值。
 //
-// EVERY DEFAULT HERE IS A VALUE THE ALGORITHM NEEDS TO HAVE, so an object that omits one is
-// refused by the schema rather than answered with a zero. The zero value of a count is a
-// meaningful count in some of these fields and a missing one in others, which is why each is
-// named rather than derived.
+// 这里的每个默认值都是算法运行所必需的值，因此省略其中任一项都会被 schema 拒绝，
+// 而不是以零值代替。对于这些字段中的一部分而言，0 是一个有意义的计数；而对另一些
+// 字段而言，0 则表示缺失。正因如此，每个默认值都必须显式命名而非隐式推导。
 const (
-	// modelDeploymentScalerDefaultIntervalSeconds is how often a scaler looks at its target.
+	// modelDeploymentScalerDefaultIntervalSeconds 是 scaler 检查目标对象的周期（秒）。
 	modelDeploymentScalerDefaultIntervalSeconds = 15
 
-	// modelDeploymentScalerDefaultPendingTimeoutSeconds is how long a committed scale-up may
-	// stay unadmitted before it is retracted.
+	// modelDeploymentScalerDefaultPendingTimeoutSeconds 是已提交的扩容请求在未获准入前
+	// 可保持挂起的最长时间（秒），超时后将被撤回。
 	modelDeploymentScalerDefaultPendingTimeoutSeconds = 300
 
-	// modelDeploymentScalerDefaultStableWindowSeconds is the window the stable recommendation
-	// is computed over.
+	// modelDeploymentScalerDefaultStableWindowSeconds 是计算稳态（stable）扩缩容建议所用的时间窗口（秒）。
 	modelDeploymentScalerDefaultStableWindowSeconds = 180
 
-	// modelDeploymentScalerDefaultPanicWindowSeconds is the window the panic recommendation is
-	// computed over.
+	// modelDeploymentScalerDefaultPanicWindowSeconds 是计算紧急（panic）扩缩容建议所用的时间窗口（秒）。
 	modelDeploymentScalerDefaultPanicWindowSeconds = 60
 
-	// modelDeploymentScalerDefaultMaxStepReplicas is the most replicas one pass may add.
+	// modelDeploymentScalerDefaultMaxStepReplicas 是单轮扩缩容最多可增加的副本数。
 	modelDeploymentScalerDefaultMaxStepReplicas = 4
 
-	// modelDeploymentScalerDefaultMaxStepPercent is the most percent one pass may add.
+	// modelDeploymentScalerDefaultMaxStepPercent 是单轮扩缩容最多可增加的副本百分比。
 	modelDeploymentScalerDefaultMaxStepPercent = 100
 
-	// modelDeploymentScalerDefaultScaleDownStabilizationSeconds is the window the scale-down
-	// recommendations are remembered over.
+	// modelDeploymentScalerDefaultScaleDownStabilizationSeconds 是保留缩容建议用于稳定判断的时间窗口（秒）。
 	modelDeploymentScalerDefaultScaleDownStabilizationSeconds = 300
 
-	// modelDeploymentScalerDefaultCooldownAfterAbortSeconds is how long a role is held after an
-	// aborted retirement.
+	// modelDeploymentScalerDefaultCooldownAfterAbortSeconds 是下线（retirement）中止后 role 需保持冷却的时间（秒）。
 	modelDeploymentScalerDefaultCooldownAfterAbortSeconds = 300
 
-	// modelDeploymentScalerDefaultDecodePostScaleUpGraceSeconds is how long a Decode role is
-	// held after it grew.
+	// modelDeploymentScalerDefaultDecodePostScaleUpGraceSeconds 是 Decode role 扩容后需保持的宽限期（秒）。
 	modelDeploymentScalerDefaultDecodePostScaleUpGraceSeconds = 120
 
-	// modelDeploymentScalerDefaultMinReplicas is the fewest replicas a role may have.
+	// modelDeploymentScalerDefaultMinReplicas 是单个 role 允许保留的最小副本数。
 	modelDeploymentScalerDefaultMinReplicas = 1
 
-	// modelDeploymentScalerDefaultCatalogKey is the ConfigMap data key a catalog reference reads
-	// when the key is omitted.
+	// modelDeploymentScalerDefaultCatalogKey 是在省略 key 时，catalog 引用默认读取的 ConfigMap 数据键。
 	modelDeploymentScalerDefaultCatalogKey = priors.DefaultCatalogConfigMapKey
 )
 
-// modelDeploymentScalerMaxReplicas is the most replicas a role may be scaled to.
+// modelDeploymentScalerMaxReplicas 是单个 role 允许扩缩容到的最大副本数。
 //
-// The number bounds the search for a feasible replica vector, so it is a property of the search
-// rather than of the algorithm: a vector is chosen from a box of at most this many integers per
-// role.
+// 该数值限制了可行副本向量的搜索范围，因此它属于搜索空间的属性而非算法本身的限制：
+// 每个 role 仅从最多包含这么多整数的区间内选取副本数，构成搜索向量空间。
 const modelDeploymentScalerMaxReplicas = 1024
 
-// modelDeploymentScalerFeasibilityBudget is how many replica vectors the search for a feasible
-// one may try before it gives up.
+// modelDeploymentScalerFeasibilityBudget 是搜索可行副本向量时在放弃前最多可尝试的向量数量。
 //
-// THE SEARCH IS EXACT, and the budget is what keeps it from spending an admission request on a
-// shape nobody runs. A search that runs out of budget does not refuse the object: it says it
-// could not decide, because refusing a configuration that is in fact feasible strands an object
-// its owner cannot repair by editing it.
+// 该搜索是精确搜索，而预算上限用于防止准入请求在无人实际使用的规模形态上耗尽资源。
+// 当搜索耗尽预算时，不会直接拒绝该对象，而是判定为无法决定，因为拒绝一个实际上
+// 可行的配置会导致对象被困住，且其所有者无法通过编辑对象来修复问题。
 const modelDeploymentScalerFeasibilityBudget = 1 << 14
 
-// ModelDeploymentScalerWebhook defaults and validates a ModelDeploymentScaler.
+// ModelDeploymentScalerWebhook 为 ModelDeploymentScaler 填充默认值并执行校验。
 //
-// IT READS THE TARGET when the target exists, because a scaler that names a role the target does
-// not have, or a role it cannot scale, is a scaler that plans for nothing. The read is skipped
-// when the target is absent, because a scaler may be written before its target.
+// 当目标存在时它会读取目标对象，因为指向目标不存在的 role 或不可扩缩容的 role 的
+// scaler 等于在做无意义规划。当目标不存在时则跳过读取，因为允许在创建目标之前
+// 先编写 scaler。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="modeldeploymentscalers",scope="Namespaced"
@@ -100,8 +90,8 @@ const modelDeploymentScalerFeasibilityBudget = 1 << 14
 type ModelDeploymentScalerWebhook struct {
 	webhook.DefaultValidator
 
-	// APIReader reads the target ModelDeployment. There is deliberately no cached client beside
-	// it: a cache that is behind would judge a scaler against a target that no longer exists.
+	// APIReader 用于读取目标 ModelDeployment。此处刻意不使用带缓存的客户端：
+	// 若缓存存在延迟，可能会拿一个已不存在的目标状态来校验 scaler。
 	APIReader ctrlcli.Reader
 }
 
@@ -116,16 +106,15 @@ var (
 	_ ctrladmission.Defaulter[runtime.Object] = (*ModelDeploymentScalerWebhook)(nil)
 )
 
-// Default fills the values a scaler leaves out.
+// Default 填充 scaler 省略的默认值。
 //
-// THE MODE DEFAULTS TO SHADOW, so a scaler that was just created observes and changes nothing
-// until its owner asks for it to act. That is the difference between a planner being installed
-// and a planner being trusted with a target.
+// 模式默认设为 Shadow，因此刚创建的 scaler 在所有者明确要求其生效前仅做观测而不产生
+// 任何变更。这区分了“已安装规划器”与“授权规划器操作目标”两个阶段。
 //
-// THE ALGORITHM TYPE IS TAKEN FROM THE BLOCK THAT IS PRESENT when the type is left out, so that
-// a scaler naming only a predictive block does not silently run the token throughput algorithm
-// with the predictive block ignored. A scaler naming no block at all runs the token throughput
-// algorithm, which is the one whose parameters have defaults for every value it needs.
+// 当省略算法类型时，会根据实际填写的配置块自动推断，从而避免仅填写了 predictive
+// 配置块的 scaler 在未察觉的情况下执行 token throughput 算法并忽略 predictive 块。
+// 若完全未配置任何算法块，则默认使用 token throughput 算法，因为只有该算法的所有必需参数
+// 均有默认值。
 func (r *ModelDeploymentScalerWebhook) Default(ctx context.Context, obj runtime.Object) error {
 	s := obj.(*workercore.ModelDeploymentScaler)
 	if !s.DeletionTimestamp.IsZero() {
@@ -203,7 +192,7 @@ func (r *ModelDeploymentScalerWebhook) defaultModelDeploymentScaler(
 	return md, targetRead, nil
 }
 
-// modelDeploymentScalerAlgorithmTypeOf picks the algorithm a scaler names by the block it filled.
+// modelDeploymentScalerAlgorithmTypeOf 根据所填写的配置块选择 scaler 使用的算法类型。
 func modelDeploymentScalerAlgorithmTypeOf(
 	algorithm workercore.ModelDeploymentScalerAlgorithmSpec,
 ) workercore.ModelDeploymentScalerAlgorithmType {
@@ -217,7 +206,7 @@ func modelDeploymentScalerAlgorithmTypeOf(
 	}
 }
 
-// defaultModelDeploymentScalerCapacityPrior fills the defaults a capacity prior block leaves out.
+// defaultModelDeploymentScalerCapacityPrior 填充容量先验（capacity prior）配置块中省略的默认值。
 func defaultModelDeploymentScalerCapacityPrior(cp *workercore.ModelDeploymentScalerCapacityPriorSpec) {
 	if cp == nil {
 		return
@@ -230,8 +219,8 @@ func defaultModelDeploymentScalerCapacityPrior(cp *workercore.ModelDeploymentSca
 	}
 }
 
-// shouldSuppressDefaultSLOs reports whether latency target defaults must be suppressed so that
-// catalog prior resolution requires explicit latency targets for roles lacking manual capacity.
+// shouldSuppressDefaultSLOs 报告是否必须抑制延迟目标的默认值，以确保在通过 catalog
+// 解析先验容量时，缺少手动容量配置的 role 必须显式指定延迟目标。
 func (r *ModelDeploymentScalerWebhook) shouldSuppressDefaultSLOs(
 	ctx context.Context, s *workercore.ModelDeploymentScaler,
 ) (bool, *workercore.ModelDeployment, bool, error) {
@@ -248,9 +237,9 @@ func (r *ModelDeploymentScalerWebhook) shouldSuppressDefaultSLOs(
 	return workerctrl.ModelDeploymentScalerNeedsCapacityPrior(s, md), md, true, nil
 }
 
-// defaultModelDeploymentScalerTokenThroughput fills the values the token throughput algorithm
-// needs to have. When capacity priors are resolved from a catalog, latency SLO defaults are left
-// unset so that validation requires explicit latency targets.
+// defaultModelDeploymentScalerTokenThroughput 填充 token throughput 算法所需的默认值。
+// 当通过 catalog 解析容量先验时，会保留延迟 SLO 默认值为未设置状态，以便校验阶段
+// 强制要求显式配置延迟目标。
 func defaultModelDeploymentScalerTokenThroughput(
 	tt *workercore.ModelDeploymentScalerTokenThroughputSpec, suppressDefaultSLOs bool,
 ) {
@@ -305,11 +294,11 @@ func (r *ModelDeploymentScalerWebhook) ValidateUpdate(
 	return warnings, nil
 }
 
-// validateModelDeploymentScaler holds every rule a scaler is judged by.
+// validateModelDeploymentScaler 包含校验 scaler 所需的全部规则。
 //
-// THE RULES THAT DO NOT NEED THE TARGET COME FIRST, and the ones that need it are skipped when
-// it is absent. A scaler may be written before its target exists, and a rule that read a target
-// that is not there would refuse an object that is merely early.
+// 不依赖目标对象的规则优先执行，需要目标对象的规则在目标不存在时跳过。
+// 因为允许在目标创建之前先编写 scaler，若在目标尚不存在时去读取并校验它，
+// 会错误地拒绝一个仅仅是提前创建的合法对象。
 func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScaler(
 	ctx context.Context, s *workercore.ModelDeploymentScaler, isUpdate bool,
 ) (ctrladmission.Warnings, field.ErrorList) {
@@ -318,10 +307,9 @@ func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScaler(
 		errs     field.ErrorList
 	)
 
-	// THE OBJECT IS JUDGED AS IT WILL BE STORED, which is the object after defaulting. A field the
-	// defaulting webhook fills is judged by the value it will carry, so a rule never refuses an
-	// object for a value that is about to be filled in, and the two halves cannot disagree about
-	// what a scaler that omitted a field means.
+	// 校验对象以其最终落盘存储的形态为准，即经过默认值填充后的对象。
+	// 由 defaulting webhook 填充的字段会以其即将承载的值接受校验，因此规则绝不会
+	// 因某个即将被自动填充的值而拒绝对象，两端也不会对“省略字段的 scaler 语义”产生分歧。
 	effective := s.DeepCopy()
 	md, targetRead, err := r.defaultModelDeploymentScaler(ctx, effective)
 	if err != nil {
@@ -370,7 +358,7 @@ func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScaler(
 	return warnings, errs
 }
 
-// readModelDeploymentScalerTarget reads the target of a scaler, or reports that it is absent.
+// readModelDeploymentScalerTarget 读取 scaler 指向的目标对象，或在目标不存在时进行报告。
 func (r *ModelDeploymentScalerWebhook) readModelDeploymentScalerTarget(
 	ctx context.Context, s *workercore.ModelDeploymentScaler,
 ) (*workercore.ModelDeployment, error) {
@@ -390,7 +378,7 @@ func (r *ModelDeploymentScalerWebhook) readModelDeploymentScalerTarget(
 	return md, nil
 }
 
-// validateModelDeploymentScalerMode validates the scaler execution mode.
+// validateModelDeploymentScalerMode 校验 scaler 的执行模式。
 func validateModelDeploymentScalerMode(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	switch s.Spec.Mode {
 	case workercore.ModelDeploymentScalerModeShadow, workercore.ModelDeploymentScalerModeActive:
@@ -404,7 +392,7 @@ func validateModelDeploymentScalerMode(s *workercore.ModelDeploymentScaler) fiel
 	}
 }
 
-// validateModelDeploymentScalerTargetRef refuses a scaler that names no target.
+// validateModelDeploymentScalerTargetRef 拒绝未指定目标的 scaler。
 func validateModelDeploymentScalerTargetRef(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -419,12 +407,11 @@ func validateModelDeploymentScalerTargetRef(s *workercore.ModelDeploymentScaler)
 	return errs
 }
 
-// validateModelDeploymentScalerTargetRefImmutable refuses a scaler that is pointed at another
-// target.
+// validateModelDeploymentScalerTargetRefImmutable 拒绝将 scaler 指向另一个目标的修改。
 //
-// THE TARGET IS WHAT THE SCALER OWNS, and a binding follows the target rather than the scaler:
-// changing it would leave the old target carrying a binding nobody may write and the new target
-// carrying none. A scaler that wants another target is a second scaler.
+// 目标是 scaler 所管理的对象，绑定关系跟随目标而非 scaler：修改目标引用会导致
+// 旧目标残留无人可更新的绑定，而新目标却没有绑定。若要管理另一个目标，应当创建
+// 第二个 scaler。
 func validateModelDeploymentScalerTargetRefImmutable(
 	old, s *workercore.ModelDeploymentScaler,
 ) field.ErrorList {
@@ -444,7 +431,7 @@ func validateModelDeploymentScalerTargetRefImmutable(
 	return errs
 }
 
-// validateModelDeploymentScalerSampling holds the two intervals a scaler works in.
+// validateModelDeploymentScalerSampling 校验 scaler 运行所依赖的两个采样时间窗口。
 func validateModelDeploymentScalerSampling(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	errs := make(field.ErrorList, 0, 2)
 
@@ -467,7 +454,7 @@ func validateModelDeploymentScalerSampling(s *workercore.ModelDeploymentScaler) 
 	return errs
 }
 
-// validateModelDeploymentScalerRoles holds the bounds of the roles a scaler plans for.
+// validateModelDeploymentScalerRoles 校验 scaler 所规划的各 role 的副本数上下界。
 func validateModelDeploymentScalerRoles(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -507,10 +494,10 @@ func validateModelDeploymentScalerRoles(s *workercore.ModelDeploymentScaler) fie
 	return errs
 }
 
-// validateModelDeploymentScalerRatios holds the relationships between roles.
+// validateModelDeploymentScalerRatios 校验各 role 之间的比例约束。
 //
-// A RATIO NAMES ROLES THE SCALER PLANS FOR, because a ratio between a role that is planned for
-// and one that is not cannot be kept by any vector.
+// 比例约束必须引用 scaler 纳入规划的 role，因为纳入规划的 role 与未纳入规划的 role
+// 之间的比例无法通过任何副本向量来维持。
 func validateModelDeploymentScalerRatios(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -554,10 +541,10 @@ func validateModelDeploymentScalerRatios(s *workercore.ModelDeploymentScaler) fi
 	return errs
 }
 
-// validateModelDeploymentScalerRatioQuantities holds the numbers of one ratio.
+// validateModelDeploymentScalerRatioQuantities 校验单个比例约束中的数值配置。
 //
-// THE TARGET IS INSIDE THE BAND, because a target the band excludes is a target no vector can
-// reach, and a band that excludes it is a band nothing satisfies.
+// 目标比例必须位于区间范围内，因为超出区间的目标比例是任何向量都无法同时满足的，
+// 而排除了目标比例的区间也是毫无意义的约束。
 func validateModelDeploymentScalerRatioQuantities(
 	ratio *workercore.ModelDeploymentScalerRoleRatio, ratioPath *field.Path,
 ) field.ErrorList {
@@ -596,7 +583,7 @@ func validateModelDeploymentScalerRatioQuantities(
 	return errs
 }
 
-// validateModelDeploymentScalerPositiveQuantity refuses a quantity that is not a positive number.
+// validateModelDeploymentScalerPositiveQuantity 拒绝非正数的数量值。
 func validateModelDeploymentScalerPositiveQuantity(
 	path *field.Path, quantity *resource.Quantity, what string,
 ) field.ErrorList {
@@ -613,11 +600,10 @@ func validateModelDeploymentScalerPositiveQuantity(
 	return errs
 }
 
-// modelDeploymentScalerRatioValue reads a quantity as an exact rational, and says whether it was
-// set at all.
+// modelDeploymentScalerRatioValue 将数量值读取为精确有理数，并指示该值是否已设置。
 //
-// THE RATIONAL IS EXACT, because a ratio bound is compared against a quotient of two integers and
-// a rounded one would decide a boundary wrongly.
+// 此处必须使用精确有理数，因为比例边界需要与两个整数的商进行比较，若经过舍入
+// 会导致边界判定出错。
 func modelDeploymentScalerRatioValue(quantity *resource.Quantity) (*big.Rat, bool) {
 	if quantity == nil {
 		return nil, false
@@ -636,7 +622,7 @@ func modelDeploymentScalerRatioValue(quantity *resource.Quantity) (*big.Rat, boo
 	return new(big.Rat).SetFrac(num, den), true
 }
 
-// validateModelDeploymentScalerBehavior holds the pacing rules of a scaler.
+// validateModelDeploymentScalerBehavior 校验 scaler 的扩缩容节奏控制规则。
 func validateModelDeploymentScalerBehavior(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -661,7 +647,7 @@ func validateModelDeploymentScalerBehavior(s *workercore.ModelDeploymentScaler) 
 	return errs
 }
 
-// validateModelDeploymentScalerStepPolicy holds one step bound.
+// validateModelDeploymentScalerStepPolicy 校验单条步长限制策略。
 func validateModelDeploymentScalerStepPolicy(
 	path *field.Path, policy *workercore.ModelDeploymentScalerStepPolicy,
 ) field.ErrorList {
@@ -689,7 +675,7 @@ func validateModelDeploymentScalerStepPolicy(
 	return errs
 }
 
-// validateModelDeploymentScalerRebalance holds the rebalance order of a scaler.
+// validateModelDeploymentScalerRebalance 校验 scaler 的重均衡（rebalance）顺序配置。
 func validateModelDeploymentScalerRebalance(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -730,7 +716,7 @@ func validateModelDeploymentScalerRebalance(s *workercore.ModelDeploymentScaler)
 	return errs
 }
 
-// validateModelDeploymentScalerAlgorithm holds the algorithm a scaler runs and its parameters.
+// validateModelDeploymentScalerAlgorithm 校验 scaler 运行的算法及其参数。
 func validateModelDeploymentScalerAlgorithm(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -783,7 +769,7 @@ func validateModelDeploymentScalerAlgorithm(s *workercore.ModelDeploymentScaler)
 	return errs
 }
 
-// validateModelDeploymentScalerCapacityPrior validates the structural fields of the capacity prior block.
+// validateModelDeploymentScalerCapacityPrior 校验容量先验（capacity prior）配置块的结构性字段。
 func validateModelDeploymentScalerCapacityPrior(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	cp := s.Spec.Algorithm.CapacityPrior
 	if cp == nil {
@@ -826,7 +812,7 @@ func validateModelDeploymentScalerCapacityPrior(s *workercore.ModelDeploymentSca
 	return errs
 }
 
-// validateModelDeploymentScalerProportional holds the parameters of the proportional algorithm.
+// validateModelDeploymentScalerProportional 校验 proportional 算法的参数。
 func validateModelDeploymentScalerProportional(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -894,8 +880,7 @@ func validateModelDeploymentScalerProportional(s *workercore.ModelDeploymentScal
 	return errs
 }
 
-// validateModelDeploymentScalerTokenThroughput holds the parameters of the token throughput
-// algorithm.
+// validateModelDeploymentScalerTokenThroughput 校验 token throughput 算法的参数。
 func validateModelDeploymentScalerTokenThroughput(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -913,8 +898,7 @@ func validateModelDeploymentScalerTokenThroughput(s *workercore.ModelDeploymentS
 	return errs
 }
 
-// validateModelDeploymentScalerTokenThroughputSpec holds the parameters one token throughput
-// block carries.
+// validateModelDeploymentScalerTokenThroughputSpec 校验单个 token throughput 配置块携带的参数。
 func validateModelDeploymentScalerTokenThroughputSpec(
 	path *field.Path, tt *workercore.ModelDeploymentScalerTokenThroughputSpec,
 ) field.ErrorList {
@@ -944,8 +928,7 @@ func validateModelDeploymentScalerTokenThroughputSpec(
 		path.Child("itlTargetMilliseconds"), tt.ITLTargetMilliseconds,
 		"the inter-token latency target is the latency a role is expected to keep under",
 	)...)
-	// THE QUANTILE IS READ AS THE EXACT VALUE THE QUANTITY HOLDS, because the
-	// value the quantity resolved is the one every comparison uses.
+	// 分位数按该 Quantity 所持有的精确值读取，因为所有比较逻辑都使用其解析后的精确数值。
 	if tt.LatencyQuantile != nil {
 		quantilePath := path.Child("latencyQuantile")
 		quantile, ok := modelDeploymentScalerRatioValue(tt.LatencyQuantile)
@@ -977,7 +960,7 @@ func validateModelDeploymentScalerTokenThroughputSpec(
 	return errs
 }
 
-// validateModelDeploymentScalerPredictive holds the parameters of the predictive algorithm.
+// validateModelDeploymentScalerPredictive 校验 predictive 算法的参数。
 func validateModelDeploymentScalerPredictive(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	predictive := s.Spec.Algorithm.Predictive
 	if predictive == nil {
@@ -1015,17 +998,15 @@ func validateModelDeploymentScalerPredictive(s *workercore.ModelDeploymentScaler
 	return errs
 }
 
-// validateModelDeploymentScalerRatioFeasibility refuses a scaler whose bounds and ratios admit
-// no replica vector at all.
+// validateModelDeploymentScalerRatioFeasibility 拒绝因上下界与比例约束冲突而不存在任何
+// 可行副本向量的 scaler。
 //
-// A SET OF BOUNDS AND A SET OF RATIOS THAT CANNOT HOLD AT ONCE is a scaler that can never
-// commit anything: every vector it might pick breaks one of the rules it was given, so it
-// would either hold the target forever or break a rule to move it.
+// 一组无法同时满足的上下界与比例约束，会使 scaler 永远无法提交任何扩缩容决策：
+// 它选出的每一个向量都会违反给定规则，从而要么永久锁死目标，要么为了调整目标而打破规则。
 //
-// THE SEARCH IS OVER INTEGERS, because a replica count is an integer and a vector that only
-// satisfies the ratios over the reals is not one the operator can commit. The search is exact:
-// it enumerates the vectors of the roles that a ratio couples, and it tightens the remaining
-// roles from every ratio as it goes.
+// 搜索在整数域上进行，因为副本数必须是整数，仅在实数域上满足比例的向量无法由
+// operator 提交执行。搜索过程是精确的：它枚举受比例耦合的各 role 的副本向量，
+// 并在搜索过程中依据每条比例约束不断收紧其余 role 的范围。
 func validateModelDeploymentScalerRatioFeasibility(s *workercore.ModelDeploymentScaler) field.ErrorList {
 	var errs field.ErrorList
 
@@ -1036,8 +1017,8 @@ func validateModelDeploymentScalerRatioFeasibility(s *workercore.ModelDeployment
 			continue
 		}
 		if budget <= 0 {
-			// The search could not decide. Refusing here would refuse a configuration that may
-			// well be feasible, and an owner cannot repair that by editing the object.
+			// 搜索无法做出判定。此时若直接拒绝，可能会误拒实际上可行的配置，
+			// 且所有者无法通过编辑对象来修复此类问题。
 			continue
 		}
 		errs = append(errs, field.Invalid(
@@ -1050,7 +1031,7 @@ func validateModelDeploymentScalerRatioFeasibility(s *workercore.ModelDeployment
 	return errs
 }
 
-// modelDeploymentScalerRatioBand is one declared ratio as a band of exact rationals.
+// modelDeploymentScalerRatioBand 是以精确有理数区间表示的一条已声明比例约束。
 type modelDeploymentScalerRatioBand struct {
 	numerator   string
 	denominator string
@@ -1058,10 +1039,10 @@ type modelDeploymentScalerRatioBand struct {
 	maximum     *big.Rat
 }
 
-// modelDeploymentScalerComponent is a set of roles whose replica counts are bound to each other.
+// modelDeploymentScalerComponent 是一组副本数相互关联约束的 role 集合。
 //
-// The roles of a scaler that no ratio mentions are alone in their component and are always
-// feasible, because any count inside their own bounds satisfies every rule.
+// 未被任何比例约束提及的 role 各自独立成组且始终可行，因为在其自身上下界内的
+// 任意副本数都能满足全部规则。
 type modelDeploymentScalerComponent struct {
 	roles  []string
 	low    []int64
@@ -1070,13 +1051,12 @@ type modelDeploymentScalerComponent struct {
 	index  map[string]int
 }
 
-// roleNames names the roles of a component, for the message a refusal carries.
+// roleNames 列出组件中的角色名称，用于构建拒绝信息。
 func (c *modelDeploymentScalerComponent) roleNames() string {
 	return strings.Join(c.roles, ", ")
 }
 
-// modelDeploymentScalerComponents groups the roles of a scaler into the sets their ratios
-// couple.
+// modelDeploymentScalerComponents 按比例耦合关系将 scaler 的角色划分为若干集合。
 func modelDeploymentScalerComponents(s *workercore.ModelDeploymentScaler) []*modelDeploymentScalerComponent {
 	parent := make([]int, len(s.Spec.Roles))
 	for i := range parent {
@@ -1145,7 +1125,7 @@ func modelDeploymentScalerComponents(s *workercore.ModelDeploymentScaler) []*mod
 	return components
 }
 
-// modelDeploymentScalerFind returns the root of a role's set.
+// modelDeploymentScalerFind 返回角色所属集合的根节点。
 func modelDeploymentScalerFind(parent []int, i int) int {
 	for parent[i] != i {
 		parent[i] = parent[parent[i]]
@@ -1154,7 +1134,7 @@ func modelDeploymentScalerFind(parent []int, i int) int {
 	return i
 }
 
-// modelDeploymentScalerUnion joins two sets of roles.
+// modelDeploymentScalerUnion 合并两个角色集合。
 func modelDeploymentScalerUnion(parent []int, a, b int) {
 	rootA, rootB := modelDeploymentScalerFind(parent, a), modelDeploymentScalerFind(parent, b)
 	if rootA == rootB {
@@ -1163,14 +1143,13 @@ func modelDeploymentScalerUnion(parent []int, a, b int) {
 	parent[rootB] = rootA
 }
 
-// feasible reports whether some replica vector inside the bounds satisfies every ratio.
+// feasible 报告在上下界内是否存在满足所有比例约束的副本数向量。
 func (c *modelDeploymentScalerComponent) feasible(budget *int) bool {
 	if len(c.ratios) == 0 {
 		return true
 	}
 
-	// THE TWO OBVIOUS VECTORS ARE TRIED FIRST, because a set of roles that is already
-	// consistent settles on one of them and the search never runs.
+	// 优先尝试两个显而易见的边界向量，因为若角色集合本身已满足约束，可直接命中其中之一而无需运行搜索。
 	for _, candidate := range [][]int64{c.uniform(c.low), c.uniform(c.high)} {
 		if c.holds(candidate) {
 			return true
@@ -1180,14 +1159,14 @@ func (c *modelDeploymentScalerComponent) feasible(budget *int) bool {
 	return c.search(0, c.low, c.high, budget)
 }
 
-// uniform copies a bound vector so the search can test it without mutating the component's bounds.
+// uniform 复制一个边界向量，以便搜索过程对其进行测试而不修改组件的原始边界。
 func (c *modelDeploymentScalerComponent) uniform(values []int64) []int64 {
 	vector := make([]int64, len(c.roles))
 	copy(vector, values)
 	return vector
 }
 
-// holds reports whether a vector satisfies every ratio of the component.
+// holds 报告给定向量是否满足组件的所有比例约束。
 func (c *modelDeploymentScalerComponent) holds(vector []int64) bool {
 	for _, band := range c.ratios {
 		numerator := vector[c.index[band.numerator]]
@@ -1206,8 +1185,7 @@ func (c *modelDeploymentScalerComponent) holds(vector []int64) bool {
 	return true
 }
 
-// search looks for a vector, assigning one role at a time and tightening the rest from the
-// ratios as it goes.
+// search 尝试查找可行向量，每次为一个角色赋值，并随搜索推进根据比例约束收紧其余角色的上下界。
 func (c *modelDeploymentScalerComponent) search(pos int, low, high []int64, budget *int) bool {
 	if pos >= len(c.roles) {
 		return c.holds(low)
@@ -1237,11 +1215,9 @@ func (c *modelDeploymentScalerComponent) search(pos int, low, high []int64, budg
 	return false
 }
 
-// propagate tightens the bounds of the roles a known count constrains.
+// propagate 收紧受已知副本数约束的其余角色的上下界。
 //
-// IT NEVER CHANGES A COUNT THAT WAS ALREADY CHOSEN. Tightening a chosen role can only make its
-// interval empty, and an empty interval is a branch that is pruned rather than a count that is
-// rewritten.
+// 该过程绝不会修改已选定的副本数。收紧已选定角色的区间只会使其变空，而空区间表示该分支被剪枝，而非改写已选副本数。
 func (c *modelDeploymentScalerComponent) propagate(index int, low, high []int64) bool {
 	for _, band := range c.ratios {
 		numerator := c.index[band.numerator]
@@ -1260,10 +1236,9 @@ func (c *modelDeploymentScalerComponent) propagate(index int, low, high []int64)
 	return true
 }
 
-// tightenNumerator bounds the numerator of a ratio whose denominator is known.
+// tightenNumerator 在分母已知的情况下约束比例中分子的上下界。
 //
-// The band says the quotient lies between the two bounds, so the numerator lies between the
-// bounds multiplied by the denominator.
+// 比例区间限定商值位于上下界之间，因此分子必然位于上下界分别乘以分母所得范围之间。
 func (c *modelDeploymentScalerComponent) tightenNumerator(
 	low, high []int64, numerator, denominator int, band modelDeploymentScalerRatioBand,
 ) bool {
@@ -1283,10 +1258,9 @@ func (c *modelDeploymentScalerComponent) tightenNumerator(
 	return low[numerator] <= high[numerator]
 }
 
-// tightenDenominator bounds the denominator of a ratio whose numerator is known.
+// tightenDenominator 在分子已知的情况下约束比例中分母的上下界。
 //
-// The band says the quotient lies between the two bounds, so the denominator lies between the
-// numerator divided by the upper bound and the numerator divided by the lower one.
+// 比例区间限定商值位于上下界之间，因此分母必然位于分子除以上界与分子除以下界所得范围之间。
 func (c *modelDeploymentScalerComponent) tightenDenominator(
 	low, high []int64, denominator, numerator int, band modelDeploymentScalerRatioBand,
 ) bool {
@@ -1306,7 +1280,7 @@ func (c *modelDeploymentScalerComponent) tightenDenominator(
 	return low[denominator] <= high[denominator]
 }
 
-// modelDeploymentScalerCeil rounds a rational up.
+// modelDeploymentScalerCeil 对有理数向上取整。
 func modelDeploymentScalerCeil(ratio *big.Rat) int64 {
 	quotient, remainder := new(big.Int).QuoRem(ratio.Num(), ratio.Denom(), new(big.Int))
 	if remainder.Sign() > 0 {
@@ -1315,17 +1289,15 @@ func modelDeploymentScalerCeil(ratio *big.Rat) int64 {
 	return quotient.Int64()
 }
 
-// modelDeploymentScalerFloor rounds a rational down.
+// modelDeploymentScalerFloor 对有理数向下取整。
 func modelDeploymentScalerFloor(ratio *big.Rat) int64 {
 	quotient, _ := new(big.Int).QuoRem(ratio.Num(), ratio.Denom(), new(big.Int))
 	return quotient.Int64()
 }
 
-// validateModelDeploymentScalerAgainstTarget holds the rules that need the target to answer.
+// validateModelDeploymentScalerAgainstTarget 包含需要结合目标对象才能判定的校验规则。
 //
-// THE ROLES A SCALER PLANS FOR ARE THE ROLES OF THE TARGET, so a scaler naming a role the
-// target does not have is a scaler that plans for nothing, and a scaler naming a role the
-// target cannot scale is a scaler whose recommendation is meaningless.
+// scaler 所规划的角色必须属于目标对象，因此引用目标对象不存在的角色将无法进行有效规划，而引用目标对象不支持扩缩容的角色则会使扩缩容建议失去意义。
 func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScalerAgainstTarget(
 	ctx context.Context, s *workercore.ModelDeploymentScaler, md *workercore.ModelDeployment, isUpdate bool,
 ) (ctrladmission.Warnings, field.ErrorList) {
@@ -1375,8 +1347,7 @@ func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScalerAgainstTarge
 	return warnings, errs
 }
 
-// validateModelDeploymentScalerCatalogRoles validates role coupling, explicit latency targets,
-// and catalog prior resolution for a scaler that asked for a capacity prior.
+// validateModelDeploymentScalerCatalogRoles 为请求容量先验的 scaler 校验角色耦合关系、显式延迟目标以及目录先验解析。
 func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScalerCatalogRoles(
 	ctx context.Context, s *workercore.ModelDeploymentScaler, md *workercore.ModelDeployment,
 	declared map[string]*workercore.ModelDeploymentRole, isUpdate bool,
@@ -1472,8 +1443,7 @@ func (r *ModelDeploymentScalerWebhook) validateModelDeploymentScalerCatalogRoles
 	return warnings, errs
 }
 
-// modelDeploymentScalerRoleNeedsCapacityPrior reports whether a role kind is missing any required
-// capacity field on the scaler algorithm.
+// modelDeploymentScalerRoleNeedsCapacityPrior 报告某种角色类型在 scaler 算法配置中是否缺少必需的容量字段。
 func modelDeploymentScalerRoleNeedsCapacityPrior(
 	s *workercore.ModelDeploymentScaler, kind workercore.ModelDeploymentRoleKind,
 ) bool {
@@ -1485,9 +1455,7 @@ func modelDeploymentScalerRoleNeedsCapacityPrior(
 	return workerctrl.ModelDeploymentScalerNeedsCapacityPrior(s, probe)
 }
 
-// validateModelDeploymentScalerUnresolvedTargetSLOs refuses a scaler created before its target
-// exists when capacity-prior resolution suppressed the latency defaults and the scaler omits the
-// latency targets that any unstated capacity kind requires.
+// validateModelDeploymentScalerUnresolvedTargetSLOs 在目标对象尚未创建前即创建 scaler 且容量先验解析抑制了默认延迟目标时，若 scaler 遗漏了任意未指定容量类型所需的延迟目标，则拒绝该 scaler。
 func validateModelDeploymentScalerUnresolvedTargetSLOs(
 	s *workercore.ModelDeploymentScaler,
 ) field.ErrorList {
@@ -1530,12 +1498,9 @@ func validateModelDeploymentScalerUnresolvedTargetSLOs(
 	return errs
 }
 
-// validateModelDeploymentScalerRoleNames refuses a bound that names an object the cluster
-// cannot hold.
+// validateModelDeploymentScalerRoleNames 拒绝会使生成对象名称超出集群长度限制的副本数上界。
 //
-// THE NAMES A REPLICA HAS DEPEND ON ITS ORDINAL, so the bound that allows the most replicas is
-// the one that has to fit. The count is measured rather than reserved for a worst case, because
-// a worst case would take characters away from every deployment to cover counts nobody runs.
+// 副本名称取决于其序号，因此必须确保允许最大副本数的上界能够容纳。此处按实际允许的最大值测算而非按最坏情况预留，因为按最坏情况预留会挤压所有部署的名称可用字符数以覆盖实际无人使用的极大副本数。
 func validateModelDeploymentScalerRoleNames(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 	bounds *workercore.ModelDeploymentScalerRoleBounds, rolePath *field.Path,
@@ -1570,13 +1535,9 @@ func validateModelDeploymentScalerRoleNames(
 	return errs
 }
 
-// validateModelDeploymentScalerAlgorithmRoles holds the rules that couple an algorithm to the
-// kinds of the roles it plans for.
+// validateModelDeploymentScalerAlgorithmRoles 包含将扩缩容算法与所规划角色类型耦合起来的校验规则。
 //
-// THE ALGORITHM READS A SIGNAL PER ROLE KIND, so a role of a kind the algorithm has no signal
-// for is a role the algorithm cannot plan for. An Encode role is the exception: it is scaled by
-// the role it is coupled to rather than by its own signal, so it needs a ratio to a Prefill or
-// a Decode role.
+// 算法按角色类型读取对应指标信号，因此算法没有信号来源的角色类型无法纳入规划。Encode 角色是例外：它依据所耦合的角色而非自身信号进行扩缩容，因此需要配置与 Prefill 或 Decode 角色之间的比例关系。
 func validateModelDeploymentScalerAlgorithmRoles(
 	s *workercore.ModelDeploymentScaler, declared map[string]*workercore.ModelDeploymentRole,
 ) field.ErrorList {
@@ -1623,8 +1584,7 @@ func validateModelDeploymentScalerAlgorithmRoles(
 	return errs
 }
 
-// validateModelDeploymentScalerTokenThroughputRoles holds the rule that a role of a kind the
-// algorithm has no target for is refused.
+// validateModelDeploymentScalerTokenThroughputRoles 包含如下规则：若角色类型在算法中没有对应的目标配置，则予以拒绝。
 func validateModelDeploymentScalerTokenThroughputRoles(
 	s *workercore.ModelDeploymentScaler, declared map[string]*workercore.ModelDeploymentRole,
 	target func(workercore.ModelDeploymentRoleKind) *resource.Quantity, algorithm string,
@@ -1668,8 +1628,7 @@ func validateModelDeploymentScalerTokenThroughputRoles(
 	return errs
 }
 
-// validateModelDeploymentScalerPredictiveCapacities holds the rule that the predictive
-// algorithm needs the capacity of every role kind it plans for.
+// validateModelDeploymentScalerPredictiveCapacities 包含如下规则：预测算法需要获取其规划的每一种角色类型的容量。
 func validateModelDeploymentScalerPredictiveCapacities(
 	s *workercore.ModelDeploymentScaler, declared map[string]*workercore.ModelDeploymentRole,
 ) field.ErrorList {
@@ -1716,8 +1675,7 @@ func validateModelDeploymentScalerPredictiveCapacities(
 	return errs
 }
 
-// validateModelDeploymentScalerProportionalRoles holds the rule that every scaled role either
-// has a target of its own or is coupled to a role that has one.
+// validateModelDeploymentScalerProportionalRoles 包含如下规则：每个参与扩缩容的角色要么自身拥有目标配置，要么耦合到拥有目标配置的角色。
 func validateModelDeploymentScalerProportionalRoles(
 	s *workercore.ModelDeploymentScaler, declared map[string]*workercore.ModelDeploymentRole,
 ) field.ErrorList {
@@ -1752,11 +1710,9 @@ func validateModelDeploymentScalerProportionalRoles(
 	return errs
 }
 
-// modelDeploymentScalerCoupledToKinds names the roles that a ratio couples to a role of one of
-// the given kinds.
+// modelDeploymentScalerCoupledToKinds 列出通过比例关系耦合到指定类型角色的所有角色名称。
 //
-// A ROLE OF ANOTHER KIND IS WHAT COUNTS, because a role coupled to another role of the same
-// kind is not coupled to anything the algorithm could read differently.
+// 只有与不同类型角色耦合才有效，因为与同类型另一个角色耦合并不会引入算法可区分读取的新信号。
 func modelDeploymentScalerCoupledToKinds(
 	s *workercore.ModelDeploymentScaler, declared map[string]*workercore.ModelDeploymentRole,
 	kinds ...workercore.ModelDeploymentRoleKind,
@@ -1791,8 +1747,7 @@ func modelDeploymentScalerCoupledToKinds(
 	return coupled
 }
 
-// modelDeploymentScalerCoupledToTargeted names the roles that a ratio couples to a role that
-// carries a target of its own.
+// modelDeploymentScalerCoupledToTargeted 列出通过比例关系耦合到自身带有目标配置的角色的所有角色名称。
 func modelDeploymentScalerCoupledToTargeted(
 	s *workercore.ModelDeploymentScaler, targeted map[string]bool,
 ) map[string]bool {

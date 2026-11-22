@@ -21,26 +21,25 @@ import (
 )
 
 const (
-	// IndexingKVCachePoolBindingByPool indexes each KVCachePoolBinding by the pool it names. It is
-	// what makes "the Bindings of this pool" one scoped query rather than a list of every Binding in
-	// the cluster filtered in memory — a pass runs it on every reconcile, so the difference is per
-	// pass rather than per startup.
+	// IndexingKVCachePoolBindingByPool 按所引用的 pool 为每个 KVCachePoolBinding 建立索引。
+	// 这样“查询该 pool 的所有 Binding”就只需一次限定范围的查询，而不必列举集群中全部 Binding
+	// 并在内存中过滤——每次 reconcile 的 pass 都会执行该查询，因此差别体现在每次 pass 而非仅在启动时。
 	IndexingKVCachePoolBindingByPool = "kvcachepoolbindings.worker.gpustack.ai/pool"
 
-	// IndexingKVCachePoolByBackend indexes each KVCachePool by the backends it draws from.
+	// IndexingKVCachePoolByBackend 按所依赖的 backend 为每个 KVCachePool 建立索引。
 	//
-	// It exists because the tenant ledger and the policy file converge per MASTER and not per pool:
-	// several pools may sit on one backend, and a pass that wrote only its own pool's tenants would
-	// erase the others' on every reconcile. Finding those sibling pools has to be one query for the
-	// same reason above — it happens on every pass, on both of them.
+	// 之所以需要该索引，是因为租户账本与策略文件按 master 而非按 pool 收敛：多个 pool 可能共享
+	// 同一个 backend，若某次 pass 仅写入自身 pool 的租户，每次 reconcile 都会抹掉其他 pool 的
+	// 租户。查找这些同属一个 backend 的兄弟 pool 同样必须通过单次查询完成，原因与上文相同——它会在
+	// 两者各自的每次 pass 中执行。
 	IndexingKVCachePoolByBackend = "kvcachepools.worker.gpustack.ai/backend"
 )
 
-// indexKVCachePoolBindingByPool is the field-index extractor for IndexingKVCachePoolBindingByPool.
+// indexKVCachePoolBindingByPool 是 IndexingKVCachePoolBindingByPool 的字段索引提取器。
 //
-// A Binding whose pool does not exist is still indexed. That is deliberate: the pool may be created
-// afterwards, and the index is what carries the Binding into the pass that follows — dropping it
-// here would leave a Binding that named a pool early permanently invisible to it.
+// 即使 Binding 引用的 pool 尚不存在，仍会对其建立索引。这是有意为之：pool 可能在之后创建，
+// 该索引负责将此 Binding 带入随后的 pass 中——如果在此处丢弃，提前指定了 pool 的 Binding
+// 将对其永久不可见。
 func indexKVCachePoolBindingByPool(obj ctrlcli.Object) []string {
 	kvcpb, ok := obj.(*workercore.KVCachePoolBinding)
 	if !ok || kvcpb == nil || kvcpb.Spec.PoolRef.Name == "" {
@@ -49,12 +48,11 @@ func indexKVCachePoolBindingByPool(obj ctrlcli.Object) []string {
 	return []string{kvcpb.Spec.PoolRef.Name}
 }
 
-// indexKVCachePoolByBackend is the field-index extractor for IndexingKVCachePoolByBackend.
+// indexKVCachePoolByBackend 是 IndexingKVCachePoolByBackend 的字段索引提取器。
 //
-// It indexes every entry of spec.backends rather than the first, although admission admits exactly
-// one: the index has to describe what is STORED, and an object stored before that rule tightened, or
-// written by a client that bypassed the webhook, would otherwise be missing from the very query its
-// siblings use to find each other.
+// 尽管准入校验仅允许一个条目，它仍对 spec.backends 中的每一项建立索引，而不是只取第一项：
+// 索引必须如实反映已存储的对象内容，否则在该规则收紧之前存储的对象，或由绕过 Webhook 的客户端
+// 写入的对象，将在兄弟 pool 相互查找的查询中被遗漏。
 func indexKVCachePoolByBackend(obj ctrlcli.Object) []string {
 	kvcp, ok := obj.(*workercore.KVCachePool)
 	if !ok || kvcp == nil {
@@ -70,8 +68,8 @@ func indexKVCachePoolByBackend(obj ctrlcli.Object) []string {
 	return names
 }
 
-// The phases a KVCachePool reports, derived from what was observed rather than from what was asked
-// for: a pool whose backend has published no address is Provisioning however complete its spec is.
+// KVCachePool 上报的阶段，由实际观测状态而非期望配置推导得出：即使 spec 已完整，只要其
+// backend 尚未发布地址，pool 的阶段就仍为 Provisioning。
 const (
 	KVCachePoolPhaseProvisioning = "Provisioning"
 	KVCachePoolPhaseReady        = "Ready"
@@ -79,66 +77,61 @@ const (
 	KVCachePoolPhaseDeleting     = "Deleting"
 )
 
-// The condition types a KVCachePool reports, one per axis.
+// KVCachePool 上报的 condition 类型，每个维度对应一个。
 //
-// They are spelled POSITIVELY, as every condition in this repository is and as the Kubernetes API
-// conventions ask: the type names the healthy state and False carries the fault. The spec names two
-// faults — MultiTenancyDisabled and QuotaPolicyNotWritable — and those are REASONS on the two
-// conditions below rather than condition types of their own, because a type that is True when
-// something is wrong reads backwards from every other condition an operator sees on this cluster.
+// 它们均采用正向命名，与本仓库所有 condition 一致，也符合 Kubernetes API 规范：类型名表示
+// 健康状态，False 表示存在故障。规范中命名了两个故障——MultiTenancyDisabled 和
+// QuotaPolicyNotWritable——它们作为下面两个 condition 的 Reason 存在，而不是独立的 condition
+// 类型，因为当故障发生时表现为 True 的类型，在阅读体验上会与集群中操作员看到的其余所有
+// condition 完全相反。
 const (
-	// KVCachePoolConditionBackendResolved is False while the backend cannot be read or has published
-	// no address to reach it on.
+	// KVCachePoolConditionBackendResolved 在无法读取 backend 或其尚未发布可访问地址时为 False。
 	KVCachePoolConditionBackendResolved kubeapistatus.ConditionType = "BackendResolved"
-	// KVCachePoolConditionQuotaLedgerAvailable is False when the master holds no tenant ledger to
-	// write into — reason MultiTenancyDisabled, which is F5's precondition observed at runtime
-	// rather than assumed from admission.
+	// KVCachePoolConditionQuotaLedgerAvailable 在 master 未持有可写入的租户账本时为 False——
+	// 此时 Reason 为 MultiTenancyDisabled，即在运行时观测到的 F5 前置条件，而非在准入阶段做假设。
 	KVCachePoolConditionQuotaLedgerAvailable kubeapistatus.ConditionType = "QuotaLedgerAvailable"
-	// KVCachePoolConditionQuotaPolicyWritable is False when the master accepted no quota write —
-	// reason QuotaPolicyNotWritable when its own policy source is what refused it.
+	// KVCachePoolConditionQuotaPolicyWritable 在 master 拒绝写入配额时为 False——
+	// 若是其自身的策略源拒绝该写入，则 Reason 为 QuotaPolicyNotWritable。
 	KVCachePoolConditionQuotaPolicyWritable kubeapistatus.ConditionType = "QuotaPolicyWritable"
-	// KVCachePoolConditionQuotaWithinTotal is False when the ceilings this pool's Bindings ask for
-	// together exceed the total the pool itself declared — reason Oversubscribed, naming the sum and
-	// the total both. False is NOT a fault and nothing is broken: the store grants every tenant a
-	// share of what it can serve in proportion to what each asked, and each Binding's
-	// status.effectiveQuota reports the figure actually granted. It is a Condition and not a refusal
-	// because refusing would break the ordinary sequence of creating Bindings and then growing the
-	// backend; admission refuses only the one ceiling that could never be granted alone.
+	// KVCachePoolConditionQuotaWithinTotal 在该 pool 下各 Binding 请求的上限之和超过 pool 自身
+	// 声明的总量时为 False——Reason 为 Oversubscribed，同时列出总和与总量。False 并不代表故障，
+	// 也没有组件损坏：存储层会按各自请求的比例向每个租户分配其所能提供的份额，且每个 Binding 的
+	// status.effectiveQuota 会上报实际授予的数值。此处将其作为 Condition 而非直接拒绝，是因为
+	// 直接拒绝会破坏“先创建 Binding 再扩容 backend”的常规操作顺序；准入阶段仅拒绝单个本身就
+	// 绝对无法满足的上限请求。
 	//
-	// It is deliberately absent from the axes summarizeKVCachePool reads, so an oversubscribed pool
-	// does not read as Error: what False names is a proportional division the store performs by
-	// design, and a pool telling an operator to fix what is working is the reading this spelling
-	// exists to avoid.
+	// summarizeKVCachePool 读取的维度中刻意不包含该 condition，因此超额分配的 pool 不会被判定为
+	// Error：False 所表示的是存储层按设计执行的按比例分配，这样命名正是为了避免误导操作员去“修复”
+	// 一个本来正常工作的状态。
 	KVCachePoolConditionQuotaWithinTotal kubeapistatus.ConditionType = "QuotaWithinTotal"
-	// KVCachePoolConditionCapacityAllocatable is False when the master reports nothing to allocate.
-	// That is the startup-ordering trap: no member has mounted, so every effective quota is zero and
-	// no write can succeed while every object still looks correctly configured.
+	// KVCachePoolConditionCapacityAllocatable 在 master 上报无可分配容量时为 False。
+	// 这对应启动顺序问题：此时尚无成员完成挂载，因此所有有效配额均为零，尽管各个对象表面上看起来
+	// 都配置正确，但任何写入都无法成功。
 	KVCachePoolConditionCapacityAllocatable kubeapistatus.ConditionType = "CapacityAllocatable"
-	// KVCachePoolConditionReleasable is False only while a deletion is being HELD, and it is
-	// deliberately absent from the axes summarizeKVCachePool reads: a live pool never carries it, and
-	// an axis nobody has observed reads as Provisioning to that function.
+	// KVCachePoolConditionReleasable 仅在删除操作被阻塞保持时才为 False，且刻意不包含在
+	// summarizeKVCachePool 读取的维度中：运行中的 pool 从不携带此 condition，而在该函数中，
+	// 未观测到的维度会被视作 Provisioning。
 	KVCachePoolConditionReleasable kubeapistatus.ConditionType = "Releasable"
 )
 
-// The reasons the spec names by name. They are constants because criterion 11 asserts them and an
-// e2e case greps for them.
+// 规范中明确指定名称的 Reason 列表。它们被定义为常量，因为验收标准 11 会对其断言，
+// 且 e2e 用例会按名称检索它们。
 const (
 	KVCachePoolReasonMultiTenancyDisabled   = "MultiTenancyDisabled"
 	KVCachePoolReasonQuotaPolicyNotWritable = "QuotaPolicyNotWritable"
 	KVCachePoolReasonOversubscribed         = "Oversubscribed"
 )
 
-// KVCacheMasterSeparatesTenants reports whether the master serving a pool can hold two reuse
-// domains apart. It is the renderer's question: a master that cannot separates no tenant names, so
-// forwarding one would claim an isolation the store does not deliver.
+// KVCacheMasterSeparatesTenants 报告服务于某 pool 的 master 是否能够隔离两个复用域。
+// 这是渲染器需要回答的问题：无法隔离的 master 不会区分租户名称，若仍转发租户名，就相当于宣称
+// 提供了存储层实际并不具备的隔离能力。
 //
-// The OBSERVATION answers first — the pool's QuotaLedgerAvailable condition, which the reconciler
-// writes from the master's own responses and which therefore covers an external master this
-// operator never started. True separates; False with reason MultiTenancyDisabled does not. Every
-// other reading (absent, Unknown, False for another cause) is no answer, and then the DECLARATION
-// answers for a managed backend — exact, because this operator renders that flag onto the leader's
-// own command line — while an unreadable external one keeps the tenant, matching the gates that
-// hold a Pod off such a pool until it reports.
+// 优先采用观测结果——即 pool 的 QuotaLedgerAvailable condition，由 reconciler 根据 master 自身的
+// 响应写入，因此也涵盖了并非由本 operator 启动的外部 master。True 表示支持隔离；Reason 为
+// MultiTenancyDisabled 的 False 表示不支持。其他任何读取结果（缺失、Unknown 或其他原因导致的
+// False）均无法得出结论，此时对于托管 backend 则依据声明配置判断——这是精确的，因为本 operator
+// 会将该参数渲染到 leader 自身的命令行中——而对于不可读的外部 backend 则保留租户信息，与在 pool
+// 上报结果前阻止 Pod 调度到该 pool 的门控逻辑保持一致。
 func KVCacheMasterSeparatesTenants(kvcb *workercore.KVCacheBackend, kvcp *workercore.KVCachePool) bool {
 	condition := KVCachePoolConditionQuotaLedgerAvailable
 	switch {
@@ -153,35 +146,34 @@ func KVCacheMasterSeparatesTenants(kvcb *workercore.KVCacheBackend, kvcp *worker
 	return true
 }
 
-// KVCachePoolReconciler reconciles a KVCachePool.
+// KVCachePoolReconciler 负责调谐 KVCachePool。
 //
-// The pool is the ONLY reconciled object of this pair: a KVCachePoolBinding has no reconciler of its
-// own, and every Binding event is mapped onto the pool it names. That is not a simplification, it is
-// what makes the pass correct — the tenant ledger and the policy file are per master, so writing
-// them from a per-Binding loop would have each Binding's pass erase what the others just wrote.
+// 在这一对资源中，pool 是唯一被直接调谐的对象：KVCachePoolBinding 没有独立的 reconciler，
+// 所有 Binding 事件都会映射到其指定的 pool 上。这并非简化实现，而是保证每次 pass 正确性的关键——
+// 租户账本与策略文件均按 master 维度维护，若在每个 Binding 的循环中各自写入，每次 pass 都会
+// 覆盖其他 Binding 刚刚写入的内容。
 type KVCachePoolReconciler struct {
 	Client ctrlcli.Client
 
-	// AdminHTTP reads and writes the leader's admin surface. It carries its own timeout for the
-	// reason the backend reconciler's does: a master that accepts a connection and then stalls would
-	// otherwise hold this reconcile open for as long as the transport allows.
+	// AdminHTTP 用于读写 leader 的管理接口。它与 backend reconciler 一样带有独立的超时设置，
+	// 原因相同：若 master 接受连接后发生卡死，缺少超时会导致本次 reconcile 一直阻塞，直到传输层
+	// 允许的上限为止。
 	AdminHTTP *http.Client
 }
 
 func (r *KVCachePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Implement this function in chapter 22.
+	// 在第 22 章中实现此函数。
 	var result0 ctrl.Result
 	var result1 error
 	return result0, result1
 }
 
-// kvCachePoolPredicate decides which events about the pool itself are worth a pass.
+// kvCachePoolPredicate 决定关于 pool 自身的哪些事件值得触发一次 reconcile。
 //
-// It triggers on a create, on a generation (spec) change, and on the object being marked for
-// deletion. It refuses the final removal — there is nothing left to converge — and, load-bearingly,
-// it refuses this operator's OWN writes: a status update and a finalizer edit change neither the
-// generation nor the deletion timestamp, so without this every pass would schedule the next one and
-// the loop would never settle.
+// 它在创建、generation（spec）变更以及对象被标记删除时触发。它忽略最终移除事件——此时已无
+// 状态需要收敛——而且关键在于，它忽略本 operator 自身的写入：状态更新和 finalizer 修改既不会
+// 改变 generation，也不会改变删除时间戳，若不加以过滤，每次 pass 都会触发下一次 pass，从而
+// 导致循环无法收敛。
 func kvCachePoolPredicate() ctrlpredicate.Predicate {
 	return ctrlpredicate.Funcs{
 		DeleteFunc: func(ctrlevent.DeleteEvent) bool { return false },
@@ -203,9 +195,8 @@ func kvCachePoolPredicate() ctrlpredicate.Predicate {
 }
 
 func (r *KVCachePoolReconciler) SetupController(ctx context.Context, opts controller.SetupOptions) error {
-	// Configure field indexers. Both are registered here rather than where they are read, because
-	// an index has to exist before the cache starts and a List against a missing one fails at
-	// runtime rather than at compile time.
+	// 配置字段索引器。两个索引均在此处而非读取处注册，因为索引必须在缓存启动前就绪，
+	// 对不存在的索引执行 List 会在运行时而非编译时失败。
 	fi := opts.Manager.GetFieldIndexer()
 	err := fi.IndexField(ctx, &workercore.KVCachePoolBinding{},
 		IndexingKVCachePoolBindingByPool, indexKVCachePoolBindingByPool)
@@ -226,30 +217,28 @@ func (r *KVCachePoolReconciler) SetupController(ctx context.Context, opts contro
 	return ctrl.NewControllerManagedBy(opts.Manager).
 		Named("kvcachepool").
 		For(
-			// Reconcile each KVCachePool by its own name.
+			// 按 KVCachePool 自身名称对其进行调谐。
 			//
-			// Trigger on create, on a generation (spec) change, and on the object being marked for
-			// deletion. Never on the final removal — there is nothing left to converge — and never
-			// on this operator's own status or finalizer writes, which change neither the generation
-			// nor the deletion timestamp and would otherwise make every pass schedule the next one.
+			// 在创建、generation（spec）变更以及对象被标记删除时触发。绝不在最终移除时触发——此时已无
+			// 状态需要收敛——也绝不在本 operator 自身的状态或 finalizer 写入时触发，这些写入既不会改变
+			// generation，也不会改变删除时间戳，否则会导致每次 pass 都调度下一次 pass。
 			&workercore.KVCachePool{},
 			ctrlbuilder.WithPredicates(kvCachePoolPredicate()),
 		).
 		Watches(
-			// Every Binding event reaches the pool it names. A Binding is where a reuse domain and a
-			// ceiling are declared, so its create, its edit and its deletion are all changes to what
-			// the pool has to write into the master's ledger.
+			// 每个 Binding 事件都会传递到其指定的 pool。Binding 用于声明复用域和配额上限，因此其创建、
+			// 编辑和删除都会改变 pool 必须写入 master 账本的内容。
 			//
-			// Deletion is NOT filtered out here, unlike on the pool itself: a Binding that goes away
-			// is a tenant whose entry has to be removed, and no other event says so.
+			// 此处与 pool 自身不同，不会过滤掉删除事件：Binding 消失意味着该租户的条目必须被移除，
+			// 且没有其他事件会传达这一变化。
 			&workercore.KVCachePoolBinding{},
 			ctrlhandler.EnqueueRequestsFromMapFunc(r.enqueueKVCachePoolWhenBindingChanged),
 		).
 		Complete(r)
 }
 
-// compareKVCacheObjectReferences orders a usedBy list. Kind first, because one list may hold several,
-// then the namespace and the name that identify an object within it.
+// compareKVCacheObjectReferences 对 usedBy 列表进行排序。由于单个列表中可能包含多种类型，
+// 先按 Kind 排序，再按用于标识同类对象的 Namespace 和名称排序。
 func compareKVCacheObjectReferences(a, b workercore.KVCacheObjectReference) int {
 	if c := strings.Compare(a.Kind, b.Kind); c != 0 {
 		return c
@@ -260,39 +249,35 @@ func compareKVCacheObjectReferences(a, b workercore.KVCacheObjectReference) int 
 	return strings.Compare(a.Name, b.Name)
 }
 
-// The condition types a KVCachePoolBinding reports. Spelled positively, like the pool's.
+// KVCachePoolBinding 上报的 condition 类型。与 pool 一样采用正向命名。
 const (
-	// KVCachePoolBindingConditionDomainExclusive is False when another Binding claims the same reuse
-	// domain — reason DomainClaimedByMultipleBindings, naming the other claimant.
+	// KVCachePoolBindingConditionDomainExclusive 在另一个 Binding 声明了相同的复用域时为 False——
+	// Reason 为 DomainClaimedByMultipleBindings，并指明另一声明方。
 	KVCachePoolBindingConditionDomainExclusive kubeapistatus.ConditionType = "DomainExclusive"
-	// KVCachePoolBindingConditionQuotaObserved is False when the master's figures for this domain
-	// could not be read, and True even when the master has never heard of the domain — that is an
-	// observation, not a failure to observe.
+	// KVCachePoolBindingConditionQuotaObserved 在无法读取 master 中该复用域的数据时为 False；
+	// 即使 master 从未见过该复用域，该 condition 仍为 True——这是观测到了“不存在”这一事实，
+	// 而非观测失败。
 	KVCachePoolBindingConditionQuotaObserved kubeapistatus.ConditionType = "QuotaObserved"
-	// KVCachePoolBindingConditionQuotaGranted is False when the observed grant cannot serve a write:
-	// no ledger entry, no exported figure, or a grant of zero. It is separate from QuotaObserved
-	// because a grant of zero is a successful observation — the pair distinguishes "we could not
-	// look" from "we looked, and there is nothing to write into".
+	// KVCachePoolBindingConditionQuotaGranted 在观测到的授权额度无法支持写入时为 False：
+	// 包括没有账本条目、未导出数值或授权额度为零。它与 QuotaObserved 分开，因为授权为零属于
+	// 一次成功的观测——两者配合即可区分“无法查看”与“查看到了，但没有可写入的配额”。
 	//
-	// Without it a Binding reached Ready on observation alone, so a domain whose grant was zero — the
-	// ordinary state for tens of seconds after its master restarts — reported Ready while no write
-	// could succeed. That is precisely the reading a Binding exists to prevent.
+	// 如果没有它，Binding 仅凭观测成功就会进入 Ready 状态，导致刚重启完 master 后几十秒内
+	// 授权额度仍为零的复用域在写入必然失败的情况下被报告为 Ready。这正是 Binding 存在所要
+	// 防止的误判。
 	KVCachePoolBindingConditionQuotaGranted kubeapistatus.ConditionType = "QuotaGranted"
-	// KVCachePoolBindingConditionReleasable is False while a workload in this namespace still holds
-	// the pool through this Binding. Absent from the axes summarizeKVCachePoolBinding reads, for the
-	// reason the pool's own is.
+	// KVCachePoolBindingConditionReleasable 在该 Namespace 内仍有工作负载通过此 Binding 持有
+	// pool 时为 False。出于与 pool 自身相同的原因，summarizeKVCachePoolBinding 读取的维度中不包含它。
 	KVCachePoolBindingConditionReleasable kubeapistatus.ConditionType = "Releasable"
 )
 
-// enqueueKVCachePoolWhenBindingChanged maps a Binding onto the pool it names.
+// enqueueKVCachePoolWhenBindingChanged 将 Binding 映射到其指定的 pool。
 //
-// The pool is cluster-scoped, so the request carries a bare name and no namespace — a Binding from
-// any namespace enqueues the same pool, which is the whole point of the pool being the single
-// reconciled object.
+// pool 是集群作用域资源，因此请求仅包含名称而不含 Namespace——来自任意 Namespace 的 Binding
+// 都会将同一个 pool 入队，这正是让 pool 作为唯一被调谐对象的意义所在。
 //
-// A Binding naming a pool that does not exist still enqueues it. The pass then finds nothing and
-// returns, which costs one no-op reconcile and keeps the Binding from being invisible if the pool is
-// created a moment later.
+// 即使 Binding 指定的 pool 尚不存在，仍会将其入队。随后的 pass 会发现该资源不存在并返回，
+// 仅耗费一次空操作 reconcile，却能避免 pool 稍后创建时该 Binding 处于不可见状态。
 func (r *KVCachePoolReconciler) enqueueKVCachePoolWhenBindingChanged(
 	ctx context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {

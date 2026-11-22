@@ -19,11 +19,11 @@ const (
 	_InstanceTypeResource = "instancetypes"
 )
 
-// InstanceTypeHandler handles v1.InstanceType objects.
+// InstanceTypeHandler 处理 v1.InstanceType 对象。
 //
-// InstanceTypeHandler proxies the v1.InstanceType to the v1alpha1.InstanceType CRD.
-// The backing ClusterQueue and the four-view status are reconciled by the
-// InstanceTypeReconciler; this handler only serves the CRD storage.
+// InstanceTypeHandler 将 v1.InstanceType 代理到 v1alpha1.InstanceType CRD。
+// 背后的 ClusterQueue 与四视图状态由 InstanceTypeReconciler 负责调谐；
+// 本处理器仅提供 CRD 存储服务。
 type InstanceTypeHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -33,7 +33,7 @@ func (h *InstanceTypeHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &workercore.InstanceType{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -46,19 +46,18 @@ func (h *InstanceTypeHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_InstanceTypeResource)
 
-	// The four-view column can only show the partition view as a single scalar, which is a best
-	// case over profiles competing for the same physical slices. This column is the per-profile
-	// menu behind it — which profiles the pool can still host, a profile it offers but cannot
-	// currently build shown at zero. Priority 1 keeps it to `-o wide`: it is long, and empty for
-	// every pool with no partitioned card.
+	// 四视图列只能将分区视图显示为单个标量值，这是在竞争同一物理切分的多个 profile
+	// 之间取最优情况的结果。本列展示其背后的逐 profile 列表——即该资源池仍可容纳哪些
+	// profile；其中资源池提供但当前无法构建的 profile 会显示为零。优先级 1 将其限制在
+	// `-o wide` 下显示：该列内容较长，且对于没有分区卡的资源池均为空。
 	partitions := extensionapi.RenderColumn("Partitions", func(obj *worker.InstanceType) string {
 		profiles := obj.Status.AcceleratorPartitioned.RemainingProfiles
 		if len(profiles) == 0 {
-			// A pool with no partitioned card offers no menu. Render the same placeholder the
-			// jsonpath columns use for a missing value, so the wide table stays uniform.
+			// 没有分区卡的资源池不提供可选列表。渲染与 jsonpath 列在缺省值时相同的占位符，
+			// 以保持宽表格式统一。
 			return "-"
 		}
 		parts := make([]string, 0, len(profiles))
@@ -69,14 +68,13 @@ func (h *InstanceTypeHandler) SetupHandler(
 	})
 	partitions.Priority = 1
 
-	// Create table converter to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 的输出。
 	tc, err := extensionapi.NewJSONPathTemplateTableConvertor(
 		extensionapi.JSONPathTemplateColumn("Entrance", "{.status.entrance}"),
 		extensionapi.JSONPathTemplateColumn("Unit(CPU/RAM)/Storage",
 			"{.spec.unitResources.cpu}/{.spec.unitResources.ram}/{.spec.localStorage}"),
-		// Fold the exclusive/shared/sliced/partitioned four-view into one column: four
-		// space-separated onceMaxRequest/remaining groups, in the order named
-		// by the column header.
+		// 将独占/共享/切片/分区四类视图折叠为一列：按列头所示顺序排列的
+		// 四组以空格分隔的 onceMaxRequest/remaining 数值。
 		extensionapi.JSONPathTemplateColumn("Accelerator(EX/SH/SL/PT)",
 			"{.status.accelerator.onceMaxRequest}/{.status.accelerator.remaining} "+
 				"{.status.acceleratorShared.onceMaxRequest}/{.status.acceleratorShared.remaining} "+
@@ -90,7 +88,7 @@ func (h *InstanceTypeHandler) SetupHandler(
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储实现。
 	h.ObjectInfo = &worker.InstanceType{}
 	h.CurdOperations = extensionapi.WithCurdProxy[
 		*worker.InstanceType, *worker.InstanceTypeList, *workercore.InstanceType, *workercore.InstanceTypeList,

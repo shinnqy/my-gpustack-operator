@@ -1,55 +1,49 @@
-// Package priors resolves capacity priors from an offline catalog of measured
-// serving profiles.
+// Package priors 从实测服务画像的离线目录中解析容量先验。
 //
-// A prior is a measured capacity for one deployment shape: an exact model,
-// engine, hardware and topology, a declared workload envelope, and the load
-// points that were measured on it.
+// 先验指针对特定部署形态测得的容量：包含精确的模型、推理引擎、硬件与拓扑、
+// 声明的工作负载包络，以及在其上实测得到的负载点。
 //
-// The catalog never guesses. A profile that cannot be matched exactly, or that
-// lacks the evidence the resolver needs, is refused with a typed reason
-// instead of being filled in.
+// 该目录绝不做猜测。无法精确匹配的画像，或缺少解析器所需依据的画像，
+// 会以带类型的原因拒绝，而不会自动填充默认值。
 package priors
 
 import (
 	"gpustack.ai/gpustack/pkg/worker/scaling/algorithm"
 )
 
-// CatalogAPIVersion is the API group and version of a capacity prior catalog document.
+// CatalogAPIVersion 是容量先验目录文档的 API 组与版本。
 const CatalogAPIVersion = "worker.gpustack.ai/v1alpha1"
 
-// CatalogKind is the kind of a capacity prior catalog document.
+// CatalogKind 是容量先验目录文档的资源类型（kind）。
 const CatalogKind = "ModelDeploymentScalerCapacityPriorCatalog"
 
-// SchemaVersion is the catalog schema this package reads.
+// SchemaVersion 是本包读取的目录 schema 版本。
 //
-// A catalog written by another schema version is refused rather than guessed
-// at, because the fields it carries decide which measurements are usable.
+// 由其他 schema 版本编写的目录会被直接拒绝而非猜测解析，
+// 因为其携带的字段决定了哪些测量数据可用。
 const SchemaVersion = CatalogAPIVersion
 
-// The bounds a decoded catalog may not exceed.
+// 解码后的目录不得超过的上限。
 //
-// They exist so a catalog read from a ConfigMap cannot make the controller
-// hold an unbounded amount of data.
+// 设置这些上限是为了防止从 ConfigMap 读取的目录导致控制器持有无界数据。
 const (
-	// MaxCatalogBytes is the largest decoded catalog the reader accepts.
+	// MaxCatalogBytes 是读取器接受的解码后目录最大字节数。
 	MaxCatalogBytes = 512 * 1024
 
-	// MaxProfiles is the largest number of profiles a catalog may hold.
+	// MaxProfiles 是单个目录最多可包含的画像数量。
 	MaxProfiles = 256
 
-	// MaxPointsPerProfile is the largest number of measured load points one
-	// profile may hold.
+	// MaxPointsPerProfile 是单个画像最多可包含的实测负载点数量。
 	MaxPointsPerProfile = 128
 )
 
-// RoleKind is the serving role a profile describes.
+// RoleKind 是画像所描述的服务角色。
 //
-// IT REUSES THE ALGORITHM ROLE KIND, because the roles the catalog describes
-// and the roles the algorithms scale are the same set, and a second set of
-// names would let the two drift apart.
+// 它复用算法包的 RoleKind，因为目录描述的角色与算法扩缩容的角色属于同一集合，
+// 另起一套名称会导致两者逐渐偏离。
 type RoleKind = algorithm.RoleKind
 
-// The serving roles a catalog profile may describe.
+// 目录画像可描述的服务角色。
 const (
 	RoleKindServer  = algorithm.RoleKindServer
 	RoleKindPrefill = algorithm.RoleKindPrefill
@@ -57,449 +51,399 @@ const (
 	RoleKindEncode  = algorithm.RoleKindEncode
 )
 
-// ThroughputMetric names the numerator of a measured throughput.
+// ThroughputMetric 指定实测吞吐量的分子指标名称。
 //
-// THE NUMERATOR MUST MATCH THE SAMPLER, because the sampler reads the demand
-// the capacity is divided by. A source that measures a different quantity
-// cannot fill the same field.
+// 该分子必须与采样器一致，因为采样器读取的正是用来与容量相除的需求量；
+// 测量不同物理量的数据源不能填入同一字段。
 type ThroughputMetric string
 
 const (
-	// ThroughputMetricCacheMissedInputTokensPerSecond counts the prompt tokens
-	// a replica prefetched, per second, after the cache did not serve them.
+	// ThroughputMetricCacheMissedInputTokensPerSecond 统计单副本每秒在缓存未命中后
+	// 预取的 prompt token 数。
 	//
-	// IT IS THE PREFILL NUMERATOR, because the sampler reads the prompt
-	// tokens the cache did not serve.
+	// 它是 prefill 阶段的分子，因为采样器读取的正是缓存未命中的 prompt token 数。
 	ThroughputMetricCacheMissedInputTokensPerSecond ThroughputMetric = "CacheMissedInputTokensPerSecond"
 
-	// ThroughputMetricOutputTokensPerSecond counts the tokens a replica
-	// generated, per second.
+	// ThroughputMetricOutputTokensPerSecond 统计单副本每秒生成的 token 数。
 	//
-	// IT IS THE DECODE NUMERATOR.
+	// 它是 decode 阶段的分子。
 	ThroughputMetricOutputTokensPerSecond ThroughputMetric = "OutputTokensPerSecond"
 
-	// ThroughputMetricCacheMissedTotalTokensPerSecond counts the prompt tokens
-	// the cache did not serve plus the generated tokens, per second.
+	// ThroughputMetricCacheMissedTotalTokensPerSecond 统计每秒未被缓存命中的
+	// prompt token 数与生成的 token 数之和。
 	//
-	// IT IS THE SERVER NUMERATOR, because the sampler adds both for a server
-	// role. IT NAMES THE CACHE MISSES EXPLICITLY, because a total that
-	// includes cached prompt tokens is a different quantity.
+	// 该指标作为服务端分子，因为采样器针对服务端角色会将两者相加；且它显式
+	// 标注了缓存未命中，因为包含已缓存 prompt token 的总计属于不同的度量口径。
 	ThroughputMetricCacheMissedTotalTokensPerSecond ThroughputMetric = "CacheMissedTotalTokensPerSecond"
 
-	// ThroughputMetricInputTokensPerSecondIncludingCacheHits counts the prompt
-	// tokens of every request, whether the cache served them or not.
+	// ThroughputMetricInputTokensPerSecondIncludingCacheHits 统计每个请求的
+	// prompt token 数，无论缓存是否命中。
 	//
-	// IT MATCHES NO SAMPLER NUMERATOR, so a profile that only carries it is
-	// ineligible for every role.
+	// 该指标不匹配任何采样器分子，因此仅包含此指标的 profile 不适用于任何角色。
 	ThroughputMetricInputTokensPerSecondIncludingCacheHits ThroughputMetric = "InputTokensPerSecondIncludingCacheHits"
 
-	// ThroughputMetricTotalTokensPerSecond counts the prompt tokens of every
-	// request plus the generated tokens.
+	// ThroughputMetricTotalTokensPerSecond 统计每个请求的 prompt token 数与
+	// 生成的 token 数之和。
 	//
-	// IT IS THE WEAKEST TOTAL A SOURCE CAN PUBLISH, because it does not say
-	// whether the prompt part contains tokens the cache served. IT MATCHES NO
-	// SAMPLER NUMERATOR ON ITS OWN.
+	// 这是数据源可发布的最弱总计口径，因为它未说明 prompt 部分是否包含
+	// 缓存命中的 token；其自身不匹配任何采样器分子。
 	ThroughputMetricTotalTokensPerSecond ThroughputMetric = "TotalTokensPerSecond"
 )
 
-// TokenCountConvention names which tokens a measured rate counted.
+// TokenCountConvention 指定实测速率所统计的 token 口径。
 //
-// IT IS SEPARATE FROM THE METRIC, because the metric says what the rate
-// means to the resolver and the convention says which tokens the source
-// counted to produce it.
+// 它与指标定义相互独立：指标说明该速率对解析器的语义含义，而口径说明
+// 数据源为生成该速率具体统计了哪些 token。
 type TokenCountConvention string
 
 const (
-	// TokenCountConventionCacheMissedInput counts the prompt tokens the cache
-	// did not serve.
+	// TokenCountConventionCacheMissedInput 统计未被缓存命中的 prompt token。
 	TokenCountConventionCacheMissedInput TokenCountConvention = "CacheMissedInput"
 
-	// TokenCountConventionOutput counts the generated tokens.
+	// TokenCountConventionOutput 统计生成的 token。
 	TokenCountConventionOutput TokenCountConvention = "Output"
 
-	// TokenCountConventionCacheMissedInputPlusOutput counts the prompt tokens
-	// the cache did not serve plus the generated tokens.
+	// TokenCountConventionCacheMissedInputPlusOutput 统计未被缓存命中的
+	// prompt token 与生成的 token 之和。
 	TokenCountConventionCacheMissedInputPlusOutput TokenCountConvention = "CacheMissedInputPlusOutput"
 
-	// TokenCountConventionInputIncludingCacheHits counts the prompt tokens of
-	// every request.
+	// TokenCountConventionInputIncludingCacheHits 统计每个请求的 prompt token。
 	TokenCountConventionInputIncludingCacheHits TokenCountConvention = "InputIncludingCacheHits"
 
-	// TokenCountConventionInputPlusOutput counts the prompt tokens of every
-	// request plus the generated tokens.
+	// TokenCountConventionInputPlusOutput 统计每个请求的 prompt token 与
+	// 生成的 token 之和。
 	TokenCountConventionInputPlusOutput TokenCountConvention = "InputPlusOutput"
 )
 
-// Denominator names what a measured throughput is counted over.
+// Denominator 指定实测吞吐量的统计基准。
 //
-// IT DECIDES HOW THE MEASUREMENT IS RECONSTRUCTED for one scaling replica.
+// 它决定了如何针对单个扩缩容副本重构测量结果。
 type Denominator string
 
 const (
-	// DenominatorPerGPU counts tokens per second over one GPU of the measured
-	// system.
+	// DenominatorPerGPU 按实测系统的单块 GPU 统计每秒 token 数。
 	DenominatorPerGPU Denominator = "PerGPU"
 
-	// DenominatorPerReplica counts tokens per second over one complete
-	// scaling replica.
+	// DenominatorPerReplica 按单个完整的扩缩容副本统计每秒 token 数。
 	DenominatorPerReplica Denominator = "PerReplica"
 
-	// DenominatorWholeSystem counts tokens per second over the whole measured
-	// system.
+	// DenominatorWholeSystem 按整个实测系统统计每秒 token 数。
 	DenominatorWholeSystem Denominator = "WholeSystem"
 )
 
-// LatencyMetric names a measured latency.
+// LatencyMetric 指定一种实测延迟指标。
 type LatencyMetric string
 
 const (
-	// LatencyMetricTTFT is the time to first token.
+	// LatencyMetricTTFT 表示首 token 延迟（TTFT）。
 	LatencyMetricTTFT LatencyMetric = "TTFT"
 
-	// LatencyMetricITL is the inter-token latency.
+	// LatencyMetricITL 表示 token 间延迟（ITL）。
 	//
-	// IT IS NOT TIME PER OUTPUT TOKEN, which is a mean over the tokens of one
-	// request rather than a distribution of the gaps between them.
+	// 它不同于单输出 token 平均耗时（TPOT），后者是单个请求所有输出 token 的
+	// 均值，而非 token 间隔的分布。
 	LatencyMetricITL LatencyMetric = "ITL"
 
-	// LatencyMetricTPOT is the time per output token.
+	// LatencyMetricTPOT 表示单输出 token 平均耗时（TPOT）。
 	//
-	// IT IS RECORDED SO A SOURCE THAT ONLY PUBLISHES IT CAN BE REFUSED WITH
-	// THE REASON, because it does not establish any ITL quantile.
+	// 记录该值是为了在数据源仅发布 TPOT 时能够给出明确的拒绝原因，因为它
+	// 无法确定任何 ITL 分位数。
 	LatencyMetricTPOT LatencyMetric = "TPOT"
 )
 
-// LoadKind names what a measured load point varies.
+// LoadKind 指定实测负载点所变化的维度。
 type LoadKind string
 
 const (
-	// LoadKindConcurrency is a fixed number of concurrent requests.
+	// LoadKindConcurrency 表示固定数量的并发请求。
 	LoadKindConcurrency LoadKind = "Concurrency"
 
-	// LoadKindRequestRate is a fixed arrival rate.
+	// LoadKindRequestRate 表示固定的请求到达速率。
 	LoadKindRequestRate LoadKind = "RequestRate"
 )
 
-// ClientModel names how the load was offered.
+// ClientModel 指定负载的发送模式。
 type ClientModel string
 
 const (
-	// ClientModelFixedConcurrency is a closed-loop client that sends the next
-	// request when the previous one finishes.
+	// ClientModelFixedConcurrency 表示闭环客户端，仅在上一个请求完成后才发送下一个请求。
 	ClientModelFixedConcurrency ClientModel = "FixedConcurrency"
 
-	// ClientModelOpenLoop is a client that sends requests at a fixed rate
-	// regardless of how fast the server answers.
+	// ClientModelOpenLoop 表示开环客户端，无论服务端响应快慢均以固定速率发送请求。
 	ClientModelOpenLoop ClientModel = "OpenLoop"
 )
 
-// CacheBehavior names how the measured workload treated the prefix cache.
+// CacheBehavior 指定实测工作负载对前缀缓存的处理方式。
 type CacheBehavior string
 
 const (
-	// CacheBehaviorAllMisses means every prompt token the run counted was a
-	// cache miss.
+	// CacheBehaviorAllMisses 表示运行期间统计的每个 prompt token 均为缓存未命中。
 	CacheBehaviorAllMisses CacheBehavior = "AllMisses"
 
-	// CacheBehaviorIncludesHits means the counted prompt tokens include tokens
-	// the cache served.
+	// CacheBehaviorIncludesHits 表示统计的 prompt token 包含由缓存提供的 token。
 	CacheBehaviorIncludesHits CacheBehavior = "IncludesCacheHits"
 
-	// CacheBehaviorUnknown means the source does not say how the cache
-	// behaved.
+	// CacheBehaviorUnknown 表示数据源未说明缓存行为。
 	//
-	// IT IS NOT A WILDCARD. A profile with an unknown cache behavior cannot
-	// fill a numerator that counts cache-missed prompt tokens.
+	// 它不是通配符；缓存行为未知的 profile 不能用于统计缓存未命中 prompt token 的分子。
 	CacheBehaviorUnknown CacheBehavior = "Unknown"
 )
 
-// The units the catalog stores measurements in.
+// catalog 中存储测量数据时使用的单位。
 //
-// A source is converted on import, so a stored value never carries a unit the
-// reader has to interpret.
+// 数据源在导入时即完成单位换算，因此存储值不会附带需要读取方自行解释的单位。
 const (
-	// UnitTokensPerSecond is a token rate.
+	// UnitTokensPerSecond 表示 token 速率单位。
 	UnitTokensPerSecond = "tokens/second"
 
-	// UnitMilliseconds is a duration.
+	// UnitMilliseconds 表示时长单位。
 	UnitMilliseconds = "milliseconds"
 
-	// UnitQueriesPerSecond is an arrival rate.
+	// UnitQueriesPerSecond 表示到达速率单位。
 	UnitQueriesPerSecond = "queries/second"
 )
 
-// DefaultLatencyQuantile is the latency quantile the resolver requires when a
-// request does not name one.
+// DefaultLatencyQuantile 是请求未指定分位数时解析器默认要求的延迟分位数。
 //
-// A HIGHER QUANTILE OF THE SAME METRIC MAY BE USED INSTEAD, because it bounds
-// the required quantile from above.
+// 由于同一指标的更高分位数可从上方约束目标分位数，因此允许用更高分位数替代。
 //
-// IT IS THE DEFAULT AND NOT A REQUIREMENT, because a request names the
-// quantile it is held to and the resolver holds every required latency metric
-// to that one quantile.
+// 该值仅作为默认值而非强制要求，因为请求可以显式指定目标分位数，解析器会
+// 按该单一分位数约束所有必需的延迟指标。
 const DefaultLatencyQuantile = 0.95
 
-// Catalog is a versioned, bounded set of measured profiles.
+// Catalog 是带版本控制的、有界的实测 profile 集合。
 type Catalog struct {
-	// SchemaVersion is the schema the catalog was written in.
+	// SchemaVersion 是编写该 catalog 所使用的 schema 版本。
 	SchemaVersion string `json:"schemaVersion"`
 
-	// Digest covers the catalog content.
+	// Digest 覆盖整个 catalog 的内容。
 	//
-	// IT IS NOT PART OF THE COVERED CONTENT, so the digest can be checked
-	// against the content it describes.
+	// 它本身不属于被覆盖的内容，因此可用来校验与其描述的内容是否一致。
 	Digest string `json:"digest"`
 
-	// Sources records where the profiles came from.
+	// Sources 记录 profile 的来源信息。
 	Sources []Source `json:"sources"`
 
-	// Profiles holds the measured profiles.
+	// Profiles 保存实测的 profile 列表。
 	Profiles []Profile `json:"profiles"`
 }
 
-// Source records the attribution of one imported measurement set.
+// Source 记录单个导入测量数据集的归属信息。
 //
-// IT IS RECORDED EVEN WHEN THE IMPORT PRODUCED NO PROFILE, because a refused
-// source has to say why it was refused.
+// 即使导入未生成 profile 也会记录该信息，以便被拒绝的数据源能够说明原因。
 type Source struct {
-	// ID identifies the source inside the catalog.
+	// ID 在 catalog 内唯一标识该数据源。
 	ID string `json:"id"`
 
-	// Name is the human readable name of the source.
+	// Name 是数据源的可读名称。
 	Name string `json:"name"`
 
-	// URL is where the source was read from.
+	// URL 是读取该数据源的地址。
 	URL string `json:"url"`
 
-	// Revision pins the exact source revision the artifacts came from.
+	// Revision 固定产物所来自的确切源码修订版本。
 	Revision string `json:"revision"`
 
-	// CaptureDate is when the measurement was taken.
+	// CaptureDate 是进行该测量的日期。
 	CaptureDate string `json:"captureDate"`
 
-	// License is the SPDX identifier of the license the artifacts carry.
+	// License 是产物所遵循许可证的 SPDX 标识符。
 	License string `json:"license"`
 
-	// AdapterVersion is the version of the adapter that read the source.
+	// AdapterVersion 是读取该数据源的适配器版本。
 	AdapterVersion string `json:"adapterVersion"`
 
-	// Artifacts records the pinned files the import read.
+	// Artifacts 记录导入过程读取的固定文件列表。
 	Artifacts []Artifact `json:"artifacts"`
 
-	// Outcome is Accepted when the import produced a profile and Refused when
-	// it did not.
+	// Outcome 在导入成功生成 profile 时为 Accepted，否则为 Refused。
 	Outcome string `json:"outcome"`
 
-	// RefusalError explains a Refused outcome.
+	// RefusalError 说明结果为 Refused 的原因。
 	RefusalError *RefusalError `json:"refusal,omitempty"`
 }
 
-// The outcomes a source import can have.
+// 数据源导入可能产生的结果状态。
 const (
 	SourceOutcomeAccepted = "Accepted"
 	SourceOutcomeRefused  = "Refused"
 )
 
-// Artifact is one pinned source file.
+// Artifact 表示单个固定的源文件。
 type Artifact struct {
-	// Path is the path of the file inside the upstream repository.
+	// Path 是该文件在上游仓库中的路径。
 	Path string `json:"path"`
 
-	// SHA256 is the digest of the upstream bytes the import read.
+	// SHA256 是导入时所读取上游字节内容的摘要。
 	SHA256 string `json:"sha256"`
 }
 
-// Profile is one immutable measured profile.
+// Profile 是单个不可变的实测 profile。
 //
-// IT COVERS ONE SERVING CONFIGURATION AND ONE WORKLOAD ENVELOPE, because a
-// frontier that combines serving configurations is not one deployment's
-// capacity curve.
+// 每个 profile 仅对应一种服务配置和一种工作负载包络，因为混合多种服务配置的
+// 前沿曲线无法代表单一部署的容量曲线。
 type Profile struct {
-	// Digest covers the profile content.
+	// Digest 覆盖该 profile 的内容。
 	Digest string `json:"digest"`
 
-	// SourceID names the source the profile was imported from.
+	// SourceID 指定导入该 profile 的数据源 ID。
 	SourceID string `json:"sourceID"`
 
-	// Role is the serving role the measurements describe.
+	// Role 是测量结果所描述的服务角色。
 	Role RoleKind `json:"role"`
 
-	// Identity is what the deployment must match.
+	// Identity 是部署必须匹配的标识信息。
 	Identity Identity `json:"identity"`
 
-	// ServingConfig is the serving configuration the measurements were taken
-	// under.
+	// ServingConfig 是进行测量时所采用的服务配置。
 	ServingConfig ServingConfig `json:"servingConfig"`
 
-	// Topology is the shape of one scaling replica.
+	// Topology 是单个扩缩容副本的拓扑形态。
 	Topology Topology `json:"topology"`
 
-	// MeasuredReplicas is how many scaling replicas the measured system ran.
+	// MeasuredReplicas 是被测系统运行的扩缩容副本数。
 	//
-	// IT IS NOT PART OF THE MATCH, because the same shape measured on a
-	// different number of replicas is still the same profile.
+	// 该字段不参与匹配，因为在相同拓扑形态下，不同副本数测得的结果仍属于同一性能画像。
 	MeasuredReplicas int `json:"measuredReplicas"`
 
-	// Workload is the workload envelope the measurements were taken under.
+	// Workload 是进行测量时所处的工作负载范围。
 	Workload Workload `json:"workload"`
 
-	// Points are the measured load points.
+	// Points 是测得的负载数据点。
 	Points []MeasuredPoint `json:"points"`
 }
 
-// Identity is what a deployment must match to use a profile.
+// Identity 是部署使用某性能画像时必须匹配的标识信息。
 //
-// EVERY FIELD IS REQUIRED, because an unknown value is not a wildcard and
-// must not become a permissive default.
+// 每个字段均为必填项，因为未知值并非通配符，不得将其视为宽松的默认值。
 type Identity struct {
-	// Model is the served model.
+	// Model 是所服务的模型。
 	Model ModelIdentity `json:"model"`
 
-	// Engine is the serving engine.
+	// Engine 是服务引擎。
 	Engine EngineIdentity `json:"engine"`
 
-	// Hardware is the accelerator the replica runs on.
+	// Hardware 是副本运行所用的加速器。
 	Hardware HardwareIdentity `json:"hardware"`
 }
 
-// ModelIdentity names the served model.
+// ModelIdentity 标识所服务的模型。
 type ModelIdentity struct {
-	// Name is the model name, with its variant suffixes kept.
+	// Name 是模型名称，并保留其变体后缀。
 	Name string `json:"name"`
 
-	// Revision is the weight revision or digest.
+	// Revision 是权重版本或摘要。
 	Revision string `json:"revision"`
 
-	// Tokenizer is the tokenizer identity.
+	// Tokenizer 是分词器标识。
 	Tokenizer string `json:"tokenizer"`
 
-	// Quantization is the quantization recipe.
+	// Quantization 是量化方案。
 	Quantization string `json:"quantization"`
 }
 
-// EngineIdentity names the serving engine.
+// EngineIdentity 标识服务引擎。
 type EngineIdentity struct {
-	// Image is the engine image.
+	// Image 是引擎镜像。
 	Image string `json:"image"`
 
-	// Build is the engine build or version.
+	// Build 是引擎构建号或版本。
 	Build string `json:"build"`
 }
 
-// HardwareIdentity names the accelerator.
+// HardwareIdentity 标识加速器。
 type HardwareIdentity struct {
-	// Accelerator is the accelerator model, with its form factor suffix kept.
+	// Accelerator 是加速器型号，并保留其外形规格后缀。
 	Accelerator string `json:"accelerator"`
 
-	// MemoryGB is the accelerator memory in gibibytes.
+	// MemoryGB 是加速器显存大小（单位为 GiB）。
 	MemoryGB int `json:"memoryGB"`
 
-	// FormFactor is the accelerator form factor.
+	// FormFactor 是加速器的外形规格。
 	FormFactor string `json:"formFactor"`
 }
 
-// ServingConfig is the serving configuration a measurement was taken under.
+// ServingConfig 是进行测量时所采用的服务配置。
 //
-// EVERY FIELD IS REQUIRED, because an omitted performance-critical setting is
-// not a wildcard and a permissive default would let an incompatible
-// deployment reuse the measurement.
+// 每个字段均为必填项，因为被省略的性能关键设置并非通配符，宽松的默认值会导致不兼容的部署复用该测量结果。
 type ServingConfig struct {
-	// Router is the router or scheduler in front of the engine.
+	// Router 是位于引擎前端的路由器或调度器。
 	Router string `json:"router"`
 
-	// KVCacheDType is the KV cache dtype.
+	// KVCacheDType 是 KV 缓存的数据类型。
 	KVCacheDType string `json:"kvCacheDType"`
 
-	// Offload says how the KV cache is offloaded.
+	// Offload 说明 KV 缓存的卸载方式。
 	Offload string `json:"offload"`
 
-	// PrefixCaching says whether prefix caching is on.
+	// PrefixCaching 说明是否开启前缀缓存。
 	PrefixCaching string `json:"prefixCaching"`
 
-	// SpeculativeDecoding says how speculative decoding is configured.
+	// SpeculativeDecoding 说明投机解码的配置方式。
 	SpeculativeDecoding string `json:"speculativeDecoding"`
 
-	// LaunchParameters preserves ordered arguments that affect performance.
-	// Reordering can change repeated flags and option values.
+	// LaunchParameters 保留会影响性能的有序启动参数。
+	// 调整顺序可能会改变重复标志和选项值的生效结果。
 	LaunchParameters []string `json:"launchParameters"`
 
-	// EffectiveLaunchParameters records the arguments the engine actually ran
-	// with when they differ from the launch arguments.
+	// EffectiveLaunchParameters 在引擎实际运行参数与启动参数不同时，记录引擎实际使用的参数。
 	//
-	// IT IS EVIDENCE AND NOT A MATCHING CRITERION, because it says what the
-	// engine did with the launch arguments rather than what the deployment
-	// asked for. A deployment that launches with the recorded launch
-	// arguments runs the recorded effective arguments on the recorded engine
-	// build.
+	// 它仅作为证据而非匹配条件，因为它反映的是引擎对启动参数的实际解析结果，而非部署所请求的配置。
+	// 使用所记录启动参数拉起的部署，在所记录的引擎构建版本上就会以所记录的实际生效参数运行。
 	//
-	// IT IS ABSENT WHEN THEY AGREE, because a copy of the launch arguments
-	// says nothing the launch arguments do not.
+	// 当两者一致时该字段省略，因为与启动参数完全相同的副本不会提供额外信息。
 	EffectiveLaunchParameters []string `json:"effectiveLaunchParameters,omitempty"`
 
-	// EngineEnv records the engine environment the measurement ran under.
+	// EngineEnv 记录测量运行时的引擎环境变量。
 	//
-	// IT IS THE COMPLETE SET THE SOURCE CAN PROVE, because a partial set
-	// would let a deployment with an unknown engine variable reuse the
-	// measurement. A deployment has to match every entry and must carry
-	// nothing the measurement did not.
+	// 它是数据源能够证实的完整集合，因为不完整的集合会让带有未知引擎变量的部署复用该测量结果。
+	// 部署必须匹配其中的每一项，且不得携带测量时未包含的变量。
 	//
-	// IT IS EVIDENCE AND NOT A MATCHING CRITERION, because the environment
-	// of the measurement is what the measurement ran under and the deployment
-	// has to be checked against it by the caller that owns the deployment.
+	// 它仅作为证据而非匹配条件，因为测量环境描述的是测量运行时的条件，需要由持有部署信息的调用方据此进行校验。
 	EngineEnv []string `json:"engineEnv,omitempty"`
 
-	// EngineEnvComplete says that EngineEnv is every environment variable the
-	// measurement ran under.
+	// EngineEnvComplete 表示 EngineEnv 包含了测量运行时的全部环境变量。
 	//
-	// IT IS SET ONLY BY A SOURCE THAT OBSERVED THE WHOLE ENVIRONMENT, because
-	// an environment the source did not observe is not an environment that was
-	// empty. A source that could not watch the environment says so here and
-	// the profile cannot be matched against a deployment, because the
-	// deployment would be checked against a set that does not say what the
-	// measurement ran under.
+	// 仅当数据源观测到了完整环境时才设置该字段，因为数据源未观测到的环境并不等同于空环境。
+	// 无法监控环境的数据源会在此标明，此时该性能画像不能与部署进行匹配，因为这会导致部署根据一个无法反映测量实际运行环境的集合进行校验。
 	EngineEnvComplete bool `json:"engineEnvComplete,omitempty"`
 
-	// EffectiveDefaults records the effective values of the engine arguments
-	// the source did not pass.
+	// EffectiveDefaults 记录数据源未显式传入的引擎参数的实际生效默认值。
 	//
-	// IT IS EVIDENCE AND NOT A MATCHING CRITERION, because a default the
-	// engine chose for itself is not a default of the engine build. A
-	// deployment may rely on one only when its image, its launch arguments
-	// and its environment are the ones the measurement ran under.
+	// 它仅作为证据而非匹配条件，因为引擎自行选定的默认值并不代表该引擎构建版本的固有默认值。
+	// 只有当部署的镜像、启动参数和环境与测量时完全一致时，才能依赖这些默认值。
 	EffectiveDefaults map[string]string `json:"effectiveDefaults,omitempty"`
 }
 
-// Topology is the shape of one scaling replica.
+// Topology 是单个扩缩容副本的拓扑形态。
 //
-// EVERY FIELD IS REQUIRED, because a parallelism width the source did not
-// state is not a wildcard.
+// 每个字段均为必填项，因为数据源未指明的并行度宽度并非通配符。
 type Topology struct {
-	// GPUsPerReplica is how many GPUs one scaling replica uses.
+	// GPUsPerReplica 是单个扩缩容副本使用的 GPU 数量。
 	GPUsPerReplica int `json:"gpusPerReplica"`
 
-	// TensorParallel is the tensor parallel width.
+	// TensorParallel 是张量并行度。
 	TensorParallel int `json:"tensorParallel"`
 
-	// PipelineParallel is the pipeline parallel width.
+	// PipelineParallel 是流水线并行度。
 	PipelineParallel int `json:"pipelineParallel"`
 
-	// DataParallel is the data parallel width.
+	// DataParallel 是数据并行度。
 	DataParallel int `json:"dataParallel"`
 
-	// LocalDataParallel is the local data parallel width.
+	// LocalDataParallel 是本地数据并行度。
 	LocalDataParallel int `json:"localDataParallel"`
 
-	// ContextParallel is the context parallel width.
+	// ContextParallel 是上下文并行度。
 	ContextParallel int `json:"contextParallel"`
 
-	// ExpertParallel is the expert parallel width.
+	// ExpertParallel 是专家并行度。
 	ExpertParallel int `json:"expertParallel"`
 }
 
-// Normalized returns the topology in its canonical form.
+// Normalized 返回规范化形式的拓扑结构。
 //
-// IT REPLACES AN UNSTATED WIDTH WITH ONE, because a width a source did not
-// state is the width of one and a width of zero names no deployment.
+// 它会将未指明的并行度宽度替换为 1，因为数据源未声明的宽度即为 1，而宽度为 0 不对应任何有效的部署。
 func (t Topology) Normalized() Topology {
 	if t.TensorParallel <= 0 {
 		t.TensorParallel = 1
@@ -522,176 +466,174 @@ func (t Topology) Normalized() Topology {
 	return t
 }
 
-// Workload is the workload envelope the measurements were taken under.
+// Workload 是进行测量时所处的工作负载范围。
 type Workload struct {
-	// ID identifies the workload.
+	// ID 标识该工作负载。
 	ID string `json:"id"`
 
-	// Revision pins the workload definition.
+	// Revision 锁定工作负载的版本定义。
 	Revision string `json:"revision"`
 
-	// Modality is the modality of the requests.
+	// Modality 是请求的模态类型。
 	Modality string `json:"modality"`
 
-	// InputLengths describes the input token lengths.
+	// InputLengths 描述输入 token 长度分布。
 	InputLengths LengthDistribution `json:"inputLengths"`
 
-	// OutputLengths describes the output token lengths.
+	// OutputLengths 描述输出 token 长度分布。
 	OutputLengths LengthDistribution `json:"outputLengths"`
 
-	// CacheBehavior says how the prefix cache treated the requests.
+	// CacheBehavior 说明前缀缓存处理请求的方式。
 	CacheBehavior CacheBehavior `json:"cacheBehavior"`
 
-	// ArrivalModel says how the load was offered.
+	// ArrivalModel 说明负载的施加方式。
 	ArrivalModel ClientModel `json:"arrivalModel"`
 }
 
-// LengthDistribution describes a token length distribution.
+// LengthDistribution 描述 token 长度分布。
 //
-// A LENGTH THE SOURCE DID NOT PUBLISH IS ABSENT, because a zero length is a
-// measurement and a missing one is not.
+// 数据源未公布的长度字段将保持缺省，因为长度为 0 属于实际测量值，而缺失值并非如此。
 type LengthDistribution struct {
-	// Min is the shortest measured length.
+	// Min 是测得的最短长度。
 	Min *int `json:"min,omitempty"`
 
-	// Max is the longest measured length.
+	// Max 是测得的最长长度。
 	Max *int `json:"max,omitempty"`
 
-	// Mean is the mean measured length.
+	// Mean 是测得的平均长度。
 	Mean *float64 `json:"mean,omitempty"`
 
-	// Count is how many requests the distribution was measured over.
+	// Count 是测量该分布时所统计的请求数量。
 	Count int `json:"count"`
 }
 
-// MeasuredPoint is one measured load point.
+// MeasuredPoint 表示一个实测负载点。
 type MeasuredPoint struct {
-	// Load is the offered load.
+	// Load 是施加的负载。
 	Load LoadLevel `json:"load"`
 
-	// Throughput is what the system sustained at that load.
+	// Throughput 是系统在该负载下持续达到的吞吐量。
 	Throughput Throughput `json:"throughput"`
 
-	// Latencies are the measured latency statistics.
+	// Latencies 是实测延迟统计信息。
 	Latencies []Latency `json:"latencies"`
 
-	// Requests counts the requests the load point ran.
+	// Requests 统计该负载点运行的请求数。
 	Requests RequestCounts `json:"requests"`
 
-	// Duration is how long the load point ran.
+	// Duration 是该负载点的运行时长。
 	Duration MeasurementDuration `json:"duration"`
 
-	// SLO records whether the run met its latency constraint.
+	// SLO 记录此次运行是否满足延迟约束。
 	SLO *SLOOutcome `json:"slo,omitempty"`
 
-	// Saturation records an explicit saturation measurement.
+	// Saturation 记录显式的饱和度测量结果。
 	Saturation *Saturation `json:"saturation,omitempty"`
 }
 
-// LoadLevel is the offered load of a measured point.
+// LoadLevel 表示实测点所施加的负载。
 type LoadLevel struct {
-	// Kind is what the load varies.
+	// Kind 表示负载的变化维度。
 	Kind LoadKind `json:"kind"`
 
-	// Value is the offered load.
+	// Value 是施加的负载值。
 	Value float64 `json:"value"`
 
-	// ClientModel says how the load was offered.
+	// ClientModel 说明负载是如何施加的。
 	ClientModel ClientModel `json:"clientModel"`
 
-	// Unit is the unit of Value.
+	// Unit 是 Value 的单位。
 	Unit string `json:"unit"`
 }
 
-// Throughput is a measured throughput.
+// Throughput 表示一项实测吞吐量。
 type Throughput struct {
-	// Metric is the numerator.
+	// Metric 是分子指标。
 	Metric ThroughputMetric `json:"metric"`
 
-	// Value is the measured rate.
+	// Value 是实测速率。
 	Value float64 `json:"value"`
 
-	// Unit is the unit of Value.
+	// Unit 是 Value 的单位。
 	Unit string `json:"unit"`
 
-	// Denominator says what the rate is counted over.
+	// Denominator 说明该速率统计的分母维度。
 	Denominator Denominator `json:"denominator"`
 
-	// TokenCountConvention says which tokens the rate counted.
+	// TokenCountConvention 说明该速率统计了哪些 token。
 	TokenCountConvention TokenCountConvention `json:"tokenCountConvention"`
 
-	// TokenTotals holds the token totals the rate was computed from.
+	// TokenTotals 保存用于计算该速率的 token 总数。
 	//
-	// IT IS ABSENT WHEN THE SOURCE DID NOT PUBLISH THEM, because a missing
-	// measurement stays missing.
+	// 当数据源未公布这些数据时该字段缺省，因为缺失的测量值应保持缺失。
 	TokenTotals *TokenTotals `json:"tokenTotals,omitempty"`
 }
 
-// TokenTotals holds the token totals behind a measured rate.
+// TokenTotals 保存实测速率背后的 token 总数。
 type TokenTotals struct {
-	// InputTokens is the counted prompt token total.
+	// InputTokens 是统计的 prompt token 总数。
 	InputTokens *float64 `json:"inputTokens,omitempty"`
 
-	// OutputTokens is the counted generated token total.
+	// OutputTokens 是统计的生成 token 总数。
 	OutputTokens *float64 `json:"outputTokens,omitempty"`
 }
 
-// RequestCounts counts the requests a load point ran.
+// RequestCounts 统计负载点运行的请求数。
 type RequestCounts struct {
-	// Successful is how many requests completed.
+	// Successful 是已完成的请求数。
 	Successful int `json:"successful"`
 
-	// Failed is how many requests failed.
+	// Failed 是失败的请求数。
 	Failed int `json:"failed"`
 }
 
-// MeasurementDuration is how long a load point ran.
+// MeasurementDuration 表示负载点的运行时长。
 type MeasurementDuration struct {
-	// WarmUpSeconds is the warm-up time that was excluded.
+	// WarmUpSeconds 是被排除的预热时间（秒）。
 	WarmUpSeconds float64 `json:"warmUpSeconds"`
 
-	// MeasuredSeconds is the measured duration.
+	// MeasuredSeconds 是实测持续时间（秒）。
 	MeasuredSeconds float64 `json:"measuredSeconds"`
 }
 
-// Latency is one measured latency statistic.
+// Latency 表示一项实测延迟统计信息。
 type Latency struct {
-	// Metric is what was measured.
+	// Metric 是所测量的指标。
 	Metric LatencyMetric `json:"metric"`
 
-	// Quantile is the quantile the value is the quantile of.
+	// Quantile 是该数值对应的分位数。
 	Quantile float64 `json:"quantile"`
 
-	// Value is the measured value.
+	// Value 是实测值。
 	Value float64 `json:"value"`
 
-	// Unit is the unit of Value.
+	// Unit 是 Value 的单位。
 	Unit string `json:"unit"`
 
-	// SampleCount is how many samples the statistic was computed over.
+	// SampleCount 是计算该统计量所用的样本数量。
 	SampleCount int `json:"sampleCount"`
 
-	// Censoring says how the samples were censored.
+	// Censoring 说明样本的截尾方式。
 	Censoring string `json:"censoring"`
 }
 
-// SLOOutcome records whether a run met its latency constraint.
+// SLOOutcome 记录某次运行是否满足延迟约束。
 type SLOOutcome struct {
-	// ConstraintsSatisfied says whether the run met the constraint.
+	// ConstraintsSatisfied 表示该次运行是否满足约束。
 	ConstraintsSatisfied bool `json:"constraintsSatisfied"`
 
-	// TTFTConstraintMilliseconds is the time to first token constraint.
+	// TTFTConstraintMilliseconds 是首 token 延迟（TTFT）约束（毫秒）。
 	TTFTConstraintMilliseconds float64 `json:"ttftConstraintMilliseconds"`
 
-	// TPOTConstraintMilliseconds is the time per output token constraint.
+	// TPOTConstraintMilliseconds 是单输出 token 耗时（TPOT）约束（毫秒）。
 	TPOTConstraintMilliseconds float64 `json:"tpotConstraintMilliseconds"`
 }
 
-// Saturation records an explicit saturation measurement.
+// Saturation 记录显式的饱和度测量结果。
 type Saturation struct {
-	// Measured says whether saturation was measured.
+	// Measured 表示是否测量了饱和度。
 	Measured bool `json:"measured"`
 
-	// Note says how it was established.
+	// Note 说明饱和度是如何确定的。
 	Note string `json:"note,omitempty"`
 }

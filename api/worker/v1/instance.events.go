@@ -6,8 +6,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstanceEvents is the events of an Instance subresource,
-// which provides the events related to the underlying Kubernetes Pod.
+// InstanceEvents 是 Instance 子资源的事件对象，
+// 提供与底层 Kubernetes Pod 相关的事件信息。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceEvents struct {

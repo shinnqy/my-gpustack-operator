@@ -19,8 +19,8 @@ import (
 	"gpustack.ai/gpustack/pkg/systemmeta"
 )
 
-// ModelDeploymentElasticTensorParallelSize reads the fixed TP degree from extraArgs.
-// Non-elastic roles retain their ordinary accelerator default of one.
+// ModelDeploymentElasticTensorParallelSize 从 extraArgs 中读取固定的 TP 度。
+// 非弹性角色保留默认的单加速器配置（值为 1）。
 func ModelDeploymentElasticTensorParallelSize(role *workercore.ModelDeploymentRole) (int, error) {
 	if role == nil || role.ElasticEP == nil {
 		return 1, nil
@@ -47,15 +47,12 @@ func modelDeploymentElasticMasters(md *workercore.ModelDeployment, pods []core.P
 	return masters
 }
 
-// modelDeploymentElasticCollectiveMembers is the elastic deployment's logical group: every current
-// GPU worker of the elastic role, the master included.
+// modelDeploymentElasticCollectiveMembers 表示弹性部署的逻辑成员组：即弹性角色当前的所有 GPU worker（包含 master）。
 //
-// A WORKER ON ITS WAY OUT IS NOT A MEMBER, because it is leaving the collective, and the ancillary
-// Ray head is not a worker at all: its component label is the head's own name, so the role's workers
-// exclude it by construction.
+// 正在退出的 worker 不属于成员，因为它即将离开集合通信组；辅助的 Ray head 也根本不是 worker：
+// 其组件标签使用 head 自身名称，因此角色的 worker 集合在构造上自然将其排除。
 //
-// THE LIST IS THE ONE THE PASS ALREADY FETCHED AND CHECKED, so this costs no second fetch and no
-// probe.
+// 该列表直接复用本轮调谐已获取并校验的结果，无需二次拉取或探测。
 func modelDeploymentElasticCollectiveMembers(
 	md *workercore.ModelDeployment, pods []core.Pod,
 ) []core.Pod {
@@ -168,7 +165,7 @@ func (r *ModelDeploymentReconciler) renderModelDeploymentElasticPods(ctx context
 	return desired, nil
 }
 
-// renderModelDeploymentElasticHeadPod bypasses GPU and InstanceType admission for the auxiliary head.
+// renderModelDeploymentElasticHeadPod 为辅助 head 绕过 GPU 与 InstanceType 准入校验。
 func renderModelDeploymentElasticHeadPod(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, main core.Container,
 ) *core.Pod {
@@ -241,12 +238,10 @@ func renderModelDeploymentElasticHeadService(md *workercore.ModelDeployment) *co
 	return svc
 }
 
-// modelDeploymentTerminalPods returns the members that have already left and that nothing is
-// deleting: a Succeeded or Failed Pod carrying no deletion timestamp. A failed Pod never runs again
-// and Kubernetes never garbage-collects one, so a departure no other path initiates stays behind as an
-// object, with its Workload and its share of the group's quota still held. A Pod already on its way
-// out is not returned, because its departure is in flight and its Workload is released by the
-// protocol that issued the delete.
+// modelDeploymentTerminalPods 返回已退出且尚无删除操作的成员：即不带删除时间戳的 Succeeded 或 Failed Pod。
+// 失败的 Pod 不会再次运行且 Kubernetes 也不会自动垃圾回收，因此非主动发起的退出会残留为静态对象，
+// 导致其 Workload 及所属组的配额份额仍被占用。已在删除过程中的 Pod 不会返回，
+// 因为其退出正在进行中，对应 Workload 会由发起删除的协议负责释放。
 func modelDeploymentTerminalPods(pods []core.Pod) []core.Pod {
 	terminal := make([]core.Pod, 0, len(pods))
 	for i := range pods {
@@ -263,10 +258,10 @@ func modelDeploymentTerminalPods(pods []core.Pod) []core.Pod {
 	return terminal
 }
 
-// deleteModelDeploymentTerminalPods removes the members that have already left and releases the
-// Workloads that hold them. Both writes are needed: the Pod delete frees the ordinal the create gate
-// reads, and the Workload delete is what releases Kueue's finalizer on the member and the quota its
-// group held. Absence is success on both, because a pass may follow one that already issued them.
+// deleteModelDeploymentTerminalPods 移除已退出的成员并释放持有它们的 Workload。
+// 两次写操作缺一不可：删除 Pod 释放创建门控读取的序号，删除 Workload 才能移除 Kueue
+// 在成员上的 finalizer 并释放其组占用的配额。两者若不存在均视为成功，
+// 因为前一轮调谐可能已经发起过删除。
 func (r *ModelDeploymentReconciler) deleteModelDeploymentTerminalPods(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
 ) error {
@@ -286,12 +281,10 @@ func (r *ModelDeploymentReconciler) deleteModelDeploymentTerminalPods(
 	return r.deleteModelDeploymentGroupWorkload(ctx, md, terminal)
 }
 
-// convergeModelDeploymentElastic realizes an elastic deployment and returns the pass's observation.
+// convergeModelDeploymentElastic 实现弹性部署的收敛并返回本轮调谐的观测结果。
 //
-// THE OBSERVATION COMES BACK BECAUSE THE STATUS PUBLISHES IT AND THE ELIGIBILITY WRITE ACTS ON IT,
-// and both must read the same one: a second collection would be a second answer about a second
-// moment, and a second qualification would be a second verdict about a second grouping of the same
-// Pods.
+// 之所以返回观测结果，是因为状态发布与资格写入都需要基于同一份结果：
+// 二次采集会得到另一时刻的不同答案，二次资格判定也会对同一批 Pod 给出另一分组下的不同裁决。
 func (r *ModelDeploymentReconciler) convergeModelDeploymentElastic(ctx context.Context, md *workercore.ModelDeployment,
 	actual []core.Pod, desired map[string]map[int][]*core.Pod, weights *modelArtifactWeights,
 ) (bool, modelDeploymentPassObservation, error) {
@@ -299,22 +292,18 @@ func (r *ModelDeploymentReconciler) convergeModelDeploymentElastic(ctx context.C
 	if role == nil {
 		return false, modelDeploymentPassObservation{}, nil
 	}
-	// A TERMINAL MEMBER IS A DEPARTURE THIS OPERATOR DID NOT INITIATE, and the elastic path is the
-	// only path that can leave one behind: the fixed desired-set comparison below, which deletes
-	// terminal replicas and their Workloads, is behind this call. Kueue never garbage-collects a
-	// Succeeded or Failed Pod, and the create loop further down deliberately reads a terminal member
-	// as absent so its ordinal can be filled again. Left alone it stays an admitted member of the
-	// group it shares with its own replacement, which Kueue reads as the excess member and deletes
-	// again and again, so the slot never heals. The delete and the Workload that releases the
-	// group's finalizer and quota are issued here instead, on the same terms the fixed path uses.
+	// 终态成员属于非本 operator 主动发起的退出，且只有弹性路径可能遗留此类成员：
+	// 下文用于删除终态副本及其 Workload 的固定期望集合比对逻辑位于本调用之后。Kueue 绝不会自动回收
+	// Succeeded 或 Failed 的 Pod，而下方的创建循环刻意将终态成员视为缺失以便重新填充其序号。
+	// 若放任不管，它会作为已准入成员继续与自己的替代者共存于同一组中，导致 Kueue 将其判定为多余成员
+	// 并反复删除，使该槽位永远无法恢复。因此，此处改用与固定路径相同的条件，主动执行 Pod 删除及释放组 finalizer 与配额的 Workload 删除。
 	if err := r.deleteModelDeploymentTerminalPods(ctx, md, actual); err != nil {
 		return true, modelDeploymentPassObservation{}, err
 	}
-	// A MEMBER ALREADY ON ITS WAY OUT IS THE OTHER DEPARTURE NOTHING HERE SENT AWAY, and the fixed
-	// path's stranded sweep never reaches this branch, so the sweep runs here. Its Workload is what
-	// holds Kueue's finalizer on the Pod and the group's quota, and the sweep keeps the fixed
-	// path's condition: a Workload that also owns a member still standing is left alone, because
-	// Kueue answers a deleted Workload by stopping the whole group.
+	// 已处于删除中的成员是另一类非此处发起的退出，而固定路径的滞留清理永远不会执行到此分支，
+	// 因此在此处运行清理。它的 Workload 持有 Pod 上 Kueue 的 finalizer 及组配额，
+	// 清理沿用固定路径的条件：如果一个 Workload 同时还拥有仍在运行的成员，则保持不动，
+	// 因为 Kueue 对被删除 Workload 的响应是停止整个组。
 	if err := r.releaseModelDeploymentStrandedWorkloads(ctx, md, actual); err != nil {
 		return true, modelDeploymentPassObservation{}, err
 	}
@@ -373,15 +362,15 @@ func (r *ModelDeploymentReconciler) convergeModelDeploymentElastic(ctx context.C
 		case err == nil:
 			actual = live
 		case errors.Is(err, errElasticDeploymentChanged):
-			// The deployment moved under this pass. The writes below would label the master, patch
-			// the Service and rewrite router state from a member list this pass can no longer vouch
-			// for, so the pass stops here. The spec watch requeues the deployment.
+			// 部署在本轮调谐期间发生了变更。下方的写操作会基于本轮已无法担保一致性的成员列表
+			// 去给 master 打标签、修补 Service 并重写路由器状态，因此本轮调谐在此终止。
+			// spec watch 会重新将部署入队。
 			return true, modelDeploymentPassObservation{
 				Serving: modelDeploymentServingUnobserved(md, "the deployment moved under this pass"),
 			}, nil
 		default:
-			// A read that failed is not a member list. Refuse the writes rather than converge from
-			// the caller's list, which is the one path that could confirm what it never observed.
+			// 读取失败不能等同于有效成员列表。拒绝执行写操作，而非基于调用方传入的列表强行收敛，
+			// 否则会误确认从未观测到的状态。
 			return true, modelDeploymentPassObservation{}, err
 		}
 	}
@@ -393,15 +382,14 @@ func (r *ModelDeploymentReconciler) convergeModelDeploymentElastic(ctx context.C
 	qualifications := qualifyModelDeploymentInstances(ctx, md, masters, modelDeploymentPendingReplacement{}, fetch)
 	byMember := modelDeploymentQualificationsByMember(qualifications)
 
-	// THE PASS'S OBSERVATION IS COLLECTED HERE, AFTER THE QUALIFICATION AND BEFORE THE LABEL WRITE.
-	// The qualification can spend a whole probe, and a collection taken before it would be stale by
-	// the time the restore decision reads it.
+	// 本轮调谐的观测在此处采集，位于资格判定之后、标签写入之前。
+	// 资格判定可能耗时一整次探针周期，若在其之前采集，到恢复决策读取时数据就已经过时。
 	serving := r.observeModelDeploymentServing(ctx, md)
 	observation := modelDeploymentPassObservation{
 		Serving:        serving,
 		Qualifications: qualifications,
-		// THE COLLECTIVE'S MEMBERSHIP IS THE LIST THIS PASS ALREADY READ, and the head is
-		// excluded by construction. The status publishes the collective's own entry from it.
+		// 集合通信组的成员列表直接采用本轮已读取的结果，且在构造上已排除 head。
+		// status 会据此发布集合通信组自身的条目。
 		CollectiveMembers: modelDeploymentElasticCollectiveMembers(md, actual),
 	}
 	if err := r.convergeModelDeploymentEndpointEligibility(

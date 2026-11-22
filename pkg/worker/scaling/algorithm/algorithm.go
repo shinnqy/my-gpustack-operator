@@ -1,4 +1,4 @@
-// Package algorithm contains pure scaling recommendation algorithms.
+// Package algorithm 包含纯扩缩容建议算法。
 package algorithm
 
 import (
@@ -7,7 +7,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/datax"
 )
 
-// RoleKind identifies the serving role represented by an observation.
+// RoleKind 标识观测数据所代表的服务角色。
 type RoleKind string
 
 const (
@@ -15,10 +15,10 @@ const (
 	RoleKindPrefill RoleKind = "Prefill"
 	RoleKindDecode  RoleKind = "Decode"
 	RoleKindEncode  RoleKind = "Encode"
-	// RoleKindUnknown says the role is one the algorithms do not know.
+	// RoleKindUnknown 表示该角色属于算法未知的类型。
 	//
-	// IT IS NOT A DEFAULT TO SERVER, because a role whose kind was not named is not a server:
-	// treating it as one would scale it on a target it never declared.
+	// 它不会默认回退为 Server，因为未指定类型的角色并非 Server：
+	// 若将其当作 Server 处理，就会按它从未声明过的目标进行扩缩容。
 	RoleKindUnknown RoleKind = "Unknown"
 
 	ServerRole  = RoleKindServer
@@ -27,10 +27,10 @@ const (
 	EncodeRole  = RoleKindEncode
 )
 
-// SignalState describes the quality of one sampled signal.
+// SignalState 描述单个采样信号的质量状态。
 type SignalState string
 
-// RoleObservation contains the values sampled for one role at one instant.
+// RoleObservation 包含某个角色在某一时刻的采样值。
 type RoleObservation struct {
 	Role                      string
 	Kind                      RoleKind
@@ -43,16 +43,14 @@ type RoleObservation struct {
 	KVCacheUsage              float64
 	TTFTMilliseconds          float64
 	ITLMilliseconds           float64
-	// TTFTUnmeasured says the first token latency was not measured.
+	// TTFTUnmeasured 表示未测量到首 Token 延迟。
 	//
-	// IT IS SET WHEN THE SAMPLER COULD NOT READ THE LATENCY, because a latency that
-	// was not measured is not a latency of no time. The value beside it says
-	// nothing, and the algorithms that hold a role by this latency skip it.
+	// 当采样器无法读取该延迟时会设置此标记，因为未测量的延迟并不等于零延迟。
+	// 旁边的数值不具实际意义，依赖该延迟对角色进行保持决策的算法会跳过它。
 	TTFTUnmeasured bool
-	// ITLUnmeasured says the inter token latency was not measured.
+	// ITLUnmeasured 表示未测量到 Token 间延迟。
 	//
-	// IT IS SET WHEN THE SAMPLER COULD NOT READ THE LATENCY, for the same reason
-	// the first token latency carries the same mark.
+	// 当采样器无法读取该延迟时会设置此标记，原因与首 Token 延迟携带相同标记一致。
 	ITLUnmeasured    bool
 	ThroughputState  SignalState
 	LatencyState     SignalState
@@ -61,22 +59,22 @@ type RoleObservation struct {
 	ObservedAt       time.Time
 }
 
-// DemandSample is a timestamped role demand sample.
+// DemandSample 是带时间戳的角色需求采样点。
 type DemandSample struct {
 	Timestamp       time.Time
 	TokensPerSecond float64
 }
 
-// PredictorState is the state carried between recommendations for one role.
+// PredictorState 是单个角色在多次扩缩容建议之间保留的状态。
 type PredictorState struct {
 	Level       float64
 	Trend       float64
 	Covariance  [4]float64
 	SampleCount int32
-	// History is the demand history of the role.
+	// History 是该角色的需求历史记录。
 	//
-	// IT IS A RING BUFFER, because the history grows by one sample on every tick and is
-	// read as a window: a slice would be reallocated on every tick to hold the same window.
+	// 它采用环形缓冲区实现，因为历史记录会在每个周期新增一个样本并按窗口读取：
+	// 若使用切片，则在每个周期都需要重新分配内存来维持同一窗口。
 	History     *datax.RingBuffer[DemandSample]
 	PanicExitAt time.Time
 }

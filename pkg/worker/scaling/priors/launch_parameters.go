@@ -5,23 +5,20 @@ import (
 	"strings"
 )
 
-// LaunchParameter is one launch argument.
+// LaunchParameter 表示单个启动参数。
 //
-// IT IS THE ARGUMENT AND ITS VALUE, because an engine accepts a flag with
-// its value attached and a flag with its value in the next argument, and both
-// spellings describe the same launch.
+// 它包含参数名及其值，因为引擎既支持将值附加在标志中，也支持将值放在下一个参数中，这两种写法描述的是同一次启动配置。
 type LaunchParameter struct {
-	// Flag is the argument name, with its leading dashes.
+	// Flag 是包含前导短横线的参数名称。
 	Flag string
 
-	// Value is the argument value, empty for a bare flag.
+	// Value 是参数值；对于不带值的布尔标志，该字段为空。
 	Value string
 }
 
-// ParseLaunchParameters reads an ordered argument list.
+// ParseLaunchParameters 读取有序的参数列表。
 //
-// IT READS BOTH SPELLINGS, because an engine accepts a flag with its value
-// attached and a flag with its value in the next argument.
+// 它同时支持两种写法，因为引擎既接受值紧随其后的等号连接形式，也接受值位于下一参数的分离形式。
 func ParseLaunchParameters(tokens []string) ([]LaunchParameter, error) {
 	parameters := make([]LaunchParameter, 0, len(tokens))
 	for i := 0; i < len(tokens); i++ {
@@ -46,14 +43,11 @@ func ParseLaunchParameters(tokens []string) ([]LaunchParameter, error) {
 	return parameters, nil
 }
 
-// CheckEffectiveLaunchParameters checks that the effective launch parameters
-// describe the same launch as the launch parameters.
+// CheckEffectiveLaunchParameters 检查生效的启动参数是否与给定的启动参数描述相同的启动配置。
 //
-// IT REFUSES WHEN THEY DO NOT, because an effective list that names other
-// arguments describes a different launch.
+// 若不一致则拒绝，因为包含其他参数的生效列表对应的是不同的启动配置。
 //
-// IT IS EMPTY WHEN THERE IS NO EFFECTIVE LIST, because a launch that ran with
-// the arguments it was given has nothing to record.
+// 若无生效参数列表则为空，因为直接按给定参数运行的启动无需额外记录。
 func CheckEffectiveLaunchParameters(launch, effective []string) error {
 	if len(effective) == 0 {
 		return nil

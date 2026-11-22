@@ -17,161 +17,154 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// NO LABEL OF OUR OWN CARRIES THE ROLE'S NAME, and that is a decision rather than an omission.
-// app.kubernetes.io/component already holds the role's name on every replica: it is in the selector
-// labels the Service selects on, and it is what modelDeploymentPodRole reads to attribute a Pod to a
-// role in status. A second selectable carrier would be two answers to one question, written by two
-// functions, agreeing today -- and the one that drifted would be the one nothing reads on the
-// failure path, whose symptom is a Service with no endpoints or a role reporting nobody ready.
+// 我们不使用自有 label 携带角色名称，这是有意设计而非疏漏。
+// 每个副本上的 app.kubernetes.io/component 已经保存了角色名称：它既是 Service
+// 选择器所匹配的 label，也是 modelDeploymentPodRole 在状态中将 Pod 归属到对应角色
+// 时读取的字段。若再增加第二个可供选择的载体，就会出现由两个函数写入的同一问题的
+// 两个答案；它们目前或许一致，但一旦发生漂移，出问题的往往是故障路径上无人读取
+// 的那一个，其表现就是 Service 没有端点，或者角色报告无就绪副本。
 //
-// ONE KEY IN THIS PROJECT'S DOMAIN NOW CARRIES THE ROLE'S KIND: modelDeploymentLabelKeyRoleKind.
-// That is not the case above and does not weaken it. A kind is a closed set of three values that
-// something in front of the replicas selects on to tell a prefiller from a decoder; a name is a
-// user's free-form string that only this deployment's own objects ever match. So the kind key has
-// no second writer to drift from -- it is derived from the same ModelDeploymentEffectiveRoleKind
-// the status echo uses -- while a name key would have had app.kubernetes.io/component.
+// 当前项目域内有一个键携带角色类型：modelDeploymentLabelKeyRoleKind。
+// 这与上述情况不同，也不会削弱上述原则。类型是仅包含三个值的封闭集合，副本前端
+// 组件借此区分 prefiller 与 decoder；而名称是用户自由定义的字符串，只有当前
+// 部署自身的对象才会匹配它。因此类型键没有第二个写入方会导致漂移——它与状态回显
+// 同样派生自 ModelDeploymentEffectiveRoleKind——而若另设名称键则会与
+// app.kubernetes.io/component 重叠。
 //
-// Adding that key was additive, which is why it was available to add: removing one already
-// published breaks whoever selected on it.
+// 新增该键属于增量扩展，因此可以安全添加；而移除已经对外发布的键则会破坏依赖它进行
+// 选择的调用方。
 
 const (
-	// modelDeploymentPodGroupNamePrefix marks a group name this operator derived rather than took
-	// verbatim. It is the escape nodefeature.FormatLocalQueueName takes for an over-long
-	// ClusterQueue name, spelled the same way on purpose so one form is recognizable everywhere.
+	// modelDeploymentPodGroupNamePrefix 标记由本 operator 派生而非原样采用的组名。
+	// 它沿用了 nodefeature.FormatLocalQueueName 处理过长 ClusterQueue 名称时的回退
+	// 前缀，刻意采用相同拼写以便在各处保持一致的可辨识形态。
 	//
-	// That function is not called: its subject is a ClusterQueue name, and reusing it here would
-	// make a group's identity read as a queue's. What is shared is the shape, not the derivation.
+	// 此处并未直接调用该函数：它的处理对象是 ClusterQueue 名称，在此复用会让组标识
+	// 看起来像队列标识。两者共享的是命名形态，而非派生逻辑。
 	modelDeploymentPodGroupNamePrefix = "gpustack-fnv64-"
 
-	// modelDeploymentReplicaOrdinalLabel carries the ordinal a replica was rendered at, which is
-	// the only per-replica identity the converger keys on: the group name is derived from it, the
-	// spec-hash covers it, and a scale-down decides which replicas stay by it.
+	// modelDeploymentReplicaOrdinalLabel 记录副本渲染时的序号，它是收敛器所依赖的
+	// 唯一单副本标识：组名由其派生，spec-hash 涵盖该序号，缩容时也依据它决定保留
+	// 哪些副本。
 	//
-	// IT IS BUILT FROM systemname.LabelPrefix RATHER THAN SPELLED, because the prefix is the one
-	// place this project states its label domain; a second spelling would drift with nothing
-	// failing.
+	// 该键基于 systemname.LabelPrefix 拼接而非硬编码拼写，因为该前缀是本项目声明
+	// label 域名的唯一位置；若另写一份拼写，日后即使漂移也不会立即报错。
 	modelDeploymentReplicaOrdinalLabel = "modeldeployment." + systemname.LabelPrefix + "pod-ordinal"
 
-	// modelDeploymentMemberIndexLabel carries which Pod of its replica this one is, counting from
-	// zero. The ordinal label above says which replica; this says which member of it, and the two
-	// together name exactly one Pod of the deployment.
+	// modelDeploymentMemberIndexLabel 记录当前 Pod 是所属副本中的第几个成员（从零开始计数）。
+	// 上方的序号 label 指明属于哪个副本，此 label 指明属于该副本中的哪个成员，两者
+	// 共同唯一确定部署中的一个 Pod。
 	//
-	// IT IS A LABEL RATHER THAN AN ENVIRONMENT VALUE THE RENDERER WRITES, and that is what keeps
-	// one Pod template per replica. The container reads its own rank through a fieldRef naming this
-	// key, so the container spec is identical in every member while the value differs -- a renderer
-	// writing the index into env directly would make two members of one replica hash differently
-	// and every member read as a pending rollout.
+	// 它作为 label 而非渲染器写入的环境变量存在，这样才能让每个副本只需维护一份 Pod
+	// 模板。容器通过指向该键的 fieldRef 读取自身 rank，从而使每个成员的容器规约完全
+	// 一致而实际取值各异——若渲染器直接将索引写入 env，同一副本内两个成员的哈希就会
+	// 不同，导致每个成员都被判定为待滚动更新。
 	//
-	// IT IS ALSO WHAT MAKES A LEADER SELECTABLE. A Service selector cannot express "the Pod whose
-	// name ends in -m0", so fronting only the member that serves the API needs the index to be
-	// matchable, and index zero is the leader by construction rather than by election.
+	// 这也使 leader 可被 Service 选择器选中。Service 选择器无法表达“名称以 -m0
+	// 结尾的 Pod”，因此若仅代理提供 API 服务的成员，就必须让成员索引可被匹配，且
+	// 索引 0 按构造即为 leader，而非通过选举产生。
 	modelDeploymentMemberIndexLabel = "modeldeployment." + systemname.LabelPrefix + "member-index"
 
-	// modelDeploymentLeaderMemberIndex is the member every replica has and the only one the role's
-	// Service fronts. A replica of size one is all leader; above that, the others serve no API.
+	// modelDeploymentLeaderMemberIndex 是每个副本都具备的成员索引，也是角色 Service
+	// 唯一代理的成员。规模为 1 的副本本身即为 leader；规模大于 1 时，其余成员不提供 API。
 	modelDeploymentLeaderMemberIndex = 0
 
-	// modelDeploymentLabelKeyEndpointEligible marks a Pod whose endpoints a Router or an ordinary
-	// Service may select: "true" on exactly the members that serve -- the leader alone for a
-	// leader-served role, every rank-carrying member for an External-DP-shaped one -- and absent
-	// otherwise. Absence is the disqualification, so there is no "false" to misread.
+	// modelDeploymentLabelKeyEndpointEligible 标记可被 Router 或普通 Service 选中的端点
+	// 所属 Pod：仅在提供服务的成员上为 "true"（leader 服务模式的角色仅为 leader，
+	// External-DP 形态的角色为所有携带 rank 的成员），其余情况下均不设置。不设置即表示
+	// 不具备资格，因此不存在易被误读的 "false" 值。
 	//
-	// IT IS WRITTEN BY THE RECONCILER AT RUNTIME, never rendered: inside the template it would be
-	// part of the spec-hash and removing it to disqualify would roll the very replica a drain
-	// means to keep. The Pod's own identity labels above are rendered; this one is the reconciler's
-	// level-based answer to what the Pod is doing.
+	// 该 label 由调谐器在运行时写入，绝不参与模板渲染：若放入模板，它会成为 spec-hash
+	// 的一部分，摘除它以取消资格时反而会触发副本滚动重建，违背排空时保留该副本的初衷。
+	// 上方的 Pod 自身身份 label 由模板渲染，而此 label 则是调谐器对 Pod 当前状态的
+	// 电平式（level-based）判定结果。
 	//
-	// IT IS BUILT FROM systemname.LabelPrefix like every label above, because it must be matchable
-	// by a Service selector in the same domain those selectors already name.
+	// 与上方所有 label 一样，它也基于 systemname.LabelPrefix 构建，因为 Service
+	// 选择器必须能在同一域名空间下匹配到它。
 	modelDeploymentLabelKeyEndpointEligible = "modeldeployment." + systemname.LabelPrefix + "endpoint-eligible"
 
-	// modelDeploymentEndpointEligibleValue is the only value the eligibility key carries. A label
-	// selector is a conjunction of equalities, so the term is present-or-absent; the value exists
-	// because a selector needs one, and "true" states what presence means.
+	// modelDeploymentEndpointEligibleValue 是资格键唯一携带的值。label 选择器本质上是
+	// 一组等值条件的合取，因此该条件只看是否存在；该值之所以存在是因为选择器需要一个
+	// 匹配值，而 "true" 明确表达了存在即有效的语义。
 	modelDeploymentEndpointEligibleValue = "true"
 
-	// modelDeploymentLabelKeyAPIAnswering marks a Pod whose replicas answer the deployment's HTTP
-	// API under the routing rules of the mode they were created with.
+	// modelDeploymentLabelKeyAPIAnswering 标记按其创建时所用模式的路由规则响应部署
+	// HTTP API 的副本 Pod。
 	//
-	// IT IS ROUTING MEMBERSHIP, NOT ENGINE QUALIFICATION. The eligibility key above says this
-	// member's endpoints serve; this one says which Service this member is behind. They differ for
-	// exactly one reason: a role mid-edit holds replicas built under different command modes, and
-	// each mode keeps the routing it already had. A take-over replica answers under the legacy
-	// rules whether or not this operator can verify its engine, and a managed replica answers under
-	// the qualification rules, which the eligibility key already carries.
+	// 它表示路由归属，而非引擎资格判定。上方的资格键表示该成员的端点可提供服务；而
+	// 此键表示该成员归属于哪个 Service 之后。两者之所以不同，原因只有一个：正在变更中
+	// 的角色可能同时存在按不同命令模式构建的副本，每种模式都保留其原有的路由方式。
+	// 接管模式（take-over）的副本无论本 operator 能否校验其引擎，均按旧规则响应请求；
+	// 而托管副本则按资格规则响应请求，该规则已由上方的资格键承载。
 	//
-	// It is written by the reconciler at runtime and never rendered, so it stays out of the
-	// spec-hash: turning a member's routing on or off must not roll the replica that serves.
+	// 该 label 由调谐器在运行时写入且绝不参与模板渲染，因此不计入 spec-hash：开启或
+	// 关闭某个成员的路由绝不应导致正在提供服务的副本发生滚动重建。
 	modelDeploymentLabelKeyAPIAnswering = "modeldeployment." + systemname.LabelPrefix + "api-answering"
 
-	// modelDeploymentAPIAnsweringValue is the only value the answering key carries, for the same
-	// reason the eligibility key has one.
+	// modelDeploymentAPIAnsweringValue 是响应标记键唯一携带的值，原因与资格键相同。
 	modelDeploymentAPIAnsweringValue = "true"
 
-	// modelDeploymentTrueValue is the spelling a boolean takes in this package: in the
-	// annotations the reconciler writes and in the environments the operator reads.
+	// modelDeploymentTrueValue 是本包中布尔真值的统一拼写：既用于调谐器写入的
+	// annotation，也用于 operator 读取的环境变量。
 	//
-	// IT IS NAMED ONCE BECAUSE THE SPELLING IS ONE THING, and the package reads it in more
-	// than one place: a comparison that spelled it out again would be a second answer to what
-	// "true" means here, and the two could drift apart.
+	// 只定义一处是因为该拼写本身是同一概念，且包内有多处需要读取它：若在别处再次
+	// 手写拼写，就会成为“true”在此处含义的第二个定义，日后两者可能出现偏差。
 	modelDeploymentTrueValue = "true"
 )
 
-// ModelDeploymentPodGroupMeta is the Kueue group metadata one replica's Pod carries.
+// ModelDeploymentPodGroupMeta 是单个副本的 Pod 所携带的 Kueue 组元数据。
 //
-// LABELS AND ANNOTATIONS ARE RETURNED TOGETHER AND NOTHING MAY APPLY A SUBSET. The membership label
-// is what puts a Pod in the group, and the total-count annotation is what tells Kueue how many to
-// wait for; a Pod carrying the first without the second joins a group whose size is unknown, and
-// Kueue then refuses to compose the Workload with an error naming neither the Pod nor the field.
-// The failure is silence, so the two travel as one value.
+// LABELS 与 ANNOTATIONS 必须一并返回，任何调用方都不得只应用其中一部分。成员
+// 归属 label 用于将 Pod 纳入组内，而总数 annotation 用于告知 Kueue 需要等待的 Pod
+// 数量；若 Pod 只带前者不带后者，就会加入一个规模未知的组，随后 Kueue 会拒绝
+// 组装 Workload，且报错既不指明 Pod 也不指明字段。这种故障表现极其隐蔽，因此
+// 两者必须作为整体一同传递。
 type ModelDeploymentPodGroupMeta struct {
-	// Labels go on the Pod's metadata.labels.
+	// Labels 写入 Pod 的 metadata.labels。
 	Labels map[string]string
 
-	// Annotations go on the Pod's metadata.annotations.
+	// Annotations 写入 Pod 的 metadata.annotations。
 	Annotations map[string]string
 }
 
-// modelDeploymentPodGroupSpec is one role's entry in the deployment's scheduling picture: the role,
-// a name that role's share of the picture is keyed by, and the total the role declares.
+// modelDeploymentPodGroupSpec 是部署调度视图中单个 role 的条目：包含 role、用于索引该 role
+// 在调度视图中份额的名称，以及该 role 声明的总数。
 //
-// THE NAME IS A JOIN KEY RATHER THAN A WAY OF FINDING ANYTHING. A Pod's Kueue group is that one
-// replica's own, derived per (role, ordinal) by modelDeploymentReplicaGroupName, so no Pod carries
-// this name in its membership label. What still consumes this shape -- the status paths that key a
-// role's Workloads by group name -- joins through it, which is the remaining coupling the per-replica
-// split left behind and is refined by the status work that follows it.
+// 该名称是一个关联键，而非查找对象的途径。Pod 的 Kueue 分组属于单个副本自身，由
+// modelDeploymentReplicaGroupName 按 (role, ordinal) 派生，因此没有 Pod 会在其成员标签中
+// 携带该名称。仍然使用此结构的路径（按组名索引 role 的 Workload 的状态路径）通过该名称
+// 进行关联；这是按副本拆分后遗留的耦合，将由后续的状态重构工作进一步细化。
 type modelDeploymentPodGroupSpec struct {
-	// Role is the grouping key: one entry is one role and nobody else's, and the total below is
-	// that role's declared count.
+	// Role 是分组键：每个条目仅对应一个 role 而不属于其他任何 role，下方的总数即该 role
+	// 声明的副本数量。
 	Role string
 
-	// InstanceType is carried, not keyed on. It is the role's own type, held here so every message
-	// and condition that names a cluster queue can name the queue this role schedules into: the
-	// ClusterQueue is named after the InstanceType, and naming the role instead would send an
-	// operator to an object that does not exist.
+	// InstanceType 仅作携带之用，不作为索引键。它是该 role 自身的实例类型，保存在此处以便所有
+	// 提及 cluster queue 的消息和条件都能准确指明该 role 调度进入的队列：ClusterQueue 以
+	// InstanceType 命名，若改用 role 名称则会把运维人员引向一个不存在的对象。
 	InstanceType string
 
-	// Name is the per-role join key described on the struct. It is stable for a role and distinct
-	// between roles, which is all a join key owes.
+	// Name 是结构体注释中所述的按 role 划分的关联键。它在同一 role 内保持稳定，在不同 role
+	// 之间互不相同，这正是关联键所需的全部性质。
 	Name string
 
-	// TotalCount is THIS role's declared replicas and no other role's.
+	// TotalCount 是当前 role 声明的副本数，不包含其他任何 role。
 	TotalCount int32
 }
 
-// modelDeploymentPodGroups returns the deployment's roles as scheduling entries, one per role in the
-// roles' order.
+// modelDeploymentPodGroups 将部署的各个 role 作为调度条目返回，每个 role 对应一项并保持
+// roles 的原始顺序。
 //
-// It is PURE: same deployment, same result, no client and no clock.
+// 该函数是纯函数：相同的部署输入总是产生相同的结果，不依赖客户端也不依赖时钟。
 //
-// THE GROUPING KEY IS THE ROLE, NOT THE instanceType. Kueue admits each replica as its own unit and
-// everything the role-level picture exists to carry -- per-role counting, per-role flavor
-// assignment, per-role status -- still hangs off that grouping. Keying on the type instead puts two
-// roles on one instanceType into one entry, and their counts then disagree with nothing the total
-// can express: moving prefill 2 / decode 2 to prefill 1 / decode 3 leaves the sum at four.
+// 分组键是 role，而不是 instanceType。Kueue 将每个副本作为独立单元进行准入，而 role 级
+// 视图所要承载的一切——按 role 计数、按 role 分配 flavor、按 role 统计状态——仍然挂载在
+// 该分组之上。若改用 instanceType 作为键，会把使用同一 instanceType 的两个 role 合并到
+// 同一个条目中，其计数变化将无法从总数上体现：例如将 prefill 2 / decode 2 调整为
+// prefill 1 / decode 3 时，总数依然是 4。
 //
-// THE ORDER IS THE ROLES' ORDER, so two passes over an unchanged spec return the same names in the
-// same places. A map's iteration order would not, and these names key status maps.
+// 返回顺序与 roles 的顺序一致，因此对未变更的 spec 执行两次遍历会在相同位置返回相同的名称。
+// map 的迭代顺序无法保证这一点，而这些名称需要作为状态 map 的键。
 func modelDeploymentPodGroups(md *workercore.ModelDeployment) []modelDeploymentPodGroupSpec {
 	groups := make([]modelDeploymentPodGroupSpec, 0, len(md.Spec.Roles))
 	for i := range md.Spec.Roles {
@@ -187,13 +180,12 @@ func modelDeploymentPodGroups(md *workercore.ModelDeployment) []modelDeploymentP
 	return groups
 }
 
-// modelDeploymentRoleSize is how many Pods one replica of this role is made of.
+// modelDeploymentRoleSize 返回该 role 单个副本所包含的 Pod 数量。
 //
-// IT FLOORS AT ONE RATHER THAN TRUSTING THE FIELD. The schema defaults the field to one, so an
-// object that went through the API server always carries at least that -- but a role built in
-// memory, which every test and several callers do, carries the zero value. A zero reaching the
-// total-count annotation would declare a group of no members, and Kueue composes no Workload at
-// all for one: the replica would sit gated forever with nothing naming a cause.
+// 该函数以 1 为下限，而非直接信任字段值。schema 默认将该字段设为 1，因此经过 API server
+// 的对象至少都会携带该值；但在内存中构建的 role（所有测试和部分调用方都会这样做）其字段为
+// 零值。一旦 0 传入 total-count 注解，就会声明一个成员数为 0 的分组，导致 Kueue 完全无法
+// 为其组装 Workload：副本将无限期处于阻塞状态，且没有任何信息指明原因。
 func modelDeploymentRoleSize(role *workercore.ModelDeploymentRole) int {
 	if role.ReplicaSize < 1 {
 		return 1
@@ -202,33 +194,32 @@ func modelDeploymentRoleSize(role *workercore.ModelDeploymentRole) int {
 	return int(role.ReplicaSize)
 }
 
-// modelDeploymentAnsweringShape names which members of a replica can answer an in-flight read.
+// modelDeploymentAnsweringShape 标识一个副本中哪些成员能够响应在途的读请求。
 //
-// IT IS ONE ENUM FOR TWO CALLERS THAT HOLD DIFFERENT FACTS. Endpoint eligibility reads the shape from
-// the role; the retirement drain reads it from the member Pods, because a replica whose role the spec
-// has already dropped has no role to read. They share this vocabulary and the function below so the
-// rule is written once, and neither caller can reinterpret what the other means by a shape.
+// 这是供两个掌握不同事实的调用方共用的单一枚举。端点可用性判断从 role 读取形状，而下线
+// 排空逻辑则从成员 Pod 读取，因为 spec 已移除某 role 时，其遗留副本已没有对应的 role 可读。
+// 两者共用这套词汇和下方函数，使规则只需编写一次，且任一调用方都不会曲解另一方对形状的定义。
 type modelDeploymentAnsweringShape int
 
 const (
-	// modelDeploymentAnsweringUnknown is a shape this operator could not establish. It never appears
-	// from the derivation, only from a drain that cannot agree with itself, and it holds.
+	// modelDeploymentAnsweringUnknown 表示当前 operator 无法确定的响应形状。它不会由推导
+	// 产生，仅出现在排空逻辑无法自洽时，并使排空流程保持挂起。
 	modelDeploymentAnsweringUnknown modelDeploymentAnsweringShape = iota
-	// modelDeploymentAnsweringAll is an External-DP replica: every member carries a rank and runs its
-	// own engine listener, so every member answers.
+	// modelDeploymentAnsweringAll 表示 External-DP 副本：每个成员都拥有自己的 rank 并运行
+	// 各自的引擎监听端口，因此所有成员均响应请求。
 	modelDeploymentAnsweringAll
-	// modelDeploymentAnsweringLeader is a leader-served replica of several Pods: the followers join a
-	// collective and serve no metrics endpoint, so only the leader answers.
+	// modelDeploymentAnsweringLeader 表示由 leader 提供服务的跨多 Pod 副本：follower 仅加入
+	// 集合通信而不提供指标端点，因此只有 leader 响应请求。
 	modelDeploymentAnsweringLeader
-	// modelDeploymentAnsweringSole is a replica of one Pod, which is its own leader.
+	// modelDeploymentAnsweringSole 表示仅包含单个 Pod 的副本，该 Pod 本身即为其 leader。
 	modelDeploymentAnsweringSole
 )
 
-// modelDeploymentAnsweringShapeOf derives the shape from the only two facts that decide it.
+// modelDeploymentAnsweringShapeOf 根据唯一决定响应形状的两个事实推导出对应的形状。
 //
-// THE DERIVATION NEVER RETURNS UNKNOWN, because both inputs here are concrete: a caller that has not
-// established them does not call this. A drain that holds for not knowing the shape says so with its
-// own reason, and that reason names the disagreement rather than a shape nobody could read.
+// 该推导永不返回 UNKNOWN，因为传入的两个条件均为确定值：尚未确定这两个条件的调用方不会
+// 调用本函数。因无法获知形状而挂起的排空逻辑会给出自身的原因，该原因说明的是成员间的
+// 不一致，而非某个无人能读取的形状。
 func modelDeploymentAnsweringShapeOf(externalDP bool, size int) modelDeploymentAnsweringShape {
 	if externalDP {
 		return modelDeploymentAnsweringAll
@@ -240,11 +231,11 @@ func modelDeploymentAnsweringShapeOf(externalDP bool, size int) modelDeploymentA
 	return modelDeploymentAnsweringLeader
 }
 
-// modelDeploymentReplicaRunsCommand reports whether every member of a replica was built with a
-// command line this operator wrote.
+// modelDeploymentReplicaRunsCommand 返回副本的每个成员是否都使用本 operator 编写的
+// 命令行启动。
 //
-// A replica whose members disagree, or which carries no engine container to read, is left out: the
-// mode it runs in is then not established, and the reader that asks must not be told it is managed.
+// 若副本内成员状态不一致，或成员不包含可供读取的引擎容器，则将其排除：此时其运行模式
+// 尚未确定，询问方绝不能被告知该副本处于受管状态。
 func modelDeploymentReplicaRunsCommand(members []*core.Pod) bool {
 	if len(members) == 0 {
 		return false
@@ -259,9 +250,9 @@ func modelDeploymentReplicaRunsCommand(members []*core.Pod) bool {
 	return true
 }
 
-// modelDeploymentAnyMemberRunsCommand reports whether any member standing for a role is one this
-// operator built. A role mid-transition holds replicas of both modes at once, and the gate belongs
-// to the managed ones still serving, so one is enough.
+// modelDeploymentAnyMemberRunsCommand 返回代表某 role 的成员中是否至少有一个是由本
+// operator 构建的。处于过渡期的 role 可能同时存在两种模式的副本，而准入控制仍属于还在
+// 提供服务的受管副本，因此只要有一个成员满足即可。
 func modelDeploymentAnyMemberRunsCommand(members []*core.Pod) bool {
 	for _, member := range members {
 		if managed, ok := modelDeploymentMemberExecution(member); ok && managed {
@@ -272,48 +263,44 @@ func modelDeploymentAnyMemberRunsCommand(members []*core.Pod) bool {
 	return false
 }
 
-// modelDeploymentDeployedAnsweringShape derives the answering shape from what a replica's members
-// are RUNNING, rather than from the role the spec states now.
+// modelDeploymentDeployedAnsweringShape 根据副本成员当前正在运行的实际状态，而非 spec
+// 当前声明的 role，推导出响应形状。
 //
-// IT MATTERS WHILE A REPLICA IS BEING REPLACED. A role edited from four members to one, or from an
-// External data-parallel arrangement to a leader-served one, leaves its old replicas serving under
-// the shape they were built at. Reading the desired role instead would withdraw the followers of a
-// four-member replica the moment the spec asked for one, or expose every member of a rank group the
-// moment the spec asked for a leader -- on replicas that are serving perfectly well and that nothing
-// has replaced yet.
+// 这在副本替换期间至关重要。当一个 role 从 4 成员改为 1 成员，或从 External 数据并行
+// 模式改为 leader 服务模式时，其旧副本仍按构建时的形状继续提供服务。若直接读取期望的 role，
+// 在 spec 改为 1 成员的瞬间就会撤回 4 成员副本的 follower，或在 spec 改为 leader 模式的
+// 瞬间暴露整个 rank 组的所有成员——而这些旧副本此时仍在正常服务且尚未被任何新副本替换。
 //
-// The total is the one the members themselves declare, and the parallelism is read off their own
-// command lines. Both are facts about the replica in front of us rather than about a role that may
-// have moved on.
+// 总成员数取自成员自身声明的值，并行度则直接从它们自身的命令行中读取。两者反映的都是眼前
+// 这个副本的既成事实，而不是可能已经改变的 role 期望。
 func modelDeploymentDeployedAnsweringShape(
 	view modelDeploymentReplicaView, engine string,
 ) modelDeploymentAnsweringShape {
 	total, reason := modelDeploymentReplicaDeclaredTotal(view.Members)
 	if reason != "" || total <= 0 {
-		// A replica whose members disagree on what they are has no shape to read. Holding it is the
-		// honest answer, and holding keeps whatever membership it already carries.
+		// 成员对自身状态存在分歧的副本无法确定形状。保持等待是如实的做法，且保持现状可以保留
+		// 它已携带的成员关系。
 		return modelDeploymentAnsweringUnknown
 	}
 
 	externalDP, known := modelDeploymentMembersExternalDP(view.Members, engine)
 	if !known {
-		// A failed read is not a reading of internal data parallelism. Holding keeps the membership
-		// the replica already carries instead of withdrawing followers on a guess.
+		// 读取失败并不意味着内部数据并行。保持等待可保留副本已有的成员关系，避免基于猜测撤回
+		// follower。
 		return modelDeploymentAnsweringUnknown
 	}
 
 	return modelDeploymentAnsweringShapeOf(externalDP, total)
 }
 
-// modelDeploymentMembersExternalDP reports whether the members of a replica carry a data-parallel
-// load balance, read from the command lines they are running.
+// modelDeploymentMembersExternalDP 根据副本成员正在运行的命令行，判断其是否采用
+// 数据并行负载均衡。
 //
-// IT READS THE MEMBERS AND NOT THE ROLE for the same reason the shape does: the role states what the
-// next replica will be built as, and these members are running now.
+// 该函数读取成员而非 role，原因与形状推导相同：role 描述的是下一个副本将如何构建，而
+// 这些成员代表的是当前正在运行的状态。
 //
-// known is false when a managed member was consulted and none of them could be read, so the answer
-// is not an established "leader-served". Members this operator did not build carry no managed load
-// balance, which is an established answer.
+// 当检查过受管成员但其中没有任何一个能成功读取时，known 为 false，因此结果并非确定的
+// "leader-served"。非本 operator 构建的成员不携带受管的负载均衡配置，这属于确定的结论。
 func modelDeploymentMembersExternalDP(members []*core.Pod, engine string) (externalDP, known bool) {
 	consulted := false
 	for _, member := range members {
@@ -326,10 +313,9 @@ func modelDeploymentMembersExternalDP(members []*core.Pod, engine string) (exter
 		if !found {
 			continue
 		}
-		// THE ARGV IS THE COMMAND AND THE ARGS TOGETHER, because that is what the engine is run
-		// with. A managed replica's parallelism is declared as extra arguments and rendered onto the
-		// command line, so reading the arguments alone would report every replica as leader-served
-		// and expose the followers of an External-DP group.
+		// ARGV 由 Command 和 Args 共同组成，因为引擎实际就是以这两者的拼接启动的。受管副本的
+		// 并行配置作为额外参数声明并渲染到命令行上，因此若只读取 Args，会把所有副本都误判为
+		// leader-served，进而暴露 External-DP 分组中的 follower。
 		argv := slices.Concat(container.Command, container.Args)
 		reading, err := scanModelDeploymentParallelism(engine, argv,
 			modelDeploymentDeclaredEnv(container.Env))
@@ -347,12 +333,10 @@ func modelDeploymentMembersExternalDP(members []*core.Pod, engine string) (exter
 	return false, !consulted
 }
 
-// modelDeploymentDeclaredEnv reads a container's environment back into the declared form the
-// parallelism scan takes.
+// modelDeploymentDeclaredEnv 将容器环境变量还原为并行度扫描所需的声明形式。
 //
-// ONLY VARIABLES WHOSE VALUE IS WRITTEN LITERALLY ARE READ. A value Kubernetes fills in at run time
-// is not a declaration this operator can act on, and reading its name as if it were would let any
-// Pod carrying that name change how its replica is understood.
+// 仅读取字面量写明值的变量。由 Kubernetes 在运行时注入的值并非本 operator 可依赖的声明，
+// 若仅凭变量名就视作声明来读取，任何携带该变量名的 Pod 都会改变外界对其所属副本的判定。
 func modelDeploymentDeclaredEnv(env []core.EnvVar) []workercore.ModelDeploymentEnvVar {
 	declared := make([]workercore.ModelDeploymentEnvVar, 0, len(env))
 	for _, variable := range env {
@@ -367,25 +351,23 @@ func modelDeploymentDeclaredEnv(env []core.EnvVar) []workercore.ModelDeploymentE
 	return declared
 }
 
-// modelDeploymentAnsweringMemberLeader reports whether a Pod is the member a leader-served replica's
-// answer comes from.
+// modelDeploymentAnsweringMemberLeader 判断一个 Pod 是否为 leader 服务型副本中负责
+// 响应的成员。
 //
-// THE LABEL IS READ DIRECTLY AND NOT THROUGH modelDeploymentPodMemberIndex, and that is the whole
-// point of this function. That helper defaults a missing or unparsable label to the leader index,
-// which is right for a pre-label single-member Pod and catastrophic here: a multi-member replica with
-// no member-index labels would report EVERY member as the leader, and the selection would be the one
-// this protocol already gets wrong by reading every member.
+// 这里直接读取标签而不经过 modelDeploymentPodMemberIndex，这正是本函数的意义所在。
+// 该辅助函数会将缺失或无法解析的标签默认回退为 leader 索引，这对于尚未引入标签的单成员
+// Pod 是正确的，但在此处会造成灾难性后果：一个缺少 member-index 标签的多成员副本会把
+// 每个成员都判作 leader，从而重演该协议原本因读取所有成员而犯下的错误。
 func modelDeploymentAnsweringMemberLeader(pod *core.Pod) bool {
 	index, ok := pod.Labels[modelDeploymentMemberIndexLabel]
 
 	return ok && index == strconvx.Itoa(modelDeploymentLeaderMemberIndex)
 }
 
-// modelDeploymentAnsweringMembers is the set of members whose answer stands for the replica, or the
-// reason no set can be named.
+// modelDeploymentAnsweringMembers 返回代表该副本响应的成员集合，或无法确定集合的原因。
 //
-// EVERY FAILURE IS A HOLD WITH ITS SHAPE NAMED, because an operator reading a held reservation has to
-// be able to tell a replica whose leader is unidentifiable from one whose shape could not be read.
+// 每次失败都会附带明确形状名称并进入挂起状态，以便运维人员查看挂起的预留资源时，能够
+// 区分是无法识别 leader 的副本，还是无法读取形状的副本。
 func modelDeploymentAnsweringMembers(
 	shape modelDeploymentAnsweringShape, members []*core.Pod,
 ) ([]*core.Pod, string) {
@@ -393,9 +375,8 @@ func modelDeploymentAnsweringMembers(
 		return nil, "the replica's shape could not be established, so no member can answer for it"
 	}
 
-	// External-DP and the single-member replica are both the whole set, and a sole replica is its own
-	// leader, so both shapes return every member. That is what makes a size-one replica byte-identical
-	// to a drain that walked the member set.
+	// External-DP 副本和单成员副本的响应集合都是全体成员，且单成员副本自身即为 leader，因此
+	// 这两种形状都会返回全部成员。这也使单成员副本的行为与直接遍历成员集合的排空逻辑完全一致。
 	if shape == modelDeploymentAnsweringAll || shape == modelDeploymentAnsweringSole {
 		return members, ""
 	}
@@ -421,43 +402,39 @@ func modelDeploymentAnsweringMembers(
 	}
 }
 
-// ModelDeploymentPodGroup returns the group metadata for ONE member of ONE replica of a role: the
-// member at the given index, of the replica at the given ordinal.
+// ModelDeploymentPodGroup 返回某个 role 单个副本中单个成员的分组元数据：即位于指定
+// ordinal 的副本中指定索引位置的成员。
 //
-// It is PURE: same deployment, role, ordinal, member, same result, no client and no clock. Every
-// replica joins a Kueue pod group of its own -- its members, one Workload, one admission -- which
-// is what makes a scale or a replacement a change to that replica alone rather than a change every
-// sibling has to agree on before Kueue composes anything.
+// 该函数是纯函数：相同的部署、role、ordinal 和 member 总是产生相同的结果，不依赖客户端
+// 也不依赖时钟。每个副本都加入属于自己的 Kueue Pod 分组——由其自身成员构成、对应一个
+// Workload、作为一次整体准入——这使得扩缩容或替换仅作用于该副本自身，而不必等待所有
+// 兄弟副本达成一致后 Kueue 才开始组装 Workload。
 //
-// THE ORDINAL IS WHAT TELLS TWO REPLICAS OF ONE ROLE APART, in this metadata and nowhere else: the
-// group name is derived from it and the ordinal label carries it in plain digits, so a Pod's
-// membership and its identity say the same thing twice, once for Kueue and once for the converger.
-// The group name is NEVER parsed back -- the labels are the only things read back, and the name
-// owes nothing to a reader beyond uniqueness.
+// 在这套元数据中，ordinal 是区分同一 role 下不同副本的唯一依据：组名由它派生，ordinal
+// 标签也以纯数字直接记录它，从而使 Pod 的成员归属与身份标识分别面向 Kueue 和收敛器
+// 表达同一件事。组名永远不会被反向解析——需要回读的只有标签，组名对读取方而言只需保证
+// 唯一性即可。
 //
-// THE MEMBER INDEX DOES NOT ENTER THE GROUP NAME, and that is the whole point of the group: the
-// members of one replica share a name because they are one admission, and what separates them is a
-// label Kueue does not read. Folding the index into the name would give every member its own group
-// of one, which is the shape this design exists to avoid.
+// member index 不会进入组名，这正是分组设计的本意：同一副本的成员共享同一个组名，因为
+// 它们构成一次联合准入，而区分各成员的标签 Kueue 并不会读取。若将索引混入组名，每个成员
+// 都会变成各自独立的单 Pod 分组，这正是本设计要避免的形态。
 //
-// THE FAST-ADMISSION ANNOTATION IS NEVER SET, and its absence is asserted rather than assumed.
-// Kueue's fast path takes the FIRST runnable Pod of the group, sets that PodSet's Count to the whole
-// group's total, and returns. At a total of one it buys nothing; above one it is actively wrong,
-// admitting a group of several on the strength of one member being runnable -- which is the
-// opposite of the fate-sharing the total expresses. A test names it and states that.
+// 绝不设置快速准入注解，且其缺失状态是通过断言验证而非假设。Kueue 的快速路径会取分组中
+// 第一个可调度的 Pod，将该 PodSet 的 Count 设为整个分组的总数并直接返回。总数为 1 时
+// 它毫无收益；总数大于 1 时则会造成严重错误，仅凭一个成员可调度就放行整个多成员分组，这
+// 与总数所表达的同生共死语义完全背道而驰。相关测试明确命名了该注解并断言其不存在。
 func ModelDeploymentPodGroup(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, ordinal, member int,
 ) ModelDeploymentPodGroupMeta {
-	// Implement this function in chapter 19.
+	// 在第 19 章实现此函数。
 	return ModelDeploymentPodGroupMeta{}
 }
 
-// modelDeploymentPodOrdinal reads the ordinal a replica was rendered at.
+// modelDeploymentPodOrdinal 读取渲染副本时所赋予的 ordinal。
 //
-// IT REPORTS ABSENCE RATHER THAN GUESSING ZERO: a Pod carrying no ordinal label -- one rendered
-// before the per-replica groups existed, or built by a hand -- is not any ordinal's to claim, and
-// the converger treats such a Pod as outdated rather than adopting it onto an ordinal it never
-// carried.
+// 当标签缺失时，函数明确报告缺失而非猜测为 0：一个未携带 ordinal 标签的 Pod——无论是在
+// 按副本分组机制出现之前渲染的，还是手工创建的——都不应由任何 ordinal 认领，收敛器会
+// 将此类 Pod 视为过期对象，而非将其收编到一个它从未归属过的 ordinal 槽位。
 func modelDeploymentPodOrdinal(pod *core.Pod) (int, bool) {
 	ordinal, err := strconvx.Atoi[int](pod.Labels[modelDeploymentReplicaOrdinalLabel])
 	if err != nil || ordinal < 0 {
@@ -467,44 +444,41 @@ func modelDeploymentPodOrdinal(pod *core.Pod) (int, bool) {
 	return ordinal, true
 }
 
-// modelDeploymentReplicaView is one replica as the cluster currently holds it: which role and
-// ordinal it occupies, and the live Pods seated on it.
+// modelDeploymentReplicaView 表示集群当前持有的单个副本视图：包含其所属的 role 与
+// ordinal，以及落位其上的存活 Pod。
 type modelDeploymentReplicaView struct {
-	// Role is the role the members belong to.
+	// Role 是成员所属的 role。
 	Role string
-	// Ordinal is the slot this replica occupies, meaningful only when Seated is true.
+	// Ordinal 是该副本所占用的槽位序号，仅当 Seated 为 true 时有意义。
 	Ordinal int
-	// Seated is false for a Pod claiming no ordinal. Such a Pod belongs to no replica anything can
-	// name, and it stands alone as a view of its own -- which is what it was before replicas had
-	// members, so the figures taken over these views do not move for it.
+	// Seated 对于未声明 ordinal 的 Pod 为 false。此类 Pod 不属于任何可命名的副本，因此
+	// 各自独立构成一个视图——这与副本尚未引入成员概念前的形态一致，从而使基于这些视图统计
+	// 的各项数值不会受其干扰而发生偏移。
 	Seated bool
-	// Members are the live Pods on this replica, in the order the input held them.
+	// Members 是该副本上的存活 Pod，保持输入列表中的原有顺序。
 	Members []*core.Pod
 }
 
-// modelDeploymentGroupPodsByReplica groups live Pods into the replicas they belong to, skipping the
-// ones already on their way out.
+// modelDeploymentGroupPodsByReplica 将存活的 Pod 按所属副本分组，跳过已经在退出的 Pod。
 //
-// IT EXISTS SO THAT ONE GROUPING SERVES EVERY PER-REPLICA FIGURE. Readiness, quota reservation and
-// group completeness are all answers about replicas, and each of them was a count over Pods when a
-// replica was one Pod. Reconstructing the grouping separately in each place is how two of them come
-// to disagree about what a replica is -- and the disagreement would be silent, because every one of
-// them reports a plain number that looks reasonable whatever it counted.
+// 设立该函数是为了让所有按副本统计的指标都共用同一套分组逻辑。就绪度、配额预留以及分组
+// 完整性都是针对副本的统计；当一个副本仅含单个 Pod 时，它们都是直接对 Pod 计数。若在
+// 各个位置分别重构分组逻辑，不同统计方对"什么是副本"的认知就会产生分歧——而且这种分歧
+// 是静默的，因为无论按哪种方式统计，返回的都是一个看似合理的普通数字。
 //
-// A POD WITH NO ORDINAL IS ITS OWN VIEW, keyed by POSITION rather than by name or UID. Both of those
-// would be the obvious choice and both are wrong: the key has to separate such Pods without
-// depending on a field being set, and one that collapses when the field is empty merges every
-// unseated Pod of a role into a single replica.
+// 没有 ordinal 的 Pod 会作为独立视图，以输入位置而非名称或 UID 作为分组键。后两者看似
+// 顺理成章但均不可行：分组键必须在不依赖特定字段已设置的前提下区分这些 Pod，而一旦某
+// 字段为空就会发生键冲突的方案，会把同一 role 下所有未落位的 Pod 合并成单个副本。
 func modelDeploymentGroupPodsByReplica(pods []core.Pod) []modelDeploymentReplicaView {
 	return modelDeploymentGroupPods(pods, true)
 }
 
-// modelDeploymentGroupPodsIncludingDeparting groups every Pod, departing ones included.
+// modelDeploymentGroupPodsIncludingDeparting 对所有 Pod 进行分组，包括正在退出的 Pod。
 //
-// IT EXISTS FOR THE FIGURES ABOUT LEAVING. A replica being reclaimed is a replica whose members are
-// all on their way out, so the grouping that skips them answers zero for exactly the state those
-// figures are about — a preemption report that reads "0 replicas" while the pool takes the role
-// apart, and a "they are all terminating" message with nothing to count.
+// 该函数用于统计正在离开的副本数据。正在被回收的副本，其所有成员都处于退出过程中，因此
+// 会跳过退出中 Pod 的分组函数在面对这类状态时正好会返回 0——从而导致在资源池拆解某 role
+// 时，抢占报告显示 "0 replicas"，或输出 "they are all terminating" 的消息却没有任何
+// 可计数对象。
 func modelDeploymentGroupPodsIncludingDeparting(pods []core.Pod) []modelDeploymentReplicaView {
 	return modelDeploymentGroupPods(pods, false)
 }
@@ -513,7 +487,7 @@ func modelDeploymentGroupPods(pods []core.Pod, skipDeparting bool) []modelDeploy
 	type key struct {
 		role     string
 		ordinal  int
-		standing int // 0 when seated; the Pod's position plus one otherwise
+		standing int // 已落位时为 0；否则为该 Pod 在列表中的位置加 1
 	}
 
 	at := make(map[key]int, len(pods))
@@ -545,16 +519,15 @@ func modelDeploymentGroupPods(pods []core.Pod, skipDeparting bool) []modelDeploy
 	return views
 }
 
-// modelDeploymentPodDescription names a Pod the way its own shape makes true: a replica when a
-// replica is one Pod, and a member of one when it is not.
+// modelDeploymentPodDescription 根据 Pod 自身的形态来命名：当副本仅含一个 Pod 时称为
+// replica，否则称为 replica 的 member。
 //
-// IT READS THE POD'S OWN GROUP TOTAL RATHER THAN THE SPEC, because the caller of a message is
-// reporting on a Pod that exists and the spec may already describe something else -- and because a
-// Pod that predates multi-member replicas is a replica whatever the spec now says. The member index
-// label can no longer tell the two apart: it is written on every member at every size, so reading
-// it would call every single-Pod replica a member. The group total is the value that still
-// separates the shapes, and a Pod carrying no total at all is a replica, which is what a Pod from
-// before the totals existed is.
+// 它读取 Pod 自身的分组总数而非 spec，因为消息的生成对象是一个已存在的 Pod，而 spec 可能
+// 已经变更为其他形态——同时也是因为早于多成员副本机制创建的 Pod，无论 spec 现在如何
+// 定义，它本身就是一个完整副本。member-index 标签已无法区分这两者：无论副本大小如何，
+// 每个成员都会写入该标签，因此读取它会将所有单 Pod 副本都称作 member。分组总数才是能够
+// 区分两种形态的值，而完全不带总数的 Pod 则按完整副本处理，这正符合该总数引入前旧 Pod
+// 的实际情况。
 func modelDeploymentPodDescription(pod *core.Pod) string {
 	total, err := strconvx.Atoi[int](pod.Annotations[kueuepodconst.GroupTotalCountAnnotation])
 	if err == nil && total > 1 {
@@ -564,16 +537,15 @@ func modelDeploymentPodDescription(pod *core.Pod) string {
 	return "replica " + pod.Name
 }
 
-// modelDeploymentPodMemberIndex reads which member of its replica a Pod was rendered as.
+// modelDeploymentPodMemberIndex 读取渲染 Pod 时所赋予的副本内成员索引。
 //
-// IT DEFAULTS TO THE LEADER RATHER THAN REPORTING ABSENCE, which is the opposite of the ordinal
-// above, and the asymmetry is deliberate. A missing ordinal means the Pod belongs to no replica the
-// converger can name, so guessing one would adopt it onto a slot it never held. A missing member
-// index means something narrower: the label is written on every member, so its absence marks a Pod
-// rendered before that became the rule, and the replicas rendered without it were exactly the
-// single-Member ones -- whose one Pod is the leader. Reading it as the leader is therefore what the
-// label would have said, and treating those Pods as unplaceable would turn every deployment that
-// predates the rule into a rollout on the pass it landed.
+// 当标签缺失时，函数默认返回 leader 索引而非报告缺失，这与上方 ordinal 的处理恰恰相反，
+// 且这种不对称是有意为之的。缺少 ordinal 意味着该 Pod 不属于收敛器可命名的任何副本，
+// 因此猜测一个 ordinal 会将其错误地收编到它从未占用过的槽位。而缺少 member index 的
+// 含义则窄得多：如今每个成员都会写入该标签，因此它的缺失仅标志该 Pod 是在此规则生效前
+// 渲染的，而当时未带该标签的副本全部都是单成员副本——其唯一 Pod 本身就是 leader。将其
+// 视作 leader 正符合该标签本应表达的含义；反之，若将这类 Pod 视为不可归位对象，在规则
+// 上线的那一轮调谐中就会触发所有存量部署发生滚动更新。
 func modelDeploymentPodMemberIndex(pod *core.Pod) int {
 	member, err := strconvx.Atoi[int](pod.Labels[modelDeploymentMemberIndexLabel])
 	if err != nil || member < 0 {
@@ -583,17 +555,16 @@ func modelDeploymentPodMemberIndex(pod *core.Pod) int {
 	return member
 }
 
-// deleteModelDeploymentGroupWorkload deletes the Workload Kueue composed for this deployment's group,
-// which is what releases the finalizer Kueue holds on every replica.
+// deleteModelDeploymentGroupWorkload 删除 Kueue 为该部署分组组装的 Workload，从而
+// 释放 Kueue 挂载在每个副本上的 finalizer。
 //
-// IT IS THE TEARDOWN'S ONLY WAY OUT, not an optimization. The group is annotated as serving, so Kueue
-// never reads it as finished and never finalizes its Pods on its own; the Workload being deleted is
-// the single trigger that does. Since that Workload is owned by the very Pods it is holding, and
-// owned without a controller reference, garbage collection cannot reach it either -- deleting the
-// replicas alone leaves the deployment in Deleting with nothing erroring anywhere.
+// 这是清理流程的唯一出口，而非一种优化。该分组带有服务中注解，因此 Kueue 永远不会将其
+// 判定为已完成，也不会自行清理其 Pod 的 finalizer；删除 Workload 是触发释放的唯一途径。
+// 由于该 Workload 的属主正是被它锁住的这些 Pod，且属主引用未设置 controller 标记，垃圾
+// 回收也无法触及它——仅删除副本会让部署一直卡在 Deleting 状态且任何地方都不报错。
 //
-// Absence is success. A group short of its declared total composes no Workload at all, and a pass
-// that runs after the previous one already deleted it finds nothing; both are the state this wants.
+// 未找到对象亦视为成功。未达到声明总数的分组根本不会生成 Workload，而在前一次调谐已删除
+// Workload 之后再次执行清理时也不会查到任何对象；这两种情况都已达到期望状态。
 func (r *ModelDeploymentReconciler) deleteModelDeploymentGroupWorkload(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
 ) error {
@@ -602,9 +573,9 @@ func (r *ModelDeploymentReconciler) deleteModelDeploymentGroupWorkload(
 		return err
 	}
 
-	// EVERY Workload owning these Pods, not the first. A deployment whose roles sit on different
-	// instanceTypes has one Workload per group, and each holds Kueue's finalizer on its own replicas;
-	// deleting one of them releases one group and leaves the others unable to leave at all.
+	// 必须遍历删除拥有这些 Pod 的每一个 Workload，而不仅仅是第一个。当部署中不同 role 位于
+	// 不同的 instanceType 上时，每个分组都会对应一个 Workload，各自持有所属副本上 Kueue 的
+	// finalizer；只删除其中一个只会释放一个分组，其余分组将完全无法退出。
 	for _, wl := range wls {
 		if err = r.Client.Delete(ctx, wl); err != nil && !kerrors.IsNotFound(err) {
 			return fmt.Errorf("delete workload %s: %w", wl.Name, err)
@@ -614,34 +585,23 @@ func (r *ModelDeploymentReconciler) deleteModelDeploymentGroupWorkload(
 	return nil
 }
 
-// releaseModelDeploymentStrandedWorkloads deletes the Workload of a replica that is on its way out
-// with no member of its group left standing.
+// releaseModelDeploymentStrandedWorkloads 在副本处于退出过程中且其所在组已无存活成员时，删除该副本的 Workload。
 //
-// IT EXISTS BECAUSE A DEPARTURE THIS OPERATOR DID NOT INITIATE HAS NOTHING TO DELETE THE WORKLOAD.
-// Every path this operator drives -- teardown, a role disappearing, a scale-down, a rollout
-// replacement -- deletes the Workload of the replica it removes. A replica removed by a hand, a node
-// drain or an eviction has no such path, and a serving group's finalizer is released by nothing but
-// its Workload being deleted. Without this the Pod stays terminating behind the finalizer, its
-// Workload stays admitted holding quota, the ordinal stays occupied, and the create gate never opens
-// for it: no replacement is ever made and it takes a hand to recover.
+// 之所以存在此逻辑，是因为非本 operator 发起的退出没有机制去删除 Workload。
+// 本 operator 驱动的每条路径（如拆解、角色消失、缩容、滚动替换）都会删除其移除副本对应的 Workload。
+// 而由人工操作、节点驱空（node drain）或 Pod 驱逐移除的副本则没有此类路径，且服务组的 finalizer 只能通过删除其 Workload 来释放。
+// 若无此处理，Pod 会卡在 finalizer 阻塞的 Terminating 状态，其 Workload 会继续保持已准入状态并占用配额，序号（ordinal）会保持被占用，创建门控（create gate）也永远不会为之放行：从而无法创建替代副本，必须人工介入才能恢复。
 //
-// NEITHER TERMINAL PHASE RECOVERS ON ITS OWN, and they fail differently, which is why the remedy is
-// here rather than at the create gate. A container killed for exceeding its grace period reaches
-// Failed, which Kueue counts as INACTIVE, so a replacement created beside it would push the group
-// over its total and Kueue would finalize the dead member -- that one could have been left to the
-// create gate. A container that exits cleanly on SIGTERM reaches Succeeded, which Kueue counts as
-// ACTIVE, so the same replacement is the excess member and Kueue deletes the REPLACEMENT instead,
-// again and again. Deleting the Workload is the one remedy that covers both.
+// 两种终止阶段（terminal phase）都无法自行恢复，且失败方式各不相同，这也是将修复逻辑放在此处而非创建门控的原因。
+// 因超出宽限期（grace period）而被终止的容器会进入 Failed 状态，Kueue 将其计为 INACTIVE，因此在其旁创建的替代副本会使组内成员数超出上限，Kueue 会清理掉该已死亡成员——这种情况本可以留给创建门控处理。
+// 而收到 SIGTERM 后正常退出的容器会进入 Succeeded 状态，Kueue 仍将其计为 ACTIVE，于是同一个替代副本反而成了多余成员，导致 Kueue 转而反复删除该替代副本。
+// 删除 Workload 是唯一能同时解决这两种情况的办法。
 //
-// THE LIVE MEMBERS ARE WHAT MAKE IT SAFE. Kueue answers a deleted Workload by stopping the whole
-// group, so this deletes only a Workload that owns no Pod still standing; a group with a member
-// still serving is left alone even while a sibling of it drains. One replica per group is the shape
-// this operator renders, which is what makes the two readings coincide here, but the condition is
-// written about the members rather than about the count so that a group ever holding more than one
-// is not stopped by this path.
+// 存活成员的存在保证了这一操作的安全性。Kueue 对 Workload 被删除的响应是停止整个组，因此此处仅删除不再拥有任何存活 Pod 的 Workload；
+// 只要组内仍有成员在提供服务，即使其同组副本正在排空退出，也会保留该 Workload。
+// 本 operator 渲染的形态是每组一个副本，这使得两种判断在此处恰好一致，但条件仍按成员而非数量编写，以确保即便将来存在多成员组，也不会被此路径错误停止。
 //
-// Absence is success, on the terms deleteModelDeploymentGroupWorkload states: a pass that runs after
-// a previous one already deleted the Workload finds nothing, and that is the state this wants.
+// 按 deleteModelDeploymentGroupWorkload 的语义约定，目标不存在即视为成功：若前一轮处理已经删除了该 Workload，后续执行未找到目标时，这正是期望的状态。
 func (r *ModelDeploymentReconciler) releaseModelDeploymentStrandedWorkloads(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
 ) error {
@@ -676,22 +636,17 @@ func (r *ModelDeploymentReconciler) releaseModelDeploymentStrandedWorkloads(
 	return nil
 }
 
-// modelDeploymentReplicaGroupName derives the Kueue group name of one replica: the replica of the
-// given role at the given ordinal.
+// modelDeploymentReplicaGroupName 推导单个副本（即指定角色在指定序号下的副本）的 Kueue 组名。
 //
-// THE NAME IS ALWAYS THE HASHED FORM, and that is a decision rather than an escape. Kueue names a
-// group's Workload after the group VERBATIM, and a Workload is an object name -- a lowercase RFC
-// 1123 subdomain -- so the group name owes that charset whatever a readable composite would have
-// bought; a separator the charset forbids has no readable form to offer, and a separator it allows
-// (the hyphen) cannot decompose, which was never needed anyway. The hash covers NAMESPACE, NAME,
-// ROLE AND ORDINAL: the group name is only ever compared with other Pods' -- in one namespace, but
-// two deployments of one name in two namespaces must not read as one group.
+// 该名称始终采用哈希形式，这是有意为之的设计选择而非权宜之计。Kueue 会原样使用组名作为其 Workload 名称，
+// 而 Workload 是 Kubernetes 对象名（小写 RFC 1123 子域名），因此组名受限于该字符集，可读组合名称带来的好处在此无从体现：
+// 字符集不允许的分隔符无法用于可读形式，而允许的分隔符（连字符）又无法可靠拆分，况且本来也不需要反向解析。
+// 哈希输入包含 Namespace、Name、Role 和 Ordinal：虽然组名仅在同一 Namespace 内与其他 Pod 比较，
+// 但不同 Namespace 中同名的两个部署绝不能被识别为同一个组。
 //
-// THE NAME IS UNIQUE, NOT PARSEABLE, and the difference is the point: nothing ever derives the
-// ordinal back from it. The ordinal travels in its own label, and the name owes a reader uniqueness
-// and nothing else -- which is also why the derivation has no shape that varies with how many roles
-// the deployment declares: a first role's replica names its group the same way whether it is the
-// only role or one of several.
+// 该名称仅保证唯一，而非可解析，这正是关键所在：没有任何逻辑会从中反推序号。
+// 序号通过独立的 label 传递，该名称只需向读取方保证唯一性即可——这也是为何其推导方式不随部署声明的角色数量变化：
+// 第一个角色的副本无论作为唯一角色还是多个角色之一，其组名生成方式完全一致。
 func modelDeploymentReplicaGroupName(
 	md *workercore.ModelDeployment, role string, ordinal int,
 ) string {
@@ -700,50 +655,41 @@ func modelDeploymentReplicaGroupName(
 	)
 }
 
-// modelDeploymentReplicaServiceName is the headless Service that publishes one replica's members,
-// and the subdomain every one of those members names.
+// modelDeploymentReplicaServiceName 是发布单个副本各成员的 headless Service 名称，也是所有这些成员共同使用的子域名（subdomain）。
 //
-// IT IS READABLE RATHER THAN HASHED, unlike the Kueue group name above, and the reason is who reads
-// it. A group name is compared and never shown; this one is half of an address a person debugging a
-// collective types, and it is also what an engine's logs quote when a rank cannot reach its leader.
-// The cost of readability is a length budget, since a Service name is a DNS-1035 label of 63
-// characters. Nothing here enforces it: the budget is checked at ADMISSION, against the longest name
-// the role's declared counts can produce, so a deployment whose members could not be named is
-// refused rather than rendered into objects the API server rejects one at a time.
+// 与上方的 Kueue 组名不同，此名称采用可读形式而非哈希形式，原因在于它的使用对象不同。
+// 组名只用于内部比对，从不对外展示；而此名称是调试集合通信（collective）时排查人员需要输入的地址组成部分，
+// 也是引擎日志在某个 rank 无法连接 leader 时输出的内容。
+// 可读性的代价是长度预算限制，因为 Service 名称是最多 63 个字符的 DNS-1035 标签。
+// 此处不负责强制校验：该预算会在准入（admission）阶段按角色声明数量所能产生的最长名称进行检查，
+// 从而在准入时直接拒绝成员无法命名的部署，而不是在渲染成对象后被 API server 逐个拒绝。
 //
-// IT EXISTS ONLY ABOVE SIZE ONE. A replica of one member has nobody to address, so rendering a
-// Service for it would create an object per replica for no consumer.
+// 仅当副本规模大于 1 时才存在该 Service。单成员副本没有任何需要寻址的对端，为其渲染 Service 只会为每个副本白白创建无人使用的对象。
 func modelDeploymentReplicaServiceName(
 	md *workercore.ModelDeployment, role string, ordinal int,
 ) string {
 	return md.Name + "-" + role + "-r" + strconvx.Itoa(ordinal)
 }
 
-// modelDeploymentMemberName is the name of one member of one replica, which is also its hostname and
-// therefore half of the DNS record its siblings resolve it by.
+// modelDeploymentMemberName 是单个副本中某一个成员的名称，同时也是它的主机名（hostname），
+// 因此构成了同组其他成员解析其地址所需 DNS 记录的前半部分。
 //
-// THE MEMBER INDEX IS LAST SO THE LEADER IS RECOGNIZABLE, and it counts from zero so that member
-// zero is the leader of every replica by construction. Nothing elects it and nothing stores the
-// decision: a reader with the deployment, the role and the ordinal can write down the leader's
-// address without consulting the cluster, which is what makes the address available to a container
-// before any member of the group has started.
+// 成员索引（member index）放在末尾以便识别 leader，且从零开始计数，从而在构造上保证零号成员始终是每个副本的 leader。
+// 无需选举也无需持久化存储该决策：只要知道部署名、角色和序号，任何读取方都能无需查询集群直接写出 leader 地址，
+// 这使得容器在组内任何成员启动之前就能获得该地址。
 //
-// THE NAME IS NEVER PARSED BACK. The ordinal and the member index each travel in a label of their
-// own, and this string owes a reader uniqueness and recognizability rather than structure.
+// 该名称永远不会被反向解析。序号和成员索引各自通过独立的 label 传递，此字符串只需提供唯一性和可识别性，而不承担结构解析职责。
 func modelDeploymentMemberName(
 	md *workercore.ModelDeployment, role string, ordinal, member int,
 ) string {
 	return modelDeploymentReplicaServiceName(md, role, ordinal) + "-m" + strconvx.Itoa(member)
 }
 
-// modelDeploymentPodGroupNameOf is a role's name in the group-name-keyed shapes the status paths
-// still consume: a per-role join key, derived the same way a replica's group name is but without the
-// ordinal, and carried by no Pod.
+// modelDeploymentPodGroupNameOf 是状态路径仍需使用的、以组名为键（group-name-keyed）的形态下的角色名称：
+// 一个按角色划分的关联键（join key），其推导方式与副本组名相同但不含序号，且不会被任何 Pod 携带。
 //
-// IT IS ALWAYS THE HASHED FORM, on the same terms modelDeploymentReplicaGroupName states, and for a
-// second reason that one does not have: a derivation whose shape varied with the number of roles
-// would rename the first role's key when a second role arrived, and a key that moves under its
-// consumers is worse than one that was always opaque.
+// 与 modelDeploymentReplicaGroupName 同理，它始终采用哈希形式，而且还有另一个前者不涉及的原因：
+// 若推导形态随角色数量变化，当第二个角色加入时就会改变第一个角色的键名；对于使用方而言，一个会漂移的键远不如一开始就不透明的键。
 func modelDeploymentPodGroupNameOf(md *workercore.ModelDeployment, role string) string {
 	return modelDeploymentPodGroupNamePrefix +
 		stringx.SumByFNV64a(md.Namespace, "/", md.Name, "/", role)

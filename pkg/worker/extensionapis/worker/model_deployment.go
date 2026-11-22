@@ -13,7 +13,7 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// ModelDeploymentHandler exposes the v1 view of a v1alpha1.ModelDeployment.
+// ModelDeploymentHandler 暴露 v1alpha1.ModelDeployment 的 v1 视图。
 type ModelDeploymentHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations

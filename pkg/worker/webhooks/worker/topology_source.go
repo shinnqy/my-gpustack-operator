@@ -18,7 +18,7 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kuberess"
 )
 
-// TopologySourceWebhook validates the cluster-wide topology inventory boundary.
+// TopologySourceWebhook 校验集群级拓扑清单的边界。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="topologysources",scope="Cluster"
@@ -110,7 +110,7 @@ func validateTopologyAdditionalWritePrefix(prefix string, path *field.Path) fiel
 }
 
 func validateTopologyLevels(levels []string, path *field.Path) field.ErrorList {
-	const maxTopologyLevels = 16 // must match +k8s:validation:maxItems in api/worker/v1alpha1/topology_source.go
+	const maxTopologyLevels = 16 // 必须与 api/worker/v1alpha1/topology_source.go 中的 +k8s:validation:maxItems 保持一致
 	if len(levels) == 0 {
 		return field.ErrorList{field.Required(path, "at least one level is required")}
 	}

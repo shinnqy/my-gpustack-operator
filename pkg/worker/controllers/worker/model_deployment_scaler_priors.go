@@ -19,7 +19,7 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/scaling/priors"
 )
 
-// ModelDeploymentScalerCapacityPriors contains independent effective algorithms and their evidence.
+// ModelDeploymentScalerCapacityPriors 包含各独立生效的算法及其依据。
 type ModelDeploymentScalerCapacityPriors struct {
 	Algorithms map[string]workercore.ModelDeploymentScalerAlgorithmSpec
 	Status     []workercore.ModelDeploymentScalerResolvedCapacityPriorStatus
@@ -30,9 +30,9 @@ type modelDeploymentScalerCapacityField struct {
 	value **resource.Quantity
 }
 
-// ModelDeploymentScalerNeedsCapacityPrior reports whether an actual serving role lacks capacity.
-// A missing target conservatively checks every serving kind. A scaler without a capacity prior
-// states every capacity by hand and never needs one.
+// ModelDeploymentScalerNeedsCapacityPrior 判断实际服务角色是否缺少容量配置。
+// 当目标缺失时，会保守地检查每一种服务类型。未配置容量先验的 scaler 会手动声明
+// 所有容量，因此从不需要容量先验。
 func ModelDeploymentScalerNeedsCapacityPrior(scaler *workercore.ModelDeploymentScaler, target *workercore.ModelDeployment) bool {
 	if !modelDeploymentScalerPriorRequested(scaler) {
 		return false
@@ -56,14 +56,13 @@ func ModelDeploymentScalerNeedsCapacityPrior(scaler *workercore.ModelDeploymentS
 	return false
 }
 
-// ResolveModelDeploymentScalerCapacityPriors fills only missing role capacities on deep copies.
-// Catalog refusals are typed; API failures retain their original type for admission and retries.
+// ResolveModelDeploymentScalerCapacityPriors 仅在深拷贝上填充缺失的角色容量。
+// 目录拒绝错误带有明确类型；API 故障则保留原始类型，以供准入控制和重试使用。
 func ResolveModelDeploymentScalerCapacityPriors(
 	ctx context.Context, reader ctrlcli.Reader, scaler *workercore.ModelDeploymentScaler, target *workercore.ModelDeployment,
 ) (*ModelDeploymentScalerCapacityPriors, error) {
 	result := &ModelDeploymentScalerCapacityPriors{Algorithms: make(map[string]workercore.ModelDeploymentScalerAlgorithmSpec)}
-	// THE QUANTILE THE SCALER IS HELD TO IS RESOLVED ONCE, because the
-	// resolution and the online sampling have to answer the same question.
+	// scaler 所依据的分位数仅解析一次，因为先验解析与在线采样必须针对同一指标问题作答。
 	quantile, quantileErr := ModelDeploymentScalerLatencyQuantile(&scaler.Spec.Algorithm)
 	if quantileErr != nil {
 		return nil, modelDeploymentScalerPriorRefusal("", "%v", quantileErr)
@@ -181,9 +180,8 @@ func modelDeploymentScalerLoadCatalog(ctx context.Context, reader ctrlcli.Reader
 		return nil, err
 	}
 	if !found {
-		// THE OTHER NAME IS TRIED, because a ConfigMap written before the
-		// catalog changed its file name still holds the catalog the operator
-		// shipped, and a reader that refuses it refuses the deployment too.
+		// 还会尝试另一个键名，因为在目录改名前写入的 ConfigMap 仍保存着 operator
+		// 随附的目录数据，若读取器拒绝该键名，就会连带拒绝对应的部署。
 		for _, fallback := range []string{priors.DefaultCatalogConfigMapKey, priors.LegacyCatalogConfigMapKey} {
 			if fallback == key {
 				continue
@@ -208,10 +206,10 @@ func modelDeploymentScalerLoadCatalog(ctx context.Context, reader ctrlcli.Reader
 	return catalog, nil
 }
 
-// modelDeploymentScalerCatalogData returns the bytes of one catalog key.
+// modelDeploymentScalerCatalogData 返回单个目录键对应的字节数据。
 //
-// IT REFUSES A KEY THAT EXISTS IN BOTH DATA AND BINARY DATA, because two
-// copies of a catalog are not one catalog.
+// 若同一个键同时存在于 Data 和 BinaryData 中，则会拒绝读取，因为两份目录
+// 副本无法视为同一份目录。
 func modelDeploymentScalerCatalogData(cm *core.ConfigMap, key string) ([]byte, bool, error) {
 	data, present := cm.Data[key]
 	binary := cm.BinaryData[key]
@@ -233,8 +231,8 @@ func modelDeploymentScalerResolveRolePrior(
 	quantile float64,
 ) (priors.Resolution, workercore.ModelDeploymentScalerResolvedCapacityPriorStatus, error) {
 	status := workercore.ModelDeploymentScalerResolvedCapacityPriorStatus{Name: role.Name}
-	// THE CATALOG IS SELECTED BY WHAT THE DEPLOYMENT STATES, because a profile
-	// is one deployment shape and the deployment states the shape it runs.
+	// 目录的选择取决于部署所声明的配置，因为一个 profile 对应一种部署形态，而部署
+	// 本身声明了其运行的形态。
 	declaration, err := modelDeploymentScalerPriorDeclarationOf(ctx, reader, target, role)
 	if err != nil {
 		return priors.Resolution{}, status, err
@@ -259,8 +257,7 @@ func modelDeploymentScalerResolveRolePrior(
 	if token.ITLTargetMilliseconds != nil {
 		request.Constraints.ITLTargetMilliseconds = token.ITLTargetMilliseconds.AsApproximateFloat64()
 	}
-	// THE RESOLUTION IS HELD TO THE QUANTILE THE SCALER ASKED FOR, and the
-	// resolver answers it with the measured quantile it could prove.
+	// 解析过程以 scaler 请求的分位数为约束，解析器则返回其能够验证的实测分位数。
 	request.Constraints.LatencyQuantile = quantile
 	if headroom := scaler.Spec.Algorithm.CapacityPrior.Headroom; headroom != nil {
 		value := headroom.AsApproximateFloat64()
@@ -307,9 +304,8 @@ func modelDeploymentScalerResolveRolePrior(
 		})
 	}
 
-	// THE MEASURED QUANTILE AND THE REQUESTED ONE ARE KEPT APART, because a
-	// catalog that measured a higher quantile than the request needed is a
-	// different answer from one that measured the requested quantile.
+	// 实测分位数与请求分位数分开记录，因为目录若仅测得高于请求所需分位数的数据，
+	// 其含义与直接测得请求分位数的结果并不相同。
 	status.Quantile = priors.FormatLatencyQuantile(selectedQuantile)
 	status.RequestedQuantile = priors.FormatLatencyQuantile(quantile)
 	return resolution, status, nil
@@ -329,7 +325,7 @@ func modelDeploymentScalerPriorFingerprint(
 	} {
 		annotations[key] = target.Annotations[key]
 	}
-	// Sorting removes declaration order without changing the ordered launch arguments.
+	// 排序可消除声明顺序的差异，同时不改变有序启动参数本身的顺序。
 	canonicalAlgorithm := effective.DeepCopy()
 	return priors.Digest(struct {
 		TargetUID   string
@@ -352,10 +348,10 @@ func modelDeploymentScalerFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
-// modelDeploymentScalerPriorRequested reports whether the scaler asked for a capacity prior.
+// modelDeploymentScalerPriorRequested 判断 scaler 是否请求了容量先验。
 //
-// The presence of the block is the request, because the block holds no switch that could turn
-// the resolution off. A scaler without the block states every capacity by hand.
+// 只要存在该配置块即视为发起请求，因为块内没有用于关闭解析的开关。未配置该块的
+// scaler 会手动声明全部容量。
 func modelDeploymentScalerPriorRequested(scaler *workercore.ModelDeploymentScaler) bool {
 	return scaler.Spec.Algorithm.CapacityPrior != nil
 }

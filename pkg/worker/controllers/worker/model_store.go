@@ -25,30 +25,28 @@ import (
 	"gpustack.ai/gpustack/pkg/modelstore"
 )
 
-// The conditions of a ModelStore's status.
+// ModelStore 状态的各 Condition。
 const (
-	// ModelStoreConditionReady says the store's policy is applied on every matched node: each one's
-	// NodeModelStore names this store as its effective configuration source.
+	// ModelStoreConditionReady 表示该存储的策略已应用到所有匹配的节点上：每个匹配节点的 NodeModelStore
+	// 都将此存储指定为生效的配置来源。
 	ModelStoreConditionReady = "Ready"
-	// ModelStoreConditionSelectorOverlap says another store's selector also matches at least one of
-	// this store's nodes. The node still gets a deterministic answer — the alphabetically first
-	// store wins — and both stores carry this condition, so the misconfiguration is visible where
-	// it was made.
+	// ModelStoreConditionSelectorOverlap 表示另一个存储的 selector 也匹配了当前存储的至少一个节点。
+	// 节点仍会得到确定的结果——按字母顺序靠前的存储胜出——且双方存储都会携带此 condition，使配置冲突
+	// 能在配置处直接显现。
 	ModelStoreConditionSelectorOverlap = "SelectorOverlap"
 )
 
-// selectModelStore narrows the stores to the ones whose selector matches the node, ordered by
-// name: the first entry is the node's effective store, and the length is the overlap count.
+// selectModelStore 将存储列表筛选为 selector 匹配该节点的存储，并按名称排序：第一项即为该节点的生效
+// 存储，切片长度即为重叠数。
 func selectModelStore(stores []workercore.ModelStore, node *core.Node) ([]*workercore.ModelStore, error) {
-	// Implement this function in chapter 16.
+	// 在第 16 章中实现此函数。
 	var result0 []*workercore.ModelStore
 	var result1 error
 	return result0, result1
 }
 
-// modelStoreLayer reads a store's policy as one merge layer. A field the store leaves out stays
-// nil, so the layers under it keep their say — the store cannot restate a default by accident, and
-// an explicit one, bytesPerSecond 0 among them, is a real override.
+// modelStoreLayer 将存储的策略读取为一个合并层。存储未填写的字段保持为 nil，从而让下层配置继续生效——
+// 存储不会无意中重申默认值，而显式设置的值（包括 bytesPerSecond 为 0）则作为真正的覆盖。
 func modelStoreLayer(store *workercore.ModelStore) modelstore.Layer {
 	var layer modelstore.Layer
 	if w := store.Spec.Watermarks; w != nil {
@@ -63,10 +61,9 @@ func modelStoreLayer(store *workercore.ModelStore) modelstore.Layer {
 	return layer
 }
 
-// ModelStoreReconciler keeps a store's status equal to what the pool actually is: the nodes the
-// selector matches, the cache those nodes hold, and whether another store reaches into the same
-// nodes. The per-node effects of the policy belong to the NodeModelStoreReconciler, which writes
-// them into each node's spec.
+// ModelStoreReconciler 使存储的 status 与资源池的实际情况保持一致：selector 匹配的节点、这些节点持有的
+// 缓存，以及是否有其他存储命中了相同节点。策略在单节点上的生效由 NodeModelStoreReconciler 负责，
+// 它会将配置写入各个节点的 spec。
 type ModelStoreReconciler struct {
 	Client ctrlcli.Client
 	Now    func() time.Time
@@ -74,15 +71,15 @@ type ModelStoreReconciler struct {
 
 var _ ctrlreconcile.Reconciler = (*ModelStoreReconciler)(nil)
 
-// modelStoreObservation is one pass's reading of the pool, the raw material of the status.
+// modelStoreObservation 是单轮对账中读取到的资源池状态，是生成 status 的原始数据。
 type modelStoreObservation struct {
-	nodes   int32 // nodes the selector matches
-	applied int32 // matched nodes whose spec names this store
-	overlap bool  // another store matches at least one matched node
+	nodes   int32 // selector 匹配的节点数
+	applied int32 // spec 中指定了当前存储的匹配节点数
+	overlap bool  // 是否有其他存储也匹配了至少一个当前匹配节点
 
-	capacity       bool  // at least one matched node reported a capacity reading
-	capacityTotal  int64 // summed sizes of the matched nodes' cache filesystems
-	capacityStored int64 // summed published trees and partial downloads
+	capacity       bool  // 是否至少有一个匹配节点上报了容量读数
+	capacityTotal  int64 // 匹配节点缓存文件系统的总容量之和
+	capacityStored int64 // 已发布目录树与未完成下载的总大小之和
 }
 
 func (r *ModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -101,8 +98,8 @@ func (r *ModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	selector, err := meta.LabelSelectorAsSelector(&store.Spec.NodeSelector)
 	if err != nil {
-		// The API server's own schema refuses an unparseable selector on write, so this takes a hand
-		// edit; report the store plainly broken and wait for its next generation.
+		// API Server 自身的 schema 在写入时会拒绝无法解析的 selector，因此这种情况只可能来自手动修改；
+		// 直接将存储报告为异常并等待下一个 generation。
 		logger.Error(err, "the store's nodeSelector does not parse; its status reports the store broken")
 		before := store.Status.DeepCopy()
 		store.Status.Conditions = carryConditionTransitions(store.Status.Conditions,
@@ -114,8 +111,8 @@ func (r *ModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	nodes := new(core.NodeList)
 	listOpts := []ctrlcli.ListOption{}
 	if m := store.Spec.NodeSelector.MatchLabels; len(m) > 0 && len(store.Spec.NodeSelector.MatchExpressions) == 0 {
-		// A pure matchLabels selector filters in the cache: the cluster's nodes never all need to
-		// cross the wire for a pool that names three labels.
+		// 纯 matchLabels selector 直接在本地缓存中过滤：对于仅指定三个标签的资源池，无需将集群全部节点
+		// 拉取过来。
 		listOpts = append(listOpts, ctrlcli.MatchingLabels(m))
 	}
 	if err := r.Client.List(ctx, nodes, listOpts...); err != nil {
@@ -125,7 +122,7 @@ func (r *ModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Client.List(ctx, stores); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Every store but this one, for the overlap reading.
+	// 除当前存储外的其余所有存储，用于检查选择器重叠。
 	others := make([]workercore.ModelStore, 0, len(stores.Items))
 	for i := range stores.Items {
 		if stores.Items[i].Name != store.Name {
@@ -163,7 +160,7 @@ func (r *ModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 		nms, ok := reportByName[nd.Name]
 		if !ok {
-			// The node has no plugin object yet, so nothing of this store's is applied on it.
+			// 该节点尚未创建插件对象，因此当前存储的任何配置都尚未应用到该节点上。
 			continue
 		}
 		if nms.Spec.Store == store.Name {
@@ -194,7 +191,7 @@ func (r *ModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, r.Client.Status().Update(ctx, store)
 }
 
-// modelStoreConditions turns an observation into the status's conditions.
+// modelStoreConditions 将观测结果转换为 status 中的各 condition。
 func modelStoreConditions(store *workercore.ModelStore, obs *modelStoreObservation, broken error) []gpustack.Condition {
 	ready := gpustack.Condition{Type: ModelStoreConditionReady, ObservedGeneration: store.Generation}
 	switch {
@@ -212,8 +209,8 @@ func modelStoreConditions(store *workercore.ModelStore, obs *modelStoreObservati
 		ready.Message = "the policy is applied on some matched nodes and pending on the rest"
 	}
 	if obs.overlap && ready.Status == meta.ConditionFalse {
-		// Only the losing store's message is overwritten: a store that reads Applied or NoNodes
-		// keeps its own pairing, and the overlap fact already lives on SelectorOverlap.
+		// 仅覆写竞争失败的存储的 message：处于 Applied 或 NoNodes 状态的存储保留各自的 reason/message 配对，
+		// 而重叠事实已记录在 SelectorOverlap 条件中。
 		ready.Message = "the selector overlaps another store's, so the alphabetically first store wins the shared nodes"
 		ready.Reason = "Overridden"
 	}
@@ -233,8 +230,8 @@ func modelStoreConditions(store *workercore.ModelStore, obs *modelStoreObservati
 	return []gpustack.Condition{ready, overlap}
 }
 
-// carryConditionTransitions keeps a condition's transition time while its status holds, so an
-// unchanged pool reads equal to the stored status and writes nothing.
+// carryConditionTransitions 在 condition 的状态未变时保留其上次转换时间，从而使未发生变化的资源池
+// 计算出的结果与已存储的 status 相等，避免无意义写回。
 func carryConditionTransitions(old, next []gpustack.Condition, now time.Time) []gpustack.Condition {
 	for i := range next {
 		next[i].LastTransitionTime = meta.NewTime(now.UTC().Truncate(time.Second))
@@ -256,7 +253,7 @@ func (r *ModelStoreReconciler) now() time.Time {
 	return time.Now()
 }
 
-// modelStoreCommitStatus writes the status when this pass changed it.
+// modelStoreCommitStatus 在本轮对账修改了 status 时将其写回。
 func modelStoreCommitStatus(ctx context.Context, cli ctrlcli.Client, store *workercore.ModelStore, before *workercore.ModelStoreStatus) error {
 	if kubemeta.DeepEqual(before, &store.Status) {
 		return nil
@@ -308,9 +305,8 @@ func (r *ModelStoreReconciler) SetupController(_ context.Context, opts controlle
 						return false
 					}
 
-					// Only the two facts a store's status reads move it: which store the node
-					// names, and what the node's cache holds. The rest of the node's report —
-					// per-model churn the plugin writes on thresholds — is another object's feed.
+					// 只有存储 status 读取的两项事实会触发它更新：节点所指定的存储名称，以及节点缓存的容量信息。
+					// 节点上报的其余内容（插件在达到阈值时写入的按模型维度变动）由其他对象消费。
 					return o.Spec.Store != n.Spec.Store ||
 						!kubemeta.DeepEqual(o.Status.Capacity, n.Status.Capacity)
 				},
@@ -325,10 +321,9 @@ func (r *ModelStoreReconciler) SetupController(_ context.Context, opts controlle
 		Complete(r)
 }
 
-// modelStoreSelectorChanged wakes the sibling stores only when a store's overlap-relevant shape
-// changed: a create or a delete always can move another store's overlap view, an update only when
-// the nodeSelector moved. Status writes and policy churn decide nothing about which nodes a store
-// shares, and never wake anyone — which is what keeps the watch from feeding on its own reconciles.
+// modelStoreSelectorChanged 仅在存储与重叠相关的结构发生变化时唤醒同级存储：创建或删除始终可能
+// 改变其他存储的重叠视图，而更新仅在 nodeSelector 变更时才可能影响。status 写入和策略变动均不决定
+// 存储之间共享哪些节点，因此绝不唤醒任何对象——这正是防止 watch 循环触发自身对账的关键。
 var modelStoreSelectorChanged = ctrlpredicate.Funcs{
 	CreateFunc: func(ctrlevent.CreateEvent) bool { return true },
 	DeleteFunc: func(ctrlevent.DeleteEvent) bool { return true },
@@ -347,9 +342,9 @@ var modelStoreSelectorChanged = ctrlpredicate.Funcs{
 	GenericFunc: func(ctrlevent.GenericEvent) bool { return false },
 }
 
-// enqueueSiblingStores enqueues every store but the changed one, which its own For event already
-// reconciles: a selector moving into or out of another store's nodes changes that store's overlap
-// view. Stores are few, so the map is deliberately coarse — the narrow part is the predicate.
+// enqueueSiblingStores 将除已变更对象之外的所有 ModelStore 加入队列，已变更对象会由其自身的 For 事件
+// 触发协调：选择器移入或移出其他 ModelStore 的 Node 时，会改变该 ModelStore 的重叠视图。
+// ModelStore 数量很少，因此此映射刻意保持粗粒度，由 predicate 负责精确过滤。
 func (r *ModelStoreReconciler) enqueueSiblingStores(ctx context.Context, obj ctrlcli.Object) []ctrlreconcile.Request {
 	stores := new(workercore.ModelStoreList)
 	if err := r.Client.List(ctx, stores); err != nil {
@@ -368,9 +363,8 @@ func (r *ModelStoreReconciler) enqueueSiblingStores(ctx context.Context, obj ctr
 	return reqs
 }
 
-// enqueueAllStores re-enqueues every store: a node's labels decide which stores match it, and a
-// node report decides what its pool's capacity reads. Stores are few; the map is deliberately
-// coarse.
+// enqueueAllStores 将所有 ModelStore 重新加入队列：Node 的标签决定其匹配哪些 ModelStore，
+// Node 的上报决定其池容量的计算结果。ModelStore 数量很少，此映射刻意保持粗粒度。
 func (r *ModelStoreReconciler) enqueueAllStores(ctx context.Context, _ ctrlcli.Object) []ctrlreconcile.Request {
 	stores := new(workercore.ModelStoreList)
 	if err := r.Client.List(ctx, stores); err != nil {

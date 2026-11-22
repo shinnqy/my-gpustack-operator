@@ -14,13 +14,13 @@ import (
 	"gpustack.ai/gpustack/pkg/modelstore"
 )
 
-// modelArtifactNodesWindow is the least time between two writes of one artifact's status.nodes. A
-// fleet of nodes finishing one download changes the counts once per node, and the digest may be
-// named by artifacts in many namespaces; the window bounds each artifact's writes whatever the fleet.
+// modelArtifactNodesWindow 是单个 artifact 的 status.nodes 两次写入之间的最短间隔。集群中一批节点
+// 完成同一次下载时每个节点都会使计数变化一次，且同一摘要可能被多个 namespace 中的 artifact 引用；
+// 无论集群规模如何，该时间窗口都能限制每个 artifact 的写入频率。
 const modelArtifactNodesWindow = 30 * time.Second
 
-// modelArtifactNodes is where the artifact's content is across the nodes, or nil when it has none to
-// count: a claim, or a hub source not resolved yet.
+// modelArtifactNodes 返回 artifact 内容在各节点上的分布情况；对于无可统计分布的情况（如 claim
+// 或尚未解析的 hub 来源），则返回 nil。
 func modelArtifactNodes(ma *workercore.ModelArtifact, stores []workercore.NodeModelStore) *workercore.ModelArtifactNodes {
 	r := ma.Status.Resolved
 	if ma.Spec.Source.HuggingFace == nil || r == nil || r.ManifestDigest == "" {
@@ -33,14 +33,13 @@ func modelArtifactNodes(ma *workercore.ModelArtifact, stores []workercore.NodeMo
 	}
 }
 
-// reconcileNodes sets status.nodes from the NodeModelStores, unless the artifact's nodes were written
-// less than the window ago: then the stored value stays and the result asks for the pass that
-// writes it when the window ends.
+// reconcileNodes 根据 NodeModelStore 更新 status.nodes；若该 artifact 的节点信息距离上次写入
+// 尚未超过时间窗口，则保留已存储的值，并在返回结果中请求于窗口结束时再触发一次写入。
 func (r *ModelArtifactReconciler) reconcileNodes(
 	ctx context.Context, ma *workercore.ModelArtifact, stored *workercore.ModelArtifactNodes,
 ) ctrl.Result {
-	// The stores are read only when the artifact has nodes to count at all: modelArtifactNodes
-	// returns nil for a claim or an unresolved hub source, whatever the fleet holds.
+	// 仅当 artifact 确实存在可统计的节点分布时才读取 store：无论集群中有多少节点缓存，
+	// modelArtifactNodes 对 claim 或未解析的 hub 来源都会返回 nil。
 	var stores []workercore.NodeModelStore
 	if res := ma.Status.Resolved; ma.Spec.Source.HuggingFace != nil && res != nil && res.ManifestDigest != "" {
 		list := new(workercore.NodeModelStoreList)
@@ -68,12 +67,11 @@ func (r *ModelArtifactReconciler) reconcileNodes(
 	return ctrl.Result{}
 }
 
-// IndexingModelArtifactByManifestDigest indexes ModelArtifacts by the digest their resolution
-// bound, so a NodeModelStore event reaches exactly the artifacts naming a digest it holds,
-// instead of listing them all per event.
+// IndexingModelArtifactByManifestDigest 按解析所绑定的摘要为 ModelArtifact 建立索引，使
+// NodeModelStore 事件能够精确触发引用其所持摘要的 artifact，而不必在每次事件时列举全部 artifact。
 const IndexingModelArtifactByManifestDigest = "modelartifacts.worker.gpustack.ai/manifest-digest"
 
-// indexModelArtifactByManifestDigest extracts the IndexingModelArtifactByManifestDigest key.
+// indexModelArtifactByManifestDigest 提取 IndexingModelArtifactByManifestDigest 索引键。
 func indexModelArtifactByManifestDigest(obj ctrlcli.Object) []string {
 	ma, ok := obj.(*workercore.ModelArtifact)
 	if !ok {
@@ -86,11 +84,11 @@ func indexModelArtifactByManifestDigest(obj ctrlcli.Object) []string {
 	return nil
 }
 
-// IndexingNodeModelStoreByModelDigest indexes NodeModelStores by the digests their status holds, so
-// an artifact's reconcile reads exactly the stores holding its digest instead of the whole fleet.
+// IndexingNodeModelStoreByModelDigest 按 status 中记录的摘要为 NodeModelStore 建立索引，使
+// artifact 调谐时仅读取持有该摘要的 store，而无需扫描全集群。
 const IndexingNodeModelStoreByModelDigest = "nodemodelstores.worker.gpustack.ai/model-digest"
 
-// indexNodeModelStoreByModelDigest extracts the IndexingNodeModelStoreByModelDigest keys.
+// indexNodeModelStoreByModelDigest 提取 IndexingNodeModelStoreByModelDigest 索引键。
 func indexNodeModelStoreByModelDigest(obj ctrlcli.Object) []string {
 	nms, ok := obj.(*workercore.NodeModelStore)
 	if !ok {
@@ -104,9 +102,9 @@ func indexNodeModelStoreByModelDigest(obj ctrlcli.Object) []string {
 	return digests
 }
 
-// mapModelArtifactNodeModelStore maps a NodeModelStore to the artifacts naming a digest it holds,
-// in every namespace. Each List is a lookup on the artifact's digest index; the watch wraps this in
-// the same second-scale dedup window the controller's other watches use.
+// mapModelArtifactNodeModelStore 将 NodeModelStore 映射到所有 namespace 中引用其所持摘要的
+// artifact。每次 List 都是基于 artifact 摘要索引的查找；watch 会按与控制器其他 watch 相同的秒级
+// 去重窗口对其进行包装。
 func (r *ModelArtifactReconciler) mapModelArtifactNodeModelStore(
 	ctx context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {

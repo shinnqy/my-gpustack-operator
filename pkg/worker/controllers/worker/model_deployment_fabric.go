@@ -21,10 +21,8 @@ func modelDeploymentRequestsInterfaces(md *workercore.ModelDeployment) bool {
 	return false
 }
 
-// ModelDeploymentDirectInterfaceProtocol returns the protocol a managed direct-transfer or
-// multi-member Server collective leg actually renders. A role with a user-owned command, an absent
-// pair or collective, or an engine that ignores the declared protocol cannot use that declaration to
-// select a device grant.
+// ModelDeploymentDirectInterfaceProtocol 返回托管直连传输或多成员 Server 集合通信分支实际渲染的协议。
+// 使用用户自定义命令的 role、缺少配对或集合通信，或忽略所声明协议的引擎，均不能使用该声明来选择设备授权。
 func ModelDeploymentDirectInterfaceProtocol(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, manufacturer string,
 ) string {
@@ -33,8 +31,8 @@ func ModelDeploymentDirectInterfaceProtocol(
 		manufacturer == "" || manufacturer == nodefeature.ManufacturerAscend {
 		return ""
 	}
-	// Managed multi-Pod Server collective legs (size > 1 or elasticEp) select the operator's
-	// RDMA device key ("rdma"); spec.kvTransfer applies only to routed prefill/decode pairs.
+	// 托管的多 Pod Server 集合通信分支（size > 1 或 elasticEp）会选择 operator 的
+	// RDMA 设备键（"rdma"）；spec.kvTransfer 仅适用于路由的 prefill/decode 配对。
 	if ModelDeploymentEffectiveRoleKind(role) == workercore.ModelDeploymentRoleKindServer &&
 		(modelDeploymentRoleSize(role) > 1 || role.ElasticEP != nil) {
 		return "rdma"
@@ -48,9 +46,8 @@ func ModelDeploymentDirectInterfaceProtocol(
 	return mooncake.TransportProtocol("")
 }
 
-// ModelDeploymentInterfaceResource selects one device-plugin key for a positive role interface
-// count. Member groups must agree even when one uses TCP, because a single count cannot describe
-// allocations for a backend whose groups use different protocols.
+// ModelDeploymentInterfaceResource 为正值的 role 接口计数选择一个 DevicePlugin 键。
+// 即使其中某个成员组使用 TCP，各成员组也必须保持一致，因为单个计数无法描述使用不同协议的后端的分配情况。
 func ModelDeploymentInterfaceResource(
 	storeProtocols []string, directProtocol string, count int64,
 ) (core.ResourceName, error) {

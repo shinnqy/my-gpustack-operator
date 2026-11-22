@@ -11,12 +11,12 @@ import (
 )
 
 type (
-	// Review holds the attributes for advanced reviewing.
+	// Review 保存用于权限评审的属性。
 	Review = authz.SelfSubjectAccessReviewSpec
-	// Reviews is the list of Review.
+	// Reviews 是 Review 的列表。
 	Reviews = []Review
 
-	// DeniedError is an error indicate which Review target has been denied.
+	// DeniedError 表示某项 Review 目标被拒绝的错误。
 	DeniedError struct {
 		Review Review
 	}
@@ -26,7 +26,7 @@ func (e DeniedError) Error() string {
 	return fmt.Sprintf("denied %s", e.Review)
 }
 
-// CanDo checks if the current subject can do all specified actions.
+// CanDo 检查当前主体是否有权执行所有指定操作。
 func CanDo(ctx context.Context, cli authzcli.SelfSubjectAccessReviewInterface, reviews Reviews) error {
 	if len(reviews) == 0 {
 		return errors.New("no self review to check")

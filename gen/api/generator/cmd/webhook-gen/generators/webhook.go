@@ -55,7 +55,7 @@ func (g *webhookGen) Filter(c *generator.Context, t *types.Type) bool {
 
 func (g *webhookGen) Namers(c *generator.Context) namer.NameSystems {
 	return namer.NameSystems{
-		// Have the raw namer for this file track what it imports.
+		// 让该文件的 raw namer 跟踪其导入的包。
 		"raw": namer.NewRawNamer(g.outputPackage, g.imports),
 		"private": &namer.NameStrategy{
 			Join: func(pre string, in []string, post string) string {
@@ -114,7 +114,7 @@ func (g *webhookGen) Init(c *generator.Context, w io.Writer) error {
 	sw.Do("return vwc, mwc\n", nil)
 	sw.Do("}\n\n", nil)
 
-	// START: ValidatingWebhookConfiguration.
+	// START: ValidatingWebhookConfiguration。
 	sw.Do("func GetValidatingWebhookConfiguration(n string, c $.WebhookClientConfig|raw$) *$.ValidatingWebhookConfiguration|raw$ {\n", args)
 
 	if len(validateTypes) == 0 {
@@ -138,9 +138,9 @@ func (g *webhookGen) Init(c *generator.Context, w io.Writer) error {
 	}
 
 	sw.Do("}\n\n", nil)
-	// END: ValidatingWebhookConfiguration.
+	// END: ValidatingWebhookConfiguration。
 
-	// START: MutatingWebhookConfiguration.
+	// START: MutatingWebhookConfiguration。
 	sw.Do("func GetMutatingWebhookConfiguration(n string, c $.WebhookClientConfig|raw$) *$.MutatingWebhookConfiguration|raw$ {\n", args)
 
 	if len(mutateTypes) == 0 {
@@ -164,7 +164,7 @@ func (g *webhookGen) Init(c *generator.Context, w io.Writer) error {
 	}
 
 	sw.Do("}\n\n", nil)
-	// END: MutatingWebhookConfiguration.
+	// END: MutatingWebhookConfiguration。
 
 	return sw.Error()
 }
@@ -216,13 +216,13 @@ func (g *webhookGen) generateValidating(c *generator.Context, t *types.Type, w i
 	sw.Do("return $.ValidatingWebhook|raw${\n", args)
 
 	args = args.With("SPEC", spec)
-	// START: Webhook.
+	// START: Webhook。
 	sw.Do("Name: \"$.$\",\n", spec.Name)
 	sw.Do("ClientConfig: *cc,\n", nil)
 
 	rule := spec.Rules[0]
 	args = args.With("RULE", rule)
-	// START: Webhook/Rules/0.
+	// START: Webhook/Rules/0。
 	sw.Do("Rules: []$.RuleWithOperations|raw${\n", args)
 	sw.Do("{\n", nil)
 	sw.Do("Rule: $.Rule|raw${\n", args)
@@ -243,7 +243,7 @@ func (g *webhookGen) generateValidating(c *generator.Context, t *types.Type, w i
 	}
 	sw.Do("},\n", nil)
 	sw.Do("},\n", nil)
-	// END: Webhook/Rules/0.
+	// END: Webhook/Rules/0。
 
 	if spec.FailurePolicy != nil {
 		sw.Do("FailurePolicy: $.PtrTo|raw$[$.FailurePolicyType|raw$](\"$.SPEC.FailurePolicy$\"),\n", args)
@@ -320,7 +320,7 @@ func (g *webhookGen) generateValidating(c *generator.Context, t *types.Type, w i
 	}
 
 	sw.Do("}\n", nil)
-	// END: Webhook.
+	// END: Webhook。
 
 	sw.Do("}\n\n", nil)
 
@@ -351,13 +351,13 @@ func (g *webhookGen) generateMutating(c *generator.Context, t *types.Type, w io.
 	sw.Do("return $.MutatingWebhook|raw${\n", args)
 
 	args = args.With("SPEC", spec)
-	// START: Webhook.
+	// START: Webhook。
 	sw.Do("Name: \"$.$\",\n", spec.Name)
 	sw.Do("ClientConfig: *cc,\n", nil)
 
 	rule := spec.Rules[0]
 	args = args.With("RULE", rule)
-	// START: Webhook/Rules/0.
+	// START: Webhook/Rules/0。
 	sw.Do("Rules: []$.RuleWithOperations|raw${\n", args)
 	sw.Do("{\n", nil)
 	sw.Do("Rule: $.Rule|raw${\n", args)
@@ -378,7 +378,7 @@ func (g *webhookGen) generateMutating(c *generator.Context, t *types.Type, w io.
 	}
 	sw.Do("},\n", nil)
 	sw.Do("},\n", nil)
-	// END: Webhook/Rules/0.
+	// END: Webhook/Rules/0。
 
 	if spec.FailurePolicy != nil {
 		sw.Do("FailurePolicy: $.PtrTo|raw$[$.FailurePolicyType|raw$](\"$.SPEC.FailurePolicy$\"),\n", args)
@@ -458,7 +458,7 @@ func (g *webhookGen) generateMutating(c *generator.Context, t *types.Type, w io.
 	}
 
 	sw.Do("}\n", nil)
-	// END: Webhook.
+	// END: Webhook。
 
 	sw.Do("}\n\n", nil)
 

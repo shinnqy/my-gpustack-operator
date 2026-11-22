@@ -19,39 +19,35 @@ import (
 )
 
 const (
-	// routingLabel marks the resources that carry the system routing service, so that
-	// they can be told apart from the resources of the cluster itself.
+	// routingLabel 用于标记承载系统路由 Service 的资源，以便将其与集群自身的资源区分开来。
 	routingLabel = "gpustack.ai/fake-routing"
 
-	// routingLabelValue is the value of the routingLabel.
+	// routingLabelValue 是 routingLabel 的值。
 	routingLabelValue = "true"
 
-	// routingPortName is the name of the routing port. The service, the legacy
-	// endpoints and the endpoint slice all name it the same, because the aggregator
-	// matches the port of a slice against the name of the service port it serves.
+	// routingPortName 是路由端口的名称。Service、传统 Endpoints 与 EndpointSlice
+	// 均使用相同的端口名称，因为聚合器会根据其所服务 Service 的端口名来匹配 Slice 的端口。
 	routingPortName = "https"
 )
 
-// InstallFakeSystemRoutingService creates the fake routing service/endpoint for system.
+// InstallFakeSystemRoutingService 为系统创建虚拟路由 Service/Endpoint。
 //
-// The service points to the SelfIP of the system.
+// 该 Service 指向系统的 SelfIP。
 func InstallFakeSystemRoutingService(ctx context.Context, cli kubernetes.Interface, nsName, svcName string, port int32) error {
 	return installFakeSystemRoutingService(ctx, cli, nsName, svcName, system.PrimaryIP.Get(), port)
 }
 
-// installFakeSystemRoutingService creates the fake routing service/endpoint for system.
+// installFakeSystemRoutingService 为系统创建虚拟路由 Service/Endpoint。
 //
-// The address is the address of the system the service routes to. It is a parameter, and
-// not read from the system package, so that the desired resources can be built and
-// checked without the process wide state they normally come from.
+// address 是该 Service 路由指向的系统地址。将其作为参数传入而非直接从 system 包读取，
+// 以便在不依赖全局进程状态的情况下构建并校验期望的资源。
 func installFakeSystemRoutingService(ctx context.Context, cli kubernetes.Interface, nsName, svcName, address string, port int32) error {
 	err := checkRoutingAccess(ctx, cli, nsName)
 	if err != nil {
 		return err
 	}
 
-	// The address decides the family of the endpoint slice, so it is checked before
-	// anything is written.
+	// 该地址决定了 EndpointSlice 的地址族，因此在执行任何写入操作前先进行检查。
 	desiredSlice, err := newRoutingEndpointSlice(nsName, svcName, address, port)
 	if err != nil {
 		return err
@@ -75,11 +71,10 @@ func installFakeSystemRoutingService(ctx context.Context, cli kubernetes.Interfa
 	return cleanupObsoleteRoutingSlices(ctx, cli, nsName, svc, ep, desiredSlice.GetName())
 }
 
-// checkRoutingAccess reviews the operations the routing reconcile performs.
+// checkRoutingAccess 审查路由协调过程所需执行的操作权限。
 //
-// The service and the legacy endpoints keep the operations they have always needed. The
-// endpoint slice is reviewed on its own, because the operations of the other two do not
-// cover the list the cleanup of the obsolete slices reads.
+// Service 和传统 Endpoints 保持其一贯所需的权限。EndpointSlice 则单独进行审查，
+// 因为前两者的权限并不覆盖清理过时 Slice 时所需的 list 读取权限。
 func checkRoutingAccess(ctx context.Context, cli kubernetes.Interface, nsName string) error {
 	err := review.CanDoCreate(ctx,
 		cli.AuthorizationV1().SelfSubjectAccessReviews(),
@@ -116,9 +111,8 @@ func checkRoutingAccess(ctx context.Context, cli kubernetes.Interface, nsName st
 		})
 	}
 
-	// The owner reference of the slice blocks the deletion of the routing service,
-	// so the api server asks for the permission to update the finalizers of the
-	// service before it accepts the slice.
+	// Slice 的 ownerReference 会阻止路由 Service 被删除，
+	// 因此 API Server 在接受该 Slice 前会要求具备更新 Service finalizer 的权限。
 	reviews = append(reviews, kubereviewself.Review{
 		ResourceAttributes: &authz.ResourceAttributes{
 			Verb:        "update",
@@ -133,8 +127,8 @@ func checkRoutingAccess(ctx context.Context, cli kubernetes.Interface, nsName st
 	return kubereviewself.CanDo(ctx, cli.AuthorizationV1().SelfSubjectAccessReviews(), reviews)
 }
 
-// installRoutingService creates the selectorless service the extension api services are
-// fronted by, and returns it as the cluster holds it.
+// installRoutingService 创建作为扩展 API Service 前置入口的无 selector Service，
+// 并返回集群中实际保存的对象。
 func installRoutingService(ctx context.Context, cli kubernetes.Interface, nsName, svcName string, port int32,
 	addressType discovery.AddressType,
 ) (*core.Service, error) {
@@ -143,13 +137,11 @@ func installRoutingService(ctx context.Context, cli kubernetes.Interface, nsName
 		if actual.Spec.Type != expected.Spec.Type {
 			return false
 		}
-		// The cluster ip is compared only when the wanted service asks for one.
-		// The operator does not manage it, and the api server allocates one for
-		// the service of the cluster, so comparing it against the empty ip of the
-		// wanted service would delete and recreate the service on every start.
-		// The recreation takes the endpoint slice of this installation with it,
-		// because the slice is a dependent of the service that blocks its
-		// deletion, and it changes the address of the routing as well.
+		// 仅当期望的 Service 指定了 ClusterIP 时才进行比较。
+		// operator 不管理该字段，而是由 API Server 为集群中的 Service 分配；
+		// 若将其与期望 Service 中的空 IP 比较，会导致每次启动都删除并重建 Service。
+		// 重建 Service 会连带删除当前安装的 EndpointSlice（因为 Slice 作为其从属资源会阻塞删除），
+		// 并且还会改变路由地址。
 		if expected.Spec.ClusterIP != "" && actual.Spec.ClusterIP != expected.Spec.ClusterIP {
 			return false
 		}
@@ -178,10 +170,10 @@ func installRoutingService(ctx context.Context, cli kubernetes.Interface, nsName
 	return actual, nil
 }
 
-// newRoutingService builds the desired service of the system routing.
+// newRoutingService 构建系统路由期望的 Service。
 //
-// The service has no selector, so no controller picks its endpoints for it, and the
-// endpoint slice below is the only thing that routes to the system.
+// 该 Service 没有 selector，因此不会有控制器为其选取端点，
+// 下方的 EndpointSlice 是路由到系统的唯一依据。
 func newRoutingService(nsName, svcName string, port int32, addressType discovery.AddressType) *core.Service {
 	return &core.Service{
 		ObjectMeta: meta.ObjectMeta{
@@ -205,7 +197,7 @@ func newRoutingService(nsName, svcName string, port int32, addressType discovery
 	}
 }
 
-// routingIPFamily returns the service IP family matching the endpoint slice address type.
+// routingIPFamily 返回与 EndpointSlice 地址类型匹配的 Service IP 地址族。
 func routingIPFamily(addressType discovery.AddressType) core.IPFamily {
 	if addressType == discovery.AddressTypeIPv6 {
 		return core.IPv6Protocol
@@ -213,21 +205,18 @@ func routingIPFamily(addressType discovery.AddressType) core.IPFamily {
 	return core.IPv4Protocol
 }
 
-// installRoutingEndpoints creates the legacy endpoints of the system routing, and returns
-// them as the cluster holds them.
+// installRoutingEndpoints 创建系统路由的传统 Endpoints，并返回集群中实际保存的对象。
 //
-// The legacy endpoints are kept for the aggregators that still read them, which are the
-// ones older than the Kubernetes release that moved the aggregator over to endpoint
-// slices. The skip mirror label keeps the mirroring controller from making a second
-// slice out of them, because the aggregator may then pick either of the two.
+// 保留传统 Endpoints 是为了兼容仍在读取它们的旧版聚合器（即早于聚合器迁移至 EndpointSlice 的
+// Kubernetes 版本）。skip mirror 标签可防止镜像控制器据此再生成第二个 Slice，
+// 否则聚合器可能会在两个 Slice 中任选其一。
 func installRoutingEndpoints(ctx context.Context, cli kubernetes.Interface, nsName, svcName, address string, port int32) (*core.Endpoints, error) {
 	expected := newRoutingEndpoints(nsName, svcName, address, port)
 	epAlignFn := func(actual *core.Endpoints) (*core.Endpoints, bool, error) {
 		aligned := actual.DeepCopy()
 		aligned.SetLabels(mergeLabels(actual.GetLabels(), expected.GetLabels()))
-		// The address and the port of the legacy endpoints are replaced, not
-		// appended, so that a system that moved to another address does not keep
-		// the old one.
+		// 传统 Endpoints 的地址和端口采用替换而非追加方式，
+		// 以确保系统迁移到其他地址后不会保留旧值。
 		aligned.Subsets = expected.Subsets
 
 		if apiequality.Semantic.DeepEqual(actual.GetLabels(), aligned.GetLabels()) &&
@@ -246,7 +235,7 @@ func installRoutingEndpoints(ctx context.Context, cli kubernetes.Interface, nsNa
 	return actual, nil
 }
 
-// newRoutingEndpoints builds the desired legacy endpoints of the system routing.
+// newRoutingEndpoints 构建系统路由期望的传统 Endpoints。
 func newRoutingEndpoints(nsName, svcName, address string, port int32) *core.Endpoints {
 	return &core.Endpoints{
 		ObjectMeta: meta.ObjectMeta{
@@ -275,8 +264,8 @@ func newRoutingEndpoints(nsName, svcName, address string, port int32) *core.Endp
 	}
 }
 
-// mergeLabels returns the labels of an object with the wanted ones applied on top, so
-// that the labels another actor added are kept and the wanted ones always win.
+// mergeLabels 将期望的标签叠加到对象现有标签之上并返回，
+// 从而保留其他参与者添加的标签，同时确保期望标签始终生效。
 func mergeLabels(actual, wanted map[string]string) map[string]string {
 	if len(actual) == 0 && len(wanted) == 0 {
 		return nil

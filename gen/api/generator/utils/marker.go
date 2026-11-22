@@ -29,11 +29,7 @@ func ParseMarker(line string) map[string]string {
 			}
 		}
 
-		// Neither branch above claimed the rest, so this is the LAST value on the line and it is
-		// consumed whole. Stopping here matters: continuing would Cut a value that has already been
-		// taken, and a value may legitimately contain "=" — a jsonPath filter is written
-		// `[?(@.name=='X')]`. Without the break that tail came back as two more entries, a bogus
-		// non-empty key and an empty one, both indistinguishable from a mistyped marker.
+		// 上述两个分支均未认领剩余部分，因此这是该行的最后一个值，会被完整消费。\n// 在此处停止很关键：继续执行会对已经取出的值再次调用 Cut，而值本身可能合法\n// 地包含 "="，例如 jsonPath 过滤器的写法 `[?(@.name=='X')]`。如果不加 break，\n// 该尾部会被拆成额外两项（一个无效的非空键和一个空键），两者都无法与拼写\n// 错误的标记区分开。
 		rm[h] = r
 		break
 	}

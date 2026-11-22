@@ -27,15 +27,15 @@ const (
 	modelDeploymentRouterLabelKey             = "modeldeployment.gpustack.ai/router"
 	modelDeploymentRouterHTTPPort       int32 = 8000
 	modelDeploymentRouterEPPPort        int32 = 9002
-	// modelDeploymentRouterMetricsPort is where every router serves Prometheus metrics, so that one
-	// scrape configuration reaches all of them. The llm-d picker listens here by default; the
-	// routers configured by argv are told to, because their own default is elsewhere.
+	// modelDeploymentRouterMetricsPort 是所有路由器暴露 Prometheus 指标的端口，以便使用同一套
+	// 抓取配置即可覆盖全部路由器。llm-d picker 默认监听此端口；通过 argv 配置的路由器则会
+	// 显式指定监听该端口，因为它们自身的默认端口不同。
 	modelDeploymentRouterMetricsPort  int32 = 9090
 	modelDeploymentResourceNoteRouter       = "router"
 )
 
-// ModelDeploymentRouterObjects carries the complete namespaced object set one managed router needs
-// and the typed contract rendered alongside it.
+// ModelDeploymentRouterObjects 包含单个托管路由器所需的完整命名空间级对象集合，以及
+// 随之渲染出的类型化契约。
 type ModelDeploymentRouterObjects struct {
 	Deployment     *app.Deployment
 	ConfigMap      *core.ConfigMap
@@ -44,7 +44,7 @@ type ModelDeploymentRouterObjects struct {
 	Role           *rbac.Role
 	RoleBinding    *rbac.RoleBinding
 
-	// Contract is the typed projection of the same values used to render the objects above.
+	// Contract 是上述对象渲染所用相同参数的类型化映射。
 	Contract workercore.ModelDeploymentRouterStatus
 }
 
@@ -52,7 +52,7 @@ func renderModelDeploymentRouterObjects(
 	ctx context.Context, md *workercore.ModelDeployment, manufacturers map[string]string,
 	retainedEligibility bool,
 ) (ModelDeploymentRouterObjects, error) {
-	// Implement this function in chapter 20.
+	// 在第 20 章中实现此函数。
 	var result0 ModelDeploymentRouterObjects
 	var result1 error
 	return result0, result1
@@ -63,25 +63,21 @@ func (r *ModelDeploymentReconciler) syncModelDeploymentRouter(
 ) error {
 	var rendered ModelDeploymentRouterObjects
 	if md.Spec.Router != nil {
-		// RETENTION: the discovery equality, once published, survives a quiet pass on EVERY
-		// shipped profile. The llm-d profile publishes the ConfigMap; the vllm-router and
-		// sglang-gateway profiles configure by argv and render none, so absence of a ConfigMap is
-		// not proof a surface was never narrowed -- the live router Deployment's args and env are
-		// read too. The static activatability half still governs: a deployment whose shapes
-		// stopped being activatable loses the term on this pass.
+		// 保留机制：服务发现等式条件一旦发布，在所有内置 profile 的静默轮次中都会继续保留。
+		// llm-d profile 会发布 ConfigMap；而 vllm-router 和 sglang-gateway profile 通过 argv 配置，
+		// 不渲染 ConfigMap，因此缺少 ConfigMap 并不能证明路由面从未被收窄——还需要同时读取
+		// 线上路由器 Deployment 的 args 和 env。静态可激活条件部分仍然起决定作用：若部署形态
+		// 不再具备可激活条件，本轮会移除该过滤项。
 		//
-		// IT IS READ FROM THE DOCUMENT AS WELL AS THE SELECTOR KEY, because the two are two places
-		// one requirement lives. Where a deployment's roles disagree about activatability the
-		// requirement sits in a stage filter rather than the selector, and a pass that read only
-		// the selector would find nothing, decide the gate had never been active, and put back the
-		// endpoints the fault withdrew. The document is PARSED rather than searched: a model name
-		// the user chose can be the very string of this label, and reading that as a demand would
-		// activate a gate on a deployment that never decided one.
+		// 除了 selector 键外，还会从配置文档中读取该条件，因为同一要求可能存放在这两处之一。
+		// 当部署中各角色的可激活状态不一致时，该要求位于阶段过滤器而非 selector 中；若某轮
+		// 只读取 selector，就会查无所获，误判门控从未激活过，进而恢复因故障而撤回的端点。
+		// 对文档采用解析而非字符串搜索：用户指定的模型名称恰好可能与该标签字符串相同，若直接
+		// 搜索字符串，可能会误将未启用门控的部署当成已激活处理。
 		needle := modelDeploymentLabelKeyEndpointEligible + "=" + modelDeploymentEndpointEligibleValue
-		// THE MARKER IS THE OTHER NAME THE REQUIREMENT TRAVELS UNDER, and a deployment whose roles
-		// disagree carries it instead of the eligibility term. A quiet pass must find the
-		// requirement wherever it was published, or it would conclude the gate had never fired and
-		// put back the endpoints the fault withdrew.
+		// 该标记是这一要求所使用的另一种名称，当部署中各角色状态不一致时，携带的是该标记而非
+		// 资格条件。静默轮次必须在任何发布位置都能识别出该要求，否则会误判门控从未触发，
+		// 进而恢复因故障而撤回的端点。
 		candidateNeedle := modelDeploymentRouterCandidateLabel + "=" + modelDeploymentEndpointEligibleValue
 		retained := false
 		liveConfig := new(core.ConfigMap)
@@ -141,9 +137,9 @@ func (r *ModelDeploymentReconciler) syncModelDeploymentRouter(
 		}, modelDeploymentResourceNoteRouter, "deployment"); err != nil {
 		return err
 	}
-	// A router configured entirely by argv renders no ConfigMap, so the desired list is empty for it
-	// and the prune path removes one a previous shape left behind. The typed nil is tested for
-	// rather than the interface, which would be non-nil while holding it.
+	// 完全通过 argv 配置的路由器不渲染 ConfigMap，因此其期望列表为空，清理路径会移除此前
+	// 形态遗留的 ConfigMap。此处检查的是带类型的 nil 指针而非接口本身，因为持有类型化 nil 的
+	// 接口值本身不为 nil。
 	if err := r.syncModelDeploymentOwnedChildren(ctx, md,
 		objectIfPresent(rendered.ConfigMap, wanted && rendered.ConfigMap != nil),
 		func() ctrlcli.Object { return new(core.ConfigMap) }, new(core.ConfigMapList),
@@ -198,17 +194,15 @@ func objectIfPresent(object ctrlcli.Object, present bool) []ctrlcli.Object {
 	return []ctrlcli.Object{object}
 }
 
-// alignModelDeploymentRouterDeployment brings a live router Deployment up to what was rendered.
+// alignModelDeploymentRouterDeployment 使线上路由器 Deployment 与渲染结果保持一致。
 //
-// IT DELIBERATELY DOES NOT COMPARE THE SELECTOR, which is immutable in apps/v1 and would make every
-// later Update fail if it ever differed. The rendered selector embeds `spec.router.name`, so the
-// only way to change it is to change that field -- and admission freezes it after creation. The
-// value can differ between two deployments and never within one, which is what makes leaving the
-// selector alone safe rather than merely untested.
+// 该函数刻意不比较 selector，因为 selector 在 apps/v1 中是不可变的，一旦存在差异就会
+// 导致后续所有 Update 失败。渲染出的 selector 嵌入了 `spec.router.name`，因此改变它的
+// 唯一途径就是修改该字段——而准入控制会在创建后冻结该字段。不同部署之间该值可以不同，
+// 但同一部署内部绝不会改变，因此忽略 selector 是安全可靠的，而非未经验证的妥协。
 //
-// If that freeze is ever lifted, this function is where the breakage lands, and comparing the
-// selector is NOT the fix: the object has to be deleted and recreated, because the API server will
-// not accept the new selector on the existing one.
+// 如果未来解除了该字段的冻结限制，问题将暴露在此函数中，且比较 selector 并非正确的修复
+// 方式：届时必须删除并重建该对象，因为 API server 不会接受在已有对象上修改 selector。
 func alignModelDeploymentRouterDeployment(actual, expected *app.Deployment) (changed bool) {
 	if !kubemeta.DeepEqual(actual.Spec.Replicas, expected.Spec.Replicas) {
 		actual.Spec.Replicas = expected.Spec.Replicas
@@ -227,9 +221,9 @@ func alignModelDeploymentRouterDeployment(actual, expected *app.Deployment) (cha
 		actualPod.Spec.ServiceAccountName = expectedPod.Spec.ServiceAccountName
 		changed = true
 	}
-	// Compared although the pull policy below rides inside the containers: a secret added or
-	// removed here changes what a pull can authenticate, and a field rendered but never aligned
-	// is one an edit moves only by recreating the Deployment by hand.
+	// 尽管下方的拉取策略位于容器定义内部，此处仍会比较该字段：在此添加或移除 Secret 会改变
+	// 镜像拉取时的认证凭据，而一个渲染了却从不进行对齐的字段，在修改后只能通过手动重建
+	// Deployment 才能生效。
 	if !kubemeta.DeepEqual(actualPod.Spec.ImagePullSecrets, expectedPod.Spec.ImagePullSecrets) {
 		actualPod.Spec.ImagePullSecrets = expectedPod.Spec.ImagePullSecrets
 		changed = true
@@ -260,10 +254,10 @@ func alignModelDeploymentRouterConfigMap(actual, expected *core.ConfigMap) (chan
 	return alignModelDeploymentChildMetadata(actual, expected) || changed
 }
 
-// alignModelDeploymentChildMetadata converges a child's labels and resource note onto the rendered
-// ones. The note half is LOAD-BEARING rather than cosmetic: it is written at Create only, while the
-// prune gate skips any child whose note is empty -- so a stripped note would make the object
-// permanently exempt from pruning, and this is what keeps the gate honest.
+// alignModelDeploymentChildMetadata 将子对象的标签与资源备注收敛至渲染后的值。其中
+// 备注部分并非表面装饰，而是关键依赖：它仅在 Create 时写入，而清理门控会跳过
+// 备注为空的任何子对象——因此一旦备注被剥离，该对象将永久免于清理，这一机制
+// 正是为了保证该门控的可靠性。
 func alignModelDeploymentChildMetadata(actual, expected ctrlcli.Object) (changed bool) {
 	if !maps.Equal(actual.GetLabels(), expected.GetLabels()) {
 		actual.SetLabels(maps.Clone(expected.GetLabels()))

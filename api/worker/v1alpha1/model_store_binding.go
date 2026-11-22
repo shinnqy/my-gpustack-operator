@@ -8,20 +8,18 @@ import (
 	gpustack "gpustack.ai/gpustack/api/v1"
 )
 
-// ModelStoreBinding is the schema for worker.gpustack.ai.
+// ModelStoreBinding 是 worker.gpustack.ai 的 schema。
 //
-// It is the PROVISIONING POINT for model prefetch: creating one in a namespace is what grants that
-// namespace a byte budget on the named stores and the right to pin, so both are grants an admin can
-// RBAC and audit rather than powers a tenant assumes. A namespace without a Binding cannot warm
-// anything, and a Binding is the single place its consumption is reported back to it.
+// 它是模型预取的授权配置点：在某个 Namespace 中创建该对象，即授予该 Namespace 在指定
+// store 上的字节预算及固定权限，从而使这两项能力都成为管理员可通过 RBAC 控制和审计的授权，
+// 而非租户默认拥有的权限。没有 Binding 的 Namespace 无法预热任何内容，同时 Binding 也是
+// 上报其配额消耗的唯一位置。
 //
-// THE GRANT IS EXPLICIT. There is no default pool a Binding falls back to: the chart's default
-// pool is deployment configuration, not an authorization basis, and a fallback would create a
-// second source of truth for who may warm where.
+// 授权必须是显式的。Binding 不会回退到任何默认节点池：Chart 中的默认节点池仅是部署配置，
+// 而非授权依据，回退机制会为“谁可以在何处预热”制造第二个事实来源。
 //
-// It is NOT an enforcement boundary and must not be described as one. The budget gates prefetch
-// admission and accounting; bytes a workload mounts through the ordinary delivery path are charged
-// to the node's watermarks exactly as before, never to this object.
+// 它不是强制执行边界，也不应被描述为强制边界。该预算仅用于控制预取准入与配额核算；
+// 工作负载通过常规交付路径挂载的数据仍按原样计入节点水位线，而不会计入此对象。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -41,13 +39,12 @@ type ModelStoreBinding struct {
 
 var _ runtime.Object = (*ModelStoreBinding)(nil)
 
-// ModelStoreBindingSpec is the grant. EVERY FIELD IS IMMUTABLE, webhook-enforced, except
-// AllowPinned going false to true and Quota.Bytes growing: re-pointing the grant would strand the
-// old accounting, and shrinking a budget under existing consumption would retroactively make an
-// admitted prefetch over budget.
+// ModelStoreBindingSpec 定义授权内容。除 AllowPinned 从 false 变为 true 以及 Quota.Bytes
+// 增大外，所有字段均不可变（由 Webhook 强制校验）：重新指向授权目标会遗留旧的配额账目，
+// 而在已有消耗的情况下缩减预算会追溯性地导致已准入的预取任务超出预算。
 type ModelStoreBindingSpec struct {
-	// StoreRefs names the ModelStores this namespace may prefetch into, at least one of them.
-	// Prefetch admission refuses a prefetch whose target set falls outside every granted store.
+	// StoreRefs 指定该 Namespace 可预取进入的 ModelStore 名称，至少包含一个。
+	// 若预取的目标集合落在所有已授权 store 之外，预取准入将予以拒绝。
 	//
 	// +required
 	// +listType=atomic
@@ -55,52 +52,52 @@ type ModelStoreBindingSpec struct {
 	// +k8s:validation:maxItems=8
 	StoreRefs []ModelStoreBindingStoreReference `json:"storeRefs" protobuf:"bytes,1,rep,name=storeRefs"`
 
-	// Quota is the namespace's byte budget.
+	// Quota 是该 Namespace 的字节预算。
 	//
 	// +required
 	Quota ModelStoreBindingQuota `json:"quota" protobuf:"bytes,2,name=quota"`
 
-	// AllowPinned is whether prefetches in this namespace may pin. It defaults to false, and it is
-	// the only path to pinning: pinning is an admin-granted capability, never a tenant default.
+	// AllowPinned 表示该 Namespace 中的预取任务是否允许固定内容。默认为 false，且是启用
+	// 固定的唯一途径：固定是管理员授予的能力，绝非租户默认权限。
 	//
 	// +optional
 	AllowPinned *bool `json:"allowPinned,omitempty" protobuf:"varint,3,opt,name=allowPinned"`
 }
 
-// ModelStoreBindingStoreReference names a cluster-scoped ModelStore this namespace is granted.
+// ModelStoreBindingStoreReference 指定授予该 Namespace 的集群级 ModelStore 名称。
 //
-// It carries no namespace, and that is the point: a store is cluster-scoped, so there is none to
-// name, and no namespaced object here ever reads across a namespace boundary.
+// 它不包含 Namespace 字段，这正是设计所在：store 是集群级资源，本就无 Namespace 可指定，
+// 且此处任何带有 Namespace 的对象都不会跨 Namespace 边界读取资源。
 type ModelStoreBindingStoreReference struct {
 	// +required
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 }
 
-// ModelStoreBindingQuota is the namespace's byte budget, measured in filesystem usage.
+// ModelStoreBindingQuota 是该 Namespace 的字节预算，按文件系统使用量计量。
 type ModelStoreBindingQuota struct {
-	// Bytes is what the namespace's prefetches may occupy in total. The measure is the content's
-	// own size, per digest and per node holding it, so a tree two namespaces share counts fully
-	// against each of them — conservative, and impossible to game by warming what another tenant
-	// already warmed. An increase passes admission; a decrease is refused.
+	// Bytes 是该 Namespace 的预取总共可占用的字节数。计量依据为内容自身的
+	// 大小，按摘要和持有该内容的每个节点分别计算，因此两个 Namespace 共享的目录树
+	// 会全额计入各自配额——这种方式较为保守，也能防止租户通过预热其他租户已预热
+	// 的内容来规避配额限制。增大配额可通过准入检查，减小配额将被拒绝。
 	//
 	// +required
 	Bytes resource.Quantity `json:"bytes" protobuf:"bytes,1,name=bytes"`
 }
 
-// ModelStoreBindingStatus is the namespace's own view of its grant: what it is using and whether
-// it is over.
+// ModelStoreBindingStatus 是该 Namespace 对其配额授予情况的自身视图：当前使用量以及是否
+// 超出配额。
 //
-// Every observed figure below is ABSENT rather than zero when it was not measured, and the two say
-// different things: a figure reading zero was measured as zero, and a missing figure was not
-// measured at all.
+// 下方每项观测指标在未测量时均表现为缺失（ABSENT）而非零，两者含义
+// 不同：读数为零表示实际测量结果为零，而缺失字段则表示根本未进行
+// 测量。
 type ModelStoreBindingStatus struct {
-	// Phase summarizes the conditions: Ready, OverQuota, Error.
+	// Phase 汇总各项状态条件：Ready、OverQuota、Error。
 	Phase string `json:"phase,omitempty" protobuf:"bytes,1,opt,name=phase"`
 
-	// PhaseMessage carries the reason for the phase.
+	// PhaseMessage 携带处于该 Phase 的原因。
 	PhaseMessage string `json:"phaseMessage,omitempty" protobuf:"bytes,2,opt,name=phaseMessage"`
 
-	// Conditions is the finer view, one condition per axis.
+	// Conditions 提供更精细的视图，每个维度对应一个 Condition。
 	//
 	// +patchMergeKey=type
 	// +patchStrategy=merge
@@ -108,15 +105,15 @@ type ModelStoreBindingStatus struct {
 	// +listMapKey=type
 	Conditions []gpustack.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,3,rep,name=conditions"` // nolint: lll
 
-	// UsedBytes is what the namespace's prefetches occupy, the full size of every distinct digest
-	// any of them targets on any node holding it. It is absent while nothing has been measured,
-	// and zero is a measurement rather than the lack of one.
+	// UsedBytes 是该 Namespace 的预取所占用的字节数，即任一预取指向的每个
+	// 不同摘要在所有持有它的节点上的完整大小之和。尚未进行任何测量时该字段
+	// 缺失，而零值代表实际测量结果而非未测量。
 	//
 	// +optional
 	UsedBytes *resource.Quantity `json:"usedBytes,omitempty" protobuf:"bytes,4,opt,name=usedBytes"`
 }
 
-// ModelStoreBindingList holds the list of ModelStoreBinding.
+// ModelStoreBindingList 包含 ModelStoreBinding 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelStoreBindingList struct {

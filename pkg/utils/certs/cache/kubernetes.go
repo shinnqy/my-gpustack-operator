@@ -33,7 +33,7 @@ const (
 	k8sManagedValueKey     = "value"
 )
 
-// k8sCache implements certs.Cache using the Kubernetes Secret to store the certificate data.
+// k8sCache 使用 Kubernetes Secret 存储证书数据来实现 certs.Cache。
 type k8sCache struct {
 	logger klog.Logger
 	cli    certs.SecretInterface
@@ -41,11 +41,10 @@ type k8sCache struct {
 	grp    string
 }
 
-// NewK8sCache creates a new k8sCache instance with the given client.
+// NewK8sCache 使用给定的客户端创建一个新的 k8sCache 实例。
 func NewK8sCache(ctx context.Context, group string, cli certs.SecretInterface) (certs.Cache, error) {
-	// Resolve the logger from the context so a caller can capture this cache's logging
-	// without mutating the klog global, which is not safe to change while the informer
-	// goroutine started below keeps logging.
+	// 从 context 中解析 logger，使调用方能够捕获该缓存的日志，
+	// 而无需修改全局 klog（在下方启动的 informer goroutine 持续输出日志期间修改全局 klog 并不安全）。
 	lg := klog.FromContext(ctx).WithName("certs").WithName("k8s")
 
 	lw := func() *cache.ListWatch {
@@ -94,9 +93,8 @@ func NewK8sCache(ctx context.Context, group string, cli certs.SecretInterface) (
 					return nil, nil
 				}
 
-				// Index the secret holding the key only, so that a key resolves to one secret
-				// at most. Anything else claiming the key, like a secret an older release
-				// created under a generated name, is left alone.
+				// 仅对持有该 key 的 Secret 建立索引，从而使一个 key 最多解析到一个 Secret。
+				// 其他声称拥有该 key 的 Secret（例如旧版本以随机生成名称创建的 Secret）则不予处理。
 				if s.Name != secretName(group, annos[k8sManagedNameAnno]) {
 					return nil, nil
 				}
@@ -109,7 +107,7 @@ func NewK8sCache(ctx context.Context, group string, cli certs.SecretInterface) (
 		inf.Run(ctx.Done())
 	})
 
-	// Wait for the informer to sync.
+	// 等待 informer 完成同步。
 	{
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
@@ -127,13 +125,13 @@ func NewK8sCache(ctx context.Context, group string, cli certs.SecretInterface) (
 	}, nil
 }
 
-// Get reads a certificate data from the specified secret name.
+// Get 从指定名称的 Secret 中读取证书数据。
 func (k k8sCache) Get(_ context.Context, name string) ([]byte, error) {
 	if name == "" {
 		return nil, certs.ErrCacheMiss
 	}
 
-	// Get existed secret.
+	// 获取已存在的 Secret。
 	sec := k.get(name)
 	if sec == nil || sec.DeletionTimestamp != nil {
 		return nil, certs.ErrCacheMiss
@@ -142,10 +140,10 @@ func (k k8sCache) Get(_ context.Context, name string) ([]byte, error) {
 	return sec.Data[k8sManagedValueKey], nil
 }
 
-// Put writes the certificate data to specified secret name.
+// Put 将证书数据写入指定名称的 Secret。
 //
-// The secret holding a key is named after that key, so writers racing on one key create or
-// update one secret, whichever of them gets there first.
+// 持有某个 key 的 Secret 以该 key 命名，因此并发写入同一 key 的写入方会创建或更新同一个 Secret，
+// 以先到者为准。
 func (k k8sCache) Put(ctx context.Context, name string, data []byte) error {
 	if name == "" || len(data) == 0 {
 		return nil
@@ -172,7 +170,7 @@ func (k k8sCache) Put(ctx context.Context, name string, data []byte) error {
 
 	secAlignFn := func(aSec *core.Secret) (_ *core.Secret, skip bool, err error) {
 		skip = true
-		// Align annotations.
+		// 对齐 annotations。
 		for ak, av := range sec.Annotations {
 			if aSec.Annotations[ak] == av {
 				continue
@@ -183,7 +181,7 @@ func (k k8sCache) Put(ctx context.Context, name string, data []byte) error {
 			aSec.Annotations[ak] = av
 			skip = false
 		}
-		// Align labels.
+		// 对齐 labels。
 		for lk, lv := range sec.Labels {
 			if aSec.Labels[lk] == lv {
 				continue
@@ -194,7 +192,7 @@ func (k k8sCache) Put(ctx context.Context, name string, data []byte) error {
 			aSec.Labels[lk] = lv
 			skip = false
 		}
-		// Align value.
+		// 对齐值。
 		if !bytes.Equal(aSec.Data[k8sManagedValueKey], data) {
 			if aSec.Data == nil {
 				aSec.Data = make(map[string][]byte, 1)
@@ -217,13 +215,13 @@ func (k k8sCache) Put(ctx context.Context, name string, data []byte) error {
 	return nil
 }
 
-// Delete removes the specified secret name.
+// Delete 移除指定名称的 Secret。
 func (k k8sCache) Delete(ctx context.Context, name string) error {
 	if name == "" {
 		return nil
 	}
 
-	// Delete existed secret.
+	// 删除已存在的 Secret。
 	sn := secretName(k.grp, name)
 	err := k.cli.Delete(ctx, sn,
 		meta.DeleteOptions{
@@ -249,7 +247,7 @@ func (k k8sCache) get(name string) *core.Secret {
 		return nil
 	}
 
-	// Only the secret named after the key is indexed, so there is at most one.
+	// 仅索引以该 key 命名的 Secret，因此最多只有一个。
 	if len(secs) == 0 {
 		return nil
 	}
@@ -257,9 +255,9 @@ func (k k8sCache) get(name string) *core.Secret {
 	return secs[0].(*core.Secret)
 }
 
-// secretName returns the name of the secret holding the given key of the given group.
+// secretName 返回用于存储给定 group 中指定 key 的 Secret 名称。
 //
-// The name is a digest, as a key is not constrained to what an object name allows.
+// 由于 key 不受 Kubernetes 对象名称规范的限制，因此名称采用摘要值。
 func secretName(group, key string) string {
 	return "gpustack-cert-" + stringx.SumByFNV64a(group, "/", key)
 }

@@ -26,12 +26,12 @@ import (
 
 const _SettingResource = "settings"
 
-// SettingHandler handles v1.Setting objects.
+// SettingHandler 处理 v1.Setting 对象。
 //
-// SettingHandler maps all v1.Setting objects to a Kubernetes Secret resource,
-// which is named as "gpustack-system/gpustack-settings".
+// SettingHandler 将所有 v1.Setting 对象映射到名为 "gpustack-system/gpustack-settings" 的
+// Kubernetes Secret 资源。
 //
-// Each v1.Setting object records as a key-value pair in the Secret's Data field.
+// 每个 v1.Setting 对象都作为键值对记录在 Secret 的 Data 字段中。
 type SettingHandler struct {
 	index setting.IndexFunc
 
@@ -44,7 +44,7 @@ type SettingHandler struct {
 	APIReader ctrlcli.Reader
 }
 
-// NewSettingHandler creates a new SettingHandler.
+// NewSettingHandler 创建一个新的 SettingHandler。
 func NewSettingHandler(index setting.IndexFunc) *SettingHandler {
 	return &SettingHandler{
 		index: index,
@@ -55,7 +55,7 @@ func (h *SettingHandler) SetupHandler(
 	ctx context.Context,
 	opts SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &core.Secret{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -68,10 +68,10 @@ func (h *SettingHandler) SetupHandler(
 		return gvr, srs, fmt.Errorf("index secret 'metadata.name': %w", err)
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = gpustack.SchemeGroupVersionResource(_SettingResource)
 
-	// Create table convertor to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 输出。
 	tc, err := NewJSONPathTableConvertor(
 		JSONPathColumn("Value", ".status.value"),
 	)
@@ -79,13 +79,13 @@ func (h *SettingHandler) SetupHandler(
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储。
 	h.ObjectInfo = &gpustack.Setting{}
 	h.ListWatchOperation = WithListWatch(tc, h)
 	h.GetOperation = WithGet(h)
 	h.UpdateOperation = WithUpdate(h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 
@@ -112,12 +112,12 @@ func (h *SettingHandler) NewList() runtime.Object {
 }
 
 func (h *SettingHandler) OnList(ctx context.Context, opts ctrlcli.ListOptions) (runtime.Object, error) {
-	// Support watch with `kubectl get -A`.
+	// 支持通过 `kubectl get -A` 进行 watch。
 	if opts.Namespace == "" {
 		opts.Namespace = setting.DelegatedSecretNamespace
 	}
 
-	// Get.
+	// 获取。
 	sec := &core.Secret{
 		ObjectMeta: meta.ObjectMeta{
 			Namespace: opts.Namespace,
@@ -129,22 +129,22 @@ func (h *SettingHandler) OnList(ctx context.Context, opts ctrlcli.ListOptions) (
 		if !kerrors.IsNotFound(err) {
 			return nil, err
 		}
-		// We return an empty list if the secret is not found.
+		// 如果未找到 Secret，则返回空列表。
 		return &gpustack.SettingList{}, nil
 	}
 
-	// Convert.
+	// 转换。
 	sList := convertSettingListFromSecret(sec, opts, h.index)
 	return sList, nil
 }
 
 func (h *SettingHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) (watch.Interface, error) {
-	// Support watch with `kubectl get -A`.
+	// 支持通过 `kubectl get -A` 进行 watch。
 	if opts.Namespace == "" {
 		opts.Namespace = setting.DelegatedSecretNamespace
 	}
 
-	// List and index.
+	// 列出并建立索引。
 	setIndexer := map[string]gpustack.Setting{} // [sn] -> set
 	{
 		listObj, err := h.OnList(ctx, opts)
@@ -158,7 +158,7 @@ func (h *SettingHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) 
 		}
 	}
 
-	// Watch.
+	// 监听。
 	uw, err := h.Client.(ctrlcli.WithWatch).Watch(ctx, new(core.SecretList),
 		convertSecretListOptsFromSettingListOpts(opts))
 	if err != nil {
@@ -174,31 +174,31 @@ func (h *SettingHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) 
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 因 context 取消。
 				return
 			case <-dw.StopChan():
-				// Stop by downstream.
+				// 由下游停止。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 由上游关闭。
 					return
 				}
 
-				// Nothing to do.
+				// 无需处理。
 				if e.Object == nil {
 					c <- e
 					continue
 				}
 
-				// Type assert.
+				// 类型断言。
 				sec, ok := e.Object.(*core.Secret)
 				if !ok {
 					c <- e
 					continue
 				}
 
-				// Process bookmark.
+				// 处理 bookmark。
 				if e.Type == watch.Bookmark {
 					systemmeta.UnnoteResource(sec)
 					e.Object = &gpustack.Setting{ObjectMeta: sec.ObjectMeta}
@@ -206,35 +206,35 @@ func (h *SettingHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) 
 					continue
 				}
 
-				// Send.
+				// 发送。
 				for name := range sec.Data {
-					// Ignore if not be selected by `kubectl get --field-selector=metadata.name=...`.
+					// 如果未被 `kubectl get --field-selector=metadata.name=...` 选中，则忽略。
 					if !settingMatchFieldSelector(opts, name) {
 						continue
 					}
 
-					// Convert.
+					// 转换。
 					set := convertSettingFromSecret(sec, name, h.index)
 					if set == nil {
 						continue
 					}
 
-					// Ignore if the same as previous.
+					// 如果与之前相同，则忽略。
 					setIndexKey := set.Name
 					prevSet, ok := setIndexer[setIndexKey]
 					switch {
 					default:
-						// ignore
+						// 忽略
 						continue
 					case !ok:
-						// insert
+						// 插入
 						setIndexer[setIndexKey] = *set
 					case set.Status.Value_ != prevSet.Status.Value_:
-						// update
+						// 更新
 						setIndexer[setIndexKey] = *set
 					}
 
-					// Dispatch.
+					// 分发。
 					e2 := e.DeepCopy()
 					e2.Object = set
 					c <- *e2
@@ -247,7 +247,7 @@ func (h *SettingHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) 
 }
 
 func (h *SettingHandler) OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (runtime.Object, error) {
-	// Get.
+	// 获取。
 	sec := &core.Secret{
 		ObjectMeta: meta.ObjectMeta{
 			Namespace: key.Namespace,
@@ -259,7 +259,7 @@ func (h *SettingHandler) OnGet(ctx context.Context, key types.NamespacedName, op
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	set := convertSettingFromSecret(sec, key.Name, h.index)
 	if set == nil {
 		return nil, kerrors.NewNotFound(gpustack.Resource(_SettingResource), key.Name)
@@ -268,7 +268,7 @@ func (h *SettingHandler) OnGet(ctx context.Context, key types.NamespacedName, op
 }
 
 func (h *SettingHandler) OnUpdate(ctx context.Context, obj, _ runtime.Object, opts ctrlcli.UpdateOptions) (runtime.Object, error) {
-	// Validate.
+	// 校验。
 	set := obj.(*gpustack.Setting)
 	if set.Namespace != setting.DelegatedSecretNamespace {
 		return nil, kerrors.NewNotFound(gpustack.Resource(_SettingResource), set.Name)
@@ -279,7 +279,7 @@ func (h *SettingHandler) OnUpdate(ctx context.Context, obj, _ runtime.Object, op
 			errors.New("setting is not editable"))
 	}
 
-	// Update.
+	// 更新。
 	if set.Spec.Value != nil {
 		err := s.Configure(ctx, *set.Spec.Value)
 		if err != nil {
@@ -287,7 +287,7 @@ func (h *SettingHandler) OnUpdate(ctx context.Context, obj, _ runtime.Object, op
 		}
 	}
 
-	// Get.
+	// 获取。
 	return h.OnGet(ctx, ctrlcli.ObjectKeyFromObject(set),
 		ctrlcli.GetOptions{
 			Raw: &meta.GetOptions{
@@ -297,13 +297,13 @@ func (h *SettingHandler) OnUpdate(ctx context.Context, obj, _ runtime.Object, op
 }
 
 func convertSecretListOptsFromSettingListOpts(in ctrlcli.ListOptions) (out *ctrlcli.ListOptions) {
-	// Lock field selector.
+	// 锁定字段选择器。
 	in.FieldSelector = fields.SelectorFromSet(fields.Set{
 		"metadata.namespace": in.Namespace,
 		"metadata.name":      setting.DelegatedSecretName,
 	})
 
-	// Add necessary label selector.
+	// 添加必要的标签选择器。
 	if lbs := systemmeta.GetResourcesLabelSelectorOfType(_SettingResource); in.LabelSelector == nil {
 		in.LabelSelector = lbs
 	} else {
@@ -320,7 +320,7 @@ func convertSettingFromSecret(sec *core.Secret, reqName string, index setting.In
 		return nil
 	}
 
-	// Filter out.
+	// 过滤掉。
 	s, ok := index(reqName)
 	if !ok || s.Private() || sec.Data == nil {
 		return nil
@@ -375,14 +375,14 @@ func convertSettingListFromSecret(sec *core.Secret, opts ctrlcli.ListOptions, in
 		Items: make([]gpustack.Setting, 0, len(sec.Data)),
 	}
 
-	// Sort by name.
+	// 按名称排序。
 	for _, name := range sets.List(sets.KeySet(sec.Data)) {
-		// Ignore if not be selected by `kubectl get --field-selector=metadata.name=...`.
+		// 如果未被 `kubectl get --field-selector=metadata.name=...` 选中，则忽略。
 		if !settingMatchFieldSelector(opts, name) {
 			continue
 		}
 
-		// Filter out.
+		// 过滤掉。
 		s, ok := index(name)
 		if !ok || s.Private() {
 			continue
@@ -427,7 +427,7 @@ func convertSettingListFromSecret(sec *core.Secret, opts ctrlcli.ListOptions, in
 	return sList
 }
 
-// settingMatchFieldSelector checks if the Setting matches the field selector in list options.
+// settingMatchFieldSelector 检查 Setting 是否匹配列表选项中的字段选择器。
 func settingMatchFieldSelector(opts ctrlcli.ListOptions, name string) bool {
 	fs := opts.FieldSelector
 	if fs == nil {

@@ -25,137 +25,97 @@ import (
 )
 
 const (
-	// ModelDeploymentPhaseStarting is reported while replicas are still coming up and none is ready.
+	// ModelDeploymentPhaseStarting 在副本仍在启动且尚无副本就绪时报告。
 	ModelDeploymentPhaseStarting = "Starting"
-	// ModelDeploymentPhaseReady is reported when every role's ready count equals its desired count.
+	// ModelDeploymentPhaseReady 在每个角色的就绪副本数都等于期望副本数时报告。
 	ModelDeploymentPhaseReady = "Ready"
-	// ModelDeploymentPhaseDegraded is reported when at least one replica is ready and at least one
-	// is not. It is a distinct phase rather than a shade of Starting because it is the state a
-	// deployment sits in when it is serving and under-provisioned at the same time.
+	// ModelDeploymentPhaseDegraded 在至少有一个副本就绪、同时至少有一个副本未就绪时报告。它是独立于 Starting 的阶段，用于表示 deployment 在对外提供服务的同时处于容量不足的状态。
 	ModelDeploymentPhaseDegraded = "Degraded"
-	// ModelDeploymentPhaseDeleting is reported while the replicas are being torn down.
+	// ModelDeploymentPhaseDeleting 在副本正在被销毁时报告。
 	ModelDeploymentPhaseDeleting = "Deleting"
 )
 
-// The condition types a ModelDeployment reports, one per axis. They are independent: "quota
-// reserved but cache not attached" is a real and actionable state, which is what a single phase
-// string cannot carry.
+// ModelDeployment 报告的 condition 类型，每个维度对应一个。它们彼此独立：“配额已预留但缓存未挂载”是一个真实且可操作的状态，这是单个阶段字符串无法表达的。
 //
-// DomainRegistered is declared beside the rule that resolves the Binding, CacheAttached beside the
-// reading that judges it, and ReplicasUpToDate beside the convergence that decides it, so that each
-// condition's vocabulary sits with the code that can actually observe it.
+// DomainRegistered 声明在解析 Binding 的规则旁，CacheAttached 声明在判断它的读取逻辑旁，ReplicasUpToDate 声明在决定它的收敛逻辑旁，从而使每个 condition 的词汇定义都与真正能观测到它的代码放在一起。
 const (
 	ModelDeploymentConditionQuotaReserved kubeapistatus.ConditionType = "QuotaReserved"
 
-	// ModelDeploymentConditionRoleKindsReady reports whether every role kind this deployment
-	// declares has at least one ready replica.
+	// ModelDeploymentConditionRoleKindsReady 报告本 deployment 声明的每一种角色类型是否都至少有一个就绪副本。
 	//
-	// IT IS NOT REPLICA COMPLETENESS, which is the question it sits closest to and the one it will
-	// be read as. "Every role has all the replicas it asked for" is what the phase already answers,
-	// by summing every role's counts before judging — and a sum cannot express this one: a
-	// deployment missing an entire kind and a deployment merely one replica short produce the same
-	// sum, so the same phase.
+	// 它不是副本完整性——尽管两者概念最接近，也最容易被误解为此意。“每个角色都拥有其请求的全部副本”已由阶段（phase）通过汇总各角色计数后判断并给出回答——而简单的总和无法表达本 condition 的语义：完全缺失某种角色类型的 deployment 与仅缺少一个副本的 deployment 会得到相同的总和，从而处于相同的阶段。
 	//
-	// IT IS ALSO NOT AVAILABILITY, and the distance is larger than it looks. Whether a request can
-	// be served depends on what the engine does with a role it was told is a producer, and on
-	// whether a Service's endpoints reach the replicas that are ready. Neither is observable from
-	// this object. So this reports readiness BY KIND and claims nothing past it, which is also what
-	// keeps it correct whichever way those two questions are later answered.
+	// 它也不等同于可用性，两者之间的差距比表面看起来更大。请求能否被成功处理，取决于引擎如何对待被告知为 producer 的角色，以及 Service 的端点是否能路由到已就绪的副本。这两点都无法从当前对象直接观测到。因此，本 condition 仅按角色类型报告就绪状态，不做超出此范围的断言；无论上述两个问题日后如何解答，这一语义都能保持正确。
 	ModelDeploymentConditionRoleKindsReady kubeapistatus.ConditionType = "RoleKindsReady"
 
-	// ModelDeploymentConditionRouterReady reports whether the managed router rendered and has a
-	// ready replica. A render refusal is projected HERE rather than returned: it is a spec problem,
-	// and failing the whole status pass over it would freeze every other axis while naming none.
-	// The convergence path still returns the same error, so the pass is still retried.
+	// ModelDeploymentConditionRouterReady 报告受管 router 是否已完成渲染且拥有就绪副本。渲染失败会投影到此处而非直接返回：它属于 spec 问题，若因此中断整个状态更新轮次，会导致其他所有维度的状态被冻结，且无法指明具体原因。收敛路径仍会返回相同的 error，因此该轮次依然会重试。
 	ModelDeploymentConditionRouterReady kubeapistatus.ConditionType = "RouterReady"
 
-	// ModelDeploymentConditionWeightsReady reports whether every engine role's weights are available:
-	// a claim mounted, or an engine's own download finished. It is True with NotApplicable for a
-	// deployment naming no artifact.
+	// ModelDeploymentConditionWeightsReady 报告每个引擎角色的模型权重是否已可用：即声明挂载已就绪，或引擎自身下载已完成。对于未指定 artifact 的 deployment，其状态为 True，原因为 NotApplicable。
 	ModelDeploymentConditionWeightsReady kubeapistatus.ConditionType = "WeightsReady"
 
-	// ModelDeploymentConditionEndpointEligibility reports whether the deployment's endpoints have
-	// been qualified at all. Unknown with NotObserved says no qualification observation exists yet —
-	// a different answer from False, which would say the operator disqualified endpoints it saw.
-	// The per-role eligible counts under status.roles[].endpoints carry the same distinction one
-	// level down: nil is unobserved, an explicit zero is an observed empty set.
+	// ModelDeploymentConditionEndpointEligibility 报告 deployment 的端点是否已经过资格判定。状态为 Unknown 且原因为 NotObserved 表示尚无资格观测记录——这与 False 不同，后者表示 operator 取消了已观测端点的资格。status.roles[].endpoints 下按角色统计的合格数量在下一层级保留了同样的区分：nil 表示未观测，显式的 0 表示观测到的空集合。
 	ModelDeploymentConditionEndpointEligibility kubeapistatus.ConditionType = "EndpointEligibility"
 )
 
-// modelDeploymentReasonNotObserved is the reason an axis that exists in this status carries no
-// observation yet: the reading that would answer it has not been built. It names a missing
-// observation rather than an observed absence, which is the difference between "wait for the
-// reading" and "act on an empty set".
+// modelDeploymentReasonNotObserved 是状态中已存在但尚无观测结果的维度所使用的 reason：能够回答该维度的读取逻辑尚未构建。它表示观测缺失而非观测到不存在，这正是“等待读取结果”与“针对空集合采取行动”之间的区别。
 const modelDeploymentReasonNotObserved = "NotObserved"
 
-// The reasons EndpointEligibility carries once the whole-group health predicate answers. They are
-// REASONS on an existing condition rather than new fields, because the wire is frozen and every
-// one of these states is something the condition could already express.
+// 整组健康谓词给出结果后 EndpointEligibility 携带的各类 reason。它们作为已有 condition 上的 reason 而不是新增字段存在，因为接口契约已冻结，且其中每一种状态都是该 condition 本身即可表达的。
 //
-// A reason is the machine-readable class and a message is not a contract. The distinction that
-// matters most here is Revoked against Unsupported: the first says this operator took endpoints
-// out of selection, the second says it could not put them back. A reader that cannot tell those
-// apart sees one healthy deployment.
+// reason 是机器可读的分类，而 message 并非契约。这里最重要的区分在于 Revoked 与 Unsupported：前者表示本 operator 将端点移出了选择集合，后者表示无法将其恢复。无法区分这两者的读取方会误以为看到的是一个健康的 deployment。
 const (
-	// modelDeploymentReasonEndpointsQualified is every replica's whole group verified.
+	// modelDeploymentReasonEndpointsQualified 表示所有副本的整组均已验证通过。
 	modelDeploymentReasonEndpointsQualified = "Qualified"
 
-	// modelDeploymentReasonEndpointsHeldUnverified is a leg this operator could not evaluate.
-	// Eligibility stays held and the message names the leg.
+	// modelDeploymentReasonEndpointsHeldUnverified 表示存在本 operator 无法评估的分支。
+	// 资格状态保持挂起，且 message 会指明该分支。
 	modelDeploymentReasonEndpointsHeldUnverified = "HeldUnverified"
 
-	// modelDeploymentReasonEndpointsUnsupported is an engine shape with no verifiable group
-	// predicate at all. Restore is held on it rather than granted on health alone.
+	// modelDeploymentReasonEndpointsUnsupported 表示引擎形态完全没有可验证的组谓词。恢复操作在其上保持挂起，而非仅凭健康状态即予以放行。
 	modelDeploymentReasonEndpointsUnsupported = "Unsupported"
 
-	// modelDeploymentReasonEndpointsRevoked is a definite health fault: a member is not ready,
-	// the member set is short, or a replica is being replaced. Withdrawal is unconditional.
+	// modelDeploymentReasonEndpointsRevoked 表示明确的健康故障：有成员未就绪、成员集合数量不足，或副本正在被替换。撤回端点资格是无条件的。
 	modelDeploymentReasonEndpointsRevoked = "Revoked"
 )
 
-// The reasons RoleKindsReady carries. Three rather than two, because "no kind is missing" and "no
-// role has been accounted for yet" are different answers that a False would merge into one.
+// RoleKindsReady 携带的各类 reason。共有三个而非两个，因为“没有缺失的角色类型”和“尚无任何角色纳入统计”是两种不同的结果，若统一用 False 会将它们混为一谈。
 const (
 	modelDeploymentReasonAllKindsReady = "AllKindsReady"
 
 	modelDeploymentReasonKindsNotReady = "KindsNotReady"
 
-	// modelDeploymentReasonNoRoleStatuses is the Unknown case: the pass accounted for no role at
-	// all, so there is nothing to judge. Reporting False here would say a kind is missing, which is
-	// a claim this pass cannot make.
+	// modelDeploymentReasonNoRoleStatuses 表示 Unknown 情况：本轮处理未统计到任何角色，
+	// 因此无从判断。此处若报告 False，则意味着某种角色类型缺失，而本轮处理无法
+	// 做出这一断言。
 	modelDeploymentReasonNoRoleStatuses = "NoRoleStatuses"
 )
 
-// modelDeploymentReasonPodGroupIncomplete is QuotaReserved's reason for a group that is short of the
-// total it declares.
+// modelDeploymentReasonPodGroupIncomplete 是 QuotaReserved 在副本组数量不足其声明总数
+// 时的原因。
 //
-// It exists because that state has NO Workload at all — Kueue declines to compose one for a group it
-// has not fully seen — so it is indistinguishable, from the Workload's side, from admission that has
-// simply not happened yet. The two need telling apart: one clears in a moment, the other is a
-// deployment sitting with gated Pods and an empty `kubectl get workloads` until something creates
-// the missing replica.
+// 之所以需要该原因，是因为处于此状态时根本没有 Workload（Kueue 不会为尚未完整出现的组
+// 生成 Workload），因此从 Workload 侧来看，它与准入尚未发生的情况无法区分。这两者必须
+// 加以区分：后者很快就会恢复正常，而前者则表现为部署一直停留在 Pod 受门控且
+// `kubectl get workloads` 为空的状态，直到有组件创建出缺失的副本为止。
 const modelDeploymentReasonPodGroupIncomplete = "PodGroupIncomplete"
 
-// modelDeploymentReasonPreemptedInPart is QuotaReserved's reason for a deployment a higher-priority
-// workload has taken part of.
+// modelDeploymentReasonPreemptedInPart 是 QuotaReserved 在部署被更高优先级工作负载
+// 抢占部分资源时的原因。
 //
-// IT IS A SEPARATE REASON BECAUSE THE OPERATOR ACTION IS SEPARATE. Every other wait this condition
-// reports resolves itself or names something in the deployment to fix; this one resolves only when
-// capacity elsewhere frees up, and until then the surviving groups hold accelerators for a
-// deployment that is short of what it was admitted for, and, when the reclaimed groups were every
-// group of some role kind, for one that has lost that role entirely. Waiting is right for the
-// others and is
-// a decision here, because how long to wait
-// depends on what preempted it — which is outside this object, and outside this operator.
+// 之所以单独设立此原因，是因为运维处理方式不同。该条件报告的其他所有等待状态要么会
+// 自行恢复，要么会指明部署中需要修复的问题；而此状态只有当其他地方释放出容量时才会
+// 解除，在此之前，存活的副本组仍占用着加速器，但部署实际拥有的资源已少于准入配额；
+// 若被回收的恰好是某种角色类型的全部副本组，则意味着该部署已完全失去该角色。对于
+// 其他情况而言，等待是合理的，但此处需要人工决策，因为等待时长取决于抢占方的行为，
+// 而这超出了当前对象与本 operator 的控制范围。
 //
-// A REASON IS THE MACHINE-READABLE CLASSIFICATION AND A MESSAGE IS NOT A CONTRACT. An alert rule or a
-// runbook that wants to tell "wait for it" from "go and look at what took the quota" has to branch on
-// something stable, and substring-matching a sentence is not that.
+// Reason 是机器可读的分类，而 Message 不是契约。若告警规则或运维手册需要区分
+// “继续等待”与“排查配额被谁占用”，必须基于稳定的字段进行分支判断，而非对语句做子串匹配。
 const modelDeploymentReasonPreemptedInPart = "PreemptedInPart"
 
-// The reasons RouterReady carries. NotApplicable is True for the same reason KVEventsPublishing
-// reports one: an absent condition and an inapplicable one are different states, and a reader
-// should not have to infer the second from the first.
+// RouterReady 携带的原因。NotApplicable 为 True 的理由与 KVEventsPublishing 报告该原因
+// 相同：条件缺失与条件不适用属于两种不同状态，不应让读取方根据前者去推断后者。
 const (
 	modelDeploymentReasonRouterReady          = "Ready"
 	modelDeploymentReasonRouterNotApplicable  = "NotApplicable"
@@ -164,54 +124,52 @@ const (
 	modelDeploymentReasonRouterNoReadyReplica = "NoReadyReplicas"
 )
 
-// The reasons a group's serving answer carries.
+// 副本组服务状态结果携带的原因。
 //
-// THEY NAME THE GROUP, because the deployment's own reasons name the deployment: the two are one
-// defect read at two levels, and a reader of a group entry is looking at the group.
+// 它们以副本组为主体，而部署自身的原因则以部署为主体：两者是同一缺陷在两个层级上的
+// 体现，查看副本组条目的读取方关注的是该副本组本身。
 const (
-	// modelDeploymentReasonStaleGroupServing names a group whose Router view grew stale before
-	// the status could be published.
+	// modelDeploymentReasonStaleGroupServing 表示该副本组的 Router 视图在状态发布前已过期。
 	modelDeploymentReasonStaleGroupServing = "the collected view of this group is stale by the time " +
 		"this status was written"
-	// modelDeploymentReasonGroupUnobserved names a group the Router's answer does not carry.
+	// modelDeploymentReasonGroupUnobserved 表示 Router 返回结果中未包含该副本组。
 	modelDeploymentReasonGroupUnobserved = "the Router's answer does not carry this group"
-	// modelDeploymentReasonCollectiveNotEvaluated names the elastic collective, which the
-	// operator never qualified as one group.
+	// modelDeploymentReasonCollectiveNotEvaluated 表示弹性集合体（elastic collective），
+	// operator 从未将其作为单一副本组进行资格判定。
 	//
-	// THE MASTER'S VERDICT IS NOT THE COLLECTIVE'S. The qualification that exists covers the
-	// master alone, and the master is one member of the collective rather than the collective
-	// itself, so publishing the master's state would publish a verdict about a different group.
+	// master 的判定结果不代表整个集合体。现有的资格判定仅针对 master 本身，而 master 只是
+	// 集合体中的一个成员，并非集合体本身；若直接发布 master 的状态，就相当于发布了针对
+	// 另一个不同组别的判定结果。
 	modelDeploymentReasonCollectiveNotEvaluated = "the whole elastic collective has not been " +
 		"evaluated as one group"
 )
 
-// syncModelDeploymentStatus rebuilds the status from what was observed this pass and writes it only
-// if it differs from what is stored.
+// syncModelDeploymentStatus 根据本轮观察到的状态重建 status，且仅当其与已存储状态不同时
+// 才执行写入。
 //
-// It is REBUILT rather than patched, so a stale field cannot survive a disagreement with the Pods:
-// a role that was Ready and is not any more reports the count that was just measured, not the one
-// that was true when it last changed. Anything a later task adds must fold into this one function
-// for the same reason — a second writer would be free to leave its own field behind.
-// The domain is what THIS pass observed about the referenced Binding, or nil for a pass that did not
-// look. Nil leaves the domain projection and its condition exactly as they were, because a teardown
-// pass reporting "not observed" would read as the domain having gone away.
+// 状态采用重建而非局部 patch 的方式，因此过期字段不会在与 Pod 实际情况不一致时残留：
+// 曾处于 Ready 但现已不再 Ready 的角色，会报告刚刚实测到的计数，而非上次变更时的旧值。
+// 出于同样的原因，后续任务新增的任何字段都必须汇总到此函数中，若存在第二个写入点，
+// 就可能遗留旧字段。
+// domain 是本轮对所引用 Binding 的观察结果；若本轮未检查 Binding，则为 nil。传入 nil 时
+// 会完整保留原有的 domain 投影及其 condition，因为若在销毁阶段报告“未观察到”，
+// 会被误读为 domain 已消失。
 //
-// THE ROLLOUT RECORD IS NIL ON THE SAME OCCASIONS AND ANSWERS THE OPPOSITE WAY, which is the one
-// asymmetry here worth knowing before adding a caller. Nil, or a record that accounted for no
-// replica, reports Unknown rather than leaving the stored condition alone. The difference is whose
-// object it is: the Binding belongs to somebody else, so a pass that did not read it has no question
-// to answer, while the replicas are this controller's own, so a pass that could account for none has
-// an answer and that answer is "could not tell". Left alone instead, a steady deployment's True
-// survives the very pass that deletes every replica.
+// rollout 记录在相同场景下同样为 nil，但处理方式恰好相反，这是在新增调用方前唯一
+// 需要注意的不对称性。当 rollout 记录为 nil 或未统计到任何副本时，系统会报告 Unknown，
+// 而非保留已存储的 condition。差异在于对象归属：Binding 属于其他组件，未读取它的一轮
+// 处理无需给出结论；而副本归本控制器自身管理，未统计到任何副本时控制器必须给出明确
+// 结论，即“无法判断”。若改为保留旧值，则处于稳定状态的部署其 True 状态会在删除全部
+// 副本的那一轮处理中错误地留存下来。
 func (r *ModelDeploymentReconciler) syncModelDeploymentStatus(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod, domain *modelDeploymentDomain,
 	rollout *modelDeploymentRollout, weights *modelArtifactWeights,
 	observation modelDeploymentPassObservation,
 ) error {
-	// The serving answer is the one the pass collected, and the pass hands the same answer to the
-	// eligibility write: it is an observation of the Routers as they exist right now, and a change
-	// in it must reach the status on its own, the way any other observed change does. Every failure
-	// on the way is already a state of the answer, never a reconcile error.
+	// 此处使用的是本轮收集到的服务状态结果，本轮也会将同一结果传递给资格写入逻辑：
+	// 它是对当前实际存在的 Router 的观察快照，其中的任何变化都必须像其他观察结果的变化
+	// 一样独立反映到 status 中。过程中的所有失败均已编码为结果中的状态，绝不作为
+	// reconcile error 返回。
 	serving := r.modelDeploymentServingForStatus(md, observation)
 
 	desired, err := r.computeModelDeploymentStatusWithQualifications(
@@ -222,29 +180,28 @@ func (r *ModelDeploymentReconciler) syncModelDeploymentStatus(
 	}
 	applyModelDeploymentServing(desired, serving)
 
-	// THE GROUP ENTRIES ARE ATTACHED HERE, and not inside the count, so that the collective's
-	// membership reaches the publication: the count reads the Pods this status was given, and the
-	// elastic deployment's group is not one of the count's replicas.
+	// 副本组条目在此处附加，而非在计数逻辑内部附加，以便将集合体的成员信息传递至发布结果：
+	// 计数逻辑仅读取传入的 Pod，而弹性部署的副本组并不对应计数中的某一个副本。
 	//
-	// THE COLLECTIVE'S MEMBERSHIP ARRIVES ON THE PASS'S CARRIER, and it is empty for every shape
-	// that has no collective, so the elastic role keeps the replica-derived groups.
+	// 集合体成员列表随本轮载体传入，对于没有集合体的形态该列表为空，因此非集合体角色
+	// 仍保留由副本推导出的副本组。
 	collective := applyModelDeploymentGroupStatuses(
 		md, desired.Roles, observation.Qualifications, pods, observation.CollectiveMembers,
 	)
 
-	// THE GROUPS ARE RESOLVED FROM THE SAME ANSWER THE COUNTS WERE, so a group and the role it
-	// belongs to cannot describe two different moments of the same collection.
+	// 副本组状态与计数均基于同一份观察结果解析，从而避免副本组与其所属角色描述同一批对象
+	// 在两个不同时刻的状态。
 	r.applyModelDeploymentGroupAnswer(desired, observation, md, collective)
 
-	// THE INSTANTS ARE SETTLED AGAINST WHAT WAS PUBLISHED BEFORE, so a group that stays eligible
-	// keeps the instant it earned rather than the instant of the latest pass.
+	// 时间点依据此前已发布的状态进行结算，使持续具备资格的副本组保留其最初获得资格的
+	// 时间点，而非更新为最新一轮处理的时间点。
 	applyModelDeploymentGroupQualificationTimes(
 		desired, md.Status.Roles, meta.NewTime(r.modelDeploymentNow()), collective,
 	)
 
-	// kubemeta.DeepEqual covers LastTransitionTime too, and that is correct rather than incidental:
-	// the condition accessors move it only when the condition's value changes, so an unchanged pass
-	// leaves it alone and compares equal.
+	// kubemeta.DeepEqual 也会比较 LastTransitionTime，这并非巧合而是有意为之：
+	// condition 访问器仅在条件值发生变化时才会更新该时间戳，因此状态未变的一轮处理
+	// 会保持其不变，使比较结果为相等。
 	if kubemeta.DeepEqual(*desired, md.Status) {
 		return nil
 	}
@@ -254,14 +211,14 @@ func (r *ModelDeploymentReconciler) syncModelDeploymentStatus(
 	return r.Client.Status().Update(ctx, md)
 }
 
-// modelDeploymentServingForStatus is the serving answer the status publishes.
+// modelDeploymentServingForStatus 返回将发布到 status 中的服务状态结果。
 //
-// A CARRIER WITH NO ANSWER IS A PATH THAT OBSERVED NOTHING, and it says so rather than publishing
-// the empty string, which is not a serving state at all.
+// 未携带结果的载体表示该路径未进行观察，此时会明确表达该语义，而不是发布空字符串
+// （空字符串并非有效的服务状态）。
 //
-// A CONFIRMATION THAT HAS GROWN STALE IS NOT PUBLISHED AS ONE. The answer was judged fresh when it
-// was collected, and the writes between the collection and this publication are not bounded, so a
-// count confirmed minutes ago would be published as a count confirmed now.
+// 已过期的确认结果不会作为当前确认结果发布。虽然结果在收集时是新鲜的，但从收集到
+// 本次发布之间的写入耗时并无上限，若直接发布，几分钟前确认的计数就会被当成此刻确认的
+// 计数对外公布。
 func (r *ModelDeploymentReconciler) modelDeploymentServingForStatus(
 	md *workercore.ModelDeployment, observation modelDeploymentPassObservation,
 ) ServingAnswer {
@@ -282,39 +239,35 @@ func (r *ModelDeploymentReconciler) modelDeploymentServingForStatus(
 	}
 }
 
-// computeModelDeploymentStatusWithQualifications derives the status for a pass that has already
-// evaluated the whole-group health predicate, so the published endpoint answer and the eligibility
-// write that ran earlier in the same pass come from ONE set of qualifications rather than two
-// groupings of the same Pods.
+// computeModelDeploymentStatusWithQualifications 为已完成整组健康谓词评估的一轮处理
+// 计算 status，使发布到状态中的端点结果与本轮早些时候执行的资格写入均来自同一组
+// 资格判定，而非对同一批 Pod 进行两次分组。
 //
-// A PASS THAT EVALUATED NO PREDICATE PASSES NO QUALIFICATIONS, which leaves the endpoint answer the
-// unobserved one rather than a verdict the pass never made.
+// 未执行谓词评估的处理轮次不会传入任何资格判定结果，从而使端点结果保持“未观察”状态，
+// 而非伪造一个本轮从未做出的判定。
 func (r *ModelDeploymentReconciler) computeModelDeploymentStatusWithQualifications(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod, domain *modelDeploymentDomain,
 	rollout *modelDeploymentRollout, weights *modelArtifactWeights,
 	qualifications []modelDeploymentInstanceQualification,
 ) (*workercore.ModelDeploymentStatus, error) {
-	// The condition accessors mutate the object they are given, so they work on a copy of the
-	// observed status: conditions carry a LastTransitionTime that must not be reset on every pass,
-	// and only the accessors know when it should move.
+	// condition 访问器会直接修改传入的对象，因此这里基于已观察 status 的深拷贝进行操作：
+	// condition 中包含 LastTransitionTime，不能在每一轮都重置，只有访问器自己知道
+	// 何时应当更新该时间戳。
 	holder := &workercore.ModelDeployment{Status: *md.Status.DeepCopy()}
 
-	// EVERY Workload of the deployment, resolved once: both the per-role flavor answers and the
-	// quota verdicts come from this same read. Reading it twice would let two halves of the status
-	// describe two moments.
+	// 一次性获取该部署的所有 Workload：各角色的 flavor 结果和配额判定均源自这一次读取。
+	// 若分两次读取，status 的两部分就可能描述两个不同时刻的状态。
 	wls, err := r.findModelDeploymentGroupWorkloads(ctx, md, pods)
 	if err != nil {
 		return nil, err
 	}
-	// EACH REPLICA'S OWN WORKLOAD, RESOLVED ONCE. There is no such thing as "the deployment's
-	// Workload" once each replica composes one of its own, and a per-role view that answered for a
-	// role from whichever Workload sorts first would report the survivors' answer for a replica
-	// whose own is missing.
+	// 一次性解析每个副本各自的 Workload。当每个副本各自对应一个 Workload 时，便不存在所谓的
+	// “部署级 Workload”；若按角色视图直接取排序最前的 Workload 作为代表，则会把存活副本
+	// 的状态误报给自身 Workload 缺失的副本。
 	wlByReplica := modelDeploymentReplicaWorkloads(pods, wls)
 
-	// The qualified counts are derived here, once, from the same qualifications the eligibility
-	// write acted on. Deriving them a second time from the same pods would be a second grouping,
-	// and two groupings are how two figures come to disagree about what a replica is.
+	// 此处基于与资格写入逻辑相同的资格判定结果一次性计算合格计数。若从同一批 Pod 重新
+	// 推导一次，就意味着二次分组，而两次分组正是导致两个统计数字对副本界定不一致的根源。
 	qualified := modelDeploymentRoleQualified(qualifications)
 	holder.Status.Roles = modelDeploymentRoleStatuses(md, pods, wlByReplica, qualified)
 
@@ -334,8 +287,8 @@ func (r *ModelDeploymentReconciler) computeModelDeploymentStatusWithQualificatio
 
 	observeModelDeploymentRoleKinds(holder)
 
-	// The eligibility view is reported alongside the counts it qualifies, so a reader scanning
-	// conditions alone can tell an unobserved endpoint set from an observed empty one.
+	// 资格视图会与相应的计数结果一同上报，使仅查看 condition 的读取方也能区分“未观察到
+	// 端点集合”与“已观察到但结果为空”。
 	observeModelDeploymentEndpointEligibility(holder, qualifications)
 
 	var nodeModels map[string]*workercore.NodeModelStoreModel
@@ -346,8 +299,8 @@ func (r *ModelDeploymentReconciler) computeModelDeploymentStatusWithQualificatio
 	}
 	observeModelDeploymentWeights(holder, pods, weights, nodeModels)
 
-	// Resolved once for both routed-path observers, and nil for an unrouted deployment, which has
-	// nothing that reads a manufacturer.
+	// 为两个路由路径观察器统一解析一次；对于未路由的部署，由于不存在读取厂商信息的逻辑，
+	// 此处为 nil。
 	manufacturers := r.modelDeploymentRoleManufacturers(ctx, md)
 
 	observeModelDeploymentKVEvents(md, holder, manufacturers)
@@ -386,14 +339,12 @@ func modelDeploymentRoleSummary(
 			fmt.Fprintf(&other, "%d%s", role.Ready, strings.ToUpper(string(role.Kind)))
 		}
 	}
-	// THE ORDER IS FIXED, NOT THE ROLES' OWN. The summary is read at a glance and compared with
-	// another summary in a glance, so a deployment written encoder-first and one written
-	// encoder-last have to render the same letters in the same places.
+	// 顺序是固定的，而非按角色声明顺序。摘要信息需要一眼读懂并与其他摘要快速对比，因此
+	// 无论部署中将 encoder 写在前面还是后面，渲染出的字母位置都必须保持一致。
 	//
-	// THE SERVER LETTER STAYS IN FRONT. A server and an encoder are not one deployment's shape --
-	// admission refuses the pair -- so their relative position is not observable on any deployment
-	// that can be admitted, and keeping it where every deployment without an encoder already puts
-	// it is the reading that changes nothing.
+	// server 对应的字母保持在最前。server 与 encoder 不会同时出现在同一个可准入部署中
+	// （准入阶段会拒绝该组合），因此两者的相对位置在任何合法部署上都不可见；将其保留在
+	// 所有不含 encoder 的部署原本所在的位置，即可确保原有展示形式不受任何影响。
 	for _, kind := range []struct {
 		name workercore.ModelDeploymentRoleKind
 		code string
@@ -425,10 +376,9 @@ func (r *ModelDeploymentReconciler) observeModelDeploymentRouter(
 
 	objects, err := renderModelDeploymentRouterObjects(ctx, md, manufacturers, false)
 	if err != nil {
-		// A render refusal is a spec problem, not a cluster one: it is projected as the condition
-		// and the rest of the status computes anyway, because returning here would freeze every
-		// other field while naming none of them. The convergence path returns the same error, so
-		// the pass is still retried.
+		// 渲染拒绝属于 spec 问题而非集群问题：此处将其投影为 condition 并继续计算其余 status
+		// 字段，因为在此直接返回会冻结其他所有字段而不更新其状态。收敛路径会返回相同的 error，
+		// 因此本轮处理仍会被重试。
 		ModelDeploymentConditionRouterReady.False(holder,
 			modelDeploymentReasonRouterRenderFailed, err.Error())
 		return 0, nil
@@ -480,34 +430,30 @@ func projectModelDeploymentRouterStatus(
 	return status
 }
 
-// modelDeploymentRoleStatuses counts, per role, how many replicas the spec asks for, how many of
-// them are Ready, how many hold a quota reservation, and which flavors the assigned ones landed on.
+// modelDeploymentRoleStatuses 按角色统计 spec 请求的副本数、处于 Ready 状态的副本数、
+// 持有配额预留（quota reservation）的副本数，以及已分配副本所落入的 flavor 集合。
 //
-// A role's replicas are identified by the Pod's resource note rather than by parsing its name,
-// because a name is a rendering and a note is what the renderer recorded.
+// 角色下的副本通过 Pod 的资源注解识别，而非解析其名称，因为名称只是渲染产物，而注解
+// 才记录了渲染器写入的元信息。
 //
-// THE COUNTS AND THE FLAVOR SET ARE TAKEN OVER THE REPLICAS THAT ARE STAYING. A replica on its way
-// out still holds its workload and its quota, and counting it would let a shortfall be met by
-// replicas the deployment is shedding; its flavor is leaving with it, and naming it would answer
-// "where is this role landing" with a placement the role is moving off of.
+// 计数与 flavor 集合仅针对保留中的副本统计。正在退出的副本仍持有其 Workload 与配额，
+// 若将其计入，就会让即将淘汰的副本掩盖实际的副本缺口；其 flavor 也会随之退出，若仍
+// 将其列出，在回答“该角色落在何处”时就会给出角色正在迁出的位置。
 //
-// THE QUOTA COUNT AND THE FLAVOR SET READ THE SAME RESOLUTION BUT ASK DIFFERENT QUESTIONS, so the
-// second is not gated on the first: a workload carries its assignment after the reservation it came
-// with is gone -- a preemption in flight reads QuotaReserved false with the admission still naming
-// the flavor -- and "which model did this replica land on" is a question that moment still has an
-// answer to. What the two cannot do is disagree about WHICH replicas were looked at.
+// 配额计数与 flavor 集合基于同一解析结果，但回答的问题不同，因此后者不以先决条件
+// 依赖前者：在伴随的预留已消失后，Workload 仍保留其分配信息——正在被抢占的副本表现为
+// QuotaReserved 为 false，但准入信息中仍指明了 flavor——而此时“该副本落在了哪种
+// 型号上”依然有明确答案。两者绝不能在“统计了哪些副本”这一点上出现分歧。
 func modelDeploymentRoleStatuses(
 	md *workercore.ModelDeployment, pods []core.Pod,
 	wlByReplica map[types.UID]*kueue.Workload, qualified map[string]*int32,
 ) []workercore.ModelDeploymentRoleStatus {
-	// EVERY FIGURE HERE IS PER REPLICA, WHICH IS WHY THE PODS ARE GROUPED FIRST. Both counts read
-	// wrong when taken per Pod once a replica may be several of them, and they read wrong in
-	// different directions: Ready would report a replica that is half up as partly serving, when a
-	// group whose members are not all up serves nothing at all; QuotaReserved would report one
-	// reservation once per member, because the members of a replica share a single Workload, so a
-	// role of two replicas of four Pods would claim eight reservations against a desired count of
-	// two. At one member per replica the grouping is the identity, which is why this reads exactly
-	// as it did for the shape that came before.
+	// 此处的每一项统计都以副本为单位，因此必须先对 Pod 进行分组。一旦单个副本可能包含多个
+	// Pod，按 Pod 计数就会出错，且两项统计的错误方向截然不同：Ready 会将半启动状态的
+	// 副本误报为部分提供服务，而实际上成员未全部就绪的副本组根本无法提供服务；由于同一
+	// 副本的各成员共享同一个 Workload，QuotaReserved 会按成员重复计算同一份预留，导致
+	// 包含 2 个副本（每副本 4 个 Pod）的角色在期望数为 2 的情况下报出 8 份预留。当每个
+	// 副本只有一个成员时，分组即为恒等映射，因此其结果与此前单 Pod 形态完全一致。
 	//
 	ready := make(map[string]int32, len(md.Spec.Roles))
 	unmanaged := make(map[string]bool, len(md.Spec.Roles))
@@ -516,20 +462,18 @@ func modelDeploymentRoleStatuses(
 	for _, view := range modelDeploymentGroupPodsByReplica(pods) {
 		role := view.Role
 
-		// Whether the operator built the running command lines is read from the replicas, never
-		// from the role, and one replica it contributed nothing to is enough.
+		// 运行命令行是否由 operator 构建，需从副本而非角色中读取，只要存在一个 operator
+		// 未参与构建命令行的副本即可判定。
 		if execution, _ := modelDeploymentDeployedReplicaExecution(view.Members); execution ==
 			modelDeploymentExecutionTakeover {
 			unmanaged[role] = true
 		}
 
-		// A REPLICA IS READY WHEN IT HOLDS EVERY MEMBER IT DECLARES AND ALL OF THEM ARE READY. The
-		// completeness half is not redundant with the readiness half: a replica short of a member
-		// can have every member it DOES hold reporting ready, while Kueue has composed no Workload
-		// for it and it is admitted by nothing.
+		// 当一个副本集齐了其声明的全部成员且所有成员均处于 Ready 状态时，该副本才算 Ready。
+		// 完整性检查与就绪检查并非冗余：缺少成员的副本，其已存在的每个成员都可能报告就绪，
+		// 但 Kueue 并未为其生成 Workload，它也未获得任何准入。
 		//
-		// The member set is taken against the group's own total, so a role being edited still
-		// counts the replicas it is serving from.
+		// 成员总数取自副本组自身声明的总数，因此处于编辑中的角色仍会统计其正在提供服务的副本。
 		allReady := modelDeploymentDeployedReplicaShape(view).modelDeploymentReplicaIsWhole()
 		for _, pod := range view.Members {
 			allReady = allReady && podIsReady(pod)
@@ -538,10 +482,9 @@ func modelDeploymentRoleStatuses(
 			ready[role]++
 		}
 
-		// THE REPLICA'S OWN WORKLOAD, not one resolved for its role: each replica composes one of
-		// its own, and a missing one is indistinguishable from an unassigned one through any
-		// coarser view. Its members all resolve to that same Workload, so it is read ONCE per
-		// replica -- reading it per member is what would multiply the count by the size.
+		// 使用副本自身的 Workload，而非按角色解析的 Workload：每个副本都会生成各自的 Workload，
+		// 若采用更粗粒度的视图，缺失 Workload 与未分配 Workload 将无法区分。同一副本的所有成员
+		// 都解析到同一个 Workload，因此每个副本只需读取一次——按成员读取会导致计数乘以副本规模。
 		var wl *kueue.Workload
 		for _, pod := range view.Members {
 			if wl = wlByReplica[pod.UID]; wl != nil {
@@ -567,16 +510,14 @@ func modelDeploymentRoleStatuses(
 		role := &md.Spec.Roles[i]
 		statuses = append(statuses, workercore.ModelDeploymentRoleStatus{
 			Name: role.Name,
-			// The kind is ECHOED so an operator reading status alone sees which role is which. It is
-			// resolved rather than copied: this field is required and enumerated, so writing an
-			// unset spec kind through would be refused, and the API server refuses the status write
-			// rather than the one field.
+			// 此处回显 kind 字段，使仅查看 status 的运维人员也能分清各个角色。该字段通过解析而非直接
+			// 拷贝得到：由于它是必填枚举字段，若直接透传未设置的 spec kind 会被校验拒绝，且
+			// API server 会拒绝整个 status 写入，而不仅仅是这一个字段。
 			Kind:          ModelDeploymentEffectiveRoleKind(role),
 			Desired:       role.Replicas,
 			Ready:         ready[role.Name],
 			QuotaReserved: reserved[role.Name],
-			// A replica that replaced the whole command line got no cache client, so nothing here
-			// can claim it is attached to one.
+			// 替换了整条命令行的副本并未注入缓存客户端，因此此处不能声称其挂载了缓存客户端。
 			Unmanaged:       unmanaged[role.Name],
 			AssignedFlavors: modelDeploymentAssignedFlavors(flavors[role.Name]),
 			Parallelism:     ReadModelDeploymentRoleParallelism(md.Spec.Engine.Name, role),
@@ -587,12 +528,12 @@ func modelDeploymentRoleStatuses(
 	return statuses
 }
 
-// modelDeploymentAssignedFlavors is the sorted set of flavors Kueue assigned this role's replicas,
-// or nil when no assigned replica named one.
+// modelDeploymentAssignedFlavors 返回 Kueue 为该角色各副本分配的 flavor 有序集合；
+// 若没有已分配副本指定 flavor，则返回 nil。
 //
-// NIL RATHER THAN EMPTY: "no replica holds an assignment" is a fact, and a present-but-empty list
-// would read as an assignment to a flavor with no name — the same collapse the scalar form of this
-// field refused with its pointer.
+// 返回 nil 而非空切片：“没有副本持有分配”是一个明确事实，而存在但为空的列表会被
+// 误读为“分配到了一个无名 flavor”——这与该字段早期标量形式通过指针避免的语义混淆
+// 如出一辙。
 func modelDeploymentAssignedFlavors(flavors sets.Set[string]) []string {
 	if flavors.Len() == 0 {
 		return nil
@@ -601,15 +542,13 @@ func modelDeploymentAssignedFlavors(flavors sets.Set[string]) []string {
 	return sets.List(flavors)
 }
 
-// modelDeploymentRoleEndpoints is the endpoints answer of one role: how many of its replicas the
-// whole-group health predicate qualified, and the serving confirmation taken over those
-// endpoints.
+// modelDeploymentRoleEndpoints 返回单个角色的端点状态结果：有多少个副本通过了整组
+// 健康谓词的资格判定，以及基于这些端点获取的服务确认状态。
 //
-// THE QUALIFIED COUNT IS NIL WHENEVER THE LIST IS NOT COMPLETE. A role with three qualified
-// replicas and one held does not report three eligible endpoints: it reports nothing it can
-// stand behind, because a reader would otherwise see a number and conclude the role is
-// qualified. An explicit zero remains a real answer, and it is the answer for a role whose every
-// replica is known and none of them qualifies.
+// 只要列表不完整，合格计数就必须为 nil。对于有三个合格副本和一个待定（held）副本的角色，
+// 不能报告三个可用端点：此时不应报告无法保证准确的数字，否则读取方会看到数字并误以为
+// 该角色已完全合格。显式的 0 仍然是一个真实有效的答案，它代表该角色所有副本都已知且
+// 没有任何一个符合资格。
 func modelDeploymentRoleEndpoints(
 	routed bool, eligible *int32,
 ) workercore.ModelDeploymentRoleEndpointsStatus {
@@ -624,48 +563,44 @@ func modelDeploymentRoleEndpoints(
 	}
 }
 
-// The group projection.
+// 副本组投影。
 //
-// THE GROUP ENTRY IS THE PER-REPLICA ANSWER, and the role's counts above are its derived views. A
-// reader asking WHICH replica failed, or which one the Router stopped selecting, needs the entry
-// and cannot get it from the counts.
+// 副本组条目是按副本粒度的状态结果，上方的角色计数是由此衍生出的聚合视图。当读取方
+// 需要知道具体是哪个副本失败或 Router 停止选择哪个副本时，必须查看该条目，而无法
+// 从计数中获取。
 //
-// THE STATE AND THE SERVING CONFIRMATION ARE TWO ANSWERS AND NEVER COLLAPSE INTO ONE: the state
-// names what holds the GROUP, and the serving confirmation names what the ROUTER says about it.
+// 副本组状态（state）与服务确认（serving confirmation）是两个独立的结果，绝不能合并为一：
+// 状态指明阻碍该副本组的原因，而服务确认则反映 Router 对它的反馈。
 
-// applyModelDeploymentGroupStatuses attaches one published entry to every group the status sees.
+// applyModelDeploymentGroupStatuses 为 status 看到的每个副本组附加一条待发布条目。
 //
-// ONE ENTRY PER GROUP, NOT PER MEMBER: a replica of three members is one group that names its
-// three members, and a list that named the members would answer a question nobody asked.
+// 每个副本组一条条目，而非每个成员一条：包含三个成员的副本是一个列出其三个成员的
+// 副本组，按成员拆分的列表只会回答一个无人关心的问题。
 //
-// THE GROUP COMES FROM THE PODS THIS STATUS READS, so a replica the pass created is published in
-// the pass that created it. THE MEMBERS COME WITH IT: a group without a qualification still has
-// members, and the absence of a qualification is not the absence of a membership.
+// 副本组来自本 status 读取的 Pod 列表，因此本轮刚创建的副本在本轮就会被发布。
+// 成员信息随之附带：尚未获得资格判定的副本组依然拥有成员，缺少资格判定不代表没有成员。
 //
-// THE ELASTIC DEPLOYMENT'S GROUP IS ITS COLLECTIVE, and the collective's membership is the
-// complete current worker set rather than the members of one ordinal.
+// 弹性部署的副本组即其集合体（collective），而集合体的成员是当前完整的 worker 集合，
+// 而非单个序号（ordinal）下的成员。
 //
-// THE COUNTS AND THE GROUP ARE TWO VIEWS, and on the elastic shape they are of DIFFERENT THINGS,
-// which the reader has to be told rather than left to discover. THE COUNTS ARE THE ROLE'S REPLICA
-// COUNTS: the role declares one replica, and the count says whether that replica is up. THE GROUP
-// NAMES THE MEMBERS OF THAT ONE REPLICA: the workers that make up the collective. The counts are
-// computed from the master the elastic path reads, because the master is the replica the Router
-// observes, and the group is computed from the whole worker set, because the collective is the
-// thing a reader asks about when a rank fails.
+// 计数与副本组是两个不同的视图，且在弹性形态下它们描述的是不同的对象，这一点必须明确
+// 告知读取方而非让其自行摸索。计数是角色的副本计数：角色声明了一个副本，计数说明该
+// 副本是否已启动。副本组则列出了构成该集合体的所有 worker 成员。计数依据弹性路径
+// 读取的 master 计算（因为 Router 观察的副本是 master），而副本组依据完整的 worker 集合
+// 计算（因为当某个 rank 失败时，读取方关心的是整个集合体）。
 //
-// SO A COUNT AND A GROUP NEVER DESCRIBE THE SAME MEMBERSHIP ON THIS SHAPE, and the group's own
-// reason says that the operator holds no verdict on the whole.
+// 因此在该形态下，计数与副本组绝不描述同一批成员，且副本组自身的原因会表明
+// operator 未对整体做出判定。
 //
-// THE STATE IS THE PASS'S OWN VERDICT WHERE THE PASS HAS ONE, and the PENDING STATE DERIVED FROM
-// THE VIEW WHERE IT DOES NOT. The two agree on a group whose members have not reported yet, which
-// is what keeps the pass that created a replica and the pass after it from publishing two
-// different answers about the same replica.
+// 当本轮已有判定结果时，状态取本轮的判定；否则取从当前视图推导出的 Pending 状态。
+// 对于成员尚未上报状态的副本组，两者的结论一致，从而确保创建副本的那一轮处理与
+// 紧随其后的下一轮处理不会对同一副本发布两种不同的结果。
 //
-// THE ENTRIES ARE ORDERED BY ORDINAL, so a reader can find a replica without searching, and the
-// order does not depend on the order the cluster listed the Pods in.
+// 条目按序号（ordinal）排序，以便读取方无需搜索即可定位副本，且排序结果不依赖于
+// 集群返回 Pod 列表的顺序。
 //
-// THE PUBLISHED COLLECTIVE IS RETURNED, because the Router's answer must not be read as an answer
-// about it: the Router observed the master, and the master is one member of the collective.
+// 函数返回已发布的集合体条目，因为 Router 的反馈不能被误读为针对整个集合体的反馈：
+// Router 观察的是 master，而 master 只是集合体中的一个成员。
 func applyModelDeploymentGroupStatuses(
 	md *workercore.ModelDeployment, roles []workercore.ModelDeploymentRoleStatus,
 	qualifications []modelDeploymentInstanceQualification, pods []core.Pod,
@@ -676,13 +611,13 @@ func applyModelDeploymentGroupStatuses(
 		byRole[view.Role] = append(byRole[view.Role], view)
 	}
 
-	// THE COLLECTIVE IS THE ELASTIC ROLE'S ONLY LOGICAL REPLICA, so its entry replaces the
-	// replica-derived ones rather than joining them.
+	// collective 是弹性角色唯一的逻辑副本，因此其条目会替换由副本派生的条目，
+	// 而不是加入其中。
 	//
-	// AN ABSENT MEMBERSHIP PUBLISHES NO GROUP AT ALL, rather than a master-derived replica group.
-	// The master's group answers a question about one replica of the role, and the collective is
-	// the role's one replica seen whole: a reader that found the master's group where the
-	// collective belongs would read a verdict about a group this operator never evaluated.
+	// 成员为空时完全不发布任何组，而不是发布由 master 派生的副本组。
+	// master 组回答的是该角色单个副本的问题，而 collective 则是从整体视角看待的
+	// 该角色唯一副本：如果读取方在应属于 collective 的位置读到了 master 组，
+	// 就会读到本 operator 从未评估过的组的判定结论。
 	collective := modelDeploymentElasticCollectiveView(md, collectiveMembers)
 
 	for i := range roles {
@@ -700,10 +635,9 @@ func applyModelDeploymentGroupStatuses(
 		if len(groupViews) == 0 {
 			continue
 		}
-		// THE ORDINAL IS THE ORDER, AND THE GENERATION BREAKS A TIE, because two groups can hold
-		// one ordinal only when one of them occupies no slot at all. The generation is what tells
-		// those two apart, so the order is settled with it rather than with the order the cluster
-		// happened to list the Pods in.
+		// ordinal 决定主要顺序，generation 用于打破平局，因为只有当其中一个组完全未占用槽位时，
+		// 两个组才会持有相同的 ordinal。generation 正是区分这两者的依据，因此排序由 generation
+		// 决定，而不依赖集群碰巧列出 Pod 的顺序。
 		slices.SortStableFunc(groupViews, func(a, b modelDeploymentReplicaView) int {
 			if a.Ordinal != b.Ordinal {
 				return a.Ordinal - b.Ordinal
@@ -727,17 +661,17 @@ func applyModelDeploymentGroupStatuses(
 	return collective
 }
 
-// modelDeploymentElasticCollectiveView is the elastic deployment's logical group.
+// modelDeploymentElasticCollectiveView 返回弹性部署的逻辑组视图。
 //
-// THE COLLECTIVE'S MEMBERS ARE THE CURRENT GPU WORKERS OF THE ELASTIC ROLE, the API/DP master
-// included, and the ancillary Ray head excluded: the head is not a worker, and a head in the
-// collective's membership would name a member of a group it does not serve.
+// collective 的成员是当前弹性角色的 GPU worker，包含 API/DP master，但不包含辅助的
+// Ray head：head 不是 worker，若将 head 纳入 collective 成员中，就会把一个不服务该组的
+// 对象列为成员。
 //
-// A WORKER ON ITS WAY OUT IS NOT A MEMBER, because it is leaving the collective, and publishing it
-// would make the membership and its generation flap on every departure.
+// 正在退出的 worker 不算作成员，因为它正在离开 collective，将其发布会导致每次退出时
+// 成员列表及其 generation 发生抖动。
 //
-// A COLLECTIVE WITH NO WORKERS IS NO GROUP, because there is nothing to name. The master is one
-// of the workers, so a collective without workers is also a deployment without a master.
+// 没有 worker 的 collective 不构成组，因为没有可列出的成员。master 本身就是 worker 之一，
+// 因此没有 worker 的 collective 也意味着部署当前没有 master。
 func modelDeploymentElasticCollectiveView(
 	md *workercore.ModelDeployment, members []core.Pod,
 ) *modelDeploymentReplicaView {
@@ -769,18 +703,17 @@ func modelDeploymentElasticCollectiveView(
 	}
 }
 
-// modelDeploymentGroupCollectiveStatus is the published entry of the elastic collective.
+// modelDeploymentGroupCollectiveStatus 返回弹性 collective 的已发布状态条目。
 //
-// THE STATE IS UNKNOWN, because the operator never qualified the collective as one group: the
-// qualification that exists covers the master alone. Publishing a state nobody evaluated would be
-// a claim the operator cannot back, and publishing the master's state would be a claim about a
-// different group.
+// 其状态为 Unknown，因为 operator 从未将 collective 作为一个整体组进行资格评估：
+// 现有的资格评估仅覆盖 master 本身。发布一个未经评估的状态等于作出 operator 无法证实的声明，
+// 而发布 master 的状态则是对另一个不同组作出的声明。
 //
-// THE SERVING ANSWER IS THE DEFAULT AND CARRIES NO COUNT, because only a confirmation carries a
-// count and the Router's answer carries the master's fact rather than the collective's.
+// 服务状态（serving answer）取默认值且不携带计数，因为只有确认状态才携带计数，
+// 且 Router 的响应反映的是 master 的事实而非 collective 的事实。
 //
-// THE INSTANT IS NOT MINTED HERE, because an instant belongs to a transition into published
-// ELIGIBLE, and the collective is never eligible.
+// 此处不生成时间戳，因为时间戳属于转换到已发布 Eligible 状态的过程，而 collective 永远不会
+// 处于 Eligible 状态。
 func modelDeploymentGroupCollectiveStatus(
 	md *workercore.ModelDeployment, collective modelDeploymentReplicaView,
 ) workercore.ModelDeploymentGroupStatus {
@@ -795,10 +728,9 @@ func modelDeploymentGroupCollectiveStatus(
 	}
 }
 
-// modelDeploymentGroupStatus is the published entry of one group.
+// modelDeploymentGroupStatus 返回单个组的已发布状态条目。
 //
-// THE STATE IS THE QUALIFICATION'S OWN VERDICT WHERE THE PASS HAS ONE, and the pending state
-// derived from the view where it does not.
+// 当本轮调谐已有资格评估结论时，状态取自该评估自身的判定；否则取自基于视图推导出的待定状态。
 func modelDeploymentGroupStatus(
 	md *workercore.ModelDeployment, view modelDeploymentReplicaView,
 	qualification modelDeploymentInstanceQualification, found bool,
@@ -823,17 +755,16 @@ func modelDeploymentGroupStatus(
 	}
 }
 
-// modelDeploymentPendingGroupState is the state of a group the pass has not evaluated.
+// modelDeploymentPendingGroupState 返回本轮尚未评估的组的状态。
 //
-// IT IS THE MEMBER LEGS' OWN VERDICT, taken from the same helper the qualification takes them
-// from, so the pending state and the qualified state are ONE classification: a replica whose
-// members have not reported yet reads the same whether the pass has a qualification for it or
-// not, and a status that answered two ways about the same replica would move on a pass that
-// changed nothing.
+// 该状态直接取自各成员判定环节（member legs）自身的结论，并与资格评估使用同一辅助函数，
+// 从而保证待定状态与已评估状态属于同一套分类体系：对于成员尚未上报的副本，无论本轮是否对其
+// 进行过资格评估，呈现的状态都一致；若同一副本在不同路径下给出两种状态，就会在没有任何变更的
+// 轮次中导致状态抖动。
 //
-// THE FORWARD LEG IS NOT AVAILABLE HERE, because reading it is the probe this pass did not run. A
-// group whose members are all ready is therefore not eligible: the classification could not be
-// reached, and the state says so rather than claiming a qualification nobody made.
+// 此处无法获取前向探测环节（forward leg）的结果，因为读取它正是本轮未执行的探测。
+// 因此，即使所有成员都已就绪，该组也不能标记为 Eligible：目前尚无法得出该分类结论，
+// 状态会如实反映这一点，而不会伪称通过了从未进行的资格评估。
 func modelDeploymentPendingGroupState(
 	md *workercore.ModelDeployment, view modelDeploymentReplicaView,
 ) (workercore.ModelDeploymentGroupState, string) {
@@ -861,14 +792,13 @@ func modelDeploymentPendingGroupState(
 	}
 }
 
-// modelDeploymentGroupMembers publishes the members of one group.
+// modelDeploymentGroupMembers 生成并发布单个组的成员列表。
 //
-// THE MEMBERS ARE ORDERED BY SEAT, because the seat is what tells them apart, and a member that
-// claims none goes last: it cannot be placed, and an entry that put it in the middle would claim
-// an order the group does not have.
+// 成员按 seat 排序，因为 seat 是区分成员的依据；未声明 seat 的成员排在最后：它无法被定位，
+// 若将其排在中间，就会宣称一种该组实际并不存在的顺序。
 //
-// A MEMBER THAT CLAIMS NO SEAT, OR ONE THAT CANNOT BE READ, PUBLISHES NO SEAT AT ALL, rather than
-// the leader's: the default the seat helper elsewhere uses is right there and wrong here.
+// 未声明 seat 或无法读取 seat 的成员，在发布时完全不设置 seat，而不会回退为 leader 的 seat：
+// 其他地方的 seat 辅助函数所使用的默认值在那里是正确的，但在此处并不适用。
 func modelDeploymentGroupMembers(members []*core.Pod) []workercore.ModelDeploymentGroupMemberStatus {
 	published := make([]workercore.ModelDeploymentGroupMemberStatus, 0, len(members))
 	for _, member := range members {
@@ -885,18 +815,16 @@ func modelDeploymentGroupMembers(members []*core.Pod) []workercore.ModelDeployme
 	return published
 }
 
-// modelDeploymentCollectiveMembers publishes the members of the elastic collective.
+// modelDeploymentCollectiveMembers 生成并发布弹性 collective 的成员列表。
 //
-// A MEMBER'S SEAT IS ITS ADMISSION ORDINAL HERE, and not the seat it claims among the members of
-// its own replica: the collective's members are whole replicas, so the seat they claim inside one
-// replica is not a seat of the collective at all, and publishing it would put every member in seat
-// zero.
+// 此处成员的 seat 是其准入序号（admission ordinal），而非它在所属副本成员中声明的 seat：
+// collective 的成员是一个个完整的副本，它们在单个副本内部声明的 seat 并非 collective 的 seat，
+// 若直接发布会导致所有成员的 seat 都变成 0。
 //
-// THE ORDINAL IS THE OPERATOR'S OWN FACT and not the engine's runtime rank: which member holds
-// which rank is the engine's business, and the operator's numbering never implies it.
+// 该 ordinal 是 operator 自身记录的事实，而非推理引擎的运行时 rank：哪个成员持有哪个 rank
+// 由引擎决定，operator 的编号从不隐含这一点。
 //
-// A WORKER WHOSE ORDINAL CANNOT BE READ PUBLISHES NO SEAT, on the same terms as any other member
-// that claims none.
+// 无法读取 ordinal 的 worker 在发布时不设置 seat，处理方式与任何其他未声明 seat 的成员相同。
 func modelDeploymentCollectiveMembers(members []*core.Pod) []workercore.ModelDeploymentGroupMemberStatus {
 	published := make([]workercore.ModelDeploymentGroupMemberStatus, 0, len(members))
 	for _, member := range members {
@@ -913,10 +841,9 @@ func modelDeploymentCollectiveMembers(members []*core.Pod) []workercore.ModelDep
 	return published
 }
 
-// modelDeploymentGroupMemberStatusOf is the identity and the readiness one member publishes.
+// modelDeploymentGroupMemberStatusOf 返回单个成员要发布的身份标识与就绪状态。
 //
-// THE SEAT IS NOT SET HERE, because what a member claims as its seat depends on the shape of the
-// group it belongs to.
+// 此处不设置 seat，因为成员声明的 seat 取决于它所属组的形态。
 func modelDeploymentGroupMemberStatusOf(member *core.Pod) workercore.ModelDeploymentGroupMemberStatus {
 	return workercore.ModelDeploymentGroupMemberStatus{
 		Name:  member.Name,
@@ -925,11 +852,10 @@ func modelDeploymentGroupMemberStatusOf(member *core.Pod) workercore.ModelDeploy
 	}
 }
 
-// modelDeploymentGroupMemberOrder orders published members by seat and then by identity.
+// modelDeploymentGroupMemberOrder 先按 seat、再按身份标识对已发布的成员排序。
 //
-// THE SEAT COMES FIRST because it is the position in the group, and the identity settles the
-// order of the members that share one, so two passes over the same membership publish the same
-// list.
+// seat 优先，因为它代表成员在组中的位置；当成员共享同一 seat 时，由身份标识决定顺序，
+// 从而确保对同一成员集合执行两次遍历时发布的列表顺序一致。
 func modelDeploymentGroupMemberOrder(a, b workercore.ModelDeploymentGroupMemberStatus) int {
 	switch {
 	case a.Seat != nil && b.Seat != nil:
@@ -949,11 +875,11 @@ func modelDeploymentGroupMemberOrder(a, b workercore.ModelDeploymentGroupMemberS
 	return strings.Compare(a.UID, b.UID)
 }
 
-// modelDeploymentGroupMemberReady is the readiness one member publishes.
+// modelDeploymentGroupMemberReady 返回单个成员发布的就绪状态。
 //
-// IT IS THREE-VALUED, and the third value is not an absence: a member whose Ready condition has
-// never been reported is Unknown, which is a different fact from a member that was observed and
-// found not ready. A status that cannot tell those two apart cannot say which one happened.
+// 它是三态值，且第三种状态并非“缺失”：从未上报过 Ready 条件的成员状态为 Unknown，这与
+// 已被观测到但处于未就绪状态的成员是两种不同的事实。若状态无法区分这两者，就无法说明究竟
+// 发生了哪种情况。
 func modelDeploymentGroupMemberReady(pod *core.Pod) meta.ConditionStatus {
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type != core.PodReady {
@@ -972,12 +898,10 @@ func modelDeploymentGroupMemberReady(pod *core.Pod) meta.ConditionStatus {
 	return meta.ConditionUnknown
 }
 
-// modelDeploymentGroupServingDefault is the serving answer a group carries before the Router's
-// answer is applied.
+// modelDeploymentGroupServingDefault 返回在应用 Router 响应之前，组默认携带的服务状态。
 //
-// A DEPLOYMENT WITH NO ROUTER HAS NOTHING TO CONFIRM, and a deployment with one has not been read
-// yet. The two are different answers, and neither of them is the empty string, which is not a
-// serving state at all.
+// 未配置 Router 的部署没有任何需要确认的对象，而配置了 Router 的部署则是尚未读取到结果。
+// 这两者对应不同的状态，且都不是空字符串（空字符串根本不是有效的服务状态）。
 func modelDeploymentGroupServingDefault(md *workercore.ModelDeployment) workercore.ModelDeploymentServingStatus {
 	if md.Spec.Router == nil {
 		return workercore.ModelDeploymentServingStatus{
@@ -990,14 +914,14 @@ func modelDeploymentGroupServingDefault(md *workercore.ModelDeployment) workerco
 	}
 }
 
-// applyModelDeploymentGroupAnswer resolves the Router's answer for every published group, and
-// holds the groups the observation holds.
+// applyModelDeploymentGroupAnswer 为每个已发布的组解析 Router 的响应，并暂留因观测条件
+// 未满足而需要等待的组。
 //
-// THE ANSWER IS THE PASS'S CARRIER, which is the one the restoration reads too, so the status and
-// the labels are written from one answer about one moment.
+// 该响应是本轮调谐的状态载体，恢复屏障（restoration）也会读取同一份响应，从而确保状态与标签
+// 均基于同一时刻的同一份响应写入。
 //
-// THE HOLD IS THE RESTORATION BARRIER'S OWN QUESTION, READ GROUP BY GROUP: a protected group whose
-// observation is missing or invalid waits for one, and a group that retains keeps what it has.
+// 是否暂留由恢复屏障逐组判断：受保护的组若观测缺失或无效，则会等待有效观测；允许保留的组则
+// 维持现有状态。
 func (r *ModelDeploymentReconciler) applyModelDeploymentGroupAnswer(
 	status *workercore.ModelDeploymentStatus,
 	observation modelDeploymentPassObservation,
@@ -1009,11 +933,9 @@ func (r *ModelDeploymentReconciler) applyModelDeploymentGroupAnswer(
 		for j := range status.Roles[i].Groups {
 			group := &status.Roles[i].Groups[j]
 
-			// THE COLLECTIVE IS NOT THE GROUP THE ROUTER OBSERVED. The Router's answer carries the
-			// master's fact, and the master is one member of the collective rather than the
-			// collective itself, so the fact is never read as an answer about the collective --
-			// not even when the collective has a single member and its generation is the master's
-			// own generation.
+			// collective 并非 Router 所观测的组。Router 的响应承载的是 master 的事实，而 master 只是
+			// collective 的一个成员而非 collective 本身，因此该事实绝不能被解读为关于 collective 的响应——
+			// 即使当 collective 只有一个成员且其 generation 与 master 自身的 generation 相同时也是如此。
 			if modelDeploymentGroupIsCollective(group, collective) {
 				group.Serving, group.ServingReason = modelDeploymentGroupCollectiveServing(md)
 				continue
@@ -1030,10 +952,9 @@ func (r *ModelDeploymentReconciler) applyModelDeploymentGroupAnswer(
 	}
 }
 
-// modelDeploymentGroupIsCollective reports whether a published group is the elastic collective.
+// modelDeploymentGroupIsCollective 报告已发布的组是否为弹性 collective。
 //
-// IT IS THE GROUP'S OWN SLOT: the collective is the elastic role's one logical replica, and it is
-// published at ordinal zero.
+// 通过组自身的槽位判断：collective 是弹性角色的唯一逻辑副本，固定发布在 ordinal 0 处。
 func modelDeploymentGroupIsCollective(
 	group *workercore.ModelDeploymentGroupStatus, collective *modelDeploymentReplicaView,
 ) bool {
@@ -1044,15 +965,13 @@ func modelDeploymentGroupIsCollective(
 	return group.Role == collective.Role && group.Ordinal == int32(collective.Ordinal)
 }
 
-// modelDeploymentGroupCollectiveServing is the serving answer the elastic collective publishes.
+// modelDeploymentGroupCollectiveServing 返回弹性 collective 发布的服务状态。
 //
-// IT IS THE DEFAULT, because the Router's answer is about the master and not about the
-// collective, and it CARRIES NO COUNT: only a confirmation carries a count, and the collective is
-// never confirmed.
+// 它取默认值，因为 Router 的响应针对的是 master 而非 collective；同时它不携带计数：只有确认状态
+// 才携带计数，而 collective 永远不会被确认。
 //
-// WITH A ROUTER THE REASON NAMES THE MISSING OBSERVATION, so a reader that finds an Unknown
-// serving answer can tell it apart from a Router that observed the collective and reported
-// nothing.
+// 配置了 Router 时，reason 会指明缺失的观测，以便读取到 Unknown 服务状态的调用方能够将其与
+// “Router 已观测 collective 但未上报任何内容”区分开来。
 func modelDeploymentGroupCollectiveServing(
 	md *workercore.ModelDeployment,
 ) (workercore.ModelDeploymentServingStatus, string) {
@@ -1063,13 +982,11 @@ func modelDeploymentGroupCollectiveServing(
 	return modelDeploymentGroupServingDefault(md), modelDeploymentReasonGroupUnobserved
 }
 
-// holdModelDeploymentGroup holds a group the Router's observation holds.
+// holdModelDeploymentGroup 暂留因 Router 观测原因需要等待的组。
 //
-// A GROUP THE QUALIFICATION ALREADY HOLDS KEEPS ITS OWN STATE AND ITS OWN REASON: the
-// observation's reason never takes the place of the leg that holds the group.
+// 已被资格评估暂留的组保留其自身的状态与原因：观测原因绝不会覆盖导致该组被暂留的评估环节。
 //
-// A GROUP THAT IS NOT PROTECTED IS NOT HELD: the compatibility classes keep the behavior they
-// have, and an ordinary single-member Server has no group to protect.
+// 不受保护的组不会被暂留：兼容类型保留其原有行为，且普通的单成员 Server 没有需要保护的组。
 func (r *ModelDeploymentReconciler) holdModelDeploymentGroup(
 	group *workercore.ModelDeploymentGroupStatus,
 	observation modelDeploymentPassObservation,
@@ -1101,10 +1018,9 @@ func (r *ModelDeploymentReconciler) holdModelDeploymentGroup(
 		return
 	}
 
-	// A GROUP WHOSE FRESH MEMBER IS NOT READY IS HELD BY THAT MEMBER, AND THE STATE NAMES THE LEG.
-	// AwaitingObservation names a group the Router's observation holds, and the observation is not
-	// what holds this one: the fresh membership is. The reason already names the member, and the
-	// Router's own reason stays on the answer it belongs to.
+	// 若组内有新近成员尚未就绪，则由该成员暂留该组，且状态应标明对应的环节。
+	// AwaitingObservation 表示因 Router 观测而暂留的组，但暂留本组的并非观测而是新近成员状态。
+	// reason 中已经指明了该成员，而 Router 自身的原因则保留在其对应的服务响应中。
 	if observed && fact.MemberNotReady {
 		group.State = workercore.ModelDeploymentGroupStateAwaitingReady
 		group.Reason = modelDeploymentGroupObservationReason(observation.Serving, fact, observed)
@@ -1116,11 +1032,10 @@ func (r *ModelDeploymentReconciler) holdModelDeploymentGroup(
 	group.Reason = modelDeploymentGroupObservationReason(observation.Serving, fact, observed)
 }
 
-// modelDeploymentGroupRestores reports whether the Router's answer lets this group keep serving.
+// modelDeploymentGroupRestores 报告 Router 的响应是否允许该组继续提供服务。
 //
-// IT IS THE RESTORATION BARRIER'S OWN QUESTION, READ AT THE GROUP'S LEVEL: a group restores on a
-// fresh, complete and coherent observation of itself, and a group that is eligible and unchanged
-// keeps what it has while the observation is lost.
+// 这是在组级别评估的恢复屏障判定：当组拥有针对自身的最新、完整且一致的观测时即可恢复；
+// 当观测丢失时，处于 Eligible 且未发生变更的组可维持现有状态。
 func modelDeploymentGroupRestores(observed, fresh bool, fact modelDeploymentGroupServing) bool {
 	if observed && fresh && fact.SnapshotValid {
 		return true
@@ -1129,15 +1044,13 @@ func modelDeploymentGroupRestores(observed, fresh bool, fact modelDeploymentGrou
 	return observed && fact.Retained
 }
 
-// modelDeploymentGroupServingAnswer is the serving answer one group publishes.
+// modelDeploymentGroupServingAnswer 返回单个组发布的服务状态响应。
 //
-// THE GROUP'S OWN FACT IS THE ANSWER, AND ONLY A FRESH FACT MAY CONFIRM: a view that has grown
-// stale is not a confirmation, and publishing the count it carried would report an observation
-// the operator no longer has.
+// 组自身的观测事实即为其响应，且只有最新的事实才能用于确认：已经过期的视图不能作为确认依据，
+// 发布其中携带的计数将等于上报一个 operator 已不再拥有的观测。
 //
-// A GROUP THE ANSWER DOES NOT CARRY IS NOT CONFIRMED BY THE DEPLOYMENT'S ANSWER: the union speaks
-// for the endpoints it counted, and it says nothing about a group it does not name. Such a group
-// says Unknown, or NotConfigured where there is no Router whose answer could be missing.
+// 响应中未包含的组不能由部署级的响应来确认：聚合结果仅代表其实际统计到的端点，对未提及的组
+// 不作任何说明。此类组的状态为 Unknown，或者在没有配置 Router 的情况下为 NotConfigured。
 func modelDeploymentGroupServingAnswer(
 	answer ServingAnswer, fact modelDeploymentGroupServing, observed, fresh bool,
 	md *workercore.ModelDeployment,
@@ -1152,8 +1065,7 @@ func modelDeploymentGroupServingAnswer(
 		if serving.State == "" {
 			serving.State = workercore.ModelDeploymentServingStateUnknown
 		}
-		// ONLY A CONFIRMATION CARRIES A COUNT. The other states say that no count was established,
-		// and the API carries that as an absent value rather than as a zero.
+		// 只有确认状态才携带计数。其他状态表示未能确立计数，API 中将其表示为缺失值（nil）而非零。
 		if serving.State == workercore.ModelDeploymentServingStateConfirmed {
 			endpoints := fact.Endpoints
 			serving.Value = &endpoints
@@ -1171,12 +1083,10 @@ func modelDeploymentGroupServingAnswer(
 	}
 }
 
-// modelDeploymentGroupObservationReason names what is missing from the Router's answer about one
-// group.
+// modelDeploymentGroupObservationReason 指明 Router 关于单个组的响应中缺失的内容。
 //
-// THE GROUP'S OWN FACT NAMES ITS OWN DEFECT, and the deployment's answer names the defect of the
-// collection as a whole. Neither is ever empty: a reader that finds a serving state without a
-// reason cannot tell an unobserved Router from one that was observed and reported nothing.
+// 组自身的事实指明其自身的缺陷，部署级响应则指明整体的缺陷。两者均不能为空：若读取方发现
+// 存在服务状态却没有原因，就无法区分是未观测到 Router，还是已观测到但 Router 未上报任何内容。
 func modelDeploymentGroupObservationReason(
 	answer ServingAnswer, fact modelDeploymentGroupServing, observed bool,
 ) string {
@@ -1190,11 +1100,10 @@ func modelDeploymentGroupObservationReason(
 	return modelDeploymentReasonGroupUnobserved
 }
 
-// modelDeploymentGroupKeyOf is the key the Router's per-group facts are filed under.
+// modelDeploymentGroupKeyOf 返回用于索引 Router 逐组事实的键。
 //
-// IT IS THE GROUP'S OWN IDENTITY, and a fact filed under another membership is not this group's
-// answer: the members changed, so the earlier observation describes Pods that are no longer the
-// group.
+// 该键代表组自身的身份，归档在其他成员集合名下的事实不属于当前组的响应：成员已经变更，
+// 因此先前的观测描述的是不再属于当前组的 Pod。
 func modelDeploymentGroupKeyOf(group *workercore.ModelDeploymentGroupStatus) modelDeploymentGroupKey {
 	return modelDeploymentGroupKey{
 		Role:       group.Role,
@@ -1203,12 +1112,11 @@ func modelDeploymentGroupKeyOf(group *workercore.ModelDeploymentGroupStatus) mod
 	}
 }
 
-// modelDeploymentGroupQualificationOf finds the qualification the pass reached for one group.
+// modelDeploymentGroupQualificationOf 查找本轮对指定组得出的资格评估结果。
 //
-// IT IS THE GROUP'S OWN SLOT, the role and the ordinal AND THE GENERATION, because the answer
-// about a group is about that group and not about whichever group happens to share its role, and
-// because a qualification taken against a membership that has since changed describes Pods that
-// are no longer the group.
+// 匹配依据是组自身的槽位（role 与 ordinal）以及 generation：因为关于某个组的结论只针对该组
+// 本身，而非碰巧共享同一 role 的其他组；同时，基于已变更的成员集合所做的资格评估描述的是
+// 不再属于当前组的 Pod。
 func modelDeploymentGroupQualificationOf(
 	qualifications []modelDeploymentInstanceQualification,
 	role string, ordinal int, generation string,
@@ -1230,7 +1138,7 @@ func modelDeploymentGroupQualificationOf(
 	return modelDeploymentInstanceQualification{}, false
 }
 
-// modelDeploymentRoleByName finds the role the status names.
+// modelDeploymentRoleByName 查找状态中指定名称对应的 role。
 func modelDeploymentRoleByName(md *workercore.ModelDeployment, name string) *workercore.ModelDeploymentRole {
 	for i := range md.Spec.Roles {
 		if md.Spec.Roles[i].Name == name {
@@ -1241,24 +1149,22 @@ func modelDeploymentRoleByName(md *workercore.ModelDeployment, name string) *wor
 	return nil
 }
 
-// applyModelDeploymentGroupQualificationTimes settles the instant each group last became eligible.
+// applyModelDeploymentGroupQualificationTimes 确定每个组最近一次变为 Eligible 的时间点。
 //
-// THE INSTANT RECORDS THE TRANSITION INTO PUBLISHED ELIGIBLE, and nothing else. A group the
-// Router's observation holds has not been published as eligible, so it earns no instant of its
-// own: the instant would name a transition that never happened.
+// 该时间点仅记录转换到“已发布 Eligible”的时刻，别无其他含义。因 Router 观测而被暂留的组尚未
+// 作为 Eligible 发布，因此不会生成自己的时间点：否则该时间点将指向一次从未发生过的状态转换。
 //
-// A HELD GROUP KEEPS THE INSTANT IT EARNED, because the hold is the Router's and the
-// qualification that earned the instant still happened. The history survives it.
+// 被暂留的组会保留此前已获得的时间点，因为暂留源于 Router 观测，而此前获得该时间点的资格评估
+// 确实发生过，历史记录应予以保留。
 //
-// A GROUP THAT COMES BACK TO PUBLISHED ELIGIBLE RECORDS A NEW ONE, because the instant names the
-// moment the group was published as eligible and that moment has moved.
+// 重新回到已发布 Eligible 状态的组会记录新的时间点，因为该时间点标识的是组作为 Eligible 发布的
+// 时刻，而这一时刻已经更新。
 //
-// A NEW GENERATION INHERITS NOTHING: the membership it names is a membership that was never
-// qualified, and an inherited instant would claim otherwise.
+// 新的 generation 不继承任何时间点：它所对应的成员集合从未通过资格评估，继承旧时间点会产生
+// 误导。
 //
-// THE INSTANT IS RECORDED AT ONCE, WHEN THE GROUP FIRST QUALIFIES. Deferring it to a later pass
-// would move the status on the pass after the first one, and a status that moves for an unchanged
-// spec is a status write nobody asked for.
+// 该时间点在组首次通过资格评估时立即记录。推迟到后续轮次记录会导致状态在首次通过后的下一轮发生
+// 变动，而在 spec 未变的情况下变动状态会触发多余的状态写入。
 func applyModelDeploymentGroupQualificationTimes(
 	status *workercore.ModelDeploymentStatus,
 	previous []workercore.ModelDeploymentRoleStatus,
@@ -1269,11 +1175,10 @@ func applyModelDeploymentGroupQualificationTimes(
 		for j := range status.Roles[i].Groups {
 			group := &status.Roles[i].Groups[j]
 
-			// THE COLLECTIVE INHERITS NO HISTORY FROM THE SLOT IT OCCUPIES. The entry that was
-			// published there before was a replica of the role -- the master's own group -- and its
-			// instant belongs to that group. At one worker the two share a generation, so the
-			// settlement would find the prior entry by its own slot and copy the instant across,
-			// giving a group that was never eligible the history of one that was.
+			// collective 不继承其所占槽位上的任何历史记录。此前发布在该槽位上的条目是该角色的一个副本
+			// （即 master 自身的组），其时间点属于那个组。当只有一个 worker 时两者共享同一个 generation，
+			// 结算逻辑若按槽位查找先前的条目并复制时间点，就会把曾经 Eligible 的组的历史赋予从未 Eligible 的
+			// collective。
 			if modelDeploymentGroupIsCollective(group, collective) {
 				group.LastQualificationTime = nil
 				continue
@@ -1282,35 +1187,34 @@ func applyModelDeploymentGroupQualificationTimes(
 			prior := modelDeploymentGroupStatusOf(previous, group)
 			switch {
 			case prior == nil:
-				// THE GROUP IS PUBLISHED FOR THE FIRST TIME.
+				// 该组首次发布。
 				if group.State == workercore.ModelDeploymentGroupStateEligible {
 					group.LastQualificationTime = &now
 				}
 			case prior.Generation != group.Generation:
-				// A NEW MEMBERSHIP EARNS ITS OWN INSTANT, AND INHERITS NONE.
+				// 新的成员集合独立生成自己的时间点，不继承任何历史时间点。
 				if group.State == workercore.ModelDeploymentGroupStateEligible {
 					group.LastQualificationTime = &now
 				}
 			case group.State == workercore.ModelDeploymentGroupStateEligible &&
 				prior.State != workercore.ModelDeploymentGroupStateEligible:
-				// THE GROUP HAS COME BACK TO PUBLISHED ELIGIBLE.
+				// 该组重新回到已发布 Eligible 状态。
 				group.LastQualificationTime = &now
 			case prior.LastQualificationTime != nil:
-				// THE HISTORY IS PRESERVED, THROUGH A HOLD AND THROUGH A WITHDRAWAL.
+				// 在暂留和撤销期间保留历史记录。
 				group.LastQualificationTime = prior.LastQualificationTime.DeepCopy()
 			case group.State == workercore.ModelDeploymentGroupStateEligible:
-				// THE GROUP IS ELIGIBLE AND ITS INSTANT WAS NEVER RECORDED.
+				// 该组处于 Eligible 状态，且其时间点此前从未被记录。
 				group.LastQualificationTime = &now
 			}
 		}
 	}
 }
 
-// modelDeploymentGroupStatusOf finds the entry a group was published as before.
+// modelDeploymentGroupStatusOf 查找某个组此前已发布的条目。
 //
-// IT IS THE GROUP'S OWN SLOT, the role and the ordinal, and NOT the generation: the generation is
-// what the entry is compared against, and a lookup that matched on it would never find the entry
-// whose membership has moved.
+// 匹配依据是组自身的槽位（role 与 ordinal），而不是 generation：generation 是用于与找到的条目
+// 进行比对的字段，若按 generation 查找，将永远找不到成员已发生变更的组条目。
 func modelDeploymentGroupStatusOf(
 	previous []workercore.ModelDeploymentRoleStatus,
 	group *workercore.ModelDeploymentGroupStatus,
@@ -1329,43 +1233,35 @@ func modelDeploymentGroupStatusOf(
 	return nil
 }
 
-// observeModelDeploymentEndpointEligibility reports, at the deployment level, what the whole-group
-// health predicate concluded for the replicas this pass saw.
+// observeModelDeploymentEndpointEligibility 在部署级别上报本轮所见副本的整组健康谓词结论。
 //
-// NO QUALIFICATIONS MEANS NO OBSERVATION, and that stays Unknown rather than becoming False: a
-// False here would read as a disqualification the operator made when no pass has made one. The
-// nil per-role counts and this condition say the same fact at their two levels.
+// 没有任何资格评估结果意味着尚无观测，此时应保持为 Unknown 而非变为 False：False 会被解读为
+// operator 作出了取消资格的判定，而实际上没有任何轮次作出过该判定。为 nil 的各 role 计数与该条件
+// 分别在两个层级表达相同的事实。
 //
-// THE PRECEDENCE IS WHAT MAKES THE CONDITION TRUSTWORTHY. A definite revocation outranks a
-// missing observation, because an operator that can see a broken group must say so even when it
-// cannot see a working one; and Unsupported outranks a plain hold, because an engine shape with
-// no group predicate at all is a different situation from one leg that could not be read this
-// pass, and a reader's next action differs.
+// 优先级规则保证了该条件的可信度。明确的吊销（revocation）优先于缺失观测，因为 operator 只要能
+// 观测到异常组就必须明确指出，即便此时无法观测到正常组；Unsupported 优先于普通暂留，因为
+// 完全没有组谓词的引擎形态与本轮某个环节暂时无法读取是两种不同的情况，调用方后续采取的措施也
+// 截然不同。
 func observeModelDeploymentEndpointEligibility(
 	holder *workercore.ModelDeployment, qualifications []modelDeploymentInstanceQualification,
 ) {
 	revoked, unsupported, held, qualified, observed := 0, 0, 0, 0, 0
 	heldLegs := map[modelDeploymentQualificationLegName]bool{}
 	for _, qualification := range qualifications {
-		// A REPLICA NOTHING HAS REPORTED ON IS NOT PART OF THIS ANSWER. It is the state a
-		// deployment is in between creating its replicas and their first readiness report, and
-		// counting it would publish a hold the operator has not made. Excluding it is also what
-		// keeps the pass after a create from moving the condition, because a pass that changed
-		// this value on an unchanged spec would issue a status write on every one of them.
+		// 尚未有任何上报的副本不计入此结论。这是部署在创建副本后、首次收到就绪报告前所处的状态，将其计入
+		// 会发布一个 operator 尚未作出的暂留判定。排除这类副本也能避免创建后的下一轮调谐变动该条件——
+		// 若在 spec 未变的情况下变动此值，每一轮都会触发一次状态写入。
 		if !qualification.Observed {
 			continue
 		}
 		observed++
-		// ELIGIBLE IS TESTED FIRST, because it is the only one of the four that no failure and no
-		// missing observation can produce, and because a replica whose every leg verified is
-		// qualified rather than held -- an activated replica with nothing wrong is not waiting on
-		// anything.
+		// 首先检查 Eligible，因为它是四者中唯一不会由任何失败或缺失观测产生的结果，且所有评估环节均已
+		// 验证通过的副本应当被认定为合格而非暂留——一个已激活且没有任何异常的副本并不在等待任何条件。
 		//
-		// A REPLICA THAT IS NOT ACTIVATED IS SPLIT BY WHY. Unsupported means no observation exists
-		// for this shape, which is a standing fact about the deployment. Unknown means the
-		// observation was attempted and could not be bound, which is a fact about this pass and may
-		// be different next pass. Collapsing them would tell an operator that a group is
-		// permanently unverifiable when it may be answering a moment from now.
+		// 未激活的副本按原因进一步区分。Unsupported 表示当前形态不存在可用的观测机制，这是部署的固有
+		// 事实；Unknown 表示本轮尝试了观测但未能完成绑定，这是本轮的临时事实，下一轮可能会有所变化。
+		// 将两者混为一谈会向操作者错误地传递“该组永久无法验证”的信号，而实际上它片刻之后就可能恢复响应。
 		switch {
 		case qualification.Eligible():
 			qualified++
@@ -1381,11 +1277,9 @@ func observeModelDeploymentEndpointEligibility(
 		}
 	}
 
-	// ONE MESSAGE FOR THE ONE STATE. A deployment that has no replicas yet and a deployment whose
-	// replicas have not reported are the same answer -- no observation exists -- and they are
-	// given the same words deliberately: the condition accessors move LastTransitionTime when the
-	// message changes, so two phrasings of one state would write the status on every pass of a
-	// deployment that never changes.
+	// 同一状态只用同一条消息。尚无副本的部署和副本尚未上报的部署对应同一结果——尚无观测数据——因此这里有意
+	// 使用相同的措辞：condition 访问器会在消息变化时更新 LastTransitionTime，如果对同一状态使用两种表述，
+	// 即使部署从未发生变化，每次处理也会不断改写状态。
 	if observed == 0 {
 		ModelDeploymentConditionEndpointEligibility.Unknown(holder,
 			modelDeploymentReasonNotObserved,
@@ -1417,11 +1311,10 @@ func observeModelDeploymentEndpointEligibility(
 	}
 }
 
-// modelDeploymentQualificationsDecided mirrors observeModelDeploymentEndpointEligibility's
-// precedence over the same replicas: a definite revocation decides False and a fully qualified
-// pass decides True, while Unsupported, a hold, and no observation decide nothing. The status
-// holder is a copy, so the convergence paths read the pass's decision from here rather than from
-// a condition that is not persisted yet.
+// modelDeploymentQualificationsDecided 在同一组副本上遵循与
+// observeModelDeploymentEndpointEligibility 相同的优先级：明确撤销判定为 False，全部合格的轮次
+// 判定为 True，而 Unsupported、暂缓以及无观测结果均不做判定。status holder 只是一个拷贝，因此
+// 收敛路径从这里读取本轮的判定，而非读取尚未持久化的 condition。
 func modelDeploymentQualificationsDecided(
 	qualifications []modelDeploymentInstanceQualification,
 ) bool {
@@ -1439,13 +1332,13 @@ func modelDeploymentQualificationsDecided(
 		}
 	}
 
-	// A definite failure decides False. Otherwise the pass decides only when every observed
-	// replica qualified, which is the same bar the recorded Unknown condition uses.
+	// 明确失败时判定为 False。否则，本轮仅在所有已观测到的副本都合格时才作出判定，这一标准与记录
+	// Unknown condition 时所使用的门槛一致。
 	return revoked > 0 || (observed > 0 && qualified == observed)
 }
 
-// heldLegNames renders the unverified leg names for a condition message, sorted so the same held
-// group reports the same reason on two consecutive passes.
+// heldLegNames 将未验证的环节名称格式化为 condition 消息，并排序以确保同一受阻组在连续两轮
+// 处理中报告相同的理由。
 func heldLegNames(held map[modelDeploymentQualificationLegName]bool) string {
 	names := make([]string, 0, len(held))
 	for name := range held {
@@ -1459,42 +1352,36 @@ func heldLegNames(held map[modelDeploymentQualificationLegName]bool) string {
 	return strings.Join(names, ", ")
 }
 
-// modelDeploymentPodRole reads which role a replica belongs to.
+// modelDeploymentPodRole 读取副本所属的角色。
 func modelDeploymentPodRole(pod *core.Pod) string {
 	return pod.Labels[modelDeploymentLabelKeyComponent]
 }
 
-// observeModelDeploymentQuota reports whether EVERY ONE of the deployment's replicas holds quota.
+// observeModelDeploymentQuota 报告部署的每一个副本是否都持有配额。
 //
-// Each replica is its own workload and reserves on its own, so `True` is an answer about the whole
-// set rather than about whichever workload sorts first, and the branches below are what make it one:
-// half a deployment holding quota is not the deployment holding quota, and reporting a survivor's
-// answer for a replica whose own reservation is gone was a defect a cluster found.
+// 每个副本都有自己的 Workload 并独立预留资源，因此 `True` 是针对整个集合而非排在最前面的某个
+// Workload 的回答，下面的各个分支正是为了保证这一点：半个部署持有配额并不等于整个部署持有配额，
+// 此前集群中就曾发现过将幸存副本的结果误报给自身预留已丢失副本的缺陷。
 //
-// It reads those workloads' OWN conditions rather than asking the admission gate. The gate stops
-// evaluating a workload once it is admitted, so anything derived from the gate would answer for
-// the moment of admission and never again — and a workload that has been preempted since would still
-// read as reserved.
+// 它直接读取这些 Workload 自身的 condition，而不是查询准入网关（admission gate）。Workload 一旦
+// 被准入，网关就会停止对其评估，因此任何来自网关的结果都只反映准入那一刻的状态而不再更新——之后
+// 被抢占的 Workload 仍会被读作已预留。
 //
-// THE ORDER OF THE BRANCHES IS THE POINT, and PodGroupIncomplete has to come before "no workload
-// yet". A replica that does not exist composes NO workload by construction — Kueue refuses to
-// compose one and says so unretryably on the Pods — so the two states look identical from here and
-// mean opposite things: one resolves itself in a moment, the other is the deployment sitting with
-// gated Pods and an empty `kubectl get workloads` forever. Reporting the second as the first is
-// the failure this reason exists to name.
+// 分支的顺序至关重要，PodGroupIncomplete 必须排在“尚无 workload”之前。缺员的副本从构造上就不
+// 会组合出任何 Workload——Kueue 会拒绝为其组合，并在 Pod 上给出不可重试的说明——因此这两种状态
+// 在这里看起来完全相同，实际含义却截然相反：前者片刻后就会自行解决，后者则会让部署带着被阻塞的
+// Pod 和空空如也的 `kubectl get workloads` 永远停在那里。设置这个原因正是为了避免把后者误报成前者。
 func observeModelDeploymentQuota(
 	md *workercore.ModelDeployment, pods []core.Pod, wls []*kueue.Workload,
 	wlByReplica map[types.UID]*kueue.Workload, holder *workercore.ModelDeployment,
 ) {
-	// A PARKED DEPLOYMENT IS REPORTED FIRST, because every other answer below would describe it
-	// wrongly. Its groups are complete and their Workloads deactivated, which the vocabulary here
-	// otherwise reads as "waiting for admission" -- the opposite of the truth once the bound has
-	// fired, and the reading that sends an operator to wait for something that is never coming.
+	// 优先报告已驻停（Parked）的部署，因为下面其他所有答案都会错误地描述它。它的各个组是完整的，且其
+	// Workload 已被停用（deactivated），而这里的其余逻辑会把这种状态误读为“等待准入”——一旦上限
+	// 触发，这与事实恰好相反，并且会让运维人员白白等待一个永远不会发生的结果。
 	//
-	// IT IS OBSERVED HERE RATHER THAN WRITTEN BY THE CONTROLLER THAT PARKED IT. Status is rebuilt from
-	// observed state on every pass by this one function, so a second writer would leave its own field
-	// behind the moment this one disagreed. The bound is measured on the Workload; this reads what
-	// that measurement left there.
+	// 该状态在此处通过观测得出，而不是由将其驻停的控制器直接写入。Status 在每轮协调中都完全由这一个
+	// 函数根据观测状态重建，若存在第二个写入方，一旦二者意见不一致就会留下过时字段。上限是在 Workload
+	// 上度量的；这里只读取该度量在 Workload 上留下的结果。
 	if parked := parkedModelDeploymentWorkloads(wls); len(parked) > 0 {
 		ModelDeploymentConditionQuotaReserved.False(holder, "Parked", fmt.Sprintf(
 			"the deployment's groups could not all be placed, so %d of its workloads are deactivated "+
@@ -1507,70 +1394,57 @@ func observeModelDeploymentQuota(
 		return
 	}
 
-	// A DEPLOYMENT PREEMPTED IN PART IS REPORTED BEFORE ANY OTHER WAIT, and it is a different fact
-	// from every one of them: part of it is still admitted and serving, holding accelerators for a
-	// deployment that is no longer whole, while the rest waits for quota that was taken.
+	// 部分被抢占的部署必须在任何其他等待状态之前报告，它反映的是与后者完全不同的事实：其中一部分仍处于
+	// 准入并服务状态，为一个不再完整的部署占用着加速器，而其余部分则在等待已被夺走的配额。
 	//
-	// EVERY OTHER BRANCH DESCRIBES IT WRONGLY, and one of them says something FALSE. The multi-group
-	// wait below ends with "no role is admitted until the whole set can run"; here a role IS admitted,
-	// and it is the reason the state matters. The completeness branch would report the preempted
-	// group as merely short of its replicas, which sends an operator to look for a scheduling problem
-	// rather than at the higher-priority workload that took the quota.
+	// 其他所有分支都会错误地描述这种状态，其中一个甚至会给出完全错误的结论。下面的多组等待分支最后会写
+	// “在整套副本都能运行之前没有任何角色被准入”；而在这里确实有角色处于准入状态，这正是该状态重要
+	// 的原因。完整性分支则会把被抢占的组仅仅报告为副本数量不足，误导运维人员去排查调度问题，而不是去
+	// 查找抢走配额的更高优先级 Workload。
 	//
-	// THE REASON CARRIES THE CLASSIFICATION RATHER THAN THE MESSAGE. Telling this from an ordinary
-	// wait decides what an operator does -- wait, or go and look at what preempted it -- and a
-	// consumer that has to substring-match a message to make that decision is reading something that
-	// is not a contract.
+	// 分类信息由 Reason 而非 Message 承载。区分当前状态是部分被抢占还是普通等待，决定了运维人员的
+	// 后续动作——是继续等待，还是去排查是什么抢占了它——如果调用方必须通过子串匹配消息来做此判断，
+	// 那它依赖的就不是稳定的契约。
 	//
-	// THE WORKLOAD SURVIVES PREEMPTION, WHICH IS WHAT MAKES THIS READABLE AT ALL, and it is read out of
-	// Kueue rather than assumed: its preemption path calls workload.Evict with the Preempted reason
-	// and a prepare step that sets the Preempted condition, and Evict patches status -- nothing on
-	// that path deletes the object. Both conditions are therefore present to be read.
+	// Workload 在抢占后依然保留，这是整个状态可被读取的前提，且该行为是从 Kueue 实现中确认而非凭空
+	// 假设的：Kueue 的抢占路径会以 Preempted reason 调用 workload.Evict，并在准备步骤中设置
+	// Preempted condition，而 Evict 只会 patch status——该路径上没有任何操作会删除对象。因此
+	// 两个 condition 都会保留在对象上供读取。
 	//
-	// WHAT IS STILL ASSUMED IS WHAT HAPPENS TO THE REPLICAS, and this branch is placed before the
-	// completeness check so that the answer cannot change what gets reported. If a preempted serving
-	// group's Pods are removed, this is what keeps that group from being announced as merely short of
-	// its total; if they stay, the ordering is inert. Both ways the report is right, and the
-	// assumption decides only whether this ordering is load-bearing.
+	// 唯一仍需假设的是副本本身后续会发生什么，而将该分支放在完整性检查之前，正是为了确保无论答案如何
+	// 都不会影响报告结果。如果被抢占服务组的 Pod 被移除，这一顺序可以避免该组被误报为仅仅缺少副本；
+	// 如果这些 Pod 保留下来，这一顺序则不会产生额外影响。无论哪种情况，报告都是正确的，该假设只决定
+	// 这一顺序是否是必要约束。
 	lost, kept, lostReplicas := modelDeploymentPreemptedInPart(md, pods, wlByReplica)
-	// WHAT ELSE IS WRONG STILL GETS REPORTED, and the preemption is carried down with it. A role
-	// preempted while no sibling survived is not the state PreemptedInPart names -- nothing is being
-	// held -- but "something took a replica's quota" is a fact that would otherwise be dropped, and
-	// without it the answer sends the reader to investigate the wrong thing.
+	// 其他异常情况仍然会被报告，并且抢占信息会一并向下传递。当某个角色被抢占且没有其他兄弟角色幸存时，
+	// 并不属于 PreemptedInPart 所指的状态——此时没有任何资源被继续占用——但“有其他任务夺走了某个
+	// 副本的配额”这一事实若被丢弃，结果就会误导读者去排查错误的方向。
 	//
-	// EVERY ANSWER THAT CAN BE GIVEN WHILE A REPLICA OF THIS DEPLOYMENT IS PREEMPTED CARRIES IT, and
-	// the ones that do not are listed here with the reason, because "deliberately not carried" and
-	// "forgotten" read the same in code:
+	// 在该部署存在副本被抢占时可能给出的每一种结果都会附带该信息，下面列出不附带的几种情况及其原因，
+	// 因为“有意不附带”和“遗漏”在代码里看起来是一样的：
 	//
-	//   - NoReplicas cannot be reached with a preemption observed. The Workload of a replica is
-	//     resolved through that replica's ownership, so a deployment with no Pods resolves no Workload
-	//     and there is nothing on which a preemption could have been seen.
-	//   - NoQueueInReservedNamespace is the same in a different way: a reserved namespace carries no
-	//     LocalQueue, so a deployment there is never scheduled, never holds quota, and has none to lose.
-	//   - Parked supersedes it rather than missing it. Those Workloads are deactivated and no longer ask
-	//     for quota at all, so who took some of it earlier does not decide anything the reader does
-	//     next. It is also answered before this is computed, which is why it reads as an omission.
+	//   - NoReplicas 在观测到抢占时不可能到达。副本的 Workload 是通过该副本的所有权关系解析的，
+	//     因此没有 Pod 的部署无法解析出任何 Workload，也就无从观测到抢占。
+	//   - NoQueueInReservedNamespace 从另一个角度同样不可能：保留 Namespace 中没有
+	//     LocalQueue，因此其中的部署从未被调度，也从未持有配额，自然无从失去配额。
+	//   - Parked 则是覆盖而非遗漏。这些 Workload 已被停用，不再申请任何配额，因此此前是谁夺走了
+	//     部分配额已不再影响读者接下来的操作。并且它在计算该信息之前就已返回，所以看起来像未附带。
 	//
-	// AllReplicasTerminating DOES carry it, and it is the one that looks unreachable and is not: a
-	// replica's workload is resolved whether or not it is terminating, so a preempted replica whose
-	// Pod is on its way out lands exactly there.
+	// AllReplicasTerminating 确实会附带该信息，它看似不可达但实际上可达：无论副本是否正在终止，
+	// 其 Workload 都会被解析，因此 Pod 正在退出的被抢占副本正好会落入这一分支。
 	taken := modelDeploymentPreemptionNote(lost)
 	if len(lost) > 0 && len(kept) > 0 {
-		// WHAT WAS LOST DEPENDS ON THE SHAPE, so it is computed rather than asserted. Losing some
-		// replicas of every kind costs capacity; losing every replica of one kind costs that role
-		// outright, and an operator's next step differs between them.
+		// 损失的具体影响取决于部署形态，因此需要通过计算而非直接断言。每种角色各损失部分副本只会削减容量；
+		// 而某一种角色失去全部副本则会彻底丧失该角色的功能，运维人员针对这两种情况的下一步操作并不相同。
 		//
-		// NEITHER SENTENCE SAYS THE DEPLOYMENT STOPPED, and the earlier one that did was wrong. A
-		// prefill role supplies ingress throughput while a decode role's nodes can complete a
-		// request by themselves, so a deployment that keeps decode is degraded and still serving.
-		// Which losses leave it able to answer is a question about the roles and the routing in
-		// front of them, not one this branch can settle from quota alone -- and the phase already
-		// carries availability, by summing replicas across roles without branching on kind.
+		// 两种措辞都不应说部署已经停止服务，之前的旧表述正是错在这里。prefill 角色提供入口吞吐能力，而
+		// decode 角色的节点可以独立完成请求，因此保留了 decode 的部署只是处于降级状态，仍在提供服务。
+		// 哪种损失会让部署丧失应答能力取决于各角色及其前端路由，而非该分支仅凭配额就能断定的问题——并且
+		// phase 已经通过跨角色汇总副本数而不区分类型来反映可用性了。
 		//
-		// THE SENTENCE MUST NOT IMPLY THE KIND WAS EVER ADMITTED. A kind counts here when no replica
-		// of it is admitted, and a role that never was -- one still short of its declared count,
-		// so Kueue has composed nothing for its missing replicas -- reaches this branch too, because
-		// the preemption of a sibling kind's replica is answered before incompleteness is.
+		// 措辞不能暗示该类型曾经被准入过。只要某一类型没有任何副本处于准入状态就会被计入此处，而一个从未
+		// 被准入过的角色——例如副本数仍低于声明值、Kueue 尚未为其缺失副本组合 Workload 的角色——也会
+		// 走到这个分支，因为对兄弟类型副本抢占的判断排在完整性检查之前。
 		effect := "the deployment still serves, without the capacity those replicas provided"
 		if unserved := modelDeploymentKindsWithoutAdmittedReplica(md, pods, wlByReplica); len(unserved) > 0 {
 			effect = fmt.Sprintf(
@@ -1600,22 +1474,19 @@ func observeModelDeploymentQuota(
 		return
 	}
 
-	// IN REPLICAS, NOT PODS, because every message below spells this figure "replicas" and compares
-	// it against a declared count that is in replicas. The two agree only while a replica is one
-	// Pod.
+	// 以副本（replica）而非 Pod 为单位，因为下面每条消息都将该数值称为“replicas”，并与同样以副本为
+	// 单位的声明数量进行比较。只有当一个副本对应一个 Pod 时，两者才相等。
 	live := len(modelDeploymentGroupPodsByReplica(pods))
 	all := len(modelDeploymentGroupPodsIncludingDeparting(pods))
 
-	// EVERY REPLICA TERMINATING IS NOT "ALL RESERVED". The early return above guards an empty LIST;
-	// this guards an empty RESULT, and they are different emptinesses. A recreate rollout or a group
-	// rebuild hands this function a non-empty slice whose every member is skipped, and reporting on
-	// what is left would claim a guarantee over a set it just finished emptying.
+	// 所有副本都在终止并不等同于“全部已预留”。上面的提前返回防护的是空列表，而这里防护的是过滤后的
+	// 空结果，两者是不同的“空”。重建发布（recreate rollout）或组重建会传给本函数一个非空切片，但
+	// 其中的每个成员都会被跳过；如果直接对剩余集合下结论，就会对一个刚刚被清空的集合做出错误保证。
 	//
-	// Unknown rather than False: no replica holds quota, but none is being refused any either.
+	// 这里设为 Unknown 而非 False：虽然没有副本持有配额，但也没有任何副本的配额申请被拒绝。
 	if live == 0 {
-		// THE PREEMPTION IS CARRIED HERE TOO, and this is the branch where it matters most: replicas
-		// on their way out is what a reclaimed group looks like from the Pod side, so "all of them are
-		// terminating" without the reason why sends the reader to look for who deleted them.
+		// 这里同样需要附带抢占信息，而且这是最关键的一个分支：从 Pod 侧来看，被回收的组正表现为所有副本
+		// 都在退出，如果只说“所有副本都在终止”而不说明原因，就会误导读者去排查是谁删除了它们。
 		ModelDeploymentConditionQuotaReserved.Unknown(holder, "AllReplicasTerminating", fmt.Sprintf(
 			"all %d replicas are terminating, so none holds quota to report on%s", all, taken,
 		))
@@ -1623,33 +1494,28 @@ func observeModelDeploymentQuota(
 		return
 	}
 
-	// THE COUNT IS PER ROLE, and so is the queue it names. Each replica composes its own workload
-	// once its one-member group is seen, so a role short of its declared count has replicas Kueue
-	// has composed nothing for while a sibling role's are all admitted, and comparing the
-	// deployment-wide sum answers about neither: it reads a complete role as short whenever a
-	// sibling is, and reports a queue that is not the one holding anything back.
+	// 计数按角色分别进行，消息中指出的队列也是如此。一旦单副本组被观测到，每个副本就会组合出各自的
+	// Workload，因此某个副本数不足声明值的角色中会存在 Kueue 尚未组合任何 Workload 的副本，而
+	// 它的兄弟角色可能已经全部准入；比较整个部署的总和无法准确反映任何一方：只要有一个兄弟角色缺员，
+	// 完整的角色也会被误判为不足，还会报告一个并非真正阻塞任务的队列。
 	//
-	// The ClusterQueue is named after the InstanceType, so the queue a refusal points at is read off
-	// the spec rather than resolved: the LocalQueue the entrance label names is derived from it.
-	// The message names the ROLE beside that queue, because the queue and the role are not the same
-	// thing to identify: two roles can name one instance type, so a queue names the pool two roles
-	// share and identifies neither, while the role names exactly the one that is short.
-	// A replica is attributed to its role through the SAME LABEL every other figure on this status
-	// reads, so a Pod cannot be counted in one place and not another -- and a replica that predates
-	// the label, or one still being built, is counted against the role it belongs to rather than
-	// against none.
-	// THE COUNT IS OF COMPLETE REPLICAS, NOT OF PODS, and the distinction is what keeps this branch
-	// working above one member per replica. group.TotalCount is a count of REPLICAS, so comparing a
-	// tally of Pods against it reads a role of two replicas of four Pods as having eight of two --
-	// the condition never fires, and the state it exists to name goes unreported precisely where it
-	// is most likely: a group short of a member is one Kueue composes nothing for.
+	// ClusterQueue 以 InstanceType 命名，因此拒绝信息指向的队列可以直接从 spec 读取，而无需再行
+	// 解析：入口标签指定的 LocalQueue 正是由它派生而来。消息中会在该队列旁同时写出角色名，因为队列
+	// 与角色在标识上并不等价：两个角色可能使用同一个 InstanceType，此时队列代表两个角色共享的资源池，
+	// 无法区分具体是哪一个角色，而角色名能精确指出究竟是哪个角色缺员。
+	// 副本通过本 status 中其他所有统计字段所使用的同一标签来归属到对应角色，因此不会出现某个 Pod 在
+	// 一处被计入而在另一处不被计入的情况——早于该标签创建或仍在构建中的副本也会归入其所属角色，而不会
+	// 遗漏不计。
+	// 统计的是完整副本数而非 Pod 数，这一区分保证了一个副本包含多个成员时该分支仍能正常工作。
+	// group.TotalCount 是副本数量，若将 Pod 总数与之比较，会把包含两个四 Pod 副本的角色算成“2 个
+	// 中有 8 个”——该 condition 永远不会触发，它本应标识的状态也恰恰在最可能出现的地方被漏报：缺少
+	// 成员的组正是 Kueue 不会为其组合 Workload 的情况。
 	views := modelDeploymentGroupPodsByReplica(pods)
 	groups := modelDeploymentPodGroups(md)
 	for _, group := range groups {
 		var alive int
 		for _, view := range views {
-			// The replica's own group total, so a role being edited still counts the replicas it is
-			// serving from.
+			// 使用副本自身的组总数，这样正在被编辑的角色依然能够计入当前正在提供服务的副本。
 			if view.Role == group.Role &&
 				modelDeploymentDeployedReplicaShape(view).modelDeploymentReplicaIsWhole() {
 				alive++
@@ -1669,18 +1535,15 @@ func observeModelDeploymentQuota(
 		}
 	}
 
-	// Every role is at its declared count, so what is left to report is whether every replica holds
-	// quota.
+	// 每个角色都已达到声明的副本数，因此接下来只需报告是否每个副本都持有配额。
 	//
-	// THE ANSWER IS OVER EVERY REPLICA, NOT OVER THE FIRST WORKLOAD. A deployment spread over
-	// several instanceTypes has one workload per replica, and answering a role from whichever sorts
-	// first says the deployment holds quota while half of it does not. Measured on a cluster: one
-	// group reserved, its sibling's queue was held, and this condition read Reserved with a message
-	// naming the deployment's whole replica count -- a reading that is wrong in both halves at once.
-	// A SINGLE-ROLE DEPLOYMENT HAS ONE QUEUE AND ITS WORDING SAYS SO; a multi-role one has no single
-	// queue to name, and naming the first role's is a statement about one role offered as a statement
-	// about the deployment. So the queue is read only where the branch has already established there
-	// is one role, and the multi-role branches name the roles they are actually talking about.
+	// 结论针对所有副本，而非第一个 Workload。跨越多个 InstanceType 的部署为每个副本创建一个
+	// Workload，若按排序最靠前的那个来代表整个角色，就会在部署一半没有配额的情况下仍报告已持有配额。
+	// 集群实测中曾出现过：一个组已预留配额，其兄弟组的队列仍被阻塞，但该 condition 却显示 Reserved，
+	// 且消息中写着部署的总副本数——结果在两个方面同时出错。
+	// 单角色部署只有一个队列，消息措辞也明确体现这一点；多角色部署没有单一队列可指代，把第一个角色的
+	// 队列说成整个部署的队列是不准确的。因此，仅在分支已确认只有单一角色时才读取队列，而多角色分支则
+	// 直接指明其实际涉及的角色。
 	queue := md.Spec.Roles[0].InstanceType
 
 	if uncomposedRoles, uncomposed := modelDeploymentRolesWithUncomposedReplicas(md, pods, wlByReplica); uncomposed > 0 {
@@ -1710,8 +1573,8 @@ func observeModelDeploymentQuota(
 
 	waitingRoles, waiting := modelDeploymentRolesWithUnquotaedReplicas(md, pods, wlByReplica)
 	if waiting == 0 {
-		// The single-role wording is kept close to what an operator reading this condition today
-		// already recognizes, because for one role it is exactly right.
+		// 单角色场景的措辞尽量与当前运维人员熟悉的该 condition 文本保持一致，因为在单角色下这本就是
+		// 完全准确的。
 		if len(groups) == 1 {
 			ModelDeploymentConditionQuotaReserved.True(holder, "Reserved", fmt.Sprintf(
 				"all %d replicas have quota reserved in cluster queue %q", live, queue,
@@ -1735,10 +1598,9 @@ func observeModelDeploymentQuota(
 
 		return
 	}
-	// THE BARRIER IS STATED ABOUT THE REPLICAS STILL WAITING, not about the deployment. A scale-up
-	// reaches this branch with the replicas that were already running still admitted and only the new
-	// ones queued, so a sentence saying no replica is admitted contradicts the count beside it and
-	// tells an operator nothing is serving while the deployment serves.
+	// 阻塞说明针对的是仍在等待的副本，而非整个部署。扩容操作走到这一分支时，原本运行中的副本仍处于
+	// 准入状态，只有新增副本在排队，因此如果说“没有任何副本被准入”，不仅与旁边的计数相矛盾，还会在
+	// 部署实际仍在服务时误导运维人员以为没有任何副本在服务。
 	ModelDeploymentConditionQuotaReserved.False(holder, "Pending", fmt.Sprintf(
 		"%d of this deployment's %d replicas are waiting for quota: the replicas of roles %s. Those "+
 			"replicas are admitted only once the whole set can run%s%s",
@@ -1746,10 +1608,9 @@ func observeModelDeploymentQuota(
 	))
 }
 
-// modelDeploymentInadmissibleWorkloadDetails preserves Kueue's explanation while adding the role
-// and replica identity an operator needs to find the affected group. Kueue's reason and message are
-// downstream prose, not a stable ModelDeployment reason vocabulary, so they are displayed but
-// never parsed or promoted into a new condition reason.
+// modelDeploymentInadmissibleWorkloadDetails 在保留 Kueue 原始说明的同时，补充了运维人员定位
+// 受影响组所需的角色和副本标识。Kueue 的 reason 和 message 属于下游描述文本，并非稳定的
+// ModelDeployment reason 词汇表，因此仅做展示，绝不解析或提升为新的 condition reason。
 func modelDeploymentInadmissibleWorkloadDetails(
 	pods []core.Pod, wlByReplica map[types.UID]*kueue.Workload,
 ) string {
@@ -1795,36 +1656,29 @@ func modelDeploymentInadmissibleWorkloadDetails(
 	return "; downstream admission: " + strings.Join(parts, "; ")
 }
 
-// modelDeploymentReplicaWorkloads resolves, for every replica this pass observed, the one Workload
-// owning it.
+// modelDeploymentReplicaWorkloads 为本轮观测到的每个副本解析唯一拥有它的 Workload。
 //
-// THE WORKLOAD IS READ BY OWNERSHIP AND BY NOTHING ELSE. The name this operator derives for a
-// group moves with the spec, and whatever composes Workloads names them by its own rules -- Kueue
-// today, something else if the substrate ever changes -- so a reader that reconstructed the name
-// would not error on the day the two diverge; it would find nothing and report an empty status.
-// Ownership is the one relation both sides keep, so it is the only thing this matches on.
+// 仅通过所有权关系读取 Workload，不依赖任何其他途径。本 operator 为组生成的名称会随 spec 变化，
+// 而组合 Workload 的组件也会按自身规则为其命名——目前是 Kueue，若底层以后更换也可能是其他组件——
+// 因此靠重新拼接名称来查找的做法在两者规则分叉的那天不会报错，而是直接找不到对象并报告空状态。
+// 所有权是双方都会维护的唯一关系，因此是这里唯一使用的匹配依据。
 //
-// ONE ENTRY PER REPLICA RATHER THAN PER ROLE, because a role's replicas are one workload each now,
-// and every question the status asks -- how many hold quota, which flavors they landed on, which
-// slot of which role is empty -- is a question about replicas. A per-role view that answered for a
-// role from whichever workload owned any of its Pods could not tell a role that lost one replica's
-// workload from one that kept them all: the lookup hits either way, and the figures it fed carried
-// the survivors' answer for the missing replica too.
+// 按副本而非按角色建立条目，因为现在角色下的每个副本各自对应一个 Workload，而 status 要回答的
+// 每一个问题——有多少副本持有配额、落在了哪些 flavor 上、哪个角色的哪个槽位空缺——都是针对副本的。
+// 如果按角色视图从拥有其任意 Pod 的 Workload 中取值，就无法区分丢失了一个副本 Workload 的角色
+// 与保留全部 Workload 的角色：两种情况都会命中查找，进而把幸存副本的结果套用到缺失副本上。
 //
-// THE INDEX COVERS EVERY POD, TERMINATING ONES INCLUDED, because a workload holding a departing
-// replica is still the thing holding its quota and its finalizer, and the readers that must not
-// count a departing replica skip it at their own branch rather than the index pre-deciding for
-// them.
+// 该索引覆盖所有 Pod（包括正在终止的 Pod），因为持有退出中副本的 Workload 仍然持有其配额和
+// finalizer，不应计入退出中副本的读取方会在各自逻辑分支中跳过它，而不是由索引预先替它们决定。
 //
-// The Workloads arrive in name order, so a replica briefly owned by two during a rebuild resolves
-// to the same one on every pass rather than flipping while the old one drains.
+// 传入的 Workload 按名称排序，因此重建期间短暂同时被两个 Workload 拥有的副本在每次处理中都会
+// 解析到同一个 Workload，不会在旧对象排空期间来回切换。
 //
-// THE OWNERSHIP IS INVERTED ONCE rather than searched per Pod. A Workload names its members, so
-// reading the references forward builds the whole answer in one walk; asking each Pod which Workload
-// claims it walks every Workload's references again for every Pod, and a deployment's Pods and its
-// Workloads both grow with it. Keeping the FIRST Workload to claim a UID is what preserves the name
-// order above: the walk visits the Workloads in that order, so the entry a contested replica lands
-// on is the same one the per-Pod search would have stopped at.
+// 所有权关系只做一次反向索引，而不是按 Pod 逐个搜索。Workload 自身记录了成员列表，正向读取这些
+// 引用即可在一次遍历中构建完整映射；若对每个 Pod 逐一查询哪个 Workload 认领了它，则每个 Pod
+// 都要重走一遍所有 Workload 的引用，而部署的 Pod 数和 Workload 数都会随规模同步增长。只保留
+// 第一个认领该 UID 的 Workload 正是为了维持上述按名称排序的确定性：遍历本身按该顺序访问 Workload，
+// 因此存在归属竞争的副本所落定的条目与逐 Pod 搜索最先停下的那个完全一致。
 func modelDeploymentReplicaWorkloads(
 	pods []core.Pod, wls []*kueue.Workload,
 ) map[types.UID]*kueue.Workload {
@@ -1850,48 +1704,41 @@ func modelDeploymentReplicaWorkloads(
 	return byReplica
 }
 
-// modelDeploymentPreemptedInPart names the roles with a replica whose quota a higher-priority
-// workload reclaimed, and the roles with a replica that is still admitted, when BOTH lists are
-// non-empty, and counts the reclaimed replicas.
+// modelDeploymentPreemptedInPart 在以下两个列表均非空时，分别列出存在配额被高优先级
+// Workload 回收的副本的角色、以及仍处于已准入（admitted）状态的副本的角色，并统计被回收的副本数。
 //
-// THE SECOND LIST IS THE WHOLE PREDICATE. A deployment every one of whose replicas was preempted
-// is an ordinary state: it holds nothing, serves nothing, and is waiting for capacity exactly as a
-// deployment that never started is. What makes this one different is that part of it kept its quota
-// and is running — so accelerators are held for a deployment that is no longer whole, and neither
-// half of that is visible from the other half alone. Whether the rest still serves is a question
-// about the KINDS the reclaimed replicas carried, answered separately and never assumed. Reading
-// only "was anything preempted" answers the same for both, which is the shape this is written
-// against.
+// 第二个列表是整个判定的核心。若某个部署的所有副本都被抢占，这属于常规状态：它不占用任何资源、
+// 不提供服务，与从未启动过的部署一样只是在等待容量。本状态的不同之处在于，部署中仍有部分副本
+// 保留了配额并在运行——这意味着一个已不再完整的部署仍在占用加速器资源，而仅凭其中任何一半的
+// 状态都无法看出全貌。其余副本是否仍在提供服务取决于被回收副本所承载的 kind，该问题会单独判定，
+// 绝不做假设。如果只检查“是否有副本被抢占”，对这两种情况会得出相同结论，而本函数正是为区分
+// 它们而设计。
 //
-// A REPLICA WITH NO WORKLOAD COUNTS AS NEITHER, and that asymmetry is deliberate. Kueue composes
-// no workload for a replica that does not exist, so such a replica holds nothing and there is
-// nothing on it to read: it cannot be a survivor holding accelerators, and it cannot be shown to
-// have been preempted. Two consequences follow, and they are not the same.
+// 没有关联 Workload 的副本既不计入被抢占列表也不计入存活列表，这种不对称是有意为之。Kueue
+// 不会为尚不存在的副本生成 Workload，因此这类副本不占用任何资源，也无状态可读：它既不能作为
+// 占用加速器的存活副本，也无法证明其曾被抢占。由此带来两个不同的结果。
 //
-// WITH A SURVIVOR PRESENT THE PREEMPTION WINS THE REPORT, even though another replica is still
-// assembling. Something took capacity this deployment was admitted for, which is the one fact an
-// operator can act on, and the assembling replica resolves itself.
+// 只要存在存活副本，报告就会以抢占状态为准，即使此时仍有其他副本正在组装中。毕竟有其他任务
+// 抢走了本部署已获准入的容量，这是运维人员唯一需要采取行动的事实，而正在组装的副本最终会自行
+// 就绪。
 //
-// WITH NO SURVIVOR THERE IS NOTHING TO HOLD, so this is not the state this reason names and the
-// report falls through to the branch that describes what else is wrong. That branch used to say
-// nothing about the preemption at all -- it sent the reader to investigate missing replicas when
-// something had taken a replica's quota -- so the fact is carried down instead of the reason being
-// widened to cover a state whose harm it does not describe.
+// 若不存在存活副本，则说明没有资源被空占，因此不属于该 reason 所指代的状态，报告会继续向下
+// 走入描述其他异常原因的分支。该分支过去完全不提及抢占事实——当某个副本的配额被抢走时，它会
+// 引导排查人员去调查缺失副本——因此现在会将抢占事实向下传递，而不是扩大该 reason 的适用范围
+// 去覆盖并不存在资源碎片危害的状态。
 //
-// A ROLE CAN SIT ON BOTH LISTS AT ONCE now that each of its replicas is its own workload: one
-// replica reclaimed beside a sibling still admitted is exactly the fragmentation this reason
-// names, and sorting the role onto one list or the other would drop one of its two facts.
+// 如今同一个角色可以同时出现在两个列表中，因为它的每个副本都有各自独立的 Workload：同一角色
+// 下一个副本被回收而另一个同级副本仍处于已准入状态，正是该 reason 所描述的碎片化场景；若强行
+// 将该角色归入单一列表，反而会丢失其中一半的事实。
 //
-// PREEMPTION IS ASKED OF KUEUE RATHER THAN INFERRED. Kueue names it: an evicted workload carries a
-// reason, and Preempted is one value among PodsReadyTimeout, AdmissionCheck and the queue-stopped
-// ones. Inferring it from "lost its reservation" would fold every one of those into this answer, and
-// they need different actions.
+// 抢占状态直接向 Kueue 查询，而非自行推断。Kueue 会明确标出抢占：被驱逐的 Workload 带有
+// 原因字段，Preempted 与 PodsReadyTimeout、AdmissionCheck 及队列停止等原因并列。若仅凭
+// “失去预留配额”来推断，就会把上述所有情况混为一谈，而它们各自需要完全不同的处理措施。
 func modelDeploymentPreemptedInPart(
 	md *workercore.ModelDeployment, pods []core.Pod, wlByReplica map[types.UID]*kueue.Workload,
 ) (lost, kept []string, lostReplicas int) {
-	// Grouped without dropping the departing, unlike the figures above: replicas on their way out
-	// is what a reclaimed group looks like from the Pod side, so skipping them here would hide the
-	// preemption this function exists to name.
+	// 与上述统计不同，此处分组时保留了正在退出的副本：从 Pod 侧来看，被回收的组正处于退出过程中，
+	// 若在此跳过它们，就会掩盖本函数旨在识别的抢占状态。
 	views := modelDeploymentGroupPodsIncludingDeparting(pods)
 	for i := range md.Spec.Roles {
 		role := &md.Spec.Roles[i]
@@ -1923,12 +1770,11 @@ func modelDeploymentPreemptedInPart(
 	return lost, kept, lostReplicas
 }
 
-// modelDeploymentWorkloadPreempted reports whether Kueue took this Workload's quota back for a
-// higher-priority one.
+// modelDeploymentWorkloadPreempted 报告 Kueue 是否因高优先级任务而收回了该 Workload 的配额。
 //
-// BOTH CONDITIONS ARE READ because they are written at different moments and either can be the one
-// still standing: Kueue sets Preempted when it decides, and Evicted with the Preempted reason when it
-// acts. A reader of one alone answers differently depending on which write it arrives between.
+// 这里会同时检查两个条件，因为它们在不同时间点写入，且任意一个都可能仍保留在状态中：Kueue
+// 在做出抢占决策时设置 Preempted，在执行驱逐时设置带 Preempted 原因的 Evicted。只读其中
+// 一个条件会因读写时机差异而得出不同结论。
 func modelDeploymentWorkloadPreempted(wl *kueue.Workload) bool {
 	if kubeapistatus.ConditionType(kueue.WorkloadPreempted).IsTrue(wl) {
 		return true
@@ -1945,18 +1791,16 @@ func modelDeploymentWorkloadPreempted(wl *kueue.Workload) bool {
 	return false
 }
 
-// modelDeploymentKindsWithoutAdmittedReplica names the role kinds no admitted replica carries, in
-// the order the roles first mention them.
+// modelDeploymentKindsWithoutAdmittedReplica 按角色首次声明的顺序，返回没有任何已准入副本
+// 的角色 kind 列表。
 //
-// IT IS WHAT DECIDES WHETHER A PARTIALLY PREEMPTED DEPLOYMENT IS STILL SERVING, and it has to be
-// asked about KINDS rather than about roles. Two roles can share one kind, so losing one role's
-// every replica while a sibling kind's survive leaves the deployment able to serve that half, and
-// counting roles answers neither question.
+// 该结果用于判断部分被抢占的部署是否仍在提供服务，因此必须按 kind 而非按角色维度查询。两个
+// 角色可以共享同一种 kind，若其中一个角色的所有副本均丢失而同 kind 的兄弟角色副本仍在运行，
+// 部署依然能够维持该部分服务；仅统计角色数无法回答这一问题。
 //
-// A ROLE WHOSE REPLICAS HAVE NO WORKLOAD COUNTS AS NOT ADMITTED. Kueue composes none for a replica
-// that does not exist, and a replica that is not admitted is not serving whatever the reason. That
-// is the accurate reading here, unlike in the preemption predicate next door, where the same state
-// means "nothing to report about this replica" rather than "this replica is gone".
+// 若某角色的副本没有对应的 Workload，则视为未准入。Kueue 不会为不存在的副本生成 Workload，
+// 而未准入的副本无论出于何种原因都未在提供服务。这与相邻抢占判定函数的语义不同：在此处这是
+// 准确的状态解读，而在抢占判定中，相同状态仅表示“该副本无可报告信息”，而非“该副本已丢失”。
 func modelDeploymentKindsWithoutAdmittedReplica(
 	md *workercore.ModelDeployment, pods []core.Pod, wlByReplica map[types.UID]*kueue.Workload,
 ) []string {
@@ -1993,8 +1837,7 @@ func modelDeploymentKindsWithoutAdmittedReplica(
 	return unserved
 }
 
-// modelDeploymentDeclaredReplicas sums the replicas every role declares, which is the denominator
-// the per-replica answers name.
+// modelDeploymentDeclaredReplicas 汇总所有角色声明的副本总数，作为按副本统计各项指标时的分母。
 func modelDeploymentDeclaredReplicas(md *workercore.ModelDeployment) int {
 	declared := 0
 	for i := range md.Spec.Roles {
@@ -2004,14 +1847,12 @@ func modelDeploymentDeclaredReplicas(md *workercore.ModelDeployment) int {
 	return declared
 }
 
-// modelDeploymentRolesWithUncomposedReplicas names the roles that have a live replica Kueue has
-// composed no workload for, and counts those replicas. A live replica in that state is
-// mid-admission; a missing one is the completeness branch's answer above, which is why the two are
-// not the same list.
+// modelDeploymentRolesWithUncomposedReplicas 列出包含 Kueue 尚未生成 Workload 的活跃副本的
+// 角色，并统计此类副本的数量。处于该状态的活跃副本正处于准入流程中；而缺失副本由上方的完整性
+// 分支负责处理，因此两者的角色列表并不相同。
 //
-// DEPARTING REPLICAS ARE NOT COUNTED, for the same reason every figure beside this one skips them:
-// a replica on its way out is not waiting for a workload, and counting it would hold the condition
-// on a member the deployment is shedding.
+// 此处不统计正在退出的副本，原因与旁边其他统计口径一致：正在退出的副本并不在等待生成 Workload，
+// 若将其计入会导致状态条件持续卡在部署正在缩容或清理的成员上。
 func modelDeploymentRolesWithUncomposedReplicas(
 	md *workercore.ModelDeployment, pods []core.Pod, wlByReplica map[types.UID]*kueue.Workload,
 ) (roles []string, uncomposed int) {
@@ -2036,21 +1877,19 @@ func modelDeploymentRolesWithUncomposedReplicas(
 	return roles, uncomposed
 }
 
-// EVERY FIGURE THIS FILE PUBLISHES IS IN REPLICAS, because that is the unit `desired` is in and the
-// unit every message names. A Pod-keyed loop produces a figure in Pods, which is the same number
-// only while a replica is one Pod: a role of two replicas of two would report "4 of this
-// deployment's 2 replicas are waiting", a statement about a deployment that cannot exist.
+// 本文件发布的所有指标均以“副本”为单位，因为 `desired` 的单位是副本，所有状态消息也以副本
+// 计数。若按 Pod 循环统计，得出的结果是以 Pod 为单位的数值——只有当每个副本仅包含 1 个 Pod 时
+// 两者才相等：对于包含 2 个副本、每副本 2 个 Pod 的角色，按 Pod 统计会报告“该部署的 2 个副本
+// 中有 4 个正在等待”，这描述的是一个不可能存在的部署状态。
 //
-// The members of a replica share one Workload, so a Pod-keyed loop over an unreserved replica also
-// counts that one Workload once per member -- the miscount is a multiplication by `size` rather
-// than a stray increment, and it grows with exactly the field this shape was added for.
+// 同一副本内的成员共享同一个 Workload，因此按 Pod 遍历未预留配额的副本还会把同一个 Workload
+// 按成员数重复计数——这种错误计数会按 `size` 倍数放大，并恰好随着为此模型引入的字段一同增长。
 
-// modelDeploymentReplicaWorkload is the Workload the members of one replica share, or nil when Kueue
-// has composed none -- which is what an incomplete group looks like, since Kueue composes nothing
-// until a group holds every member it declares.
+// modelDeploymentReplicaWorkload 返回同一副本成员共享的 Workload；若 Kueue 尚未生成，则
+// 返回 nil——这正是不完整副本组的表现，因为 Kueue 在副本组集齐所有声明成员之前不会生成 Workload。
 //
-// It is read from the first member that answers rather than from a fixed one: a replica short of
-// its leader still has the Workload its surviving members joined.
+// 函数从首个能找到对应关系的成员读取 Workload，而非固定读取某个特定成员：即使副本缺少主节点
+// （leader），其存活成员仍关联着已加入的 Workload。
 func modelDeploymentReplicaWorkload(
 	view modelDeploymentReplicaView, wlByReplica map[types.UID]*kueue.Workload,
 ) *kueue.Workload {
@@ -2063,13 +1902,12 @@ func modelDeploymentReplicaWorkload(
 	return nil
 }
 
-// modelDeploymentRolesWithUnquotaedReplicas names the roles that have a live replica whose
-// workload holds no quota reservation, and counts those replicas.
+// modelDeploymentRolesWithUnquotaedReplicas 列出包含尚未持有配额预留（quota reservation）
+// 的 Workload 的活跃副本的角色，并统计此类副本的数量。
 //
-// A REPLICA IS ANSWERED BY THE WORKLOAD OWNING IT. Answering a role from one workload for the
-// whole of it cannot distinguish a set that is fully reserved from one where one replica's
-// reservation is gone -- a state one workload per role could not even express -- and those two are
-// the difference between a deployment that is about to run and one that is partly held.
+// 每个副本的状态由其所属的 Workload 决定。如果整个角色只用单个 Workload 来判断，就无法区分
+// “整组均已预留”与“其中某一个副本的预留已丢失”——这是每角色单 Workload 模型根本无法表达的
+// 状态——而这两种状态恰恰区分了“即将运行的部署”和“仅部分被占用的部署”。
 func modelDeploymentRolesWithUnquotaedReplicas(
 	md *workercore.ModelDeployment, pods []core.Pod, wlByReplica map[types.UID]*kueue.Workload,
 ) (roles []string, waiting int) {
@@ -2095,34 +1933,31 @@ func modelDeploymentRolesWithUnquotaedReplicas(
 	return roles, waiting
 }
 
-// findModelDeploymentGroupWorkloads returns EVERY Workload owning any of these Pods, in name order.
+// findModelDeploymentGroupWorkloads 按名称顺序返回拥有任意这些 Pod 的所有 Workload。
 //
-// THERE IS NO SINGULAR FORM OF THIS, deliberately. One that returned the first was here and had no
-// production caller left: every question is about one replica, and which Workload answers for which
-// replica is decided by the ownership each one carries (modelDeploymentReplicaWorkloads)
-// rather than by sort order. A correctly written accessor that only serves a world model this
-// package has abandoned is not dead weight, it is an invitation to reintroduce the defect it
-// enables -- and it draws no review comment, because it is not wrong.
+// 此处故意不提供仅返回单个 Workload 的方法。此前曾有返回首个 Workload 的实现且已无生产调用方：
+// 每个查询都针对单个副本，而哪个 Workload 对应哪个副本由各自携带的所有权关系
+// （modelDeploymentReplicaWorkloads）决定，而非排序顺序。一个书写正确但仅服务于本包已废弃
+// 模型的访问器并非单纯的冗余代码，它还会诱使后续代码重新引入该模型下的缺陷——并且因为代码
+// 本身没错而在评审时难以察觉。
 //
-// IT MATCHES ON A PLAIN OWNER REFERENCE, NOT A CONTROLLER REFERENCE, and that is not a relaxation —
-// it is the difference between finding the Workload and never finding one. Kueue sets a CONTROLLER
-// reference when it builds a Workload from a single Pod, and plain owner references to EVERY member
-// when it builds one from a pod group (`SetOwnerReference` per Pod, not `SetControllerReference`).
-// So the moment the replicas became a group, a controller-reference filter started matching nothing,
-// and every deployment would have reported "no workload yet" forever while being admitted normally.
+// 此处匹配的是普通 OwnerReference，而非 ControllerReference，这并非放宽条件，而是能否找到
+// Workload 的关键区别。Kueue 基于单个 Pod 构建 Workload 时会设置 ControllerReference，而基于
+// Pod 组构建 Workload 时会为每个成员设置普通 OwnerReference（对每个 Pod 调用 `SetOwnerReference`，
+// 而非 `SetControllerReference`）。因此一旦副本成为多 Pod 组，ControllerReference 过滤器就会
+// 完全匹配不到对象，导致所有部署在正常准入的情况下却永远报告“尚无 Workload”。
 //
-// The API version is checked with the kind: "Pod" is not a reserved word, and a resource of that
-// kind in another group would match on the kind alone.
+// 匹配时同时校验 APIVersion 和 Kind：“Pod”并非保留字，其他 API 组中也可能存在同名资源，
+// 仅凭 Kind 会产生误匹配。
 //
-// A rebuild can briefly leave the OLD group's Workload owning Pods that are on their way out. The
-// scan is over the Pods this pass observed, and the result is taken in name order so that two
-// candidates cannot make the reported state flip between passes while the old one drains. A caller
-// that takes only the first leaves the rest in place -- and each of those still holds Kueue's
-// finalizer on its own replicas, which is the one thing that keeps them from ever leaving. The
-// symptom is a deployment stuck in Deleting with nothing erroring.
+// 重建过程可能会短暂留下仍拥有正在退出 Pod 的旧组 Workload。本函数仅扫描本轮观测到的 Pod，
+// 并按名称排序返回结果，从而防止在旧组排水期间因存在两个候选 Workload 而导致上报状态在各轮
+// 之间来回闪烁。若调用方只取第一个 Workload，剩余的 Workload 会被遗留下来——而它们各自仍在
+// 其对应的副本上保留着 Kueue 的 finalizer，这会导致副本永远无法退出，表现为部署一直卡在
+// Deleting 状态且没有任何报错。
 //
-// Callers that scope the Pods scope the result: passing one group's replicas returns that group's
-// Workload and no other, which is how a rebuild reaches exactly the group it is rebuilding.
+// 调用方可通过限定传入的 Pod 范围来限定返回结果：传入单个组的副本即可只获取该组对应的 Workload，
+// 重建逻辑正是借此精确定位到正在重建的副本组。
 func (r *ModelDeploymentReconciler) findModelDeploymentGroupWorkloads(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
 ) ([]*kueue.Workload, error) {
@@ -2153,7 +1988,7 @@ func (r *ModelDeploymentReconciler) findModelDeploymentGroupWorkloads(
 	return found, nil
 }
 
-// modelDeploymentWorkloadOwnsAny reports whether the Workload names any of these Pods as an owner.
+// modelDeploymentWorkloadOwnsAny 报告该 Workload 是否将传入的任意 Pod 列为所有者（owner）。
 func modelDeploymentWorkloadOwnsAny(wl *kueue.Workload, pods sets.Set[types.UID]) bool {
 	for _, ref := range wl.OwnerReferences {
 		if modelDeploymentOwnerRefNamesAPod(ref) && pods.Has(ref.UID) {
@@ -2164,24 +1999,22 @@ func modelDeploymentWorkloadOwnsAny(wl *kueue.Workload, pods sets.Set[types.UID]
 	return false
 }
 
-// modelDeploymentOwnerRefNamesAPod reports whether an owner reference names a Pod, which is the only
-// kind of owner a replica's Workload is matched on.
+// modelDeploymentOwnerRefNamesAPod 报告某个 OwnerReference 是否指向 Pod，这是副本 Workload
+// 唯一认可的所有者类型。
 //
-// THE KIND IS CHECKED BECAUSE A UID ALONE IS NOT A RELATION. A Workload carries whatever owners its
-// composer gave it, and a reference to some other kind that happened to match a Pod's UID would make
-// an unrelated object answer for a replica. Every reader of this relation goes through here -- the
-// status and the rollout guard matching Workloads to replicas, and the Workload watch and the joint
-// admission barrier walking a Workload back to its deployment -- so that none of them can come to
-// disagree about what owning a replica means.
+// 必须校验 Kind，因为仅凭 UID 并不足以确立所有权关系。Workload 会保留其创建者赋予的任何
+// 所有者引用，若某个其他类型的对象碰巧与某个 Pod 拥有相同的 UID，就会导致无关对象被当作副本
+// 的 Workload。所有读取该关系的地方都统一经由本函数——包括将 Workload 匹配到副本的状态计算
+// 与发布守卫，以及根据 Workload 反查所属部署的 Workload Watch 与联合准入屏障——以确保各方
+// 对“拥有副本”的定义完全一致。
 func modelDeploymentOwnerRefNamesAPod(ref meta.OwnerReference) bool {
 	return ref.Kind == "Pod" && ref.APIVersion == "v1"
 }
 
-// observeModelDeploymentRoleKinds reports whether every role kind has a ready replica.
+// observeModelDeploymentRoleKinds 报告是否每种角色 kind 都至少有一个就绪副本。
 //
-// IT READS THE ROLE STATUSES THIS PASS JUST COMPUTED rather than the spec, so its answer cannot
-// disagree with the counts published beside it. Reading the spec instead would let the condition
-// speak about a role whose replicas this pass failed to account for.
+// 该函数读取本轮刚计算出的角色状态而非 spec，从而保证其结论不会与旁边的计数结果矛盾。如果
+// 直接读取 spec，状态条件就可能对本轮未能统计到副本的角色给出错误判断。
 func observeModelDeploymentRoleKinds(holder *workercore.ModelDeployment) {
 	roles := holder.Status.Roles
 	if len(roles) == 0 {
@@ -2203,28 +2036,24 @@ func observeModelDeploymentRoleKinds(holder *workercore.ModelDeployment) {
 		fmt.Sprintf("no replica is ready for role kinds %s", strings.Join(missing, ", ")))
 }
 
-// modelDeploymentKindsWithoutReady names the role kinds no ready replica was counted for, in the
-// order the roles first mention them.
+// modelDeploymentKindsWithoutReady 按角色首次声明的顺序，返回没有任何就绪副本的角色 kind 列表。
 //
-// It is PURE: same statuses, same result, no client and no clock.
+// 该函数是纯函数：输入相同的状态即输出相同的结果，不依赖客户端也不依赖时钟。
 //
-// THE THRESHOLD IS ONE READY REPLICA, NEVER ALL OF THEM. "All of them" is replica completeness,
-// which the phase already derives; asking it here would put one question in two fields, and the two
-// would be free to disagree the moment either is edited. One is what makes this a question about
-// the deployment's SHAPE: whether each half of a disaggregated deployment is represented at all.
+// 阈值是一个就绪副本，而非全部就绪。“全部就绪”属于副本完整性判定，phase 字段已经推导了该
+// 语义；若在此重复判定，就会让两个字段表达同一问题，一旦修改其中之一便会产生矛盾。只要求一个
+// 就绪副本，才能使该问题聚焦于部署的“形态（shape）”：即分离式部署的各个组成部分是否均已就位。
 //
-// THE ORDER IS THE ROLES' ORDER, first mention winning, so two passes over unchanged statuses
-// produce the same message. A map's iteration order would not, and this list is rendered into a
-// condition message that is compared against the stored one to decide whether to write at all.
+// 列表顺序严格遵循角色声明顺序（以首次出现为准），确保在状态未变时连续两轮生成完全一致的
+// 消息。map 的遍历顺序无法保证这一点，而该列表会被渲染进状态条件消息中，并与已存储的消息
+// 比对以决定是否需要写回更新。
 //
-// AN UNMANAGED ROLE'S READY REPLICAS COUNT, and that is a decision rather than an oversight. Such a
-// role replaced the whole command line, so the renderer attached no probes to it and its Pods are
-// Ready once their containers start — a weaker statement than a probed role's Ready. It still
-// counts, because the operator did not build that command line and has nothing better to judge it
-// by, and because discounting it would leave a deployment whose roles all took over reporting a
-// missing kind forever. What it costs is that this condition's True rests, for such a kind, on the
-// kubelet's container-start signal alone; status.roles[].Unmanaged is published per role, so a
-// reader needing the stronger reading can apply it without this field folding it in.
+// 非托管角色（unmanaged role）的就绪副本也会计入统计，这是有意的设计决策而非疏漏。此类角色
+// 替换了完整的启动命令行，渲染器未向其附加探针，因此只要容器启动其 Pod 即为 Ready——这比带
+// 探针角色的 Ready 语义更弱。但它仍需计入，因为 Operator 并未构建该命令行、没有更可靠的判断依据，
+// 且若忽略它会导致所有角色都采用自定义命令的部署永远报错缺少 kind。其代价在于，对于此类 kind，
+// 该条件为 True 仅基于 kubelet 的容器启动信号；由于每个角色的 status.roles[].Unmanaged 字段
+// 均会公开，需要更严格判定的读取方可以自行据此过滤，无需由本字段代为收紧。
 func modelDeploymentKindsWithoutReady(roles []workercore.ModelDeploymentRoleStatus) []string {
 	order := make([]string, 0, len(roles))
 	ready := make(map[string]bool, len(roles))
@@ -2250,13 +2079,11 @@ func modelDeploymentKindsWithoutReady(roles []workercore.ModelDeploymentRoleStat
 	return missing
 }
 
-// deriveModelDeploymentPhase summarizes the counts into the one field a human reads first.
+// deriveModelDeploymentPhase 将各项计数汇总为人工排查时最先查看的 phase 字段。
 //
-// Degraded means SOME replicas are ready and some are not, which is the state worth telling apart:
-// the deployment is serving, at less than the capacity that was asked for. A deployment with nothing
-// ready is Starting whatever the reason — to a reader, a replica that has not been admitted and one
-// that has not finished loading its weights are the same state, and phaseMessage is what
-// distinguishes them.
+// Degraded 表示“部分”副本就绪而另一部分未就绪，这是最值得区分的状态：部署仍在提供服务，
+// 但低于预期容量。没有任何副本就绪的部署无论原因为何统一归为 Starting——对查看者而言，尚未
+// 准入的副本与尚未加载完权重的副本处于同一阶段，具体区别由 phaseMessage 说明。
 func deriveModelDeploymentPhase(md, holder *workercore.ModelDeployment, routerReady bool) {
 	if md.DeletionTimestamp != nil {
 		holder.Status.Phase = ModelDeploymentPhaseDeleting
@@ -2274,9 +2101,8 @@ func deriveModelDeploymentPhase(md, holder *workercore.ModelDeployment, routerRe
 	switch {
 	case ready == desired && md.Spec.Router != nil && !routerReady:
 		holder.Status.Phase = ModelDeploymentPhaseDegraded
-		// The observer always sets the condition on the paths that report not-ready, and its
-		// message is the accurate one: it can say the router failed to render, which "has no ready
-		// replicas" cannot.
+		// 观测器在所有报告未就绪的路径上都会设置该条件，且其消息更准确：例如能够指明路由器渲染失败，
+		// 这是单纯的“没有就绪副本”所无法表达的。
 		holder.Status.PhaseMessage = ModelDeploymentConditionRouterReady.GetMessage(holder)
 	case ready == desired:
 		holder.Status.Phase = ModelDeploymentPhaseReady
@@ -2290,9 +2116,9 @@ func deriveModelDeploymentPhase(md, holder *workercore.ModelDeployment, routerRe
 	}
 }
 
-// annotateModelDeploymentPhase says in the phase message what the phase alone cannot: why a
-// deployment waiting on its weights has no replica, and which replica was evicted. The weights'
-// wait is checked first because while it holds nothing is created, so it is the whole answer.
+// annotateModelDeploymentPhase 在 phaseMessage 中补充仅凭 phase 无法表达的信息：为何等待
+// 权重的部署没有任何副本，以及哪个副本被驱逐了。优先检查权重等待状态，因为在该状态持续期间
+// 不会创建任何副本，它就是全部原因。
 func annotateModelDeploymentPhase(holder *workercore.ModelDeployment, pods []core.Pod) {
 	if holder.Status.Phase == ModelDeploymentPhaseReady || holder.Status.Phase == ModelDeploymentPhaseDeleting {
 		return
@@ -2310,17 +2136,16 @@ func annotateModelDeploymentPhase(holder *workercore.ModelDeployment, pods []cor
 	}
 }
 
-// parkedModelDeploymentWorkloads names the deployment's Workloads the joint barrier has deactivated.
+// parkedModelDeploymentWorkloads 返回部署中被联合准入屏障（joint barrier）停用的 Workload 名称列表。
 //
-// spec.active is what the barrier writes when it gives up holding a set, and it is durable state the
-// scheduler reads: while it is false the Workload is not considered and the group is not rebuilt
-// behind it.
+// spec.active 是屏障在放弃继续维持一组 Workload 时写入的字段，也是调度器读取的持久化状态：
+// 当其为 false 时，该 Workload 不会被调度器考虑，其对应的副本组也不会在后台重建。
 //
-// BUT THAT FLAG ALONE DOES NOT SAY WHO WROTE IT. Kueue deactivates a Workload of its own accord, and
-// so can an operator pausing one group by hand. Reporting either as "parked for infeasibility" tells
-// the reader the deployment's set could not be placed and instructs them to free capacity or delete
-// and recreate -- an answer to a question nobody asked, about a state somebody chose. So the barrier's
-// OWN check has to be carrying its verdict on the same Workload for this to be the barrier's doing.
+// 但仅凭该标志本身无法说明是谁写入的。Kueue 会自行停用 Workload，运维人员也可以手动暂停某组
+// 任务。若将这两种情况都报告为“因不可行而暂停（parked for infeasibility）”，就会误导查看者
+// 以为部署的副本组无法放置，进而指示其释放容量或删除重建——针对别人主动选择的状态给出了答非
+// 所问的指导。因此，只有当屏障自身的 AdmissionCheck 在同一个 Workload 上带有相应裁决结果时，
+// 才将其认定为屏障触发的停用。
 func parkedModelDeploymentWorkloads(wls []*kueue.Workload) []string {
 	var parked []string
 	for _, wl := range wls {
@@ -2332,21 +2157,20 @@ func parkedModelDeploymentWorkloads(wls []*kueue.Workload) []string {
 	return parked
 }
 
-// jointBarrierParked reports whether the joint-admission check is the reason this Workload is
-// inactive, by reading the verdict that controller left on it.
+// jointBarrierParked 通过读取联合准入检查控制器留下的裁决结果，报告该 Workload 是否因联合
+// 准入检查而处于非激活状态。
 func jointBarrierParked(wl *kueue.Workload) bool {
 	acs := jointCheckEntry(wl)
 
 	return acs != nil && strings.Contains(acs.Message, _JointAdmissionParkedMarker)
 }
 
-// modelDeploymentPreemptionNote is the clause the other quota answers carry when a group of this
-// deployment was preempted but the state is not the one PreemptedInPart names.
+// modelDeploymentPreemptionNote 生成附加在其他配额说明之后的补充子句，用于在部署的某个组被
+// 抢占、但整体又不属于 PreemptedInPart 状态时说明情况。
 //
-// IT IS A SUFFIX RATHER THAN A REASON OF ITS OWN, because it is not what the condition is about: the
-// branch it lands on has already said what is wrong, and this adds who took a group's quota. Giving
-// it a reason would mean two classifications of one state, and the one that resolves the reader's
-// next action is the branch's own.
+// 它作为后缀而非独立的 reason 存在，因为它并非该状态条件的核心主题：当前所处的分支已经说明了
+// 问题所在，此处仅补充是哪个对象占走了某个组的配额。若将其设为独立 reason，会导致同一状态存在
+// 两种分类，而真正能指导排查人员下一步操作的仍然是当前分支本身的 reason。
 func modelDeploymentPreemptionNote(lost []string) string {
 	if len(lost) == 0 {
 		return ""

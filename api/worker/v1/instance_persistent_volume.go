@@ -7,10 +7,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstancePersistentVolume is the schema for worker.gpustack.ai.
+// InstancePersistentVolume 是 worker.gpustack.ai 的资源 schema。
 //
-// Underhood, an InstancePersistentVolume is mapping to a Kubernetes PersistentVolumeClaim,
-// and the InstancePersistentVolume's name is the same as the Kubernetes PersistentVolumeClaim's name.
+// 在底层，InstancePersistentVolume 对应一个 Kubernetes PersistentVolumeClaim，
+// 且 InstancePersistentVolume 的名称与该 Kubernetes PersistentVolumeClaim 的名称相同。
 //
 // +genclient
 // +genclient:noStatus
@@ -26,48 +26,48 @@ type InstancePersistentVolume struct {
 
 var _ runtime.Object = (*InstancePersistentVolume)(nil)
 
-// InstancePersistentVolumeSpec defines the desired state of InstancePersistentVolume.
+// InstancePersistentVolumeSpec 定义 InstancePersistentVolume 的期望状态。
 type InstancePersistentVolumeSpec struct {
-	// DisplayName is the display name of the InstancePersistentVolume.
+	// DisplayName 是 InstancePersistentVolume 的显示名称。
 	//
 	// +k8s:validation:maxLength=64
 	DisplayName string `json:"displayName,omitempty" protobuf:"bytes,1,opt,name=displayName"`
 
-	// Description is the description of the InstancePersistentVolume.
+	// Description 是 InstancePersistentVolume 的描述信息。
 	//
 	// +k8s:validation:maxLength=1024
 	Description string `json:"description,omitempty" protobuf:"bytes,2,opt,name=description"`
 
-	// Type is the name of Kubernetes StorageClass that provisions corresponding Kubernetes PersistentVolume.
+	// Type 是用于置备对应 Kubernetes PersistentVolume 的 Kubernetes StorageClass 名称。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	Type *string `json:"type,omitempty" protobuf:"bytes,3,opt,name=type"`
 
-	// Capacity is the capacity of the InstanceVolume.
+	// Capacity 是 InstanceVolume 的容量。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +default="20Gi"
 	Capacity resource.Quantity `json:"capacity,omitempty" protobuf:"bytes,4,name=capacity"`
 
-	// AccessMode is the access mode of the InstanceVolume.
+	// AccessMode 是 InstanceVolume 的访问模式。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +k8s:validation:enum=["ReadWriteMany","ReadWriteOnce","ReadOnlyMany","ReadWriteOncePod"]
 	AccessMode *core.PersistentVolumeAccessMode `json:"accessMode,omitempty" protobuf:"bytes,5,opt,name=accessMode"`
 }
 
-// InstancePersistentVolumeStatus defines the observed state of InstancePersistentVolume.
+// InstancePersistentVolumeStatus 定义 InstancePersistentVolume 的观测状态。
 type InstancePersistentVolumeStatus struct {
-	// Phase is the phase of the InstanceVolume.
+	// Phase 是 InstanceVolume 所处的阶段。
 	Phase string `json:"phase,omitempty" protobuf:"bytes,1,opt,name=phase"`
 
-	// Volume is the reference to the Kubernetes PersistentVolume that is bound to the InstanceVolume.
+	// Volume 是绑定到该 InstanceVolume 的 Kubernetes PersistentVolume 引用。
 	Volume *core.ObjectReference `json:"volume,omitempty" protobuf:"bytes,2,opt,name=volume"`
 }
 
-// InstancePersistentVolumeList holds the list of InstancePersistentVolume.
+// InstancePersistentVolumeList 包含 InstancePersistentVolume 列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstancePersistentVolumeList struct {

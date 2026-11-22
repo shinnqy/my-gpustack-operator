@@ -13,26 +13,26 @@ import (
 )
 
 type (
-	// SetupOptions is the options for setting up a handler.
+	// SetupOptions 是用于初始化 handler 的选项。
 	SetupOptions struct {
-		// Manager is the controller-runtime manager.
+		// Manager 是 controller-runtime 的 manager。
 		Manager ctrl.Manager
 	}
 
-	// Setup is an interface for setting up a handler.
+	// Setup 是用于初始化 handler 的接口。
 	Setup interface {
 		rest.Storage
-		// SetupHandler sets up the handler.
+		// SetupHandler 用于初始化 handler。
 		//
-		// SetupHandler is called before the Cache is started,
-		// you should not do anything that requires the Cache to be started.
-		// Instead, you can configure the Cache, like IndexField or something else.
+		// SetupHandler 会在 Cache 启动前被调用，
+		// 因此不应执行任何依赖 Cache 已启动的操作。
+		// 相反，可以在此配置 Cache，例如调用 IndexField 等。
 		SetupHandler(ctx context.Context, opts SetupOptions) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) // nolint: lll
 	}
 )
 
 type (
-	// ObjectInfo is an interface for informing extension API objects.
+	// ObjectInfo 是用于描述扩展 API 对象的接口。
 	ObjectInfo interface {
 		rest.Scoper
 		rest.KindProvider
@@ -41,16 +41,16 @@ type (
 		rest.ShortNamesProvider
 	}
 
-	// ObjectWithStatusSubResource is an interface for extension API objects with status subresources,
-	// which indicates the resource has a status subresource.
+	// ObjectWithStatusSubResource 是带有 status 子资源的扩展 API 对象接口，
+	// 表示该资源包含 status 子资源。
 	ObjectWithStatusSubResource interface {
 		meta.ObjectMetaAccessor
 		runtime.Object
 		CopyStatusTo(runtime.Object)
 	}
 
-	// ObjectWithScaleSubResource is an interface for extension API objects with scale subresources,
-	// which indicates the resource has a scale subresource.
+	// ObjectWithScaleSubResource 是带有 scale 子资源的扩展 API 对象接口，
+	// 表示该资源包含 scale 子资源。
 	ObjectWithScaleSubResource interface {
 		meta.ObjectMetaAccessor
 		runtime.Object
@@ -60,8 +60,8 @@ type (
 )
 
 type (
-	// MetaObject is the interface for the object with metadata.
+	// MetaObject 是带有元数据的对象接口。
 	MetaObject = ctrlcli.Object
-	// MetaObjectList is the interface for the list of objects with metadata.
+	// MetaObjectList 是带有元数据的对象列表接口。
 	MetaObjectList = ctrlcli.ObjectList
 )

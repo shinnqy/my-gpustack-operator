@@ -13,25 +13,21 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
-// ModelDeploymentConditionReplicasUpToDate reports whether the running replicas match what the
-// convergence renders for them now.
+// ModelDeploymentConditionReplicasUpToDate 报告运行中的副本是否与当前收敛逻辑为其渲染的
+// 结果一致。
 //
-// IT IS NOT A STATEMENT ABOUT THE OBJECT'S SPEC ALONE, and defining it that way would make it
-// unreadable for consumers. The hash it compares covers the KV cache connector synthesized from the
-// Binding as well, so a replica still carrying the current spec differs from the render as soon as
-// that connector stops resolving -- which is the very state this condition exists to report.
+// 它并非仅针对对象 spec 的陈述，如果那样定义会让消费方无法理解。它所比较的哈希还涵盖
+// 从 Binding 合成的 KVCache 连接器，因此只要该连接器无法再解析，即使仍携带当前 spec 的
+// 副本也会与渲染结果产生差异——这正是本条件存在所要报告的状态。
 //
-// It exists because the rollout has one state that every other condition describes correctly while
-// saying nothing about it. A replica whose hash differs from the desired one is left in place when
-// the connection cannot be resolved, because recreating it would rebuild every replica of every
-// deployment on a store that merely blinked -- and that guard delays an unrelated edit for as long
-// as the store is away.
+// 设立该条件的原因在于，滚动更新存在一种其他所有条件都描述正确却未提及的状态。当连接
+// 无法解析时，哈希与期望不一致的副本会被保留在原地，因为重建它会导致仅因存储短暂抖动
+// 就重建所有部署的每一个副本——而这一保护机制会在存储不可用期间推迟无关的修改。
 //
-// What the object said while it delayed one was accurate and about the wrong subject: the only false
-// condition named a reuse domain whose figures could not be read, and there is no path from that
-// sentence to "the edit you are watching for is queued behind it". This condition is that path, and
-// it is the whole remedy for the diagnosability half of the cost -- the delayed change is not lost,
-// so nothing here needs to recover it.
+// 在推迟变更期间，对象给出的状态虽然准确，指向的却不是用户关注的主体：唯一为 false 的
+// 条件提到了一个指标无法读取的复用域，但用户无法从这句话推导出“你正在等待的修改正排队
+// 阻塞在它后面”。本条件正是打通这一推导的路径，完整解决了由此带来的可诊断性成本——
+// 被推迟的变更并未丢失，因此此处无需任何恢复逻辑。
 const ModelDeploymentConditionReplicasUpToDate kubeapistatus.ConditionType = "ReplicasUpToDate"
 
 const (
@@ -39,93 +35,79 @@ const (
 	modelDeploymentReasonRolloutInProgress  = "RolloutInProgress"
 	modelDeploymentReasonRolloutHeldByCache = "RolloutHeldByCache"
 
-	// modelDeploymentReasonRolloutHeldByWeights is the same hold for the other cause: the model
-	// weights a replacement needs are blocked, so the replicas a rollout would delete stay. It is its
-	// own reason because the remedy is on WeightsReady, and a deployment with no KV cache at all
-	// reaches it.
+	// modelDeploymentReasonRolloutHeldByWeights 是另一种原因导致的相同阻塞状态：替换所需
+	// 的模型权重受阻，因此滚动更新原本要删除的副本会继续保留。它单独作为一个 reason，因为
+	// 修复方向在于 WeightsReady，且完全不使用 KVCache 的部署也会进入该状态。
 	modelDeploymentReasonRolloutHeldByWeights = "RolloutHeldByWeights"
 
-	// modelDeploymentReasonReplacementInProgress is the state of a pass whose every surviving
-	// replica matches the render while the declared count is short: a replica left on its own --
-	// a node drained, Kueue reclaiming quota, the kubelet evicting, or a hand deleting it, which
-	// this pass cannot tell apart -- and the pass is replacing it.
+	// modelDeploymentReasonReplacementInProgress 表示本轮调谐中所有存活副本均与渲染结果一致，
+	// 但副本数量低于声明值时的状态：某个副本自行离开了（例如 Node 排空、Kueue 回收配额、
+	// kubelet 驱逐或手动删除，本轮无法区分具体原因），且当前正在替换该副本。
 	//
-	// IT IS A SEPARATE REASON BECAUSE THE QUESTION A READER BRINGS IS THE OPPOSITE OF A ROLLOUT'S.
-	// A rollout answers "did my edit land"; a replacement answers "why is capacity moving when I
-	// changed nothing". Reporting the first for the second sends the operator to diff a spec that
-	// did not change, and reporting nothing -- the answer this reason replaces, an UpToDate that
-	// read exactly like the steady state -- hides the one window in which the deployment is
-	// serving below the count it declared for a cause outside itself.
+	// 将其作为独立 Reason 的原因在于读者关心的问题与滚动更新（rollout）恰恰相反。
+	// rollout 回答的是“我的修改是否已经生效”；而 replacement 回答的是“在未修改任何配置的情况下，
+	// 为什么容量发生了波动”。若把前者当作后者来报告，会误导运维人员去比对并未改动的 spec；
+	// 而如果什么都不报告——即该 Reason 所替代的旧做法，返回一个与稳态完全相同的 UpToDate——
+	// 则会掩盖部署因外部原因而以低于声明副本数提供服务的这一窗口期。
 	modelDeploymentReasonReplacementInProgress = "ReplacementInProgress"
 
-	// modelDeploymentReasonRolloutNotObserved is the answer of a pass that could account for no
-	// replica. It is Unknown rather than an absent condition, because the alternative -- leaving the
-	// stored value in place -- keeps an authoritative True through exactly the passes that delete
-	// every replica.
+	// modelDeploymentReasonRolloutNotObserved 是本轮未能核实任何副本时给出的结论。
+	// 它使用 Unknown 而不是省略该 condition，因为另一种做法（保留已存储的原值）会在刚好
+	// 删除了所有副本的那些调谐轮次中继续维持一个权威的 True 状态。
 	modelDeploymentReasonRolloutNotObserved = "RolloutNotObserved"
 )
 
-// modelDeploymentRollout is what one convergence pass decided about replicas carrying an earlier
-// spec.
+// modelDeploymentRollout 记录单次收敛过程对携带旧版 spec 的副本所作出的决策。
 //
-// RECORDED AS THE PASS DECIDES, not re-derived from the Pods afterwards. The desired hashes belong
-// to the render this pass performed and are not kept, so reading the answer back would mean
-// rendering a second time and comparing against that -- which answers a different question the one
-// moment it matters, a spec edited again while the pass was running.
+// 它在调谐决策时即时记录，而非事后根据 Pod 重新推导。期望哈希值属于本轮执行渲染的
+// 产物且不会被持久化保存，因此事后回推意味着需要重新渲染一次再作比较——而在唯一关键的
+// 时刻（即本轮运行期间 spec 再次被修改时），这回答的其实是一个完全不同的问题。
 type modelDeploymentRollout struct {
-	// accounted counts the replicas this pass can vouch for: it read the hash of an existing one, or
-	// it created one from the render it just performed.
+	// accounted 统计本轮能够确认并担保的副本数量：要么读取了已有副本的哈希值，要么根据
+	// 刚刚完成的渲染结果新建了副本。
 	//
-	// It is what separates "nothing was outdated" from "nothing was looked at", and those are the
-	// same zero everywhere else in this record. A pass reaches the status write able to vouch for
-	// nothing more often than it looks: a teardown, and the pass between a rollout's delete and its
-	// create, where the names are still held by terminating replicas so the creates do not land
-	// either.
+	// 它用于区分“没有副本过期”和“没有检查任何副本”，否则在该记录的其他字段中这两者
+	// 都会表现为零。调谐在写入 status 时无法担保任何副本的情况比想象中更常见：例如销毁流程，
+	// 以及 rollout 删除旧副本与创建新副本之间的轮次——此时名称仍被正在终止的副本占用，
+	// 因此新建操作也无法落地。
 	//
-	// A create counts because the Pod it just issued was rendered from this pass's own desired state,
-	// which is a stronger claim than a hash comparison rather than a weaker one. Leaving it out would
-	// make a deployment's first pass unable to answer and its second pass write a status for a spec
-	// nobody changed, which this controller does not do.
+	// 新建操作计入其中，是因为刚刚下发的 Pod 直接由本轮自身的期望状态渲染而来，这比哈希
+	// 比较是更强而非更弱的保证。若不计入新建操作，将导致部署的首轮调谐无法给出结论，且
+	// 第二轮调谐会为无人改动的 spec 写入状态变更，而本控制器不会这样做。
 	accounted int
-	// outdated counts the existing replicas whose rendered spec hash differs from the desired one.
+	// outdated 统计渲染后的 spec 哈希值与期望值不一致的现有副本数量。
 	outdated int
-	// held counts how many of those were left in place because the KV cache connection could not be
-	// resolved. It is never greater than outdated.
+	// held 统计因无法解析 KVCache 连接而被保留在原位的过期副本数量。该值永远不会大于 outdated。
 	held int
-	// heldByWeights counts how many of those were left in place because the model weights their
-	// replacements need are blocked. A role's replicas are counted in held or here, never in both, so
-	// the two together are never greater than outdated.
+	// heldByWeights 统计因替换副本所需的模型权重受阻而被保留在原位的过期副本数量。
+	// 同一角色的副本只会计入 held 或此处之一，不会重复计数，因此两者之和永远不会大于 outdated。
 	heldByWeights int
-	// olderRenderVersion counts current replicas whose render version is compatible with the
-	// deployment's floor but strictly older than modelDeploymentRenderVersion.
+	// olderRenderVersion 统计渲染版本兼容部署下限但严格低于 modelDeploymentRenderVersion 的当前副本数量。
 	olderRenderVersion int
 }
 
-// observeModelDeploymentRollout folds one pass's rollout decision into the status.
+// observeModelDeploymentRollout 将单轮调谐的 rollout 决策汇总写入 status。
 //
-// A record that can vouch for no replica reports Unknown. It does NOT leave the stored value alone,
-// and the difference is the whole point: leaving it alone keeps whatever the last answering pass
-// wrote, which after a steady deployment is an authoritative True. A teardown then deletes every
-// replica without vouching for one, and the object goes on saying every replica matches the render
-// while none exists.
+// 无法担保任何副本的记录会报告 Unknown，而不会原封不动地保留已存储的原值。
+// 这一区别正是关键所在：保留原值会沿用上一轮有效调谐写入的结果，在稳定部署后该值为
+// 权威的 True；随后销毁流程删除所有副本且不再担保任何副本，如果不更新，该对象就会在
+// 没有任何副本存在的情况下继续声称所有副本都与渲染结果一致。
 //
-// Two passes arrive here -- a teardown, and the pass between a rollout's delete and its create
-// while the names are still taken -- and both are moments when the replicas are least current, so
-// the stale answer is wrong in exactly the state it is read in. Unknown is the same shape
-// CacheAttached already uses for a reading it could not take.
+// 共有两种情况会进入此分支：销毁流程，以及 rollout 删除旧副本后、因名称仍被占用而尚未
+// 创建新副本的中间轮次。这两种时刻恰恰是副本最不符合最新状态的时刻，因此陈旧结论正好在
+// 它被读取的状态下出错。Unknown 与 CacheAttached 在无法采集读数时采用的形式一致。
 //
-// THE PASS'S DECISION AND THE OBSERVED COUNT ANSWER TOGETHER, and the order they are asked in is
-// the ranking of causes. A held rollout outranks everything, because nothing else can be acted on
-// until the store returns. A rollout outranks a replacement, because when both are in flight the
-// rollout is the umbrella cause -- it is why a replica is away, and its message is the one the
-// reader who caused it needs. The replacement is what remains when every surviving replica is
-// current and the count is still short, which no spec change explains.
+// 本轮决策与观测计数共同决定最终结果，检查顺序即原因的优先级排序。
+// 被挂起的 rollout 优先级最高，因为在存储恢复之前无法采取任何其他操作；rollout 优先于
+// 副本替换，因为当两者同时发生时 rollout 是总因——它是副本离开的原因，触发该变更的
+// 读者需要看到它的提示信息；当所有存活副本均为最新版本但数量仍不足时，才归结为无法用
+// spec 变更解释的副本替换。
 func observeModelDeploymentRollout(
 	holder, md *workercore.ModelDeployment, pods []core.Pod,
 	wlByReplica map[types.UID]*kueue.Workload, rollout *modelDeploymentRollout,
 ) {
-	// The test is on the record rather than at the call site, because "vouched for nothing" is a
-	// property of what the pass found and every caller would otherwise have to remember it.
+	// 该判断放在记录对象本身而非调用点处，因为“未担保任何副本”是本轮检查结果自身的属性，
+	// 否则每个调用方都必须自行记住这一条件。
 	if rollout == nil || rollout.accounted == 0 {
 		ModelDeploymentConditionReplicasUpToDate.Unknown(holder, modelDeploymentReasonRolloutNotObserved,
 			"this pass accounted for no replica: it compared no hash and created none, so whether the "+
@@ -138,18 +120,15 @@ func observeModelDeploymentRollout(
 
 	switch {
 	case rollout.held > 0:
-		// IT DOES NOT SAY A CHANGE IS WAITING, because it cannot know. During an outage the desired
-		// render carries no connector, so every attached replica's hash differs whether or not
-		// anyone edited the deployment -- an ordinary store blink puts every deployment on the pool
-		// here. Naming a change the user may not have made would be wrong far more often than right,
-		// so the consequence is stated conditionally and the reader is pointed at the store.
+		// 这里不会声称有变更正在等待生效，因为它无法确认这一点。在存储中断期间，期望渲染结果
+		// 不包含连接器，因此无论是否有人编辑过部署，每个已挂载副本的哈希值都会不同——一次普通的
+		// 存储闪断就会使池中的所有部署进入此状态。指出一个用户可能根本没有作出的变更，出错的概率
+		// 远大于正确的概率，因此消息以条件方式陈述后果，并将读者指向存储状态。
 		//
-		// AND IT NAMES THE CLASS RATHER THAN "a spec edit", which is wider than this guard. What the
-		// guard holds is a difference on a replica that EXISTS: the ordinals a scale-up adds are
-		// created during the outage too, without a connector, because a replica that does not exist
-		// yet cannot be given an address that does not exist yet either. What waits is an edit that
-		// changes a running replica's rendered Pod -- and it waits whole, because there is no
-		// group-shape edit left that could carry it past the guard.
+		// 同时这里指明的是具体影响范围而非笼统的“spec 编辑”，后者比本保护机制覆盖得更宽。
+		// 该保护机制阻断的是对“已存在”副本的变更：在中断期间扩容新增的序号副本仍会创建
+		// （不带连接器），因为尚未存在的副本也无法获得尚不存在的地址。真正等待的是会改变
+		// 运行中副本渲染 Pod 的编辑——并且是整体等待，因为此时已没有任何组结构层面的编辑能绕过该保护。
 		ModelDeploymentConditionReplicasUpToDate.False(holder, modelDeploymentReasonRolloutHeldByCache, fmt.Sprintf(
 			"%d of %d replicas differ from what this pass rendered and were left in place: the KV "+
 				"cache connection could not be resolved, and recreating them on that alone would "+
@@ -159,12 +138,11 @@ func observeModelDeploymentRollout(
 			rollout.held, rollout.outdated,
 		))
 	case rollout.heldByWeights > 0:
-		// The same hold with the other cause, and the cause is what the reader acts on: a message
-		// naming the cache would point a deployment that declares none at a store it never used.
+		// 与上一种相同的挂起逻辑但原因不同，而原因正是读者后续操作的依据：如果消息提及缓存，
+		// 就会把未声明缓存的部署误导到一个它从未使用过的存储上。
 		//
-		// The two counters exclude each other per role, not per pass: one role can be held by the
-		// cache while another is held by its weights. That pass reports the cache case above, which
-		// outranks this one as it outranks everything, and WeightsReady still names the weights side.
+		// 这两个计数器按角色而非按轮次互斥：一个角色可能因缓存而挂起，同时另一个角色因权重而挂起。
+		// 该轮次会优先报告上面的缓存情况（缓存挂起的优先级高于一切），而 WeightsReady 仍会指明权重侧的问题。
 		ModelDeploymentConditionReplicasUpToDate.False(holder, modelDeploymentReasonRolloutHeldByWeights, fmt.Sprintf(
 			"%d of %d replicas differ from what this pass rendered and were left in place: the model "+
 				"weights their replacements need are blocked, so deleting them would only remove "+
@@ -174,29 +152,24 @@ func observeModelDeploymentRollout(
 			rollout.heldByWeights, rollout.outdated,
 		))
 	case rollout.outdated > 0:
-		// DELETED, NOT ALL OF THEM AT ONCE. The rollout turns over one replica per role per pass,
-		// never beside a deficit and never beside a surplus this pass already shed, so a count of
-		// differing replicas is not a count of deletions this pass issued -- a message that read it
-		// that way claimed deletions that had not happened yet. What this pass did is delete at
-		// most one per role; the pass that observes a deleted one gone creates its replacement, and
-		// a reader told the replacements were already made would stop watching for them.
+		// 并非一次性全部删除。rollout 每轮每个角色只轮换一个副本，且绝不会在存在副本缺口
+		// 或本轮已清理多余副本的情况下同时执行，因此存在差异的副本数量并不等于本轮下发的删除数——
+		// 若消息按后者来表述，就相当于声称执行了尚未发生的删除。本轮最多只为每个角色删除一个副本；
+		// 观察到被删副本消失的下一轮才会创建其替代副本，如果读者被告知替换已完成，就会停止继续观察。
 		ModelDeploymentConditionReplicasUpToDate.False(holder, modelDeploymentReasonRolloutInProgress, fmt.Sprintf(
 			"%d replicas differ from what this pass rendered and turn over one per role per pass: "+
 				"this pass deleted at most one replica per role, and the pass that finds it gone "+
 				"creates the replacement", rollout.outdated,
 		))
 	case missing > 0 && modelDeploymentRolloutWasInProgress(holder):
-		// THE GAP A ROLLOUT OPENS IS STILL THE ROLLOUT'S. The pass that deletes the last outdated
-		// replica leaves nothing outdated behind it and the replacement not yet created, so the pass
-		// after it sees a shortfall and no difference -- which is indistinguishable, from the state
-		// alone, from a replica that left on its own. Read as a departure it tells the operator that
-		// nothing changed the spec, in the middle of the rollout they started, and sends them to
-		// diff a spec against itself.
+		// rollout 造成的副本空缺仍属于 rollout 本身。删除最后一个过期副本的轮次之后，不再有
+		// 过期副本残留，且替代副本尚未创建，因此紧随其后的轮次会看到数量不足但无配置差异——
+		// 仅从当前状态来看，这与副本自行离开无法区分。若将其判为副本自行离开，就会在运维人员
+		// 刚发起的 rollout 中途告诉他们“spec 未发生任何变化”，从而误导他们把 spec 与自身作对比。
 		//
-		// THE PREVIOUS VERDICT IS THE ONLY CARRIER. A reconcile has no memory, and the replica whose
-		// hash would have proved the provenance is precisely the one that is gone. It clears itself:
-		// once the replacement exists the pass falls through to the branch below, which writes a
-		// verdict that is not this one.
+		// 上一轮的结论是唯一的传递载体。reconcile 本身无记忆，而本可通过哈希证明来源的那个副本
+		// 恰好已经消失。该状态会自动清除：一旦替代副本创建出来，调谐就会进入下方分支并写入
+		// 新的结论。
 		ModelDeploymentConditionReplicasUpToDate.False(holder, modelDeploymentReasonRolloutInProgress, fmt.Sprintf(
 			"%d of the declared replicas are being replaced by the rollout in flight: %s. The last "+
 				"replica built from the earlier spec has gone, and the pass that finds it gone "+
@@ -204,27 +177,20 @@ func observeModelDeploymentRollout(
 			missing, strings.Join(missingWhere, "; "),
 		))
 	case missing > 0:
-		// NOTHING THIS PASS COMPARED DIFFERED, so the shortfall is not a rollout this pass can see,
-		// and the message has to say that much, because the alternative readings both misdirect:
-		// RolloutInProgress sends the reader to diff a spec that may not have changed, and UpToDate
-		// reads exactly like the steady state while the deployment is serving below its declared
-		// count.
+		// 本轮比较的所有副本均无差异，因此该缺口并非本轮可见的 rollout 所致，消息必须明确
+		// 说明这一点，因为另外两种解读都会误导读者：RolloutInProgress 会让读者去排查可能并未
+		// 改变的 spec，而 UpToDate 在部署以低于声明数量提供服务时读起来却完全像正常稳态。
 		//
-		// THE CLAIM RESTS ON WHAT WAS COMPARED, NOT ON THE SPEC. An earlier wording said "nothing
-		// changed the spec" as though this axis could know that; it cannot -- a scale-up whose
-		// create has not landed arrives here looking exactly like a departure, because the replica
-		// that would tell the two apart is the one that is absent. The honest statement is the
-		// observable one, and the branch below modelDeploymentReplicasMissing records the boundary
-		// in full.
+		// 该结论仅基于实际比较过的内容，而非 spec 本身。早期措辞曾说“spec 未作任何修改”，
+		// 仿佛这一维度能够知晓此事；其实不能——创建尚未落地的扩容操作到达此处时与副本离开
+		// 看起来完全一样，因为本可区分两者的那个副本正处于缺失状态。准确的表述应严格基于
+		// 可观测事实，modelDeploymentReplicasMissing 下方的分支完整记录了这一边界。
 		//
-		// IT STOPS THERE AND DOES NOT SAY WHY THEY LEFT, which an earlier wording did. "They left on
-		// their own" is a claim about a cause this axis never observed, and it is wrong in a case
-		// that is neither rare nor the operator's doing: a Kueue preemption evicts the replicas
-		// while the Workload survives with its reservation withdrawn, so the shortfall arrives here
-		// looking exactly like a departure. Telling an operator that nothing acted on their
-		// deployment, in the middle of a preemption, sends them to look for a cause on the wrong
-		// side. The quota condition reports that one, and this message points at it instead of
-		// competing with it.
+		// 消息到此为止，不再猜测副本离开的原因（早期措辞曾这样做）。“副本自行离开”是对本维度
+		// 从未观测到的原因作出的断言，且在一种既非罕见也非运维人员操作所致的情况下是错误的：
+		// Kueue 抢占会驱逐副本，同时保留被撤回预留的 Workload，于是该缺口到达此处时看起来
+		// 完全像副本自行离开。在发生抢占期间告诉运维人员“没有任何操作作用于其部署”，会误导
+		// 他们去错误的方向排查原因。配额 condition 会报告该原因，本消息应指向它而非与其冲突。
 		ModelDeploymentConditionReplicasUpToDate.False(holder, modelDeploymentReasonReplacementInProgress, fmt.Sprintf(
 			"%d of the declared replicas are missing: %s. Every replica this pass could compare "+
 				"matched what it rendered, so no rollout is in flight. What removed them is not "+
@@ -248,14 +214,12 @@ func observeModelDeploymentRollout(
 	}
 }
 
-// modelDeploymentRolloutWasInProgress reads the verdict the PREVIOUS pass wrote, which is still on
-// the holder because the status under construction starts as a copy of the observed one and this
-// axis has not been written yet.
+// modelDeploymentRolloutWasInProgress 读取上一轮调谐写入的结论；该结论仍在 holder 上，
+// 因为正在构建的 status 是从当前观测状态复制而来，且本维度尚未写入新值。
 //
-// It exists because a rollout's last step and an unasked-for departure produce the same observable:
-// replicas short, none differing. Nothing on the objects tells them apart -- the evidence left with
-// the replica that was deleted -- so the question is answered from what this controller said one
-// pass ago rather than from the cluster.
+// 该函数的存在是因为 rollout 的最后一步与非预期的副本离开会产生完全相同的可观测现象：
+// 副本不足且无配置差异。集群对象上没有任何信息能将两者区分开——证据已随被删副本一同
+// 消失——因此只能根据本控制器上一轮的判定结果而非集群状态来回答这个问题。
 func modelDeploymentRolloutWasInProgress(holder *workercore.ModelDeployment) bool {
 	for i := range holder.Status.Conditions {
 		if holder.Status.Conditions[i].Type == string(ModelDeploymentConditionReplicasUpToDate) {
@@ -266,49 +230,41 @@ func modelDeploymentRolloutWasInProgress(holder *workercore.ModelDeployment) boo
 	return false
 }
 
-// modelDeploymentReplicasMissing measures how far the deployment sits below the counts its roles
-// declare, and names each empty slot so the verdict it feeds speaks of replicas rather than of a
-// role-level shortfall count.
+// modelDeploymentReplicasMissing 衡量部署当前副本数与各角色声明数量之间的差距，并标出每个
+// 空缺槽位，使最终结论能够精确指向具体副本，而非笼统的角色级缺口数量。
 //
-// WHAT IT DISTINGUISHES: which ordinals of which role are empty. A slot is named by the ordinal
-// label, the same identity the converger creates and removes by, so "role prefill replica 1" names
-// the exact slot that is short rather than a count over the role.
+// 它能区分的信息：哪个角色的哪些序号处于空缺状态。槽位按序号标签命名，与收敛器创建和移除
+// 副本所用的标识相同，因此“role prefill replica 1”能精确指出缺失的槽位，而非仅给出角色的总缺口数。
 //
-// WHAT IT CANNOT DISTINGUISH, and no single pass can: whether an empty slot was ever filled. The
-// evidence left with the replica -- its Pod, and with it the ownership every workload resolution
-// reads -- so a slot whose replica departed and a slot the spec grew into yesterday's count produce
-// the same observation. The shapes that meet there: a scale-up whose create has not landed, a
-// top-slot replica that left on its own, and a workload deleted by hand all read as one empty slot
-// beside replicas that still have workloads.
+// 它无法区分的信息（任何单轮调谐都无法区分）：空缺槽位此前是否曾被填充过。证据已随副本
+// （即其 Pod 以及所有 workload 解析所依赖的归属关系）一同消失，因此副本离开留下的槽位与
+// spec 扩容新增的槽位在观测上完全一致。在此交汇的情况包括：创建尚未落地的扩容、自行离开的
+// 最大序号副本、以及被手动删除的 workload，它们在观测上都表现为：旁边存在仍有 workload 的副本，
+// 而自身是一个空缺槽位。
 //
-// HOW THE INDISTINGUISHABLE IS CLASSIFIED: by the role-level proxy "any replica of this role,
-// departing ones included, still has a workload behind it". While that holds, an empty slot reads
-// as a departure -- so the scale-up window above reports replacement rather than assembly, and only
-// the previous pass's verdict (modelDeploymentRolloutWasInProgress) can upgrade the reading to a
-// rollout. When it does not hold, the role is still assembling the first set it ever had and its
-// shortfall is excluded entirely: initial creation is not the replacement of anything, and counting
-// it would report every deployment's first passes as replacements.
+// 对无法区分情况的分类方式：采用角色级代理条件“该角色的任意副本（包括正在离开的副本）背后
+// 仍关联着 workload”。当该条件成立时，空缺槽位被视为副本离开——因此上述扩容窗口会报告
+// replacement 而非初始组装，只有上一轮的结论（modelDeploymentRolloutWasInProgress）能将其
+// 升级判定为 rollout。当该条件不成立时，说明该角色仍在组装首批副本，其缺口会被完全排除：
+// 初始创建不属于对任何对象的替换，若计入其中，会导致每个部署的首几轮调谐都被报为 replacement。
 //
-// THE EMPTY SLOTS ARE FILLED LOWEST FIRST AND ONLY AS MANY AS THE COUNT IS SHORT, which is the
-// same arithmetic the converger creates them by: a role carrying a replica with no ordinal still
-// counts that replica against the shortfall without claiming any slot for it.
+// 空缺槽位按序号从低到高填充，且数量严格等于缺口数，这与收敛器创建副本的计算逻辑一致：
+// 携带无序号副本的角色仍会将该副本计入总数以抵扣缺口，但不会为其占用任何序号槽位。
 //
-// A ROLE SCALED AWAY EXCLUDES ITSELF. Its workloads are deleted by the pass that sweeps its Pods,
-// so it falls out of this count on its own and never reads as a replacement.
+// 被缩容移除的角色会自动排除。清理其 Pod 的轮次会同时删除其 workload，因此它会自动退出
+// 该统计，绝不会被误判为 replacement。
 func modelDeploymentReplicasMissing(
 	md *workercore.ModelDeployment, pods []core.Pod,
 	wlByReplica map[types.UID]*kueue.Workload,
 ) (int, []string) {
-	// LIVE COUNTS REPLICAS, NOT PODS, and it has to: the shortfall below subtracts it from a
-	// DECLARED count, which is in replicas. Tallying Pods makes `short` negative for any role whose
-	// replicas hold more than one member, so the branch never fires and a genuinely missing replica
-	// goes unnamed. At one member per replica the two tallies are the same number, which is why
-	// this read as a Pod count for as long as that was true.
+	// live 统计的是副本数而非 Pod 数，且必须如此：下方的缺口计算需要用声明数减去它，而声明数
+	// 的单位是副本。如果统计 Pod 数，对于每个副本包含多个成员的角色，short 会变成负数，
+	// 导致该分支永远不会触发，真正缺失的副本也就无法被指明。当每个副本只有一个成员时，
+	// 两种统计结果相同，这也是之前一直将其当作 Pod 计数却未暴露问题的原因。
 	//
-	// A REPLICA COUNTS AS LIVE WHETHER OR NOT IT IS COMPLETE, which is the opposite of what the
-	// quota condition asks and correct for a different question: this one is "is a slot empty", and
-	// a slot holding a half-built replica is not empty. The incompleteness is the rollout's to
-	// repair, and it is reported by the condition that owns that reading.
+	// 无论副本是否完整，只要存在即计为存活。这与配额 condition 的判定相反，但针对的是不同
+	// 问题：此处判断的是“槽位是否为空”，而容纳着半成品副本的槽位并非空槽位。副本不完整的
+	// 问题应由 rollout 修复，并由负责该维度的 condition 报告。
 	live := make(map[string]int, len(md.Spec.Roles))
 	occupied := make(map[string]map[int]bool, len(md.Spec.Roles))
 	for _, view := range modelDeploymentGroupPodsByReplica(pods) {
@@ -345,13 +301,12 @@ func modelDeploymentReplicasMissing(
 	return missing, where
 }
 
-// modelDeploymentRoleEverAssembled reports whether any replica of the role, departing ones
-// included, still has a workload behind it.
+// modelDeploymentRoleEverAssembled 报告该角色的任意副本（包括正在离开的副本）背后是否仍有 workload。
 //
-// IT IS A PROXY RATHER THAN A RECORD, and its limit is the boundary the missing-count comment
-// states: it says the role assembled before, not that the empty slot ever existed. Departing
-// replicas count, because a workload holding one is still observable ownership and its deletion --
-// the converger's, during a replacement -- is exactly the moment the proxy must not flip.
+// 它是一个代理指标而非历史记录，其局限性正如缺失计数注释中所述的边界：它只说明该角色此前
+// 完成过组装，并不代表那个空缺槽位曾经存在过。正在离开的副本也会计入，因为持有该副本的
+// workload 仍是可观测的归属关系，而且在替换期间收敛器将其删除的瞬间，正是该代理指标绝对
+// 不能翻转状态的时刻。
 func modelDeploymentRoleEverAssembled(
 	role string, pods []core.Pod, wlByReplica map[types.UID]*kueue.Workload,
 ) bool {
@@ -364,8 +319,8 @@ func modelDeploymentRoleEverAssembled(
 	return false
 }
 
-// modelDeploymentNameReplicas renders one role's empty slots as a verdict fragment:
-// "role prefill replica 1", "role prefill replicas 1, 2".
+// modelDeploymentNameReplicas 将单个角色的空缺槽位渲染为结论片段：
+// "role prefill replica 1"、"role prefill replicas 1, 2"。
 func modelDeploymentNameReplicas(role string, ordinals []int) string {
 	digits := make([]string, 0, len(ordinals))
 	for _, ordinal := range ordinals {

@@ -35,10 +35,9 @@ const (
 	modelDeploymentMetricsMaxPods  = 64
 	modelDeploymentCounterMaxAge   = 5 * time.Minute
 
-	// modelDeploymentMetricsConcurrency is sized so that every Pod up to the limit is fetched
-	// within half the request budget even when each fetch runs to its own limit, leaving the
-	// other half for discovery. With fewer concurrent fetches, Pods that hang would spend the
-	// budget before the Pods queued behind them are asked at all.
+	// modelDeploymentMetricsConcurrency 的大小经过设定，即使每次拉取都耗时至自身上限，
+	// 也能在请求预算的一半时间内拉取完上限以内的所有 Pod，将另一半预算留给发现阶段。
+	// 如果并发拉取数更少，挂起的 Pod 会在排在其后的 Pod 被请求之前就耗尽预算。
 	modelDeploymentMetricsConcurrency = 32
 )
 
@@ -52,7 +51,7 @@ type modelDeploymentPreviousWindow struct {
 	at    time.Time
 }
 
-// ModelDeploymentMetricsHandler handles the authorized metrics subresource.
+// ModelDeploymentMetricsHandler 处理已鉴权的 metrics 子资源。
 type ModelDeploymentMetricsHandler struct {
 	extensionapi.GetOperation
 	APIReader  ctrlcli.Reader
@@ -390,13 +389,11 @@ func (h *ModelDeploymentMetricsHandler) mergeMetrics(
 			metricNames["decode-transfer-waiting"] = "sglang:num_decode_transfer_queue_reqs"
 		}
 	}
-	// AN ENCODER IS NOT A LANGUAGE-MODEL SERVER, and the two halves of that are kept apart below.
-	// Its request gauges are still asked for, because an encoder that publishes one is reporting
-	// real in-flight work, and whether the encoder is the bottleneck is a question this snapshot
-	// exists to answer. What the role cannot provide is the token accounting that follows a request
-	// through a language model. THIS TREE HAS NO VERIFIED READ OF WHICH REQUEST GAUGES AN ENCODER
-	// EXPORTS, so an absent one is recorded and not counted as a failed read rather than being
-	// dropped: dropping it would silently discard a real signal if the engine does publish it.
+	// 编码器不是语言模型服务器，下文将这两部分区分处理。
+	// 这里仍会请求其请求量 gauge 指标，因为发布该指标的编码器正在上报真实的在途工作量，
+	// 而编码器是否为瓶颈正是本快照要回答的问题。该角色无法提供的是请求穿过语言模型时的 token 统计。
+	// 当前代码库尚未验证编码器具体导出哪些请求 gauge，因此缺失的指标会被记录下来而不计为读取失败，
+	// 也不会直接丢弃：如果引擎确实发布了该指标，丢弃会静默舍弃真实信号。
 	encode = !read.router &&
 		modelDeploymentPodRoleKind(md, &read.pod) == workercore.ModelDeploymentRoleKindEncode
 	for key, source := range metricNames {
@@ -437,15 +434,15 @@ func (h *ModelDeploymentMetricsHandler) mergeMetrics(
 	if read.router {
 		return
 	}
-	// EVERY SOURCE BELOW IS A LANGUAGE MODEL'S, AND AN ENCODER RUNS NONE. It produces encoder-cache
-	// output and no tokens, so it holds no prefix cache to hit and answers no prompt, and expecting a
-	// cache-hit ratio of it marks every healthy EPD snapshot partial over a series the role has no
-	// meaning for. The token windows are the same argument and are skipped for the role above.
+	// 下方所有指标源均属于语言模型，编码器不运行语言模型。编码器只生成编码器缓存输出而不生成 token，
+	// 因此没有可命中的前缀缓存，也不响应 prompt；若要求它提供缓存命中率，
+	// 会因一个对该角色毫无意义的指标序列而使每个健康的 EPD 快照被标记为部分完整。
+	// token 窗口指标同理，已在上文对该角色跳过。
 	if encode {
 		return
 	}
-	// The decode half of an SGLang pair receives its prompt's cache from the prefill half and
-	// never prefills, so its prefill token counters stay at zero and hold no hit ratio.
+	// SGLang 配对中的 decode 侧从 prefill 侧接收 prompt 的缓存，自身从不执行 prefill，
+	// 因此其 prefill token 计数器始终为零，不存在命中率。
 	if md.Spec.Engine.Name == workercore.ModelDeploymentEngineSGLang && isModelDeploymentPD(md) &&
 		modelDeploymentPodRoleKind(md, &read.pod) == workercore.ModelDeploymentRoleKindDecode {
 		return
@@ -462,8 +459,8 @@ func (h *ModelDeploymentMetricsHandler) mergeMetrics(
 	}
 	for scope, current := range read.value.counters {
 		previous, ok := h.replaceCounter(md, &read.pod, scope, current, read.at)
-		// SGLang exports every tier's hit counter from start, and a tier the Pod does not build
-		// keeps its counter at zero, which would read as a measured miss rather than an absent tier.
+		// SGLang 从启动起即导出每个层级的命中计数器，而 Pod 未构建的层级其计数器会保持为零，
+		// 这会被误读为实测未命中，而非该层级不存在。
 		if md.Spec.Engine.Name == workercore.ModelDeploymentEngineSGLang && (scope == "host-prefix" && !sglangHost ||
 			scope == "storage-prefix" && !sglangStorage) {
 			reason := modelDeploymentSGLangNoHostTier
@@ -475,20 +472,19 @@ func (h *ModelDeploymentMetricsHandler) mergeMetrics(
 			})
 			continue
 		}
-		// vLLM exports its external prefix cache counters with or without a KV connector, and
-		// without one they never move. A query counter that has moved proves a connector, so
-		// only a still-zero one on a Pod rendering none is declared unsupported.
+		// vLLM 无论是否配置 KV connector 都会导出外部前缀缓存计数器，但在没有 connector 时它们从不变化。
+		// 有变化的查询计数器证明存在 connector，因此只有当未渲染任何 connector 的 Pod 上该计数器仍为零时，
+		// 才判定为不支持。
 		if scope == "external-store" && current.queries == 0 && !modelDeploymentPodRendersKVConnector(&read.pod) {
 			result.Missing = append(result.Missing, worker.ModelDeploymentMetricMissing{
 				Pod: read.pod.Name, Source: scope, Reason: modelDeploymentVLLMNoKVConnector,
 			})
 			continue
 		}
-		// vLLM counts every token any KV connector loads as an external hit, the point-to-point
-		// leg's included. The counters measure the shared store only on a Pod that attaches a pool
-		// and is not the decode half of a pair: that half loads what the prefill half sends, and
-		// the prefill half's own leg never loads anything. A Pod with no connector keeps the one
-		// reason above.
+		// vLLM 将任意 KV connector 加载的所有 token（包括点对点传输链路上的）都计为外部命中。
+		// 这些计数器仅在挂载了共享存储池且不是配对中 decode 侧的 Pod 上才衡量共享存储：
+		// decode 侧加载的是 prefill 侧发送的数据，而 prefill 侧自身链路从不加载任何数据。
+		// 未配置 connector 的 Pod 保留上文的单一原因。
 		if scope == "external-store" && (md.Spec.KVCache == nil || (isModelDeploymentPD(md) &&
 			modelDeploymentPodRoleKind(md, &read.pod) == workercore.ModelDeploymentRoleKindDecode)) {
 			result.Missing = append(result.Missing, worker.ModelDeploymentMetricMissing{
@@ -536,10 +532,9 @@ func (h *ModelDeploymentMetricsHandler) mergeMetrics(
 	}
 }
 
-// modelDeploymentPodRendersKVConnector reports whether a vLLM engine Pod was given a KV connector.
-// The operator renders every connector a managed role runs, the shared store and the
-// point-to-point prefill/decode leg alike, through this one argument, and admission refuses it
-// among a role's extra arguments.
+// modelDeploymentPodRendersKVConnector 报告 vLLM 引擎 Pod 是否配置了 KV connector。
+// operator 会通过这同一个参数渲染受管角色运行的每个 connector（无论是共享存储还是点对点 prefill/decode 链路），
+// 且准入控制会拒绝在角色的额外参数中传入该参数。
 func modelDeploymentPodRendersKVConnector(pod *core.Pod) bool {
 	for _, container := range pod.Spec.Containers {
 		for _, arg := range append(slices.Clone(container.Command), container.Args...) {
@@ -551,40 +546,38 @@ func modelDeploymentPodRendersKVConnector(pod *core.Pod) bool {
 	return false
 }
 
-// modelDeploymentSGLangHostTierArgs are the SGLang arguments that select a tree cache reporting host
-// hits, the host_hit mode of sglang:prefill_effective_tokens_total, at v0.5.18: the tree cache's
-// host_hit_length is what split_cached_prefix_by_tier (managers/schedule_batch.py:203-215) counts as
-// host, and the plain RadixCache the selection chain falls back to reports none. The operator
-// renders only the first, and a user may add any of them.
+// modelDeploymentSGLangHostTierArgs 是在 v0.5.18 中用于选择会上报主机命中（即
+// sglang:prefill_effective_tokens_total 的 host_hit 模式）的树形缓存的 SGLang 参数：
+// split_cached_prefix_by_tier（managers/schedule_batch.py:203-215）将树形缓存的
+// host_hit_length 计为主机命中，而选择链回退到的普通 RadixCache 不上报该指标。
+// operator 仅渲染第一个参数，用户可自行添加其中任意一个。
 var modelDeploymentSGLangHostTierArgs = []string{
-	// server_args.py:2668 enable_hierarchical_cache selects HiRadixCache (mem_cache/registry.py:124-132),
-	// whose match sets host_hit_length (mem_cache/hiradix_cache.py:1754-1768).
+	// server_args.py:2668 中 enable_hierarchical_cache 会选择 HiRadixCache（mem_cache/registry.py:124-132），
+	// 其 match 会设置 host_hit_length（mem_cache/hiradix_cache.py:1754-1768）。
 	"--enable-hierarchical-cache",
-	// server_args.py:3010 enable_lmcache selects LMCRadixCache (mem_cache/registry.py:138-148),
-	// whose match sets host_hit_length (mem_cache/storage/lmcache/lmc_radix_cache.py:245).
+	// server_args.py:3010 中 enable_lmcache 会选择 LMCRadixCache（mem_cache/registry.py:138-148），
+	// 其 match 会设置 host_hit_length（mem_cache/storage/lmcache/lmc_radix_cache.py:245）。
 	"--enable-lmcache",
-	// server_args.py:3022 enable_flexkv selects the FlexKV cache (mem_cache/registry.py:151-165),
-	// whose match sets host_hit_length (mem_cache/storage/flexkv/flexkv_radix_cache.py:232).
+	// server_args.py:3022 中 enable_flexkv 会选择 FlexKV 缓存（mem_cache/registry.py:151-165），
+	// 其 match 会设置 host_hit_length（mem_cache/storage/flexkv/flexkv_radix_cache.py:232）。
 	"--enable-flexkv",
 }
 
 const (
-	// modelDeploymentSGLangRadixBackendArg names a registered tree cache in place of the selection
-	// chain (server_args.py:1742-1746, default None; mem_cache/registry.py:223-236). It selects a
-	// host tier only with the value modelDeploymentSGLangRadixBackendFlexKV, the one backend v0.5.18
-	// registers (mem_cache/storage/flexkv/__init__.py:82); any other name is a backend nothing here
-	// knows the tiers of.
+	// modelDeploymentSGLangRadixBackendArg 指定已注册的树形缓存以替代选择链
+	// （server_args.py:1742-1746，默认为 None；mem_cache/registry.py:223-236）。仅当其值为
+	// modelDeploymentSGLangRadixBackendFlexKV 时才选择主机层级，这是 v0.5.18 注册的唯一后端
+	// （mem_cache/storage/flexkv/__init__.py:82）；其他名称均为此处未知其层级的后端。
 	modelDeploymentSGLangRadixBackendArg    = "--radix-cache-backend"
 	modelDeploymentSGLangRadixBackendFlexKV = "flexkv"
-	// modelDeploymentSGLangStorageBackendArg enables the storage tier at start
-	// (managers/scheduler.py:444), and at v0.5.18 only that tier sets the storage_hit mode
-	// (managers/scheduler.py:3317-3325). The operator owns it and renders it exactly where the
-	// deployment attaches a KV cache pool.
+	// modelDeploymentSGLangStorageBackendArg 在启动时启用存储层级（managers/scheduler.py:444），
+	// 且在 v0.5.18 中仅该层级会设置 storage_hit 模式（managers/scheduler.py:3317-3325）。
+	// 该参数归 operator 所有，并会在部署挂载 KVCache 池时准确渲染。
 	modelDeploymentSGLangStorageBackendArg = "--hicache-storage-backend"
 )
 
-// modelDeploymentSGLangPodTiers reports whether an SGLang engine Pod's arguments build a host tier
-// and a storage tier, matching each flag by SGLang's own spelling rules.
+// modelDeploymentSGLangPodTiers 按 SGLang 自身的拼写规则匹配各个标志，
+// 报告 SGLang 引擎 Pod 的参数是否构建了主机层级和存储层级。
 func modelDeploymentSGLangPodTiers(pod *core.Pod) (host, storage bool) {
 	engine := workercore.ModelDeploymentEngineSGLang
 	for _, container := range pod.Spec.Containers {
@@ -650,11 +643,10 @@ const (
 		"source failing to contribute"
 )
 
-// modelDeploymentNotPartialReasons are the listed entries that do not make a snapshot partial: a
-// labeled series that a healthy Pod has had no reason to export yet, a source the router or the
-// Pod's rendered shape is known not to provide, and a source of a Pod that served no request in
-// the sampling window, which has no new sample to give. They stay in missing[] so no value is
-// fabricated, but none says a readable source failed to contribute.
+// modelDeploymentNotPartialReasons 列出了不会导致快照被标记为部分完整的原因：
+// 健康的 Pod 尚无理由导出的带标签指标序列、已知路由或 Pod 当前渲染形态不提供的指标源，
+// 以及在采样窗口内未处理任何请求的 Pod 的指标源（其没有新样本可提供）。
+// 这些条目保留在 missing[] 中以免伪造数值，但均不表示可读指标源未能提供数据。
 var modelDeploymentNotPartialReasons = []string{
 	modelDeploymentLabeledCounterUnexported,
 	modelDeploymentLabeledHistogramUnexported,
@@ -667,7 +659,7 @@ var modelDeploymentNotPartialReasons = []string{
 	modelDeploymentEncodeNoRequestGauge,
 }
 
-// modelDeploymentMissingIsPartial reports whether a required source is missing.
+// modelDeploymentMissingIsPartial 报告是否缺失了必需的指标源。
 func modelDeploymentMissingIsPartial(missing []worker.ModelDeploymentMetricMissing) bool {
 	return slices.ContainsFunc(missing, func(m worker.ModelDeploymentMetricMissing) bool {
 		return !slices.Contains(modelDeploymentNotPartialReasons, m.Reason)
@@ -677,26 +669,22 @@ func modelDeploymentMissingIsPartial(missing []worker.ModelDeploymentMetricMissi
 type modelDeploymentWindowDefinition struct {
 	name, source, area, unit string
 	histogram                bool
-	// pairedWith names the series that vouches for a labeled one. A labeled series exports nothing
-	// until its first increment or observation. A failure or error counter absent while its pair
-	// was read in the same scrape is a Pod that has not failed yet, not an unreadable source. A
-	// histogram absent while its pair recorded no new observation in the same window had nothing to
-	// observe; beside a pair that moved, its absence would drop real samples, so it stays missing.
-	// Only the entries listed with a pair get this reading; any other absent series is still a
-	// missing source.
+	// pairedWith 指定用于佐证带标签序列的基准序列。带标签的序列在首次递增或观测前不会导出任何内容。
+	// 当失败或错误计数器缺失、而其配对序列在同一次抓取中被读到时，说明该 Pod 尚未发生过失败，
+	// 而非指标源不可读。当直方图缺失、而其配对序列在同一窗口内未记录到新观测时，说明没有可观测事件；
+	// 若配对序列已有变化而直方图缺失，则会遗漏真实样本，因此保留为缺失。
+	// 只有配置了配对序列的条目才采用此判定；其他任何缺失的序列仍视为缺失指标源。
 	pairedWith string
 }
 
-// modelDeploymentWindowDefinitions lists the windowed sources of one Pod. A list that reads TTFT
-// names it first: every request the Pod answers passes through it, so the entries after it read
-// its window to tell a Pod that served no request from one that stopped recording.
+// modelDeploymentWindowDefinitions 列出单个 Pod 的窗口指标源。读取 TTFT 的列表会将其排在首位：
+// Pod 响应的每个请求都会经过 TTFT，因此后续条目会参考其窗口来区分“未处理请求的 Pod”和“停止记录的 Pod”。
 func modelDeploymentWindowDefinitions(md *workercore.ModelDeployment, router bool) []modelDeploymentWindowDefinition {
 	if router {
 		switch md.Spec.Router.Name {
 		case "llm-d-router":
-			// The router's error counter also counts requests its request counter never records,
-			// such as a bad request that names no model, so the error counter is named apart
-			// to keep the two out of an error fraction.
+			// 路由器的错误计数器还会统计其请求计数器从未记录的请求（例如未指定模型的错误请求），
+			// 因此错误计数器采用独立命名，以避免将两者混入同一错误率计算中。
 			return []modelDeploymentWindowDefinition{
 				{"ttft", "llm_d_epp_request_ttft_seconds", "latency", "seconds", true, ""},
 				{"tpot", "llm_d_epp_request_streaming_tpot_seconds", "latency", "seconds", true, ""},
@@ -704,17 +692,15 @@ func modelDeploymentWindowDefinitions(md *workercore.ModelDeployment, router boo
 				{"request-errors", "llm_d_epp_request_error_total", "traffic", "errors/second", false, "requests"},
 			}
 		case "vllm-router":
-			// The router's prefill/decode mode records only its pd_* series. Its error counter
-			// is also incremented on refusals that never reach the request counter, so the two
-			// share no denominator and are named apart to keep them out of an error fraction.
+			// 路由器的 prefill/decode 模式仅记录其 pd_* 序列。其错误计数器也会在从未到达请求计数器的
+			// 拒绝请求上递增，因此两者没有共同分母，通过独立命名避免将它们用于错误率计算。
 			if isModelDeploymentPD(md) {
 				return []modelDeploymentWindowDefinition{
 					{"pd-requests", "vllm_router_pd_requests_total", "traffic", "requests/second", false, ""},
 					{"pd-errors", "vllm_router_pd_errors_total", "traffic", "errors/second", false, "pd-requests"},
 				}
 			}
-			// The retries-exhausted counter is labeled by route like the error counter, so it too
-			// is absent until a request first exhausts its attempts.
+			// 重试耗尽计数器与错误计数器一样按路由加标签，因此在请求首次耗尽重试次数前也不会导出。
 			return []modelDeploymentWindowDefinition{
 				{"successful-requests", "vllm_router_requests_total", "traffic", "requests/second", false, ""},
 				{"errors", "vllm_router_request_errors_total", "traffic", "errors/second", false, "successful-requests"},
@@ -735,8 +721,8 @@ func modelDeploymentWindowDefinitions(md *workercore.ModelDeployment, router boo
 			{"itl", "vllm:inter_token_latency_seconds", "latency", "seconds", true, ""},
 		}
 	}
-	// SGLang's inter-token histogram is labeled and observed only when a request streams a second
-	// chunk, so a server that has answered nothing but its unstreamed warmup request exports none.
+	// SGLang 的 token 间延迟直方图带有标签，且仅当请求流式返回第二个 chunk 时才会观测记录，
+	// 因此仅响应过非流式预热请求的服务器不会导出该指标。
 	definitions := []modelDeploymentWindowDefinition{
 		{"ttft", "sglang:time_to_first_token_seconds", "latency", "seconds", true, ""},
 		{"itl", "sglang:inter_token_latency_seconds", "latency", "seconds", true, "ttft"},
@@ -752,8 +738,8 @@ func modelDeploymentWindowDefinitions(md *workercore.ModelDeployment, router boo
 	return definitions
 }
 
-// mergeWindowMetrics reports whether the Pod is idle: its TTFT histogram recorded no new request in
-// the sampling window, so none of its windowed sources had anything new to observe.
+// mergeWindowMetrics 报告 Pod 是否处于空闲状态：其 TTFT 直方图在采样窗口内未记录到新请求，
+// 因此其所有窗口指标源均无新样本可观测。
 func (h *ModelDeploymentMetricsHandler) mergeWindowMetrics(
 	result *worker.ModelDeploymentMetrics, md *workercore.ModelDeployment, read *modelDeploymentPodScrape,
 ) bool {
@@ -771,26 +757,25 @@ func (h *ModelDeploymentMetricsHandler) mergeWindowMetrics(
 	}
 	for _, definition := range modelDeploymentWindowDefinitions(md, read.router) {
 		sources[definition.name] = definition.source
-		// An encoder serves no tokens, so it observes no time to a first token, no gap between two of
-		// them and no time per output token. The prefill and decode halves are the roles that answer
-		// these, and expecting them here would mark every healthy EPD snapshot partial over three
-		// series the role cannot produce.
+		// 编码器不输出 token，因此不会观测到首 token 延迟、token 间间隔或每输出 token 耗时。
+		// 这些指标由 prefill 和 decode 角色负责提供，若在此处要求编码器提供，
+		// 会因三个该角色无法产生的指标序列而使每个健康的 EPD 快照被标记为部分完整。
 		if definition.area == "latency" &&
 			modelDeploymentPodRoleKind(md, &read.pod) == workercore.ModelDeploymentRoleKindEncode {
 			continue
 		}
-		// SGLang observes a KV transfer on the half that sends it, the prefill half.
+		// SGLang 在发送 KV 传输的一侧（即 prefill 侧）观测 KV 传输。
 		if definition.area == "transfer" && modelDeploymentPodRoleKind(md, &read.pod) != workercore.ModelDeploymentRoleKindPrefill {
 			continue
 		}
-		// The same half hands the first token to decode, which is where SGLang records TTFT.
+		// 同一侧会将首个 token 交给 decode，这也是 SGLang 记录 TTFT 的位置。
 		if definition.name == "ttft" && md.Spec.Engine.Name == workercore.ModelDeploymentEngineSGLang && isModelDeploymentPD(md) &&
 			modelDeploymentPodRoleKind(md, &read.pod) == workercore.ModelDeploymentRoleKindPrefill {
 			continue
 		}
-		// The prefill half of a pair answers with the first token alone, so it never observes
-		// a gap between two tokens and its time per output token stays at zero; expecting either
-		// would mark every paired snapshot partial or publish a mean that measures nothing.
+		// 配对中的 prefill 侧仅返回首个 token，因此从不会观测到两个 token 之间的间隔，
+		// 且其每输出 token 耗时始终为零；若要求这两个指标，会使每个配对快照被标记为部分完整，
+		// 或发布毫无意义的均值。
 		if (definition.name == "itl" || definition.name == "tpot") && isModelDeploymentPD(md) &&
 			modelDeploymentPodRoleKind(md, &read.pod) == workercore.ModelDeploymentRoleKindPrefill {
 			continue
@@ -831,8 +816,8 @@ func (h *ModelDeploymentMetricsHandler) mergeWindowMetrics(
 		durations[definition.name] = window
 		starts[definition.name] = previous.at
 		if count == 0 && definition.histogram {
-			// Only an idle Pod's latency histogram has no new sample to give. One that stands
-			// still beside a TTFT that moved missed requests the Pod served.
+			// 只有空闲 Pod 的延迟直方图才会没有新样本；若 TTFT 已变化而该直方图保持不动，
+			// 说明它遗漏了 Pod 已处理的请求。
 			reason := "no observations in the sampling window"
 			if definition.area == "latency" && unobserved("ttft") {
 				reason = modelDeploymentIdleWindow

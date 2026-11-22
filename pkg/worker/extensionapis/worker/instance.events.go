@@ -15,10 +15,10 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
 )
 
-// InstanceEventsHandler handles the "events" subresource of v1.Instance objects.
+// InstanceEventsHandler 处理 v1.Instance 对象的 "events" 子资源。
 //
-// InstanceEventsHandler lists Kubernetes Events that involve the v1.Instance's backing Pod,
-// which is named as the Instance's name.
+// InstanceEventsHandler 列出与 v1.Instance 底层 Pod 相关的 Kubernetes Event，
+// 该 Pod 与 Instance 同名。
 type InstanceEventsHandler struct {
 	extensionapi.GetOperation
 
@@ -29,10 +29,10 @@ type InstanceEventsHandler struct {
 func newInstanceEventsHandler(parent rest.Scoper, opts extensionapi.SetupOptions) *InstanceEventsHandler {
 	h := &InstanceEventsHandler{}
 
-	// As storage.
+	// 作为存储后端。
 	h.GetOperation = extensionapi.WithSubResourceGet(parent, h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 

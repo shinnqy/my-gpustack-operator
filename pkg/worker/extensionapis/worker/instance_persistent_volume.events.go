@@ -15,10 +15,10 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
 )
 
-// InstancePersistentVolumeEventsHandler handles the "events" subresource of v1.InstancePersistentVolume objects.
+// InstancePersistentVolumeEventsHandler 处理 v1.InstancePersistentVolume 对象的 "events" 子资源。
 //
-// InstancePersistentVolumeEventsHandler lists Kubernetes Events that involve the v1.InstancePersistentVolume's backing PersistentVolumeClaim,
-// which is named as the InstancePersistentVolume's name.
+// InstancePersistentVolumeEventsHandler 列出涉及 v1.InstancePersistentVolume 底层 PersistentVolumeClaim 的 Kubernetes Events，
+// 该 PersistentVolumeClaim 与 InstancePersistentVolume 同名。
 type InstancePersistentVolumeEventsHandler struct {
 	extensionapi.GetOperation
 
@@ -29,10 +29,10 @@ type InstancePersistentVolumeEventsHandler struct {
 func newInstancePersistentVolumeEventsHandler(parent rest.Scoper, opts extensionapi.SetupOptions) *InstancePersistentVolumeEventsHandler {
 	h := &InstancePersistentVolumeEventsHandler{}
 
-	// As storage.
+	// 作为存储。
 	h.GetOperation = extensionapi.WithSubResourceGet(parent, h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 

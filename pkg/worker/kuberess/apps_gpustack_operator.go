@@ -25,18 +25,16 @@ import (
 )
 
 const (
-	// gpustackOperatorChartName is the name of the operator's own chart.
+	// gpustackOperatorChartName 是 operator 自身 chart 的名称。
 	gpustackOperatorChartName = "gpustack-operator"
-	// gpustackOperatorReleaseName is the release the worker installs the bundled chart
-	// under. It keeps the name earlier versions gave the device-manager-only release,
-	// even though the release now covers every bundled application, so no existing
-	// cluster needs a release migration.
+	// gpustackOperatorReleaseName 是 worker 安装内置 chart 时使用的 release 名称。
+	// 尽管该 release 现已涵盖所有内置应用，但它沿用了早期版本为仅包含 device-manager 的
+	// release 所起的名称，从而使已有集群无需进行 release 迁移。
 	gpustackOperatorReleaseName = "gpustack-operator-device-manager"
 )
 
-// legacyApplicationReleases are the per-application Helm releases earlier versions
-// installed, before the applications became subcharts of the operator's own chart.
-// Their presence is what positively identifies a migration.
+// legacyApplicationReleases 是早期版本在应用成为 operator 自身 chart 的 subchart 之前
+// 按应用分别安装的 Helm release 列表。它们的存在是判定需要迁移的明确依据。
 var legacyApplicationReleases = []string{
 	"gpustack-kueue",
 	"gpustack-node-feature-discovery",
@@ -44,13 +42,12 @@ var legacyApplicationReleases = []string{
 	"gpustack-csi-driver-s3",
 }
 
-// installGPUStackOperator installs the operator's own chart, which bundles Kueue, Node
-// Feature Discovery and the CSI drivers as subcharts alongside the device-managers.
+// installGPUStackOperator 安装 operator 自身的 chart，其中除了 device-manager 外，
+// 还将 Kueue、Node Feature Discovery 和 CSI 驱动作为 subchart 打包在内。
 //
-// This is the worker's self-contained install path: no chart drives the worker, so it
-// installs the chart packaged into its own image (see pack/gpustack-operator/Dockerfile)
-// with an overlay computed from its settings and flags. When a chart already deploys the
-// worker, --disable-applications carries the wildcard and this never runs.
+// 这是 worker 的自包含安装路径：由于没有外部 chart 驱动 worker，它会使用基于自身配置和参数
+// 计算出的 overlay 来安装打包在自身镜像中的 chart（参见 pack/gpustack-operator/Dockerfile）。
+// 当已有 chart 部署 worker 时，--disable-applications 会携带通配符，此路径不会运行。
 func installGPUStackOperator(
 	ctx context.Context,
 	helmCli *helm.Client,
@@ -64,13 +61,12 @@ func installGPUStackOperator(
 		return err
 	}
 
-	// Reuse the exact image of the running worker so the device-managers always match the
-	// operator in use; fall back to the chart-composed image when it cannot be determined.
+	// 复用正在运行的 worker 所使用的精确镜像，以确保 device-manager 始终与当前使用的 operator 一致；
+	// 无法确定时回退到由 chart 拼接的镜像。
 	imageRepository, imageTag := splitImageReference(extractWorkerImage(ctx, helmCli.KubeClientSet()))
 
-	// Restate the identity of every manufacturer on the worker's --manufacturer list, so the
-	// chart renders the device-managers and Kueue's credits mapping on the values in force
-	// here rather than on its own defaults.
+	// 重申 worker 的 --manufacturer 列表中每个厂商的标识信息，使 chart 基于当前生效的值
+	// 而非自身默认值来渲染 device-manager 和 Kueue 的 credits 映射。
 	manufacturers, _ := globalValuesContext["Manufacturers"].([]string)
 	manufacturerIdentities := make(map[string]map[string]string, len(manufacturers))
 	for _, m := range manufacturers {
@@ -101,35 +97,31 @@ func installGPUStackOperator(
 		Release: gpustackOperatorReleaseName,
 		Path:    path,
 		Values:  values,
-		// The CRDs of the vendored subcharts (Node Feature Discovery's) are installed:
-		// nothing else ships them, and the parent's NodeFeatureRule needs them. Helm
-		// skips a CRD that already exists, so a cluster carrying its own is left alone.
-		// Kueue templates its CRDs, so they arrive with the release either way.
+		// 需要安装内置 subchart（即 Node Feature Discovery）的 CRD：
+		// 没有其他地方提供它们，且父 chart 的 NodeFeatureRule 依赖它们。Helm 会跳过已存在的 CRD，
+		// 因此自带 NFD 的集群不会受影响。Kueue 通过模板渲染其 CRD，因此无论如何都会随 release 一同下发。
 		//
-		// Repair a failed release with an upgrade, never the uninstall+install path: the
-		// release now owns Kueue, whose CRDs are Helm-managed templates and whose custom
-		// resources carry controller finalizers, so uninstalling tears down the controller
-		// while the finalizers still pin the CRs and strands the CRDs.
+		// 修复失败的 release 时仅使用 upgrade，绝不采用卸载后重装（uninstall+install）路径：
+		// 该 release 现在拥有 Kueue，其 CRD 是受 Helm 管理的模板且自定义资源带有控制器 finalizer，
+		// 卸载会在 finalizer 仍锁定 CR 的情况下删掉控制器，从而导致 CRD 被滞留卡死。
 		RepairViaUpgradeOnly: true,
 		TakeOwnership:        takeOwnership,
-		// Set only where InstallApplications took a Lease its predecessor had released, so
-		// a pending release record found here belongs to a replica that finished or died
-		// rather than to one still working. Repairing such a record is what clears a wedge
-		// no later attempt could.
+		// 仅在 InstallApplications 获取了前任已释放的 Lease 时才设置，因此此处发现的
+		// pending release 记录属于已结束或已终止的副本，而非仍在运行的副本。
+		// 修复此类记录可以解除后续任何尝试都无法自行恢复的卡死状态。
 		ExclusiveAccess: exclusive,
 	}
 
 	return installConvergedChart(ctx, helmCli, chart)
 }
 
-// manufacturerIdentity returns a manufacturer's identity as a row of the chart's
-// global.manufacturers map, carrying the values in force in this process — each one a
-// pkg/nodefeature default a GPUSTACK_<MANUFACTURER>_* variable may have overridden.
+// manufacturerIdentity 以 chart 的 global.manufacturers 映射中一行的形式返回厂商标识，
+// 携带当前进程中生效的值——每个值均源自可能已被 GPUSTACK_<MANUFACTURER>_* 环境变量
+// 覆盖的 pkg/nodefeature 默认值。
 //
-// A field the operator has no value for is left out, and so is runtimeName: pkg/nodefeature
-// names a runtime for two more manufacturers than the chart creates a RuntimeClass for, and
-// Helm merges these values into the chart's defaults row by row, so stating it here would
-// conjure classes a chart-mode install never creates.
+// operator 没有对应值的字段会被省略，runtimeName 亦然：pkg/nodefeature 为比 chart
+// 创建的 RuntimeClass 多出两个的厂商定义了运行时名称，而 Helm 会按行将这些值合并进
+// chart 的默认值中，若在此处显式给出，就会创建出 chart 模式安装从不创建的 RuntimeClass。
 func manufacturerIdentity(manufacturer string) map[string]string {
 	identity := map[string]string{
 		"pciVendorID": nodefeature.GetPciVendorID(manufacturer),
@@ -145,21 +137,19 @@ func manufacturerIdentity(manufacturer string) map[string]string {
 }
 
 const (
-	// heldReleaseRetries bounds how often an install losing to a concurrently booting
-	// replica is retried before the boot fails on it.
+	// heldReleaseRetries 限制因竞争输给并发启动的副本而触发的安装重试次数上限，
+	// 超过该次数则启动失败。
 	heldReleaseRetries = 5
-	// heldReleaseRetryInterval is the wait between those retries. It is deliberately flat:
-	// what is being waited out is the peer's own install, whose duration has nothing to do
-	// with how many times this process has looked.
+	// heldReleaseRetryInterval 是上述重试之间的等待间隔。该间隔特意采用固定值：
+	// 等待的是对等副本自身的安装完成，其耗时与当前进程检查了多少次无关。
 	heldReleaseRetryInterval = 10 * time.Second
 )
 
-// installConvergedChart installs the chart, tolerating the release a concurrently booting
-// replica created in the window between this process's release lookup and its own install:
-// only one of them can create it, and the loser must not fail the boot.
+// installConvergedChart 安装该 chart，并容忍并发启动的副本在当前进程查询 release 与
+// 执行自身安装之间的时间窗口内创建 release：只有一个副本能创建成功，竞争失败方不应导致启动失败。
 //
-// Each retry re-runs the lookup, which now finds the winner's release and either accepts it
-// as converged at these values or waits out its pending install.
+// 每次重试都会重新查询，此时会发现胜出方的 release，进而要么将其视为已按当前 values 收敛并接受，
+// 要么等待其 pending 中的安装完成。
 func installConvergedChart(ctx context.Context, helmCli *helm.Client, chart *helm.Chart) error {
 	for attempt := 0; ; attempt++ {
 		_, err := helmCli.Install(ctx, chart)
@@ -178,18 +168,16 @@ func installConvergedChart(ctx context.Context, helmCli *helm.Client, chart *hel
 	}
 }
 
-// isReleaseHeldByPeer reports whether the error is Helm refusing to act because another
-// process is already operating on the same release. Helm signals it three ways, one per
-// point a loser can land on:
+// isReleaseHeldByPeer 返回错误是否表示 Helm 因另一个进程正在操作同一 release 而拒绝执行。
+// Helm 通过三种方式发出该信号，分别对应竞争失败方可能触发的三个时机：
 //
-//   - the name lookup, before anything is written
-//     (helm.sh/helm/v3/pkg/action.(*Install).availableName);
-//   - the create of the revision record, which is the only true compare-and-create in the
-//     sequence (helm.sh/helm/v3/pkg/storage/driver.ErrReleaseExists);
-//   - an upgrade finding the release already pending (helm.sh/helm/v3/pkg/action.errPending).
+//   - 写入任何内容之前的名称查重
+//     (helm.sh/helm/v3/pkg/action.(*Install).availableName)；
+//   - 创建 revision 记录时，这是整个流程中唯一真正的 compare-and-create 操作
+//     (helm.sh/helm/v3/pkg/storage/driver.ErrReleaseExists)；
+//   - upgrade 时发现 release 已处于 pending 状态 (helm.sh/helm/v3/pkg/action.errPending)。
 //
-// Only the second carries a sentinel; the other two are bare errors, so their message is
-// the sole signal.
+// 只有第二种携带哨兵错误（sentinel error）；其余两种均为普通错误，因此错误信息是唯一判断依据。
 func isReleaseHeldByPeer(err error) bool {
 	if err == nil {
 		return false
@@ -204,15 +192,14 @@ func isReleaseHeldByPeer(err error) bool {
 		strings.Contains(msg, "another operation (install/upgrade/rollback) is in progress")
 }
 
-// hasLegacyApplicationRelease reports whether any per-application Helm release from before
-// the subchart layout is still recorded in the namespace.
+// hasLegacyApplicationRelease 返回 Namespace 中是否仍记录有采用 subchart 布局之前的
+// 按应用安装的旧版 Helm release。
 //
-// It gates TakeOwnership, which adopts every live object the render resolves by name,
-// namespace and kind — it cannot tell a former release's object from one a user created by
-// hand. Adoption is therefore offered only to a cluster that positively carries the
-// releases being migrated, never unconditionally.
+// 它用于控制 TakeOwnership，后者会按名称、Namespace 和类型接管渲染出的所有现存对象——
+// 它无法区分旧版 release 创建的对象与用户手动创建的对象。因此，仅当集群中明确存在
+// 待迁移的 release 时才启用接管，绝不无条件启用。
 func hasLegacyApplicationRelease(ctx context.Context, cli kubernetes.Interface, namespace string) (bool, error) {
-	// Helm records a release as a Secret labeled with its owner and release name.
+	// Helm 将 release 记录为带有 owner 和 release 名称标签的 Secret。
 	sel := fmt.Sprintf("owner=helm,name in (%s)", strings.Join(legacyApplicationReleases, ","))
 	list, err := cli.CoreV1().Secrets(namespace).List(ctx, meta.ListOptions{
 		LabelSelector: sel,
@@ -225,13 +212,12 @@ func hasLegacyApplicationRelease(ctx context.Context, cli kubernetes.Interface, 
 	return len(list.Items) > 0, nil
 }
 
-// gpustackOperatorChartTemplate renders the operator chart's values for the worker's own
-// install: the worker is already running, so only the applications are deployed, each
-// switched by --disable-applications. fullnameOverride pins the resource names regardless
-// of the release name.
+// gpustackOperatorChartTemplate 为 worker 自身的安装流程渲染 operator chart 的 values：
+// worker 本身已经在运行，因此只部署各应用，并由 --disable-applications 分别控制开关。
+// fullnameOverride 会固定资源名称，使其不受 release 名称影响。
 //
-// The pull policy goes onto global.imagePullPolicy, which reaches the subcharts too; the
-// parent's own image.pullPolicy never does.
+// 拉取策略设置在 global.imagePullPolicy 上，这样也能传递给 subchart；
+// 父 chart 自身的 image.pullPolicy 不会传递到 subchart。
 const gpustackOperatorChartTemplate = `
 {{- if or $.ContainerRegistry (not $.ImageRepository) $.ImagePullPolicy $.ImagePullSecrets $.ManufacturerIdentities }}
 global:
@@ -321,8 +307,8 @@ func getGPUStackOperatorChartTemplateValues(name string, data map[string]any) he
 	}
 }
 
-// gpustackOperatorChartPath locates the chart bundled into the operator image, falling back
-// to the source tree so the worker can also run from a checkout.
+// gpustackOperatorChartPath 查找打包在 operator 镜像中的 chart 路径，
+// 若不存在则回退到源码树路径，以便 worker 也能直接从代码仓库运行。
 func gpustackOperatorChartPath(chartVersion string) (string, error) {
 	path := filepath.Join(system.SubConfDir("charts"),
 		fmt.Sprintf("%s-%s.tgz", gpustackOperatorChartName, chartVersion))
@@ -342,8 +328,8 @@ func gpustackOperatorChartPath(chartVersion string) (string, error) {
 	return path, nil
 }
 
-// extractWorkerImage returns the image of the running worker's "main" container, or an empty
-// string when it cannot be determined (e.g. running outside the cluster).
+// extractWorkerImage 返回正在运行的 worker 的 "main" 容器所使用的镜像；
+// 当无法确定时（例如在集群外运行）返回空字符串。
 func extractWorkerImage(ctx context.Context, cli kubernetes.Interface) string {
 	podName := osx.Getenv("KUBERNETES_POD_NAME")
 	if podName == "" {
@@ -368,16 +354,15 @@ func extractWorkerImage(ctx context.Context, cli kubernetes.Interface) string {
 	return ""
 }
 
-// splitImageReference splits a tagged image reference into the repository and tag understood by the
-// chart's "image" values. References that cannot be expressed as "<repository>:<tag>" — digest
-// pinned ("<repo>@sha256:...") or otherwise unparseable — return empty fields, letting the chart
-// compose its own default image instead of an invalid "<repo>@<digest>:<tag>".
+// splitImageReference 将带 tag 的镜像引用拆分为 chart 的 "image" values 所识别的 repository 和 tag。
+// 对于无法表示为 "<repository>:<tag>" 的引用——例如通过 digest 固定的引用（"<repo>@sha256:..."）
+// 或其他无法解析的引用——返回空字段，让 chart 自行拼接默认镜像，而不是生成无效的 "<repo>@<digest>:<tag>"。
 func splitImageReference(ref string) (repository, tag string) {
 	if ref == "" {
 		return "", ""
 	}
-	// Classify the reference with the registry library; only tag-based references map cleanly onto
-	// the chart's repository/tag fields. Digest references parse as conregname.Digest, not Tag.
+	// 使用 registry 库对镜像引用进行分类；只有基于 tag 的引用才能准确映射到 chart 的
+	// repository/tag 字段。digest 引用会解析为 conregname.Digest 而非 Tag。
 	parsed, err := conregname.ParseReference(ref)
 	if err != nil {
 		return "", ""
@@ -392,10 +377,9 @@ func splitImageReference(ref string) (repository, tag string) {
 	return ref, ""
 }
 
-// gpustackOperatorChartVersion resolves the version of the operator chart bundled into the
-// image. It tracks the operator binary version (a release tag like "v0.6.2", stripped of its
-// "v"), falling back to "0.0.0" for development builds. The image build derives the same value
-// when packaging the chart (see pack/gpustack-operator/Dockerfile).
+// gpustackOperatorChartVersion 解析打包在镜像中的 operator chart 版本。
+// 它跟随 operator 二进制文件版本（例如去掉前缀 "v" 的发布标签 "v0.6.2"），
+// 开发构建时回退为 "0.0.0"。镜像构建打包 chart 时会推导出相同的值（参见 pack/gpustack-operator/Dockerfile）。
 func gpustackOperatorChartVersion() string {
 	if version.IsValid() {
 		return strings.TrimPrefix(version.Version, "v")

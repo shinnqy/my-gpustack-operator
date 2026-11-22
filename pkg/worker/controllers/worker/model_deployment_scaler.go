@@ -32,7 +32,7 @@ const (
 	modelDeploymentScalerMinimumPendingRequeue = time.Second
 )
 
-// ModelDeploymentScalerReconciler plans replica vectors for ModelDeployments.
+// ModelDeploymentScalerReconciler 为 ModelDeployment 规划副本向量。
 type ModelDeploymentScalerReconciler struct {
 	Client    ctrlcli.Client
 	APIReader ctrlcli.Reader
@@ -69,7 +69,7 @@ func (r *ModelDeploymentScalerReconciler) SetupController(ctx context.Context, o
 		Complete(r)
 }
 
-// Reconcile makes the scaler's target binding and status match its current mode and observations.
+// Reconcile 使扩缩器（scaler）的目标绑定与状态匹配其当前模式及观测结果。
 func (r *ModelDeploymentScalerReconciler) Reconcile(
 	ctx context.Context, req ctrlreconcile.Request,
 ) (ctrlreconcile.Result, error) {
@@ -276,11 +276,11 @@ func (r *ModelDeploymentScalerReconciler) Reconcile(
 	return r.planWithPriors(ctx, before, scaler, md, preResolved, now, true)
 }
 
-// modelDeploymentScalerPredicate decides which changes of a scaler wake its reconciler.
+// modelDeploymentScalerPredicate 决定扩缩器的哪些变更会触发其协调器。
 //
-// IT IGNORES THE STATUS OF A SCALER, because a status write is the reconciler's own doing:
-// a scaler that wrote its status would otherwise wake itself, and a scaler that samples
-// every few seconds would reconcile as fast as it writes instead of as fast as it samples.
+// 它会忽略扩缩器的 status 变更，因为写入 status 是协调器自身的行为：若不忽略，
+// 写入 status 的扩缩器会不断唤醒自身，导致每隔几秒采样一次的扩缩器以写入频率
+// 而非采样频率持续触发协调。
 func modelDeploymentScalerPredicate() ctrlpredicate.Predicate {
 	return ctrlpredicate.Funcs{
 		CreateFunc:  func(ctrlevent.CreateEvent) bool { return true },
@@ -301,7 +301,7 @@ func modelDeploymentScalerPredicate() ctrlpredicate.Predicate {
 	}
 }
 
-// modelDeploymentScalerCatalogPredicate filters ConfigMap events to payload changes and deletions.
+// modelDeploymentScalerCatalogPredicate 将 ConfigMap 事件过滤为仅包含负载数据变更与删除事件。
 func modelDeploymentScalerCatalogPredicate() ctrlpredicate.Predicate {
 	return ctrlpredicate.Funcs{
 		CreateFunc: func(e ctrlevent.CreateEvent) bool {
@@ -338,7 +338,7 @@ func modelDeploymentScalerCatalogPredicate() ctrlpredicate.Predicate {
 	}
 }
 
-// modelDeploymentScalerWorkloadPredicate filters Workload events to those belonging to a ModelDeployment.
+// modelDeploymentScalerWorkloadPredicate 将 Workload 事件过滤为属于 ModelDeployment 的事件。
 func modelDeploymentScalerWorkloadPredicate() ctrlpredicate.Predicate {
 	return ctrlpredicate.NewPredicateFuncs(func(obj ctrlcli.Object) bool {
 		return obj.GetLabels()[modelDeploymentLabelKeyInstance] != ""

@@ -7,19 +7,18 @@ import (
 	gpustack "gpustack.ai/gpustack/api/v1"
 )
 
-// ModelStore is the schema for worker.gpustack.ai.
+// ModelStore 是 worker.gpustack.ai 的 schema。
 //
-// It is ONE NODE POOL'S CACHE POLICY, the admin's per-pool layer above the cluster defaults: the
-// watermarks and download limits of every node its selector matches, overriding only the fields it
-// sets. Nodes no store matches keep the Settings' cluster defaults, so this object never has to
-// restate them.
+// 它是单个节点池的缓存策略，即管理员在集群默认值之上按节点池配置的覆盖层：控制其选择器
+// 匹配的每个节点的水位线和下载限制，仅覆盖显式设置的字段。未被任何 store 匹配的节点保留
+// Settings 中的集群默认值，因此本对象无需重复声明这些默认值。
 //
-// The cache's root path is deliberately absent: it is the plugin DaemonSet's hostPath, decided at
-// deployment, and a per-pool path would need a per-pool DaemonSet rather than a field here.
+// 此处刻意不提供缓存根路径字段：它属于插件 DaemonSet 的 hostPath，在部署时确定，
+// 按池区分路径需要部署独立的 DaemonSet，而不是在此设置字段。
 //
-// TWO STORES MUST NOT MATCH ONE NODE. The worker refuses to guess: it picks the alphabetically
-// first name deterministically, records that choice in the node's NodeModelStore.spec.store, and
-// sets SelectorOverlap on both stores so the misconfiguration is visible where it was made.
+// 两个 store 不得同时匹配同一个节点。worker 拒绝猜测：它会确定性地按字母序选取第一个名称，
+// 将该选择记录在节点的 NodeModelStore.spec.store 中，并在两个 store 上同时设置
+// SelectorOverlap 状态，以便在配置处直观暴露该错误配置。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -39,60 +38,56 @@ type ModelStore struct {
 
 var _ runtime.Object = (*ModelStore)(nil)
 
-// ModelStoreSpec is the pool's cache policy. Every field but the selector is optional: a nil field
-// leaves the cluster default in place on the matched nodes.
+// ModelStoreSpec 定义节点池的缓存策略。除选择器外所有字段均为可选：字段为 nil 时
+// 在匹配节点上保留集群默认值。
 type ModelStoreSpec struct {
-	// NodeSelector selects the pool's nodes. Two stores whose selectors match one node are a
-	// misconfiguration this API reports rather than resolves silently; see SelectorOverlap.
+	// NodeSelector 选择该节点池中的节点。两个 store 的选择器匹配同一节点属于错误配置，
+	// 本 API 会上报该问题而非静默处理；参见 SelectorOverlap。
 	//
 	// +required
 	NodeSelector meta.LabelSelector `json:"nodeSelector" protobuf:"bytes,1,name=nodeSelector"`
 
-	// Watermarks bounds the matched nodes' cache filesystem usage. Nil keeps the cluster defaults.
+	// Watermarks 限制匹配节点的缓存文件系统使用率。为 nil 时保留集群默认值。
 	//
 	// +optional
 	Watermarks *NodeModelStoreWatermarks `json:"watermarks,omitempty" protobuf:"bytes,2,opt,name=watermarks"`
 
-	// Download limits the matched nodes' downloads. Nil keeps the cluster defaults.
+	// Download 限制匹配节点的下载行为。为 nil 时保留集群默认值。
 	//
 	// +optional
 	Download *ModelStoreDownload `json:"download,omitempty" protobuf:"bytes,3,opt,name=download"`
 }
 
-// ModelStoreDownload is the pool's download policy, stated field by field: a field left out
-// carries no opinion and keeps the cluster default, so a pool may raise the concurrency without
-// also restating the bandwidth. Explicitly setting a field is a real override — bytesPerSecond 0
-// is "unlimited on this pool", not "unspecified".
+// ModelStoreDownload 按字段定义节点池的下载策略：省略的字段不作指定并保留集群默认值，
+// 因此节点池可以提高并发度而无需重申带宽限制。显式设置字段即为真正覆盖——例如
+// bytesPerSecond 为 0 表示“该节点池不限速”，而非“未指定”。
 type ModelStoreDownload struct {
-	// Concurrency is how many HTTP requests the matched nodes run at once; left out, the cluster
-	// default applies.
+	// Concurrency 表示匹配节点同时执行的 HTTP 请求数；省略时应用集群默认值。
 	//
 	// +optional
 	// +k8s:validation:minimum=1
 	// +k8s:validation:maximum=64
 	Concurrency *int32 `json:"concurrency,omitempty" protobuf:"varint,1,opt,name=concurrency"`
 
-	// BytesPerSecond is the matched nodes' download rate limit; 0 is unlimited. Left out, the
-	// cluster default applies.
+	// BytesPerSecond 表示匹配节点的下载速率上限；0 表示不限速。省略时应用集群默认值。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	BytesPerSecond *int64 `json:"bytesPerSecond,omitempty" protobuf:"varint,2,opt,name=bytesPerSecond"`
 }
 
-// ModelStoreStatus is what the worker observes about the pool: how many nodes it matches, what
-// those nodes' caches hold in total, and whether the selector overlaps another store's.
+// ModelStoreStatus 记录 worker 对该节点池的观测结果：匹配的节点数、这些节点缓存
+// 占用的总量，以及选择器是否与其他 store 重叠。
 //
-// Conditions: Ready says the store's policy is applied on every matched node; SelectorOverlap says
-// another store's selector also matches at least one of them.
+// Conditions：Ready 表示 store 的策略已应用到所有匹配节点；SelectorOverlap 表示
+// 至少有一个匹配节点同时也匹配了另一个 store 的选择器。
 type ModelStoreStatus struct {
-	// Nodes is the number of nodes the selector currently matches.
+	// Nodes 是选择器当前匹配的节点数量。
 	//
 	// +optional
 	Nodes int32 `json:"nodes,omitempty" protobuf:"varint,1,opt,name=nodes"`
 
-	// Capacity sums the matched nodes' NodeModelStore capacity readings. It is absent while no
-	// matched node has reported one.
+	// Capacity 汇总匹配节点的 NodeModelStore 容量读数。在没有任何匹配节点上报之前该字段为空。
 	//
 	// +optional
 	Capacity *ModelStoreCapacity `json:"capacity,omitempty" protobuf:"bytes,2,opt,name=capacity"`
@@ -104,20 +99,20 @@ type ModelStoreStatus struct {
 	Conditions []gpustack.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,3,rep,name=conditions"` // nolint: lll
 }
 
-// ModelStoreCapacity is the pool's cache footprint, summed over the matched nodes.
+// ModelStoreCapacity 表示该节点池的缓存占用统计，为所有匹配节点的总和。
 type ModelStoreCapacity struct {
-	// TotalBytes is the summed size of the matched nodes' cache filesystems.
+	// TotalBytes 是所有匹配节点的缓存文件系统总容量之和。
 	//
 	// +required
 	TotalBytes int64 `json:"totalBytes" protobuf:"varint,1,name=totalBytes"`
 
-	// StoredBytes is what the matched nodes' published trees and partial downloads occupy.
+	// StoredBytes 是所有匹配节点上已发布目录树与未完成下载所占用的总字节数。
 	//
 	// +required
 	StoredBytes int64 `json:"storedBytes" protobuf:"varint,2,name=storedBytes"`
 }
 
-// ModelStoreList holds the list of ModelStore.
+// ModelStoreList 包含 ModelStore 列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelStoreList struct {

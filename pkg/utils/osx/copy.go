@@ -11,8 +11,8 @@ import (
 
 type CopyOptions func(*copyOptions)
 
-// CopyWithModifier configures a modifier for change the content during copying file,
-// it only works without buffer.
+// CopyWithModifier 配置用于在复制文件时修改内容的修改器，
+// 仅在不使用缓冲区时生效。
 func CopyWithModifier(m func([]byte) ([]byte, error)) CopyOptions {
 	return func(o *copyOptions) {
 		o.modify = m
@@ -128,7 +128,7 @@ func Copy(src, dst string, opts ...CopyOptions) error {
 }
 
 func copyFromDir(src, dst string, srcInfo os.FileInfo, o copyOptions) error {
-	// Switch directory permission for copying.
+	// 切换目录权限以便复制。
 	if err := os.Mkdir(dst, 0o666); err != nil {
 		if !os.IsExist(err) {
 			return err
@@ -152,7 +152,7 @@ func copyFromDir(src, dst string, srcInfo os.FileInfo, o copyOptions) error {
 
 		switch m := srcSubInfo.Mode(); {
 		default:
-			// Unsupported src mode.
+			// 不支持的源模式。
 			return nil
 		case m&os.ModeSymlink != 0:
 			if srcSub, err = os.Readlink(srcSub); err != nil {
@@ -205,7 +205,7 @@ func copyFromFile(src, dst string, scrInfo os.FileInfo, o copyOptions) error {
 	}
 
 	if o.buffer {
-		// Copy with buffer.
+		// 使用缓冲区复制。
 		srcFile, err := os.Open(src)
 		if err != nil {
 			return err

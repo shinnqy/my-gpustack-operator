@@ -4,27 +4,26 @@ import (
 	utilversion "k8s.io/apimachinery/pkg/util/version"
 )
 
-// Feature is a Kubernetes capability whose availability is decided by the cluster version.
+// Feature 表示其可用性由集群版本决定的 Kubernetes 能力。
 type Feature int
 
 const (
-	// FeatureNativeSidecar is the initContainers[].restartPolicy field a native sidecar is
-	// rendered with. The SidecarContainers feature gate turns on by default in Kubernetes 1.29;
-	// below that the API server DROPS the field without an error, degrading a native sidecar to a
-	// plain init container.
+	// FeatureNativeSidecar 是渲染原生 sidecar 时使用的 initContainers[].restartPolicy 字段。
+	// SidecarContainers 特性门控在 Kubernetes 1.29 中默认开启；低于该版本时，API Server
+	// 会直接丢弃该字段而不报错，从而使原生 sidecar 退化为普通的 init container。
 	FeatureNativeSidecar Feature = iota + 1
 
-	// FeatureImageVolume is the volumes[].image field an image volume is rendered with. The
-	// ImageVolume feature gate turns on by default in Kubernetes 1.35 (beta) and is GA in 1.36;
-	// below that the gate has to be opened on the apiserver, and an apiserver that does not know
-	// the field DROPS it without an error, so a Pod would silently lose its weights.
+	// FeatureImageVolume 是渲染镜像卷时使用的 volumes[].image 字段。
+	// ImageVolume 特性门控在 Kubernetes 1.35 中默认开启（beta）并在 1.36 中进入 GA；
+	// 低于该版本时需在 apiserver 上手动开启该门控，而不识别该字段的 apiserver 会直接
+	// 丢弃它而不报错，导致 Pod 静默丢失其模型权重。
 	FeatureImageVolume
 )
 
-// SupportsFeature returns whether the given Kubernetes version supports the feature.
+// SupportsFeature 返回给定的 Kubernetes 版本是否支持该特性。
 //
-// A nil or unparsable version answers false: a version nobody can read must not unlock a
-// capability whose floor cannot be decided.
+// 当版本为 nil 或无法解析时返回 false：无法读取的版本绝不应解锁无法确定最低版本
+// 要求的能力。
 func SupportsFeature(v *Version, f Feature) bool {
 	if v == nil {
 		return false

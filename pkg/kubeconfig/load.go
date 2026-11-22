@@ -7,13 +7,13 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// LoadRestConfigNonInteractive loads a rest config according to the following rules.
+// LoadRestConfigNonInteractive 按以下规则加载 rest config。
 //
-//  1. assume that running as a Pod and try to connect to
-//     the Kubernetes cluster with the mounted ServiceAccount.
-//  2. load from recommended home file if none of the above conditions are met.
+//  1. 假设当前运行在 Pod 中，尝试使用挂载的 ServiceAccount 连接
+//     Kubernetes 集群。
+//  2. 若不满足上述条件，则从推荐的用户主目录配置文件加载。
 func LoadRestConfigNonInteractive() (cfgPath string, restCfg *rest.Config, inside bool, err error) {
-	// Try the in-cluster config.
+	// 尝试集群内配置。
 	restCfg, err = rest.InClusterConfig()
 	switch {
 	case err == nil:
@@ -22,7 +22,7 @@ func LoadRestConfigNonInteractive() (cfgPath string, restCfg *rest.Config, insid
 		return "", nil, false, err
 	}
 
-	// Try the recommended config.
+	// 尝试推荐配置。
 	var (
 		ld = &clientcmd.ClientConfigLoadingRules{
 			Precedence: []string{clientcmd.RecommendedHomeFile},
@@ -33,8 +33,8 @@ func LoadRestConfigNonInteractive() (cfgPath string, restCfg *rest.Config, insid
 	return clientcmd.RecommendedHomeFile, restCfg, false, err
 }
 
-// LoadClientConfig loads a client config from the specified path,
-// the given path must exist.
+// LoadClientConfig 从指定路径加载 client config，
+// 给定路径必须存在。
 func LoadClientConfig(path string) (clientcmd.ClientConfig, error) {
 	if path == "" {
 		return nil, errors.New("blank kubeconfig path")
@@ -50,8 +50,8 @@ func LoadClientConfig(path string) (clientcmd.ClientConfig, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(ld, od), nil
 }
 
-// LoadRestConfig loads a rest config from the specified path,
-// the given path must exist.
+// LoadRestConfig 从指定路径加载 rest config，
+// 给定路径必须存在。
 func LoadRestConfig(path string) (*rest.Config, error) {
 	cc, err := LoadClientConfig(path)
 	if err != nil {

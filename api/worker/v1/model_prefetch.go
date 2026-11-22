@@ -7,11 +7,11 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// ModelPrefetch is the v1 view of a namespace's model residency: what is being warmed where, and
-// how far it has got.
+// ModelPrefetch 是命名空间模型驻留状态的 v1 视图：哪些模型正在哪些位置预热，
+// 以及当前进度。
 //
-// It proxies configuration changes to the v1alpha1 resource. Status reports aggregated node
-// readiness through the main object; the public API serves no status or progress subresource.
+// 它将配置变更代理到 v1alpha1 资源。status 通过主对象报告聚合后的节点就绪情况；
+// 公共 API 不提供 status 或 progress 子资源。
 //
 // +genclient
 // +genclient:noStatus
@@ -21,7 +21,7 @@ type ModelPrefetch workercore.ModelPrefetch
 
 var _ runtime.Object = (*ModelPrefetch)(nil)
 
-// ModelPrefetchList holds the list of ModelPrefetches.
+// ModelPrefetchList 保存 ModelPrefetch 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelPrefetchList struct {

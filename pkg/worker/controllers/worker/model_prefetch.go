@@ -31,31 +31,27 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// Conditions of a ModelPrefetch's status.
+// ModelPrefetch 状态的各 Condition。
 const (
-	// ModelPrefetchConditionProgressing says delivery is under way: the artifact is resolved and
-	// some target nodes do not hold the content yet.
+	// ModelPrefetchConditionProgressing 表示分发正在进行中：制品已解析，且部分目标节点尚未持有该内容。
 	ModelPrefetchConditionProgressing = "Progressing"
-	// ModelPrefetchConditionAvailable says enough target nodes hold the content: ReadyNodes
-	// reached the MinReady bar, where MinReady 0 means all of them.
+	// ModelPrefetchConditionAvailable 表示已有足够多的目标节点持有该内容：ReadyNodes 已达到 MinReady 门槛
+	// （MinReady 为 0 表示所有目标节点）。
 	ModelPrefetchConditionAvailable = "Available"
-	// ModelPrefetchConditionDegraded says a target node gave up; the message names the reasons.
+	// ModelPrefetchConditionDegraded 表示有目标节点已放弃分发；message 中会列出具体原因。
 	ModelPrefetchConditionDegraded = "Degraded"
-	// ModelPrefetchConditionLapsed says the MinReady shortfall is the retention TTL's doing: the
-	// copies that would close the gap lapsed past TTLAfterLastUse, stopped counting as ready and
-	// were unpinned, and nothing re-warms them. It stays False while the shortfall has any other
-	// cause, so a lapse never masks a warm-up still running or a delivery that failed.
+	// ModelPrefetchConditionLapsed 表示 MinReady 缺口是由保留 TTL 导致的：本可补足缺口的副本已超过
+	// TTLAfterLastUse 而过期，不再计为就绪且已被取消固定（unpin），也不会再被重新预热。只要缺口存在任何其他
+	// 原因，该条件就会保持 False，从而避免过期状态掩盖仍在进行的预热或已失败的分发。
 	ModelPrefetchConditionLapsed = "Lapsed"
 )
 
-// ModelPrefetchReconciler turns a prefetch's residency intent into one warm-up Pod per target
-// node, reads the delivery's progress from the target nodes' own reports, and pins what its
-// retention asks to keep.
+// ModelPrefetchReconciler 将预取（prefetch）的驻留意图转化为每个目标节点上的一个预热 Pod，从目标节点
+// 各自的上报中读取分发进度，并固定（pin）其保留策略要求保留的内容。
 //
-// The warm-up Pod IS the delivery operation: it mounts the artifact's volume the consumer path
-// mounts, so the node's cache does the download, the verification and the publishing exactly once
-// per node; the Pod reads the tree back and exits, dropping its reference. It never renders a
-// queue-name label, so neither Kueue nor the operator's Pod webhook has anything to say about it.
+// 预热 Pod 本身即完成分发操作：它挂载与使用方路径相同的制品卷，因此节点缓存会在每个节点上恰好执行一次
+// 下载、校验与发布；Pod 读回目录树后即退出并释放引用。它从不渲染 queue-name 标签，因此 Kueue 和
+// operator 的 Pod webhook 都不会干预它。
 type ModelPrefetchReconciler struct {
 	Client ctrlcli.Client
 	Now    func() time.Time
@@ -72,26 +68,26 @@ func (r *ModelPrefetchReconciler) now() time.Time {
 }
 
 func (r *ModelPrefetchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Implement this function in chapter 18.
+	// 在第 18 章中实现此函数。
 	var result0 ctrl.Result
 	var result1 error
 	return result0, result1
 }
 
-// prefetchProgress is one pass's reading of the delivery, the raw material of the status.
+// prefetchProgress 是单轮对账中读取到的分发进度，是生成状态（status）的原始数据。
 type prefetchProgress struct {
 	desired     int32
 	ready       []string
 	downloading int32
 	failed      int32
-	// lapsed counts the target nodes whose copy is Ready but past the retention TTL: they stopped
-	// counting as ready and their pins are released, and no warm-up Pod re-warms them.
+	// lapsed 统计副本处于 Ready 但已超过保留 TTL 的目标节点数量：这些副本不再计为就绪，其固定标记（pin）
+	// 已被释放，且不会有预热 Pod 重新预热它们。
 	lapsed int32
 }
 
-// prefetchPlacementTypeNames returns the InstanceType names a prefetch's placement selects, or
-// the ones its namespace's deployments serve the artifact on. An empty result means the
-// placement's nodeSelector owns the target set, or that there is nothing to derive it from.
+// prefetchPlacementTypeNames 返回预取的 placement 所选择的 InstanceType 名称，或该 Namespace 下的
+// 部署用于提供该制品服务的 InstanceType 名称。返回空表示由 placement 的 nodeSelector 决定目标节点集，
+// 或没有任何可用于推导的来源。
 func prefetchPlacementTypeNames(
 	pf *workercore.ModelPrefetch, deps []workercore.ModelDeployment,
 ) []string {
@@ -104,14 +100,13 @@ func prefetchPlacementTypeNames(
 	case placement != nil && placement.NodeSelector != nil:
 		return nil
 	default:
-		// The derived set: every InstanceType the namespace's own deployments serve these weights
-		// on, so warming follows serving without a second place to say where.
+		// 推导出的集合：该 Namespace 自身部署中用于提供这些权重服务的全部 InstanceType，使预热自动跟随服务部署，
+		// 无需在第二处重复指定位置。
 		return deploymentInstanceTypes(deps, pf.Spec.ArtifactRef.Name)
 	}
 }
 
-// deploymentInstanceTypes collects the InstanceType names the namespace's deployments serve the
-// artifact's weights on.
+// deploymentInstanceTypes 收集该 Namespace 的部署中用于提供该制品权重的 InstanceType 名称。
 func deploymentInstanceTypes(deps []workercore.ModelDeployment, artifactName string) []string {
 	var out []string
 	for i := range deps {
@@ -129,11 +124,10 @@ func deploymentInstanceTypes(deps []workercore.ModelDeployment, artifactName str
 	return out
 }
 
-// writeStatus fills the status from the progress. Available wants readyNodes to reach MinReady,
-// where 0 means all of them; Degraded waits for a target node to give up — or for the artifact the
-// prefetch names to disappear, which stops the delivery rather than leaving it fetching forever.
-// Lapsed says when a shortfall below MinReady is the retention TTL's doing: it turns True only
-// when the lapsed copies alone account for the gap, so a warm-up or a failure keeps its own voice.
+// writeStatus 根据进度填充状态。Available 要求 readyNodes 达到 MinReady（0 表示全部目标节点）；Degraded
+// 在有目标节点放弃分发时置位——或当预取指定的制品消失时置位，从而终止分发而非一直拉取。Lapsed 表示
+// 低于 MinReady 的缺口是由保留 TTL 导致的：仅当过期副本本身足以解释该缺口时才变为 True，以确保预热中
+// 或失败的状态仍能独立体现。
 func (r *ModelPrefetchReconciler) writeStatus(
 	pf *workercore.ModelPrefetch, progress prefetchProgress, broken error, artifactMissing bool,
 ) {
@@ -169,14 +163,13 @@ func (r *ModelPrefetchReconciler) writeStatus(
 		ObservedGeneration: pf.Generation,
 	}
 
-	// The lapse explains the shortfall only when the lapsed copies alone account for the gap below
-	// the requirement: a gap they cannot close has other causes — a warm-up still running or a
-	// failure — that Lapsed must never paper over.
+	// 仅当过期副本单独即可填补低于要求的缺口时，才将缺口归因于过期：若过期副本无法弥补该缺口，则说明
+	// 存在其他原因（仍在运行的预热或分发失败），Lapsed 绝不能掩盖这些原因。
 	lead := fmt.Sprintf("%d of %d target node copies lapsed past retention.ttlAfterLastUse",
 		progress.lapsed, progress.desired)
 	switch gap := required - int32(len(progress.ready)); {
 	case progress.lapsed == 0:
-		// Nothing lapsed; the default stands.
+		// 无副本过期；保持默认值。
 	case gap <= 0:
 		lapsed.Reason = "NoShortfall"
 		lapsed.Message = lead + ", but readyNodes still meets the requirement"
@@ -224,8 +217,7 @@ func (r *ModelPrefetchReconciler) writeStatus(
 		[]gpustack.Condition{progressing, available, degraded, lapsed}, r.now())
 }
 
-// requiredNodes is how many ready nodes satisfy the prefetch: MinReady, or every target when it
-// is left at its default of zero.
+// requiredNodes 返回满足预取所需的就绪节点数：即 MinReady，当其保持默认值 0 时为全部目标节点数。
 func requiredNodes(pf *workercore.ModelPrefetch, desired int32) int32 {
 	if pf.Spec.MinReady == 0 || pf.Spec.MinReady > desired {
 		return desired
@@ -234,18 +226,15 @@ func requiredNodes(pf *workercore.ModelPrefetch, desired int32) int32 {
 	return pf.Spec.MinReady
 }
 
-// InstanceTypeFlavorNames carries, per InstanceType name, the ResourceFlavor names the type's
-// pool selects. A type resolving to no flavors — unknown, or no synced flavor yet — maps to an
-// empty entry, which leaves its target set empty rather than erroring: the placement contract
-// is "every node carrying the type's flavors", and a type with none carries none.
+// InstanceTypeFlavorNames 按 InstanceType 名称保存该类型资源池所选择的 ResourceFlavor 名称。若某个类型
+// 未解析出任何 flavor（未知类型或尚未同步出 flavor），则映射为空条目，使其目标节点集为空而非报错：placement
+// 的契约是“所有带有该类型 flavor 的节点”，没有 flavor 的类型自然不对应任何节点。
 type InstanceTypeFlavorNames map[string][]string
 
-// ResolveInstanceTypeFlavorNames resolves the InstanceType names a prefetch's placement — or, in
-// its default form, the type names its namespace's deployments serve the artifact on — into the
-// ResourceFlavor names each type's pool selects: the flavors carrying the schedule labels the
-// type's spec derives, the same reverse-lookup the type's backing ClusterQueue and its status
-// Detail run. Flavor names are topology-qualified and count-suffixed, so an InstanceType's
-// object name is never itself a flavor name and cannot be compared against one.
+// ResolveInstanceTypeFlavorNames 将预取 placement 指定的 InstanceType 名称（或在默认形式下，该 Namespace
+// 的部署用于提供该制品服务的类型名称）解析为各类型资源池所选择的 ResourceFlavor 名称：即携带该类型 spec
+// 派生出的调度标签的 flavor，这与该类型背后的 ClusterQueue 及其状态 Detail 所执行的反向查找一致。
+// flavor 名称包含拓扑限定和数量后缀，因此 InstanceType 的对象名称本身绝不是 flavor 名称，也不能直接与之比较。
 func ResolveInstanceTypeFlavorNames(
 	ctx context.Context, r ctrlcli.Reader, pf *workercore.ModelPrefetch, deps []workercore.ModelDeployment,
 ) (InstanceTypeFlavorNames, error) {
@@ -253,8 +242,8 @@ func ResolveInstanceTypeFlavorNames(
 	if len(typeNames) == 0 {
 		return nil, nil
 	}
-	// One list serves every named type: a cluster carries a handful of operator-owned flavors,
-	// and a type's pool is a label containment over the shared set.
+	// 一次 List 查询即可服务所有指定类型：集群中只有少数由 operator 管理的 flavor，而一个类型的资源池
+	// 只是该共享集合上的标签包含筛选。
 	flavors := new(kueue.ResourceFlavorList)
 	if err := r.List(ctx, flavors,
 		systemmeta.GetResourcesLabelSetOfType[ctrlcli.MatchingLabels](_ResourceFlavorResType),
@@ -294,26 +283,24 @@ func ResolveInstanceTypeFlavorNames(
 	return pools, nil
 }
 
-// PrefetchTargetNodes resolves a prefetch's placement into node names. It is the controller's own
-// expansion, shared with the admission webhook so admission and delivery can never disagree about
-// what a prefetch would warm. The pools carry the named InstanceTypes' flavor resolution from
-// ResolveInstanceTypeFlavorNames.
+// PrefetchTargetNodes 将预取的 placement 解析为节点名称列表。它是控制器自身的展开逻辑，并与准入 Webhook
+// 共享，确保准入校验与实际分发对预取所要预热的节点绝无分歧。pools 承载了由 ResolveInstanceTypeFlavorNames
+// 解析出的各指定 InstanceType 的 flavor 映射。
 func PrefetchTargetNodes(
 	pf *workercore.ModelPrefetch, nodes []core.Node, deps []workercore.ModelDeployment,
 	pools InstanceTypeFlavorNames,
 ) ([]string, error) {
-	// Implement this function in chapter 18.
+	// 在第 18 章中实现此函数。
 	var result0 []string
 	var result1 error
 	return result0, result1
 }
 
-// The placement refusal the webhook shares: both kinds set is ambiguous, and the schema cannot
-// see it because neither field is required.
+// Webhook 共用的 placement 拒绝错误：同时设置两种选择方式会产生歧义，而 schema 因两者均非必填而无法校验。
 var ErrPrefetchPlacementAmbiguous = fmt.Errorf("placement sets both instanceTypes and nodeSelector")
 
-// artifactResolutionChanged enqueues only when an artifact's resolution moved — the fact both the
-// accounting and the prefetch delivery read. Description and label churn is nobody's feed here.
+// artifactResolutionChanged 仅在制品的解析结果发生变化时触发入队——这是记账和预取分发共同读取的事实。
+// 描述和标签的频繁变动在此处无任何监听者关注。
 var artifactResolutionChanged = ctrlpredicate.Funcs{
 	CreateFunc: func(ctrlevent.CreateEvent) bool { return true },
 	DeleteFunc: func(ctrlevent.DeleteEvent) bool { return true },
@@ -332,9 +319,8 @@ var artifactResolutionChanged = ctrlpredicate.Funcs{
 	GenericFunc: func(ctrlevent.GenericEvent) bool { return false },
 }
 
-// nodeReportChanged enqueues only when a node's report changed in a way a prefetch reads: the
-// per-digest entries and the pin list. Watermark bookkeeping the plugin writes alongside is
-// another object's feed.
+// nodeReportChanged 仅当节点的上报以预取关注的方式发生变化时才触发入队：即按 digest 组织的条目和 pin 列表。
+// 插件顺带写入的水位线（watermark）记录由其他对象消费。
 var nodeReportChanged = ctrlpredicate.Funcs{
 	CreateFunc: func(ctrlevent.CreateEvent) bool { return true },
 	DeleteFunc: func(ctrlevent.DeleteEvent) bool { return true },
@@ -354,9 +340,8 @@ var nodeReportChanged = ctrlpredicate.Funcs{
 	GenericFunc: func(ctrlevent.GenericEvent) bool { return false },
 }
 
-// nodeLabelsChanged enqueues only when a node's labels changed: the heartbeat's status writes
-// decide nothing about which stores match a node or what a prefetch targets. The store
-// reconciler keeps its own inline copy of this shape; both read only labels.
+// nodeLabelsChanged 仅在节点标签发生变化时触发入队：心跳带来的 status 写入既不决定哪些存储匹配节点，
+// 也不决定预取的目标节点。ModelStore 协调器保留了同样形态的内联副本；两者都只读取标签。
 var nodeLabelsChanged = ctrlpredicate.Funcs{
 	CreateFunc: func(ctrlevent.CreateEvent) bool { return true },
 	DeleteFunc: func(ctrlevent.DeleteEvent) bool { return true },
@@ -375,9 +360,8 @@ var nodeLabelsChanged = ctrlpredicate.Funcs{
 	GenericFunc: func(ctrlevent.GenericEvent) bool { return false },
 }
 
-// SetupController watches everything a prefetch's target set or delivery depends on: the
-// artifact's resolution is a status change, the deployments name the derived set, the nodes are
-// the targets, and the nodes' reports are the readiness.
+// SetupController 监听预取的目标集合或分发过程所依赖的一切资源：制品解析结果属于状态变更，部署决定了
+// 推导出的目标集合，Node 本身即目标，而节点的上报则反映了就绪状态。
 func (r *ModelPrefetchReconciler) SetupController(_ context.Context, opts controller.SetupOptions) error {
 	r.Client = opts.Manager.GetClient()
 
@@ -414,8 +398,7 @@ func (r *ModelPrefetchReconciler) SetupController(_ context.Context, opts contro
 		Complete(r)
 }
 
-// enqueueAllPrefetches enqueues every prefetch: nodes and their reports are cluster-wide facts any
-// of them may read.
+// enqueueAllPrefetches 将所有预取对象入队：Node 及其上报信息属于集群级事实，任何预取都可能读取。
 func (r *ModelPrefetchReconciler) enqueueAllPrefetches(ctx context.Context, _ ctrlcli.Object) []ctrlreconcile.Request {
 	pfs := new(workercore.ModelPrefetchList)
 	if err := r.Client.List(ctx, pfs); err != nil {
@@ -434,8 +417,8 @@ func (r *ModelPrefetchReconciler) enqueueAllPrefetches(ctx context.Context, _ ct
 	return reqs
 }
 
-// enqueuePrefetchesInNamespace enqueues the prefetches of the object's namespace: an artifact's
-// resolution and a deployment's placement both decide what their namespace's prefetches do.
+// enqueuePrefetchesInNamespace 将对象所在 Namespace 内的预取对象入队：制品的解析结果与部署的 placement
+// 都会决定其所属 Namespace 中预取的行为。
 func (r *ModelPrefetchReconciler) enqueuePrefetchesInNamespace(ctx context.Context, obj ctrlcli.Object) []ctrlreconcile.Request {
 	pfs := new(workercore.ModelPrefetchList)
 	if err := r.Client.List(ctx, pfs, ctrlcli.InNamespace(obj.GetNamespace())); err != nil {

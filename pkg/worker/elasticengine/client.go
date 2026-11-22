@@ -1,29 +1,25 @@
-// Package elasticengine is the operator's client for the engine's own elastic width endpoints.
+// Package elasticengine 是 operator 用于访问引擎自身弹性宽度端点的客户端。
 //
-// It talks to a pinned vLLM's native routes and nothing else: the two resize routes below, plus
-// the one completion route ObserveNativeWorld probes to measure the world the frontend actually
-// enforces. The native contract, read from v0.29.0's serve/elastic_ep router, is:
+// 它只与固定版本 vLLM 的原生路由通信：下方两个缩扩容路由，以及 ObserveNativeWorld
+// 用来探测前端实际执行范围的单个补全路由。源自 v0.29.0 serve/elastic_ep 路由器的原生契约为：
 //
 //	POST /scale_elastic_ep      {"new_data_parallel_size": positive int, "drain_timeout": positive int}
 //	                            200 {"message": ...} | 400 | 408 | 500
 //	POST /is_scaling_elastic_ep  200 {"is_scaling_elastic_ep": bool}
 //
-// A success here means exactly one thing: the engine accepted the request. It is not the effective
-// width, and nothing in this package can tell you the effective width. The engine reports the width
-// it believes it is at, and that is a claim about itself; only a request actually served afterwards
-// is evidence that it serves. The same is true of the scaling flag, which is a statement that a
-// resize is in progress and never a statement that a worker is free to remove.
+// 此处的成功仅代表一件事：引擎已接受该请求。它不代表实际生效的宽度，本包也无法提供
+// 实际生效宽度。引擎上报的是它认为自己所处的宽度，这只是引擎的自述；只有随后实际提供
+// 服务的请求，才是其正在服务的证据。scaling 标志也是如此，它仅表示缩扩容正在进行中，
+// 绝不表示可以安全移除某个 worker。
 //
-// ObserveNativeWorld is the one native observation this package adds: the frontend's own rank
-// validation, bookended around one real forward per expected rank. It measures the bound the
-// engine enforces and which ranks served a token. It is not a membership proof, it names no Pod
-// or actor, and equal bookends cannot exclude a change across the forwards; a controller pairs it
-// with its own identity reads before it may act on it.
+// ObserveNativeWorld 是本包新增的唯一原生观测能力：围绕每个预期 rank 的一次真实前向
+// 推理，在前后分别读取前端自身的 rank 校验信息。它测量引擎实际执行的边界以及哪些 rank
+// 处理了 token。它不是成员关系证明，不涉及任何 Pod 或执行体名称，且前后校验一致也不能
+// 排除前向推理期间发生变更的可能；控制器必须将其与自身的身份读取结合后才能据此采取行动。
 //
-// Nothing here retries. A resize is a mutation of a collective, and a mutation that is replayed
-// against a request that may already have been applied is how a collective ends up at an unintended
-// width. An ambiguous answer here is reported as ambiguous and the caller's state machine decides
-// what to do about it; that state machine, not this client, owns reconstruction.
+// 本包中的所有操作均不重试。缩扩容是对集合通信组的变更操作，对可能已经生效的请求进行
+// 重放会导致集合通信组最终处于非预期的宽度。不确定的响应会按不确定类型上报，由调用方的
+// 状态机决定后续处理；重建逻辑归该状态机而非本客户端负责。
 package elasticengine
 
 import (
@@ -39,48 +35,46 @@ import (
 )
 
 const (
-	// scalePath is the native route that changes the data parallel width.
+	// scalePath 是用于修改数据并行宽度的原生路由。
 	scalePath = "/scale_elastic_ep"
-	// isScalingPath is the native route that reports whether a resize is in progress.
+	// isScalingPath 是用于上报缩扩容是否正在进行中的原生路由。
 	isScalingPath = "/is_scaling_elastic_ep"
-	// isScalingField is the single field the native answer carries. It is required to be present
-	// and boolean, because an answer that does not carry it did not say anything.
+	// isScalingField 是原生响应携带的唯一字段。该字段必须存在且为布尔值，
+	// 因为不包含该字段的响应没有表达任何有效信息。
 	isScalingField = "is_scaling_elastic_ep"
-	// ackField is the single field the native scale answer carries. It is required to be present
-	// and a string, because an answer without it did not acknowledge the resize.
+	// ackField 是原生缩扩容响应携带的唯一字段。该字段必须存在且为字符串，
+	// 因为不包含该字段的响应未确认该次缩扩容请求。
 	ackField = "message"
 )
 
-// maxResponseBytes bounds what one answer may be. A member that streams forever is cut off here
-// rather than by the size of whatever it chooses to serve.
+// maxResponseBytes 限制单次响应的最大字节数。持续不断流式输出的成员会在此处被截断，
+// 而不会任由其返回任意大小的响应。
 const maxResponseBytes = 1 << 20
 
-// Kind is why a call failed, in the terms a caller has to act on.
+// Kind 表示调用失败的原因，按调用方需要采取的处理方式分类。
 //
-// The ambiguous kind is the one that matters most. A transport that dropped a request, a caller
-// that canceled one, and a request the engine applied and then failed to acknowledge are the same
-// three states to anything that did not record the intent first. They are reported as one kind
-// precisely because no answer to them may be inferred from the failure itself.
+// 其中最关键的是不确定（ambiguous）类型。传输层丢弃请求、调用方取消请求，以及引擎已应用
+// 请求但未能返回确认，这三种状态对于未事先记录意图的观察者而言毫无区别。将它们归为同一
+// 类型，正是因为无法从失败本身推断出请求是否已生效。
 type Kind int
 
 const (
-	// KindInvalidInput is a request this client refused to send, or one the engine rejected as
-	// malformed. Nothing was changed.
+	// KindInvalidInput 表示本客户端拒绝发送的请求，或引擎因格式错误而拒绝的请求。未产生任何变更。
 	KindInvalidInput Kind = iota
-	// KindReconfiguring is the engine's own 503: it is not accepting the request right now because
-	// it is already reconfiguring. The request was not applied.
+	// KindReconfiguring 表示引擎返回的 503：由于引擎当前已在重新配置中，暂不接受该请求。
+	// 该请求未被应用。
 	KindReconfiguring
-	// KindNativeFailure is the engine's 408 or 500. The request reached it and it reported that it
-	// could not complete, which is a different fact from a request that never arrived.
+	// KindNativeFailure 表示引擎返回的 408 或 500。请求已到达引擎且引擎报告无法完成，
+	// 这与请求从未到达引擎属于不同事实。
 	KindNativeFailure
-	// KindAmbiguous is a transport failure, a cancellation, or any answer this client could not
-	// finish reading. Whether the request was applied is not known and must not be assumed.
+	// KindAmbiguous 表示传输失败、请求被取消，或本客户端未能完整读取的任何响应。
+	// 请求是否已应用不得而知，也绝不可擅自假设。
 	KindAmbiguous
-	// KindMalformed is an answer that arrived and did not carry what the route promises.
+	// KindMalformed 表示已收到响应，但响应内容不符合该路由的约定格式。
 	KindMalformed
 )
 
-// String names the kind, for a reason string and for logs.
+// String 返回该类型的名称，用于错误原因字符串及日志记录。
 func (k Kind) String() string {
 	switch k {
 	case KindInvalidInput:
@@ -98,22 +92,19 @@ func (k Kind) String() string {
 	}
 }
 
-// Error is every failure this package returns, classified.
+// Error 是本包返回的所有已分类失败。
 //
-// It carries the status and the route but not the body. A native error body is whatever the engine
-// chose to put there, and it may carry a model name, a URL, or a fragment of a request. None of
-// that is needed to decide what to do next, and all of it is the kind of thing that ends up in a
-// log.
+// 它携带状态码与路由信息，但不包含响应体。原生错误响应体由引擎自行决定内容，可能包含
+// 模型名称、URL 或请求片段。决定下一步操作并不需要这些信息，而它们往往会泄露到日志中。
 type Error struct {
 	Kind Kind
-	// Op is the route that was called.
+	// Op 是被调用的路由。
 	Op string
-	// StatusCode is the engine's status, or zero when the call never produced one.
+	// StatusCode 是引擎返回的状态码；若调用未产生状态码则为零。
 	StatusCode int
-	// Detail is a short, non-sensitive description of what was wrong.
+	// Detail 是对错误原因的简短、非敏感描述。
 	Detail string
-	// Err is the underlying cause, for an error chain. It is nil for a refusal this client made
-	// before sending anything.
+	// Err 是用于构成错误链的底层原因。对于客户端在发送请求前作出的拒绝，该字段为 nil。
 	Err error
 }
 
@@ -125,31 +116,30 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("elastic engine %s: %s: %s", e.Op, e.Kind, e.Detail)
 }
 
-// invalid builds a refusal made before anything was sent.
+// invalid 构造一个在发送任何数据之前作出的拒绝错误。
 func invalid(op, format string, args ...any) *Error {
 	return &Error{Kind: KindInvalidInput, Op: op, Detail: fmt.Sprintf(format, args...)}
 }
 
-// Client is a configured, immutable client for one engine's elastic endpoints.
+// Client 是针对单个引擎弹性端点配置的不可变客户端。
 //
-// It is immutable after construction and safe for concurrent use. Every field is read-only, the
-// underlying http.Client is itself safe for concurrent use, and no call mutates the client, so
-// there is no lock here and nothing to get wrong.
+// 它在构造后不可变且可安全并发使用。所有字段均为只读，底层的 http.Client 本身也是
+// 并发安全的，且没有任何方法会修改客户端状态，因此无需加锁也不会引入并发问题。
 type Client struct {
 	baseURL string
 	http    *http.Client
 	timeout time.Duration
 }
 
-// callContext bounds one call by the operator's timeout.
+// callContext 使用 operator 的超时时间限制单次调用。
 //
-// A timeout already respects an earlier deadline on the parent, so a caller that already bounded
-// itself keeps its own tighter bound and the sooner of the two always wins.
+// 超时设置会遵循父 ctx 中更早的截止时间，因此已自行设定上限的调用方会保留其更严格的
+// 限制，两者中较早到期的截止时间始终优先。
 func (c *Client) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, c.timeout)
 }
 
-// post sends one request and returns the bounded body, classifying every failure along the way.
+// post 发送单次请求并返回受大小限制的响应体，同时对过程中的各类失败进行分类。
 func (c *Client) post(ctx context.Context, op, path string, payload any) ([]byte, *Error) {
 	var body io.Reader
 	if payload != nil {
@@ -179,9 +169,8 @@ func (c *Client) post(ctx context.Context, op, path string, payload any) ([]byte
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		// A canceled or timed-out call is ambiguous, not failed. The request may have been
-		// applied before the client stopped hearing about it, and reporting that as a failure
-		// would invite a retry of a mutation that may already have happened.
+		// 被取消或超时的调用属于不确定状态，而非明确失败。请求可能在客户端停止接收响应前
+		// 就已生效，若将其上报为失败，可能会诱使调用方重试一个已经发生的变更。
 		kind := KindAmbiguous
 		detail := "the request could not be completed"
 		if errors.Is(err, context.Canceled) {
@@ -194,8 +183,8 @@ func (c *Client) post(ctx context.Context, op, path string, payload any) ([]byte
 	}
 	defer response.Body.Close()
 
-	// The body is bounded while it is read, so a member that never stops writing is cut off
-	// instead of being allowed to grow the answer.
+	// 读取时即对响应体大小进行限制，使持续写入不停止的成员被及时截断，而不会无限
+	// 膨胀响应数据。
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, &Error{
@@ -237,26 +226,24 @@ func (c *Client) post(ctx context.Context, op, path string, payload any) ([]byte
 	}
 }
 
-// scaleRequest is the native body, named for the native field.
+// scaleRequest 是原生请求体，按原生字段命名。
 type scaleRequest struct {
 	NewDataParallelSize int `json:"new_data_parallel_size"`
 	DrainTimeout        int `json:"drain_timeout"`
 }
 
-// Scale asks the engine to move to a new data parallel width.
+// Scale 请求引擎切换至新的数据并行宽度。
 //
-// The request is sent exactly once. There is no retry here and no path that turns a failure into
-// another attempt, because whether a failed call was applied is not something this client can answer.
+// 该请求仅发送一次。此处不设重试，也不存在将失败转为再次尝试的路径，因为本客户端
+// 无法判断一次失败的调用是否已在服务端生效。
 //
-// A nil error means the engine accepted and completed the request as its route defines it. It does
-// not mean the engine is serving at the new width, and a caller that treats it as that is reading
-// an acknowledgement as a fact.
+// 返回 nil error 表示引擎已按路由定义接受并完成了该请求，但这并不意味着引擎已在
+// 新宽度下提供服务；将其等同于已生效的调用方是把确认回执误读为了既成事实。
 func (c *Client) Scale(ctx context.Context, newDataParallelSize int, drainTimeout time.Duration) error {
 	const op = scalePath
 
-	// The inputs are checked before any request is built, because a refused request must leave the
-	// engine untouched. The native route answers 400 for exactly these cases, and a client that
-	// relied on that would turn a local mistake into a round trip.
+	// 在构造任何请求前先校验输入参数，因为被拒绝的请求不得触及引擎。原生路由对这类情况
+	// 同样返回 400，若依赖服务端校验则会把本地参数错误变成一次不必要的网络往返。
 	if newDataParallelSize <= 0 {
 		return invalid(op, "the new data parallel size must be positive, got %d", newDataParallelSize)
 	}
@@ -276,8 +263,8 @@ func (c *Client) Scale(ctx context.Context, newDataParallelSize int, drainTimeou
 		return failure
 	}
 
-	// The nil is returned explicitly. Returning the *Error directly would put a nil *Error into a
-	// non-nil error interface, and the caller would see a failure where the engine acknowledged.
+	// 此处显式返回 nil。直接返回 *Error 会将类型为 *Error 的 nil 装入非 nil 的 error
+	// 接口中，导致调用方在引擎已确认的情况下误判为失败。
 	if failure := acknowledge(op, raw); failure != nil {
 		return failure
 	}
@@ -285,11 +272,11 @@ func (c *Client) Scale(ctx context.Context, newDataParallelSize int, drainTimeou
 	return nil
 }
 
-// acknowledge checks the native 200 body against what the route promises.
+// acknowledge 依据路由约定校验原生 200 响应体。
 //
-// The route answers with one object holding a message string. A body that is valid JSON but not
-// that object did not acknowledge anything, and a nil error here would tell the caller the
-// mutation was accepted on the strength of a document the route never sends.
+// 该路由约定返回包含 message 字符串的单个 JSON 对象。即便响应体是合法 JSON，只要
+// 不是该对象就未确认任何操作；若此处返回 nil error，就会凭一段该路由从不发送的文档
+// 误导调用方认为变更已被接受。
 func acknowledge(op string, raw []byte) *Error {
 	answer, failure := decodeObject(op, raw)
 	if failure != nil {
@@ -302,8 +289,7 @@ func acknowledge(op string, raw []byte) *Error {
 			Kind: KindMalformed, Op: op, Detail: "the acknowledgement does not carry " + ackField,
 		}
 	}
-	// A null is refused before the unmarshal, because unmarshalling a null into a string leaves the
-	// string empty and reports no error at all.
+	// 在反序列化之前拒绝 null，因为将 null 反序列化到 string 只会得到空字符串而不会报任何 error。
 	if string(message) == "null" {
 		return &Error{
 			Kind: KindMalformed, Op: op, Detail: ackField + " is null rather than a string",
@@ -320,10 +306,10 @@ func acknowledge(op string, raw []byte) *Error {
 	return nil
 }
 
-// decodeObject reads exactly one JSON object out of an answer.
+// decodeObject 从响应中严格读取单个 JSON 对象。
 //
-// A null is refused on purpose. Decoding it into a map succeeds and leaves the map nil, so a
-// caller that only checked the error would read a silent engine as an object with no fields.
+// 此处刻意拒绝 null。将其解码到 map 会成功且使 map 为 nil，若调用方仅检查 error，
+// 就会把静默的引擎响应误读为一个空字段对象。
 func decodeObject(op string, raw []byte) (map[string]json.RawMessage, *Error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 
@@ -339,8 +325,7 @@ func decodeObject(op string, raw []byte) (map[string]json.RawMessage, *Error) {
 		}
 	}
 
-	// A second value after the answer is refused. The decoder reads the first and would otherwise
-	// ignore whatever followed it.
+	// 拒绝响应体末尾附带的第二个 JSON 值。解码器读取第一个值后，若不额外检查就会忽略后续内容。
 	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		return nil, &Error{
 			Kind: KindMalformed, Op: op, Detail: "the answer carries a trailing JSON value",

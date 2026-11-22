@@ -4,13 +4,13 @@ import (
 	"unsafe"
 )
 
-// FromBytes converts a byte slice to a string.
+// FromBytes 将字节切片转换为字符串。
 func FromBytes(b *[]byte) string {
 	return unsafe.String(unsafe.SliceData(*b), len(*b))
 }
 
-// ToBytes converts a string to a byte slice,
-// which is impossible to modify the item of slice.
+// ToBytes 将字符串转换为字节切片，
+// 转换后的切片元素不可修改。
 func ToBytes(s *string) (bs []byte) {
 	return unsafe.Slice(unsafe.StringData(*s), len(*s))
 }

@@ -16,99 +16,85 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
 )
 
-// The vocabulary a Pod uses to ask for a KV cache. The trigger is a LABEL because an objectSelector
-// can only match labels, and it carries a fixed value so it never meets the 63-character ceiling a
-// label value has; everything configurable is an ANNOTATION, where a name of any length is legal.
+// Pod 用来请求 KV cache 的词汇表。触发器采用 LABEL，因为 objectSelector 只能匹配标签，
+// 且它携带固定值，从而不会触及标签值 63 个字符的长度上限；所有可配置项均采用 ANNOTATION，
+// 因为注解允许任意长度的名称。
 const (
-	// KVCacheInjectLabelKey opts a Pod into injection. It is the mutating webhook's objectSelector,
-	// so a Pod without it never reaches this handler at all.
+	// KVCacheInjectLabelKey 用于将 Pod 纳入注入范围。它是 mutating webhook 的 objectSelector，
+	// 因此不带该标签的 Pod 根本不会到达此处理函数。
 	KVCacheInjectLabelKey = "kvcache." + systemname.LabelPrefix + "inject"
 
-	// KVCacheInjectLabelValue is the only value that opts in. "false" is the explicit opt-out, and
-	// so is dropping the label.
+	// KVCacheInjectLabelValue 是唯一表示启用的值。"false" 表示显式退出，移除该标签亦同。
 	KVCacheInjectLabelValue = "true"
 
-	// KVCacheBindingAnnotationKey names the KVCachePoolBinding, in the Pod's own namespace, that
-	// provisions this Pod's grant on a pool - capacity and a reuse domain, not access. There is no
-	// cross-namespace form.
+	// KVCacheBindingAnnotationKey 指定位于 Pod 自身命名空间中的 KVCachePoolBinding，
+	// 该绑定在资源池上为此 Pod 配置授权——即容量和复用域，而非访问权限。不存在跨命名空间的形式。
 	KVCacheBindingAnnotationKey = "kvcache." + systemname.LabelPrefix + "binding"
 
-	// KVCacheEngineAnnotationKey names the inference engine to configure. It is required and never
-	// guessed from an image: engines take different flags, and a wrong guess yields a container that
-	// starts normally and caches nothing.
+	// KVCacheEngineAnnotationKey 指定要配置的推理引擎。它是必填项，绝不根据镜像猜测：
+	// 不同引擎接受不同的参数标志，错误的猜测会导致容器正常启动却完全不进行缓存。
 	KVCacheEngineAnnotationKey = "kvcache." + systemname.LabelPrefix + "engine"
 
-	// KVCacheManufacturerAnnotationKey selects the vendor runtime variant for vLLM. It is a workload
-	// author's declaration, not a claim this webhook has verified against the Pod's eventual node.
-	// Only the measured Ascend variant is accepted; a wrong declaration is refused rather than guessed.
+	// KVCacheManufacturerAnnotationKey 为 vLLM 选择厂商运行时变体。它是工作负载作者的声明，
+	// 而非本 webhook 已对照 Pod 最终调度节点验证过的断言。目前仅接受经过实测的 Ascend 变体；
+	// 错误的声明会被拒绝，而不会尝试猜测。
 	KVCacheManufacturerAnnotationKey = "kvcache." + systemname.LabelPrefix + "manufacturer"
 
-	// KVCacheRoleAnnotationKey declares a prefill/decode role. Unset is legal and means the caller
-	// has no such split.
+	// KVCacheRoleAnnotationKey 声明 prefill/decode 角色。不设置是合法的，表示调用方没有此类拆分。
 	KVCacheRoleAnnotationKey = "kvcache." + systemname.LabelPrefix + "role"
 
-	// KVCacheContainerAnnotationKey names which container to inject into. It is required only when
-	// the Pod has more than one, because picking the first is how an injection lands in a sidecar
-	// while the workload runs elsewhere.
+	// KVCacheContainerAnnotationKey 指定要注入的目标容器名称。仅当 Pod 包含多个容器时才为必填，
+	// 因为若默认选取第一个容器，在工作负载运行于其他容器时注入可能会误落入 sidecar 中。
 	KVCacheContainerAnnotationKey = "kvcache." + systemname.LabelPrefix + "container"
 
-	// KVCacheLaunchArgsForwardedAnnotationKey lets a container author declare that an unrecognized
-	// launcher or script forwards appended arguments to the engine. It cannot override a launch the
-	// webhook already knows loses those arguments, such as a shell's command mode.
+	// KVCacheLaunchArgsForwardedAnnotationKey 允许容器作者声明某个未识别的启动器或脚本会将
+	// 追加的参数转发给引擎。它不能覆盖 webhook 已知会丢失这些参数的启动方式，例如 shell 的命令模式。
 	KVCacheLaunchArgsForwardedAnnotationKey = "kvcache." + systemname.LabelPrefix + "launch-args-forwarded"
 
-	// KVCacheDomainAnnotationKey is a REFUSED key, not an unrecognized one. The reuse domain comes
-	// from the Binding and only from the Binding, so a Pod that names one here is rejected rather
-	// than silently ignored - a manifest written against an escape hatch that does not exist should
-	// fail where its author can see it.
+	// KVCacheDomainAnnotationKey 是一个被拒绝（REFUSED）的键，而非未识别的键。复用域只能来自
+	// Binding，因此在此处指定复用域的 Pod 会被拒绝，而不是静默忽略——针对不存在的后门机制
+	// 编写的清单应当在作者可见的位置明确失败。
 	KVCacheDomainAnnotationKey = "kvcache." + systemname.LabelPrefix + "domain"
 )
 
-// PodKVCacheWebhook injects the client configuration an inference engine needs to use a KV cache
-// pool, into any Pod that opts in with the KVCacheInjectLabelKey label. Mutating on CREATE: it
-// appends env, args, a volume and a mount to one named container and stamps the Pod with what it
-// did. Every check that half makes is a reason to refuse the mutation itself, so it reports its
-// refusals from Default rather than from a validating handler.
+// PodKVCacheWebhook 将推理引擎使用 KV cache 池所需的客户端配置注入到所有通过
+// KVCacheInjectLabelKey 标签启用的 Pod 中。CREATE 阶段执行 Mutating：向指定的单个容器
+// 追加 env、args、volume 和 mount，并在 Pod 上标记其执行的操作。这一半所做的每项检查
+// 都是拒绝变更本身的理由，因此它从 Default 而非 validating 处理函数报告拒绝。
 //
-// Validating on UPDATE, and that half answers a different question. The mutating half decides once,
-// and the keys carrying its decision stay editable on the Pod for as long as it lives. The
-// validating half freezes those keys - the opt-in label, the injection record, and the client
-// configuration the container projects - so that what this webhook wrote about a Pod stays true for
-// the Pod's life rather than only at the instant it was admitted. The same three keys are refused as
-// INPUTS at CREATE, by checkAnnotationVocabulary and by the resolution path; this is that contract
-// held past admission.
+// UPDATE 阶段执行 Validating，这一半回答的是另一个问题。mutating 一半只做一次决策，
+// 而承载该决策的键在 Pod 存续期间默认仍是可编辑的。validating 一半会冻结这些键——
+// 即启用标签、注入记录以及容器投射的客户端配置——从而保证本 webhook 对 Pod 写入的内容
+// 在 Pod 的整个生命周期内持续为真，而不仅仅在准入那一刻有效。这相同的三个键在 CREATE
+// 阶段作为输入也会被 checkAnnotationVocabulary 和解析路径拒绝；此处则是将该契约延续到准入之后。
 //
-// ReceiveDeletionUpdate is what makes "the Pod's life" include its termination. Without that marker
-// the shared setup wraps this validator in a guard that returns success as soon as the Pod carries a
-// deletion timestamp, and all three keys would be editable for the whole grace period - during which
-// the container is still running and the kubelet still reprojects the client configuration from the
-// annotation. That guard exists so validation depending on state which may already be gone cannot
-// block a finalizer-clearing update; this validator reads no state beyond the two objects it is
-// handed, and clearing a finalizer changes none of the three keys, so it is admitted either way.
+// ReceiveDeletionUpdate 使得"Pod 的生命周期"包含其终止过程。如果没有该标记，
+// 共享配置会在校验器外层包裹一个守卫，只要 Pod 带有 deletionTimestamp 就直接返回成功，
+// 从而导致这三个键在整个宽限期内都可被编辑——而在此期间容器仍在运行，kubelet 仍会依据
+// 注解重新投射客户端配置。该守卫原本是为了防止依赖可能已消失状态的校验阻塞清除 finalizer 的
+// 更新；而本校验器除传入的两个对象外不读取任何外部状态，且清除 finalizer 不会修改上述三个
+// 键中的任何一个，因此无论如何都会被准入。
 //
-// WHAT THE UPDATE PATH DOES NOT HOLD, each gap reachable rather than hypothetical:
+// UPDATE 路径无法保障的方面（每项缺口都是实际可达而非假设的）：
 //
-//   - Its failurePolicy is Ignore, against Fail on the mutating half, so every edit it would refuse
-//     is admitted while the webhook is unreachable. That direction is deliberate: this guard keeps a
-//     record honest, and it must never be the reason a live workload cannot be updated or finished.
-//     Under Fail an unreachable webhook would block finalizer removal on every opted-in Pod, and
-//     this feature's own teardown waits on exactly that - a Binding's finalizer holds while
-//     status.usedBy is non-empty, which cannot empty while its Pods cannot finish deleting. One
-//     missed refusal costs one wrong record; a wedged deletion costs the pool.
-//   - Its objectSelector is the opt-in label, so a Pod that never carried it is never seen, and
-//     forged values for the two annotations can be written onto such a Pod. They are inert there -
-//     no volume projects the configuration and no container reads it - but an operator who read the
-//     record would be reading a fabrication.
-//   - It freezes metadata only. The volume, mount, env and args the mutating half writes live in the
-//     Pod spec, which this path does not read or compare.
+//   - 其 failurePolicy 为 Ignore（相对于 mutating 一半的 Fail），因此当 webhook 不可达时，
+//     所有本应被拒绝的编辑都会被准入。这一选择是有意为之：该守卫用于保证记录真实，
+//     绝不能成为阻塞在线工作负载更新或结束的原因。若设为 Fail，不可达的 webhook 会阻塞
+//     所有已启用 Pod 的 finalizer 移除，而本特性自身的清理流程恰恰要等待这一点——
+//     当 status.usedBy 非空时 Binding 的 finalizer 会保持锁定，而在其 Pod 无法完成删除前
+//     status.usedBy 无法清空。漏掉一次拒绝最多导致一条错误记录；卡死删除则会拖垮整个资源池。
+//   - 其 objectSelector 为启用标签，因此从未携带该标签的 Pod 不会被看到，且可以将两个
+//     注解的伪造值写入此类 Pod。这些注解在那里不起作用——没有 volume 投射配置，也没有
+//     容器读取它——但读取该记录的操作人员看到的将是伪造信息。
+//   - 它仅冻结元数据。mutating 一半写入的 volume、mount、env 和 args 位于 Pod spec 中，
+//     而此路径不会读取或比对它们。
 //
-// It is a second Pod webhook pair rather than a branch inside PodWebhook, and the two are
-// independent by construction: PodWebhook triggers on the Kueue queue-name label and rewrites
-// container resources, this one triggers on its own label and never touches resources. A Pod may
-// carry both labels, neither, or one.
+// 它是独立于 PodWebhook 之外的第二对 Pod webhook，两者在设计上相互独立：
+// PodWebhook 由 Kueue queue-name 标签触发并重写容器资源，而本 webhook 由自身标签触发且
+// 从不修改资源。一个 Pod 可以同时携带两个标签、都不携带，或只携带其中一个。
 //
-// reinvocationPolicy is Never. This webhook refuses a Pod whose target container already carries a
-// key it owns, so a second pass over its own output would refuse the Pod it had just configured.
+// reinvocationPolicy 为 Never。本 webhook 会拒绝目标容器中已包含其所管理键的 Pod，
+// 因此对其自身输出再执行一次调用将会拒绝刚刚配置好的 Pod。
 //
 // nolint: lll
 // +k8s:webhook-gen:mutating:group="",version="v1",resource="pods",scope="Namespaced"
@@ -137,12 +123,11 @@ var (
 	_ webhook.ReceiveDeletionUpdate           = (*PodKVCacheWebhook)(nil)
 )
 
-// ReceiveDeletionUpdate keeps this webhook receiving update validation for a Pod that is being
-// deleted. See the type comment: the freeze is worth least at exactly the moment the default guard
-// would drop it.
+// ReceiveDeletionUpdate 使该 webhook 在 Pod 正在被删除时仍能接收更新校验。详见类型注释：在默认保护机制
+// 本应将其忽略的那一刻，该冻结机制反而最不该失效。
 //
-// It opts the mutating half out of the same guard, which changes nothing observable there. That half
-// is registered for CREATE alone, and a create never carries a deletion timestamp.
+// 它也会让变更（mutating）部分绕过同一保护，但这在外部不会产生任何可观测变化。变更部分仅注册于
+// CREATE 操作，而创建请求从不带有删除时间戳。
 func (r *PodKVCacheWebhook) ReceiveDeletionUpdate() {}
 
 func (r *PodKVCacheWebhook) Default(ctx context.Context, obj runtime.Object) error {
@@ -151,15 +136,12 @@ func (r *PodKVCacheWebhook) Default(ctx context.Context, obj runtime.Object) err
 		return fmt.Errorf("expected a Pod, got %T", obj)
 	}
 
-	// Injection happens on CREATE and once. What keeps its decision from being edited afterwards is
-	// ValidateUpdate below, not anything here.
+	// 注入仅在 CREATE 时执行一次。防止其决策在事后被修改的是下方的 ValidateUpdate，而非此处逻辑。
 	//
-	// The objectSelector already filters to Pods carrying the opt-in label at its accepted value, so
-	// this is defense in depth rather than the primary guard. It is here because widening that
-	// selector is a one-line edit in a generated file, and the spec names that exact reversion as a
-	// risk: without this check, a widened selector would send every Pod in the cluster through
-	// resolution, and a webhook that fails closed would then stop the cluster. With it, the blast
-	// radius of that mistake is a no-op.
+	// objectSelector 已将请求过滤为携带可接受值选择加入标签的 Pod，因此这里属于纵深防御而非主防线。
+	// 保留此检查是因为放宽该选择器只需修改生成文件中的一行，且规范明确指出了此类回退的风险：
+	// 若无此检查，放宽选择器会让集群中的每个 Pod 都进入解析流程，而 fail-closed 的 webhook 会导致整个集群停摆。
+	// 有了此检查，这类失误的影响范围就被限制为空操作。
 	if pod.Labels[KVCacheInjectLabelKey] != KVCacheInjectLabelValue {
 		return nil
 	}
@@ -174,14 +156,13 @@ func (r *PodKVCacheWebhook) Default(ctx context.Context, obj runtime.Object) err
 		return err
 	}
 
-	// Every refusal has run by now, so the Pod is either fully injected or untouched. A half-injected
-	// Pod - the volume added and the variable missing - would start and behave in a way no field on it
-	// explains.
+	// 至此所有拒绝检查均已执行完毕，因此 Pod 要么被完整注入，要么保持原样。半注入状态的 Pod（例如
+	// 已添加卷但缺少环境变量）启动后会产生任何字段都无法解释的行为。
 	return r.injectPod(pod, res, out)
 }
 
-// ValidateCreate is not registered: CREATE is the mutating half's, which refuses from Default because
-// each of its checks is a reason not to mutate.
+// ValidateCreate 未注册：CREATE 阶段由变更部分负责，它在 Default 中直接拒绝，因为其每项检查都是
+// 不应执行变更的理由。
 func (r *PodKVCacheWebhook) ValidateCreate(
 	_ context.Context, _ runtime.Object,
 ) (ctrladmission.Warnings, error) {
@@ -209,18 +190,17 @@ func (r *PodKVCacheWebhook) ValidateUpdate(
 	return nil, nil
 }
 
-// ValidateDelete is not registered. Nothing about a KV cache decision needs re-checking as the Pod
-// goes: the grant is the Binding's and outlives the Pod, and refusing a delete here is the one thing
-// that could leave a workload unable to finish.
+// ValidateDelete 未注册。Pod 删除时无需重新检查 KVCache 决策：授权归属于 Binding 且生命周期长于 Pod，
+// 而在此拒绝删除反而可能导致工作负载无法正常结束。
 func (r *PodKVCacheWebhook) ValidateDelete(
 	_ context.Context, _ runtime.Object,
 ) (ctrladmission.Warnings, error) {
 	return nil, nil
 }
 
-// podKVCacheOwnedAnnotations are the two keys this webhook WRITES, with what editing one costs. They
-// are frozen for the same reason a submitted value is refused at CREATE - they record what was
-// decided rather than carry an input - and the two reasons differ, so each carries its own.
+// podKVCacheOwnedAnnotations 是该 webhook 写入的两个键，以及修改它们各自的错误提示。
+// 冻结它们的原因与在 CREATE 时拒绝传入值相同——它们用于记录已做出的决策而非承载输入——且两者的原因不同，
+// 因此各自配有说明。
 var podKVCacheOwnedAnnotations = []struct {
 	key    string
 	reason string
@@ -242,21 +222,20 @@ var podKVCacheOwnedAnnotations = []struct {
 	},
 }
 
-// validatePodKVCacheOwnedMetadata holds the three keys admission decided for the Pod's whole life.
+// validatePodKVCacheOwnedMetadata 校验准入阶段为 Pod 整个生命周期决定的三个键。
 //
-// It compares presence as well as value, so removing a key is refused on the same footing as changing
-// it. Reading the value alone would let a delete pass as an edit to the empty string.
+// 它同时比较键是否存在以及键值是否变化，因此删除键与修改键会被同等拒绝。若仅读取键值，
+// 删除操作会被误判为修改成空字符串而放行。
 //
-// Every other metadata edit is left alone, and that is the requirement rather than a side effect: an
-// opted-in Pod is a live workload whose labels, other annotations and finalizers belong to whatever
-// is managing it.
+// 其他所有元数据修改均不干预，这是设计要求而非副作用：已选择加入的 Pod 是运行中的工作负载，
+// 其标签、其他注解和 finalizer 归属于管理它的上层组件。
 func validatePodKVCacheOwnedMetadata(oldPod, newPod *core.Pod) field.ErrorList {
 	oldOptedIn := oldPod.Labels[KVCacheInjectLabelKey] == KVCacheInjectLabelValue
 	newOptedIn := newPod.Labels[KVCacheInjectLabelKey] == KVCacheInjectLabelValue
 
-	// The objectSelector matches when EITHER object carries the label, so a transition in either
-	// direction arrives here and a Pod outside the feature does not. Neither side opting in is
-	// therefore only reachable through a widened selector, where the answer is the mutating half's.
+	// 只要新旧对象中任一方携带该标签，objectSelector 就会匹配，因此任意方向的变更都会进入此处，
+	// 而未使用该特性的 Pod 不会到达这里。新旧双方均未选择加入的情况只会在选择器被放宽时出现，
+	// 其处理方式与变更部分一致。
 	if !oldOptedIn && !newOptedIn {
 		return nil
 	}

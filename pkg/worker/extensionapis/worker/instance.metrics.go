@@ -34,32 +34,29 @@ import (
 )
 
 const (
-	// _DeviceManagerSecurePort is the default secure port of the device manager's
-	// webserver, used when its container port is unnamed; it mirrors the chart's
-	// deviceManager.securePort default.
+	// _DeviceManagerSecurePort 是设备管理器 Web 服务的默认安全端口，
+	// 在其容器端口未命名时使用；它与 chart 中 deviceManager.securePort 的默认值保持一致。
 	_DeviceManagerSecurePort = 32443
 
-	// _DeviceManagerSecurePortName is the name of the device manager's secure container
-	// port; the actual port is resolved from the pod spec so a chart-level
-	// deviceManager.securePort override keeps working.
+	// _DeviceManagerSecurePortName 是设备管理器安全容器端口的名称；
+	// 实际端口会从 Pod 规约中解析，以确保 chart 层级的 deviceManager.securePort 覆盖配置依然生效。
 	_DeviceManagerSecurePortName = "https"
 
-	// _InstanceMetricsTimeout bounds the whole metrics operation of one request,
-	// including the kubelet read, the metrics API fallback, and one device manager fetch
-	// per allocated manufacturer.
+	// _InstanceMetricsTimeout 限制单次请求中整个指标获取操作的超时时间，
+	// 包括 kubelet 读取、metrics API 回退，以及按每个已分配厂商向设备管理器拉取一次数据。
 	_InstanceMetricsTimeout = 10 * time.Second
 
-	// _MonitorSnapshotMaxBytes bounds a device manager snapshot readout, orders of
-	// magnitude above one node's accelerator metrics.
+	// _MonitorSnapshotMaxBytes 限制单次读取设备管理器快照的最大字节数，
+	// 该上限远高于单节点加速器指标的实际大小。
 	_MonitorSnapshotMaxBytes = 4 << 20
 )
 
-// metricsLogger records why the best-effort accelerator section came back empty:
-// without it, a missing accelerators field is indistinguishable from "no cards allocated".
+// metricsLogger 记录尽力获取的加速器指标部分返回为空的原因：
+// 若没有该日志，缺失 accelerators 字段将无法与“未分配加速卡”区分。
 var metricsLogger = klog.Background().WithName("instance-metrics")
 
-// deviceManagerSecurePortOf resolves the device manager's secure port from its pod spec,
-// falling back to _DeviceManagerSecurePort when the port is unnamed.
+// deviceManagerSecurePortOf 从设备管理器的 Pod 规约中解析安全端口，
+// 当端口未命名时回退到 _DeviceManagerSecurePort。
 func deviceManagerSecurePortOf(pod *core.Pod) int {
 	for i := range pod.Spec.Containers {
 		for j := range pod.Spec.Containers[i].Ports {
@@ -71,20 +68,19 @@ func deviceManagerSecurePortOf(pod *core.Pod) int {
 	return _DeviceManagerSecurePort
 }
 
-// InstanceMetricsHandler handles the "metrics" subresource of v1.Instance objects.
+// InstanceMetricsHandler 处理 v1.Instance 对象的 "metrics" 子资源。
 //
-// InstanceMetricsHandler returns the current utilization of the v1.Instance's backing Pod —
-// read in real time from the node kubelet through the API-server node proxy, with a
-// metrics.k8s.io fallback for CPU/memory — merged with the allocated accelerators' metrics
-// from the device manager's latest snapshot.
+// InstanceMetricsHandler 返回 v1.Instance 底层 Pod 的当前资源利用率——
+// 通过 API-server 节点代理从节点 kubelet 实时读取（CPU/内存支持回退到 metrics.k8s.io）——
+// 并合并来自设备管理器最新快照中已分配加速器的指标。
 type InstanceMetricsHandler struct {
 	extensionapi.GetOperation
 
 	APIReader ctrlcli.Reader
 
-	// MaxAge is the age of a node's kubelet readout this handler still serves. The readout is
-	// node-wide, so without it a client walking the Instances of one node re-reads the same
-	// payload once per Instance. The zero value reads afresh every request.
+	// MaxAge 是该处理器仍可复用节点 kubelet 读数结果的最大有效时长。由于该读数是节点级别的，
+	// 若不设置此值，客户端遍历同一节点上的多个 Instance 时会对每个 Instance 重复读取同一份数据。
+	// 零值表示每次请求都重新读取。
 	MaxAge time.Duration
 }
 
@@ -94,7 +90,7 @@ func newInstanceMetricsHandler(parent rest.Scoper, opts extensionapi.SetupOption
 		MaxAge:    kubemetrics.DefaultMaxAge,
 	}
 
-	// As storage.
+	// 作为存储。
 	h.GetOperation = extensionapi.WithSubResourceGet(parent, h)
 
 	return h
@@ -113,45 +109,40 @@ func (h *InstanceMetricsHandler) Destroy() {
 }
 
 func (h *InstanceMetricsHandler) OnGet(ctx context.Context, key types.NamespacedName, _ ctrlcli.GetOptions) (runtime.Object, error) {
-	// Bound the whole operation, including the object reads below.
+	// 限制整个操作的超时时间，包括下方的对象读取。
 	ctx, cancel := context.WithTimeout(ctx, _InstanceMetricsTimeout)
 	defer cancel()
 
-	// Get the backing Instance.
+	// 获取底层 Instance。
 	inst := &workercore.Instance{}
 	err := h.APIReader.Get(ctx, key, inst, ctrlclix.WithoutQuorum)
 	if err != nil {
 		return nil, err
 	}
-	// Get the backing Pod of this very Instance. A Pod that does not exist yet, and one still
-	// belonging to a previous incarnation, are both "this Instance has no Pod": the previous
-	// one's figures are never this one's to serve.
+	// 获取当前 Instance 对应的底层 Pod。尚未创建的 Pod 以及仍属于上一个生命周期实例的 Pod，
+	// 均视为“当前 Instance 没有 Pod”：绝不能将上一个实例的指标数据用于当前实例。
 	pod, err := h.backingPod(ctx, key, inst)
 	if err != nil {
 		return nil, err
 	}
 
-	// The gate: an Instance none of whose containers has started consumes nothing, so its usage
-	// is zero by reasoning. It sits above every read below — the kubelet, the metrics API and
-	// every device manager — because measuring here could only produce a neighbour's figures or
-	// a 503, and because a client should not need a branch for an Instance that is merely
-	// starting up or stopped.
+	// 前置门槛：只要 Instance 中没有任何容器启动，就不会消耗资源，因此按逻辑其用量为零。
+	// 该判断位于下方所有读取操作（kubelet、metrics API 及各设备管理器）之前，
+	// 因为在此状态下采集只会读到相邻实例的数据或返回 503，且客户端不应为处于启动中或已停止的 Instance 编写额外分支逻辑。
 	if !kubemetrics.HasStartedContainer(pod) {
 		return newInstanceMetrics(inst, kubemetrics.NewUnstartedSample(pod, inst.Spec.Resources)), nil
 	}
 
-	// Current CPU/memory/storage usage of the backing Pod. The error already names every
-	// source that failed and why, so it becomes the client-facing message unchanged. This is the
-	// one condition still served as unavailable: something did start, so its usage is a
-	// measurement, and no source could take it.
+	// 获取底层 Pod 当前的 CPU/内存/存储用量。返回的 error 中已包含所有失败来源及原因，
+	// 因此可直接原样返回给客户端。这是唯一仍返回服务不可用错误的场景：
+	// 容器确实已启动，因此用量属于真实测量值，但没有任何数据源能够采集到它。
 	sample, err := kubemetrics.FetchPodSample(ctx, inst.Status.NodeName, pod, h.MaxAge)
 	if err != nil {
 		return nil, kerrors.NewServiceUnavailable(err.Error())
 	}
 
-	// Best-effort merge of the allocated accelerators' latest metrics:
-	// the pod usage above is authoritative, a device manager failure only
-	// drops the accelerator section.
+	// 尽力合并已分配加速器的最新指标：
+	// 上方的 Pod 用量为主结果，设备管理器读取失败仅会省略加速器指标部分。
 	allocations, aerr := deviceplugin.AllocatedAcceleratorsOf(pod)
 	if aerr != nil {
 		metricsLogger.Error(aerr, "reading the allocated accelerators", "instance", key)
@@ -165,12 +156,12 @@ func (h *InstanceMetricsHandler) OnGet(ctx context.Context, key types.Namespaced
 	return newInstanceMetrics(inst, sample), nil
 }
 
-// backingPod returns the Pod backing this very Instance, or nil when the Instance has none: not
-// scheduled anywhere, no Pod rendered yet, or only a previous incarnation's Pod — which is not this
-// Instance's to measure and must never be served as if it were.
+// backingPod 返回当前 Instance 对应的底层 Pod；当 Instance 没有对应 Pod 时返回 nil：
+// 包括尚未调度到任何节点、尚未生成 Pod，或仅存在上一个生命周期实例的 Pod——后者不应由当前 Instance 测量，
+// 也绝不能冒充当前 Instance 的数据返回。
 //
-// A nil Pod is a state, not a failure. The Instance's own declaration still says what it asked
-// for, so the caller answers from that rather than making every client branch on a 503.
+// 返回 nil 的 Pod 是一种正常状态而非错误。Instance 自身的声明仍记录了其请求的资源，
+// 因此调用方会据此生成响应，避免让每个客户端都单独处理 503 分支。
 func (h *InstanceMetricsHandler) backingPod(
 	ctx context.Context,
 	key types.NamespacedName,
@@ -194,8 +185,7 @@ func (h *InstanceMetricsHandler) backingPod(
 	return pod, nil
 }
 
-// newInstanceMetrics wraps a sample as the served object, identified by the Instance rather than
-// by whatever produced the figures.
+// newInstanceMetrics 将采样结果包装为对外返回的对象，以 Instance 作为标识，而非以产生数据的底层对象作为标识。
 func newInstanceMetrics(
 	inst *workercore.Instance,
 	sample *worker.InstanceMetricsSample,
@@ -210,8 +200,8 @@ func newInstanceMetrics(
 	}
 }
 
-// currentAcceleratorMetrics reads the device manager's latest snapshot and filters it to the
-// allocated device IDs. Any failure degrades to no accelerator section.
+// currentAcceleratorMetrics 读取设备管理器的最新快照，并按已分配的设备 ID 进行过滤。
+// 任何失败都会降级为不返回加速器指标部分。
 func (h *InstanceMetricsHandler) currentAcceleratorMetrics(
 	ctx context.Context,
 	nodeName string,
@@ -224,9 +214,9 @@ func (h *InstanceMetricsHandler) currentAcceleratorMetrics(
 		return nil
 	}
 
-	// The chart rolls one device manager DaemonSet per manufacturer and passes
-	// --manufacturer to it, so each snapshot only carries its own manufacturer's cards:
-	// read one snapshot per allocated manufacturer instead of picking a single pod.
+	// chart 会为每个厂商部署一个独立的设备管理器 DaemonSet 并传入 --manufacturer 参数，
+	// 因此每个快照仅包含对应厂商的加速卡：
+	// 应按每个已分配厂商分别读取快照，而不是只挑选单个 Pod。
 	var accelerators []worker.InstanceAcceleratorMetrics
 	for _, manufacturer := range allocatedManufacturers(allocGroups) {
 		pod := selectDeviceManagerPod(pods, manufacturer)
@@ -250,8 +240,7 @@ func (h *InstanceMetricsHandler) currentAcceleratorMetrics(
 	return accelerators
 }
 
-// allocatedManufacturers returns the distinct manufacturers of an allocation,
-// in the allocation's own order.
+// allocatedManufacturers 按分配记录中的原始顺序，返回去重后的厂商列表。
 func allocatedManufacturers(allocGroups []workercore.DevicesAllocationGroup) []string {
 	seen := make(map[string]struct{}, len(allocGroups))
 	manufacturers := make([]string, 0, len(allocGroups))
@@ -266,11 +255,10 @@ func allocatedManufacturers(allocGroups []workercore.DevicesAllocationGroup) []s
 	return manufacturers
 }
 
-// filterAllocatedAcceleratorMetrics maps the snapshot's metrics for the allocated devices onto
-// the API type. The filtering itself — the staleness bound and the manufacturer-and-ID match —
-// belongs to the device manager that produced the snapshot, and is shared with its own exporter
-// so the two surfaces cannot report different cards for one Instance. So is the resolution of what
-// each entry says, which is the grants index's, for the same reason.
+// filterAllocatedAcceleratorMetrics 将快照中已分配设备的指标映射到 API 类型。
+// 过滤逻辑本身（包括过期时间上限以及厂商和 ID 的匹配）属于生成快照的设备管理器，
+// 且与其自身的 exporter 共享，以确保两个入口不会为同一个 Instance 上报不同的加速卡。
+// 出于同样原因，每条指标具体内容的解析也由 grants 索引统一负责。
 func filterAllocatedAcceleratorMetrics(
 	snapshot *devicemanager.MonitorSnapshot,
 	allocGroups []workercore.DevicesAllocationGroup,
@@ -278,17 +266,15 @@ func filterAllocatedAcceleratorMetrics(
 ) []worker.InstanceAcceleratorMetrics {
 	allocated := detector.AllocatedAcceleratorMetricsOf(snapshot, allocGroups)
 	if len(allocated) == 0 {
-		// Nil rather than an empty list, though the response cannot tell the two apart: the
-		// field is omitempty, so both are omitted. What it therefore never distinguishes is
-		// "this Instance holds no card" from "the device manager could not be read" — both
-		// simply arrive carrying no accelerators.
+		// 返回 nil 而非空切片，不过在响应中两者并无区别：该字段带有 omitempty 标签，两者都会被省略。
+		// 因此响应不会区分“该 Instance 未持有加速卡”与“无法读取设备管理器”——两者最终都不会携带加速器字段。
 		return nil
 	}
 
 	accelerators := make([]worker.InstanceAcceleratorMetrics, 0, len(allocated))
 	for i := range allocated {
-		// One card can yield several entries: an Instance holding two hardware partitions of it
-		// holds two grants, each with its own identity and its own figures.
+		// 一张加速卡可能对应多条记录：持有同一张卡上两个硬件分区的 Instance
+		// 会拥有两个授权（grant），各自具有独立的标识和指标数据。
 		accelerators = append(accelerators, grants.Resolve(
 			snapshot.Slices, allocated[i].Manufacturer, &allocated[i].Metrics,
 		)...)
@@ -296,10 +282,9 @@ func filterAllocatedAcceleratorMetrics(
 	return accelerators
 }
 
-// selectDeviceManagerPod returns the Ready, non-terminating device manager pod serving the
-// given manufacturer, or nil. Another manufacturer's pod is never an acceptable substitute:
-// its snapshot cannot carry the cards we are asked about. An unlabeled manufacturer
-// (an allocation predating the label) accepts any pod.
+// selectDeviceManagerPod 返回服务指定厂商且处于 Ready、非终止状态的设备管理器 Pod；若不存在则返回 nil。
+// 其他厂商的 Pod 绝不能作为替代：其快照中不可能包含所查询的加速卡。
+// 若厂商标签未设置（即早于该标签引入前的分配记录），则接受任意设备管理器 Pod。
 func selectDeviceManagerPod(pods []core.Pod, manufacturer string) *core.Pod {
 	for i := range pods {
 		pod := &pods[i]
@@ -314,8 +299,7 @@ func selectDeviceManagerPod(pods []core.Pod, manufacturer string) *core.Pod {
 	return nil
 }
 
-// listNodeDeviceManagerPods lists the device manager pods of the given node
-// in the system namespace.
+// listNodeDeviceManagerPods 列出系统 Namespace 中位于指定节点上的设备管理器 Pod。
 func (h *InstanceMetricsHandler) listNodeDeviceManagerPods(ctx context.Context, nodeName string) ([]core.Pod, error) {
 	podList := &core.PodList{}
 	err := h.APIReader.List(ctx, podList,
@@ -331,21 +315,19 @@ func (h *InstanceMetricsHandler) listNodeDeviceManagerPods(ctx context.Context, 
 	return podList.Items, nil
 }
 
-// _monitorSnapshotClient is the shared client for device manager readouts: one keep-alive
-// transport per process instead of one leaked per request.
+// _monitorSnapshotClient 是用于读取设备管理器数据的共享客户端：整个进程复用一个 keep-alive transport，
+// 避免每次请求都创建并泄漏连接。
 var _monitorSnapshotClient = &http.Client{
 	Transport: httpx.Transport(httpx.TransportOptions().WithoutProxy().WithTLSClientConfig(
 		&tls.Config{InsecureSkipVerify: true}, // nolint: gosec
 	)),
 }
 
-// fetchMonitorSnapshot GETs and decodes the monitor snapshot readout of a device manager pod.
-// The caller owns the operation timeout.
+// fetchMonitorSnapshot 通过 GET 请求获取并解码设备管理器 Pod 的监控快照读数。
+// 操作超时由调用方控制。
 //
-// The device manager serves a self-signed certificate by default, so verification is skipped
-// inside the same trust domain (see the spec's Risks for the mTLS follow-up). Proxying is
-// disabled explicitly: the project's transport helpers honor proxy env vars, which must never
-// reroute pod-to-pod traffic.
+// 设备管理器默认使用自签名证书，因此在同一信任域内跳过证书校验（关于 mTLS 后续方案见设计文档的 Risks 章节）。
+// 同时显式禁用代理：项目的 transport 辅助函数会读取代理环境变量，但绝不能因此重定向 Pod 间流量。
 func fetchMonitorSnapshot(ctx context.Context, url string) (*devicemanager.MonitorSnapshot, error) {
 	client := _monitorSnapshotClient
 
@@ -359,8 +341,7 @@ func fetchMonitorSnapshot(ctx context.Context, url string) (*devicemanager.Monit
 	if err != nil {
 		return nil, err
 	}
-	// Verification is skipped, so the peer's identity is not established: bound both the
-	// decode and the keep-alive drain instead of trusting it to stop sending.
+	// 由于跳过了证书校验，对端身份尚未确认：因此同时限制解码与 keep-alive 排空的读取上限，而不假定对端会主动停止发送。
 	body := io.LimitReader(resp.Body, _MonitorSnapshotMaxBytes)
 	defer func() {
 		_, _ = io.Copy(io.Discard, body)

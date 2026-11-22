@@ -10,11 +10,11 @@ var metricsByEngine = map[string]Metrics{
 		KVCacheUtilization: "vllm:kv_cache_usage_perc",
 		CacheInfo:          "vllm:cache_config_info",
 	},
-	// SGLang exports its KV cache capacity as two gauges from v0.5.11 on; earlier versions carried
-	// it as labels on sglang:cache_config_info, which is the metric the picker's built-in SGLang
-	// entry still reads (`llm-d/llm-d-router@v0.10.0:pkg/epp/framework/plugins/datalayer/extractor/metrics/factories.go:98-107`,
-	// replaced by these gauges upstream after that release). A version before v0.5.11 exports
-	// neither gauge, so its capacity reads as zero and every scrape records an extraction error.
+	// SGLang 从 v0.5.11 起以两个 gauge 指标导出其 KV cache 容量；更早的版本则将其作为标签
+	// 放在 sglang:cache_config_info 上，这也是 picker 内置 SGLang 条目仍在读取的指标
+	// （`llm-d/llm-d-router@v0.10.0:pkg/epp/framework/plugins/datalayer/extractor/metrics/factories.go:98-107`，
+	// 上游在该版本之后将其替换为这两个 gauge）。v0.5.11 之前的版本两个 gauge 都不导出，
+	// 因此其容量会读作 0，且每次抓取都会记录一条提取错误。
 	"sglang": {
 		Port:               8000,
 		QueuedRequests:     "sglang:num_queue_reqs",
@@ -25,7 +25,7 @@ var metricsByEngine = map[string]Metrics{
 	},
 }
 
-// MetricsForEngine returns the serving metrics required by the managed router.
+// MetricsForEngine 返回托管路由器所需的服务指标。
 func MetricsForEngine(engine string) (Metrics, error) {
 	metrics := metricsByEngine[engine]
 	metrics.Engine = engine

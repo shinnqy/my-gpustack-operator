@@ -7,7 +7,7 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// ModelDeployment is the v1 view of a managed serving deployment.
+// ModelDeployment 是托管推理部署的 v1 视图。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -16,7 +16,7 @@ type ModelDeployment workercore.ModelDeployment
 
 var _ runtime.Object = (*ModelDeployment)(nil)
 
-// ModelDeploymentList holds the list of ModelDeployments.
+// ModelDeploymentList 保存 ModelDeployment 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelDeploymentList struct {

@@ -31,17 +31,17 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/gox"
 )
 
-// certKey is the key by which certificates are tracked in state and cache.
+// certKey 是用于在 state 和缓存中跟踪证书的键。
 type certKey struct {
-	// host indicates the host for generating.
+	// host 表示用于生成证书的主机。
 	host string
-	// alterIPs indicates the alternative IPs for generating,
-	// which is separated by comma.
+	// alterIPs 表示用于生成证书的备用 IP，
+	// 以逗号分隔。
 	alterIPs string
-	// alterDNSNames indicates the alternative DNS names for generating,
-	// which is separated by comma.
+	// alterDNSNames 表示用于生成证书的备用 DNS 名称，
+	// 以逗号分隔。
 	alterDNSNames string
-	// rsa indicates to use RSA algorithm, default is to use ECDSA.
+	// rsa 表示使用 RSA 算法，默认使用 ECDSA。
 	rsa bool
 }
 
@@ -53,7 +53,7 @@ func (c certKey) String() string {
 	return strings.Join([]string{c.host, c.alterIPs, c.alterDNSNames}, ":")
 }
 
-// certState is the state by which certificates are ready to read.
+// certState 表示证书已就绪可读的状态。
 type certState struct {
 	c       *sync.Cond
 	tlsCert *tls.Certificate
@@ -109,7 +109,7 @@ func (s *certState) Generate(
 		return
 	}
 
-	// Create.
+	// 创建。
 	csr := &cert.CertificateSigningRequest{
 		ObjectMeta: meta.ObjectMeta{
 			GenerateName: "kubecert-",
@@ -117,7 +117,7 @@ func (s *certState) Generate(
 		Spec: cert.CertificateSigningRequestSpec{
 			SignerName:        cert.KubeletServingSignerName,
 			Request:           funcx.MustNoError(certs.EncodeX509CertificateRequest(srvCertReq, key)),
-			ExpirationSeconds: ptr.To[int32](90 * 24 * 60 * 60), // 90 days
+			ExpirationSeconds: ptr.To[int32](90 * 24 * 60 * 60), // 90 天
 			Usages: []cert.KeyUsage{
 				cert.UsageKeyEncipherment,
 				cert.UsageDigitalSignature,
@@ -130,7 +130,7 @@ func (s *certState) Generate(
 		return
 	}
 
-	// Wait.
+	// 等待。
 	var (
 		wc watch.Interface
 		cc = make(chan any)
@@ -202,7 +202,7 @@ func (s *certState) Generate(
 		}
 	})
 
-	// Approve.
+	// 批准。
 	csr.Status.Conditions = append(csr.Status.Conditions, cert.CertificateSigningRequestCondition{
 		Type:    cert.CertificateApproved,
 		Status:  core.ConditionTrue,
@@ -249,7 +249,7 @@ func (s *certState) Get() (*tls.Certificate, error) {
 	return s.tlsCert, s.err
 }
 
-// genCertRequest generates a certificate request.
+// genCertRequest 生成证书签名请求。
 func genCertRequest(key crypto.Signer, servers []string) (*x509.CertificateRequest, error) {
 	var (
 		dnsNames    []string

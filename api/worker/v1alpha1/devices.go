@@ -5,7 +5,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// Devices is the schema for worker.gpustack.ai.
+// Devices 是 worker.gpustack.ai 的 schema。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -21,48 +21,42 @@ type Devices struct {
 
 var _ runtime.Object = (*Devices)(nil)
 
-// DevicesSpec defines the desired state of Devices.
+// DevicesSpec 定义 Devices 的期望状态。
 type DevicesSpec struct {
-	// Groups is the list of device groups on the worker.
+	// Groups 是 worker 上的设备组列表。
 	//
 	// +listType=map
 	// +listMapKey=id
 	// +listMapKey=manufacturer
 	Groups []DevicesGroup `json:"groups" yaml:"groups" protobuf:"bytes,1,name=groups"`
 
-	// Interfaces is the list of network interfaces on the worker.
+	// Interfaces 是 worker 上的网络接口列表。
 	//
-	// It hangs on the worker rather than on a device group because a network interface belongs to
-	// the machine, not to a manufacturer's accelerators: correlating the two is the reader's job
-	// and is done by comparing the bus coordinates both sides carry, never by storing a
-	// cross-reference here.
+	// 它挂在 worker 上而不是设备组上，因为网络接口属于整台机器，而非某个厂商的加速器：
+	// 将两者关联是读取方的职责，应通过比对双方携带的总线坐标来完成，绝不能在此存储
+	// 交叉引用。
 	//
-	// Absence covers two cases and does not separate them: a worker with no interfaces, which is
-	// not a state real hardware reaches, and a worker whose enumeration has never succeeded. A pass
-	// that fails leaves whatever was recorded before it in place rather than replacing it with an
-	// empty list, so on a worker profiled even once the previous inventory is what remains here.
-	// Only a first pass that fails leaves the field absent, and that failure is reported in the
-	// device manager's log at Error rather than modeled here — a state that resolves on the next
-	// pass does not earn API surface. A reader must not treat absence as "this worker has no
-	// interfaces".
+	// 该字段缺失涵盖两种情况且不加区分：一种是 worker 没有任何网络接口（真实硬件不会处于
+	// 此状态），另一种是枚举从未成功过。单次失败会保留之前记录的数据，而非将其替换为空列表，
+	// 因此只要 worker 至少成功画像过一次，这里保留的就是上一次的清单。只有首次枚举就失败
+	// 才会使该字段缺失，且该失败会以 Error 级别记录在 device manager 日志中，而不在 API 中建模——
+	// 能在下次扫描自行恢复的状态不值得暴露到 API 层。读取方不得将缺失视为“此 worker 没有接口”。
 	//
-	// Every kernel interface is recorded, EPHEMERAL VIRTUAL ONES INCLUDED — and for those the list
-	// is not guaranteed current. A change confined to virtual interfaces carrying no RDMA device and
-	// no link verdict does not itself trigger a re-read: every Pod that starts or stops adds or
-	// removes a veth, and treating that as a hardware change rewrote this cluster-scoped object on
-	// every Pod event, once per manufacturer. So such an interface's arrival or departure is
-	// published when some other change reports, not when it happens. Anything carrying an RDMA
-	// record is exempt and is always current. A consumer that needs an up-to-the-second veth list
-	// must read the node, not this field.
+	// 所有内核网络接口都会被记录，包括临时虚拟接口——并且对于这些接口，列表不保证实时最新。
+	// 仅限于不携带 RDMA 设备且无链路判定结果的虚拟接口的变更，本身不会触发重新读取：
+	// 每次 Pod 启停都会增删一个 veth，若将其视为硬件变更，会导致每个 Pod 事件都按厂商数量
+	// 重写一次该集群作用域对象。因此这类接口的加入或离开只会在其他变更上报时顺带发布，
+	// 而非在发生时立即更新。任何带有 RDMA 记录的接口均不受此限制，始终保持最新。
+	// 需要实时最新 veth 列表的消费方必须读取节点本身，而不是读取此字段。
 	//
 	// +listType=map
 	// +listMapKey=name
 	Interfaces []DeviceInterface `json:"interfaces,omitempty" yaml:"interfaces,omitempty" protobuf:"bytes,2,opt,name=interfaces"`
 }
 
-// DevicesStatus defines the observed state of Devices.
+// DevicesStatus 定义 Devices 的观测状态。
 type DevicesStatus struct {
-	// Groups is the list of device groups on the worker.
+	// Groups 是 worker 上的设备组列表。
 	//
 	// +listType=map
 	// +listMapKey=id
@@ -71,376 +65,340 @@ type DevicesStatus struct {
 }
 
 type (
-	// DevicesGroup is a group of devices with the same metadata.
+	// DevicesGroup 是具有相同元数据的一组设备。
 	DevicesGroup struct {
-		// ID is the universally unique identifier for this device group.
+		// ID 是此设备组的全局唯一标识符。
 		ID string `json:"id" yaml:"id" protobuf:"bytes,1,opt,name=id"`
 
-		// Manufacturer is the name of the device manufacturer.
+		// Manufacturer 是设备制造商的名称。
 		Manufacturer string `json:"manufacturer" yaml:"manufacturer" protobuf:"bytes,2,name=manufacturer"`
 
-		// Name is the name of the device product.
+		// Name 是设备产品的名称。
 		Name string `json:"name" yaml:"name" protobuf:"bytes,3,name=name"`
 
-		// Memory is the memory size of the device in MiB.
+		// Memory 是设备的显存大小（单位为 MiB）。
 		Memory uint64 `json:"memory" yaml:"memory" protobuf:"bytes,4,name=memory"`
 
-		// Cores is the number of cores of the device.
+		// Cores 是设备的核心数量。
 		Cores uint32 `json:"cores,omitempty" yaml:"cores,omitempty" protobuf:"bytes,5,opt,name=cores"`
 
-		// DriverVersion is the version of the driver used by the device.
+		// DriverVersion 是设备所使用的驱动版本。
 		DriverVersion string `json:"driverVersion,omitempty" yaml:"driverVersion,omitempty" protobuf:"bytes,6,opt,name=driverVersion"`
 
-		// RuntimeVersion is the version of the runtime used by the device.
+		// RuntimeVersion 是设备所使用的运行时版本。
 		RuntimeVersion string `json:"runtimeVersion,omitempty" yaml:"runtimeVersion,omitempty" protobuf:"bytes,7,opt,name=runtimeVersion"`
 
-		// ComputeCapability is the compute capability of the device.
+		// ComputeCapability 是设备的计算能力。
 		ComputeCapability string `json:"computeCapability,omitempty" yaml:"computeCapability,omitempty" protobuf:"bytes,8,opt,name=computeCapability"`
 
-		// Family is the family of the device.
+		// Family 是设备的所属系列。
 		Family string `json:"family,omitempty" yaml:"family,omitempty" protobuf:"bytes,9,opt,name=family"`
 
-		// Accelerators is the list of the accelerator devices in this group.
+		// Accelerators 是此组中的加速器设备列表。
 		//
 		// +listType=map
 		// +listMapKey=id
 		Accelerators []Accelerator `json:"accelerators,omitempty" yaml:"accelerators,omitempty" protobuf:"bytes,10,opt,name=accelerators"`
 
-		// AcceleratorSlicedDetail is the group's slicing capability, aggregated from its
-		// accelerators' per-accelerator slicing status.
+		// AcceleratorSlicedDetail 是该设备组的切分能力，由组内各加速器的切分状态汇总得到。
 		AcceleratorSlicedDetail AcceleratorSlicedDetail `json:"acceleratorSlicedDetail,omitempty" yaml:"acceleratorSlicedDetail,omitempty" protobuf:"bytes,11,opt,name=acceleratorSlicedDetail"` // nolint: lll
 	}
 
-	// DeviceTopology describes the topology information of the device.
+	// DeviceTopology 描述设备的拓扑信息。
 	DeviceTopology struct {
-		// PciBusID is the PCI bus ID of the device.
+		// PciBusID 是设备的 PCI 总线 ID。
 		PciBusID string `json:"pciBusId" yaml:"pciBusId" protobuf:"bytes,1,name=pciBusId"`
 
-		// PciRootID is the address of the OUTERMOST PCI BRIDGE above the device, or the device's own
-		// address when no bridge sits above it.
+		// PciRootID 是位于设备上方最外层 PCI 桥的地址；如果上方没有桥，则为设备自身的地址。
 		//
-		// It is NOT the root complex's identifier, despite the name. Two devices sharing this value
-		// reached it through one bridge subtree; they are not thereby behind the same switch, which
-		// is the tighter fact PciSwitches below carries. For a device attached directly to the root
-		// complex the value is the device itself, so equality there is an identity check rather
-		// than a same-root-complex claim.
+		// 尽管字段名称如此，但它并非根复合体（root complex）的标识符。两个设备共享该值仅表明它们
+		// 通过同一个桥子树到达上游，并不意味着它们位于同一个交换机之后（这一更严格的亲和关系由
+		// 下方的 PciSwitches 表示）。对于直接连接到根复合体的设备，该值为设备自身地址，此时
+		// 值相等仅相当于身份相同校验，而不表示位于同一根复合体下。
 		PciRootID string `json:"pciRootId" yaml:"pciRootId" protobuf:"bytes,2,name=pciRootId"`
 
-		// PciClass is the PCI class of the device.
+		// PciClass 是设备的 PCI 类别。
 		PciClass string `json:"pciClass" yaml:"pciClass" protobuf:"bytes,3,name=pciClass"`
 
-		// NumaAffinity is the NUMA node that the device is attached to. Empty means UNKNOWN and is
-		// never normalised to node 0 — that would report an affinity nobody read. The kernel's -1
-		// "no affinity" sentinel and a reading that does not parse both arrive here as empty, so
-		// this field and the interface fields below carry the same contract.
+		// NumaAffinity 是设备所属的 NUMA 节点。为空表示未知（UNKNOWN），绝不会规范化为
+		// 节点 0，否则会报告实际未读取到的亲和性。内核中的 -1（表示无亲和性）哨兵值以及
+		// 无法解析的读数在此均表现为空值，因此本字段与下方的网卡字段遵循相同的约定。
 		NumaAffinity string `json:"numaAffinity" yaml:"numaAffinity" protobuf:"bytes,4,name=numaAffinity"`
 
-		// CpuAffinity is the CPU cores that are close to the device.
+		// CpuAffinity 是与设备亲近的 CPU 核心。
 		CpuAffinity string `json:"cpuAffinity" yaml:"cpuAffinity" protobuf:"bytes,5,name=cpuAffinity"`
 
-		// RoCE is the RoCE (RDMA over Converged Ethernet) network information of the device.
+		// RoCE 是设备的 RoCE（基于融合以太网的 RDMA）网络信息。
 		RoCE *DeviceEthernet `json:"roce,omitempty" yaml:"roce,omitempty" protobuf:"bytes,6,opt,name=roce"`
 
-		// PciSwitches is the upstream PCI bridge/switch path of the device, innermost first.
+		// PciSwitches 是设备上游的 PCI 桥/交换机路径，按由内到外的顺序排列。
 		//
-		// Two devices sharing the whole path sit behind the same switch, which is strictly tighter
-		// proximity than sharing the outermost bridge. PciRootID above is the OUTERMOST BRIDGE and
-		// not a switch: reporting equality there as switch-level proximity advertises closeness
-		// nobody measured, so the two fields are never read as the same claim.
+		// 两个共享完整路径的设备位于同一交换机之后，这种亲和关系比仅共享最外层桥更为严格。
+		// 上方的 PciRootID 表示的是最外层桥而非交换机：将该字段相等当作交换机级别的亲和性
+		// 会虚报未实际测得的亲近关系，因此这两个字段绝不能视为相同的断言。
 		//
-		// Absent for a device with no PCI path at all, never an empty-but-present marker. Ordered
-		// by construction, so two consecutive reads of unchanged hardware are byte-identical.
+		// 对于完全没有 PCI 路径的设备，该字段缺省（nil），绝不保留空切片作为占位标记。构造时
+		// 即已排好序，因此硬件未变更时连续两次读取的结果在字节上完全一致。
 		//
 		// +listType=atomic
 		PciSwitches []string `json:"pciSwitches,omitempty" yaml:"pciSwitches,omitempty" protobuf:"bytes,7,rep,name=pciSwitches"`
 
-		// Fabric is the scale-up interconnect domain this device belongs to. Absent on a device
-		// whose generation has no such fabric, and on one whose driver has never answered any of
-		// these reads.
+		// Fabric 是该设备所属的纵向扩展（scale-up）互联域。若设备代际本身不具备此类互联
+		// 结构，或驱动从未对这些读取操作返回过结果，则该字段缺省。
 		//
-		// Present does not mean every field was read in the pass that wrote this object. A domain
-		// that was read once is carried forward while the driver refuses the read, because the
-		// alternative is withdrawing a domain the node has not left — so a record here is the last
-		// answer each field had, and only an answer the driver gave replaces it.
+		// 该字段存在并不代表写入此对象时所有子字段均在当次扫描中被成功读取。当驱动暂时拒绝
+		// 读取时，先前已读到的域信息会继续保留，否则就会错误撤回节点实际上并未离开的域——
+		// 因此这里的记录保存了各字段最后一次获得的响应值，仅当驱动返回新结果时才会替换。
 		Fabric *DeviceFabric `json:"fabric,omitempty" yaml:"fabric,omitempty" protobuf:"bytes,8,opt,name=fabric"`
 	}
 
-	// DeviceFabric describes the scale-up interconnect domain a device belongs to — the set of
-	// accelerators that can address one another directly over the manufacturer's own interconnect,
-	// which on some generations spans machines.
+	// DeviceFabric 描述设备所属的纵向扩展（scale-up）互联域，即通过厂商自有互联直接互相
+	// 寻址的加速器集合；在部分硬件代际上该域可跨越多台机器。
 	//
-	// It is recorded on each device and never as a group- or worker-level field, because the domain
-	// cuts across both: NVIDIA reports a clique per GPU and one machine can hold several, and AMD's
-	// hive id is likewise read per GPU. So "same model, same machine, different domain" is
-	// reachable, and a coarser field would flatten it. The domain is itself derived, from the
-	// devices sharing Kind and ID, which is the same rule DevicesSpec.Interfaces states for
-	// relating an interface to an accelerator: publish comparable coordinates, never a stored
-	// cross-reference. Recording a higher level's fact on each device also matches RoCE above, which
-	// belongs to the card rather than to the accelerator.
+	// 该信息记录在每个设备上，而从不作为设备组或 worker 级别的字段，因为互联域会横跨这两者：
+	// NVIDIA 按 GPU 上报 clique，单台机器可能包含多个；AMD 的 hive id 同样按 GPU 读取。
+	// 因此“同型号、同机器、不同域”是可能出现的状态，使用更粗粒度的字段会抹平这一差异。
+	// 互联域本身通过共享相同 Kind 和 ID 的设备推导得出，这与 DevicesSpec.Interfaces 将网卡
+	// 关联到加速器的规则一致：仅发布可比较的坐标，绝不存储交叉引用。在每个设备上记录更高
+	// 层级的事实也与上方的 RoCE 一致（RoCE 属于板卡而非单个加速器）。
 	//
-	// The Ascend and NVIDIA detectors fill this today. The fields below say which manufacturer
-	// publishes each, so that an empty value is readable as "this generation has none" rather than
-	// as a hole: what a manufacturer's driver does not report, its detector cannot record.
+	// 目前由 Ascend 和 NVIDIA 检测器填充此结构。下方各字段注释均注明了由哪家厂商发布，以便
+	// 将空值理解为“该代际无此属性”而非字段缺失：厂商驱动不上报的信息，检测器无法记录。
 	//
-	// Not every interconnect fits. Cambricon's MLU-Link publishes no domain identity at all, only
-	// per-link remote information, so it describes an edge list and is not recorded here.
+	// 并非所有互联都适用此结构。Cambricon 的 MLU-Link 完全不发布域标识，仅提供每条链路的
+	// 对端信息，它描述的是边列表，因此不在此处记录。
 	DeviceFabric struct {
-		// Kind names the interconnect, and is what makes ID interpretable at all: an Ascend UB super
-		// pod id, an NVIDIA NVLink cluster uuid and an AMD XGMI hive id share no namespace, so two
-		// devices are in one domain only when Kind and ID both match.
+		// Kind 标识互联类型，也是使 ID 具有可解释性的前提：Ascend UB 超节点 ID、NVIDIA NVLink
+		// 集群 UUID 与 AMD XGMI hive ID 之间不存在共享命名空间，因此仅当 Kind 和 ID 同时匹配时，
+		// 两个设备才处于同一个互联域中。
 		//
-		// One of `ub`, `nvlink` or `xgmi`.
+		// 取值为 `ub`、`nvlink` 或 `xgmi` 之一。
 		Kind string `json:"kind" yaml:"kind" protobuf:"bytes,1,name=kind"`
 
-		// ID identifies the domain, and is comparable across workers — that is the whole point of
-		// publishing it, since a domain spanning machines cannot be recognized from one machine's
-		// record alone.
+		// ID 标识互联域，并且可在不同 worker 之间进行比较——这正是发布该字段的意义所在，
+		// 因为跨机器的互联域无法仅凭单台机器的记录识别出来。
 		//
-		// Ascend reports the super pod id, NVIDIA the fabric cluster uuid, AMD the XGMI hive id.
+		// Ascend 上报超节点 ID，NVIDIA 上报 fabric cluster UUID，AMD 上报 XGMI hive ID。
 		//
-		// Empty where no domain was identified — and on Ascend that includes a device the driver
-		// answered the super pod query for. It answers on every shape, since that answer is how the
-		// shape is established, and marks the coordinates invalid on a machine that is in no super
-		// pod. So an id is published for `pod-1d` and `pod-2d`; for a `server-8p`, `card-1p` or
-		// `card-4p` whose reported id and size are not those markers, which is the "super server"
-		// the vendor's own rank table spans machines with; and never for a `server-16p` or
-		// `server-32p`. Publishing a marker would give two unrelated machines one domain, and this
-		// field is compared across workers.
+		// 未识别到互联域时该字段为空——在 Ascend 上，这也包括驱动已响应超节点查询的设备。
+		// 驱动会对所有形态返回响应（因为形态正是通过该响应确定的），并在不属于任何超节点的机器上
+		// 将坐标标记为无效。因此，针对 `pod-1d` 和 `pod-2d` 会发布该 ID；对于上报的 ID 和规模
+		// 非无效标记的 `server-8p`、`card-1p` 或 `card-4p`（即厂商自身 rank table 跨机使用的
+		// “超服务器”形态）也会发布；而对 `server-16p` 或 `server-32p` 则绝不发布。发布无效占位
+		// 标记会导致两台无关机器被归入同一个域，而该字段会在跨 worker 间进行比较。
 		//
-		// NVIDIA withholds the whole record rather than this field: the cluster uuid identifies
-		// nothing until the accelerator has finished registering with the fabric manager, and that
-		// manufacturer publishes nothing else to carry beside it.
+		// NVIDIA 则是在未就绪时不提供整条 Fabric 记录而非仅留空此字段：在加速器完成向
+		// fabric manager 的注册之前，cluster UUID 不具备标识意义，且该厂商也没有其他可附带
+		// 发布的字段。
 		ID string `json:"id" yaml:"id" protobuf:"bytes,2,name=id"`
 
-		// Type is the domain's shape, as a word rather than a vendor number — `pod-1d`, `pod-2d`,
-		// `server-8p`, `server-16p`, `server-32p`, `card-1p`, `card-4p`.
+		// Type 是互联域的形态，以可读名称而非厂商编号表示——包括 `pod-1d`、`pod-2d`、
+		// `server-8p`、`server-16p`、`server-32p`、`card-1p`、`card-4p`。
 		//
-		// Ascend only. A consumer assembling a communication plan reads it to tell a super pod from
-		// a plain server from a standalone card, which is what decides the plan's own shape.
+		// 仅适用于 Ascend。组装通信计划的消费方通过读取该字段区分超节点、普通服务器与独立板卡，
+		// 进而决定通信计划自身的结构形态。
 		Type string `json:"type,omitempty" yaml:"type,omitempty" protobuf:"bytes,3,opt,name=type"`
 
-		// CliqueID is the subset of the domain that can actually address one another, where the
-		// domain is partitioned into more than one.
+		// CliqueID 表示当互联域被划分为多个子集时，内部能够真正互相寻址的设备子集。
 		//
-		// NVIDIA only, and on that generation it is load-bearing rather than decorative: two GPUs
-		// sharing ID but not CliqueID are in one fabric and still cannot reach each other, so a
-		// consumer that compares ID alone would co-locate a job that cannot communicate.
+		// 仅适用于 NVIDIA，且在该代际上是关键约束而非装饰字段：两个共享 ID 但 CliqueID
+		// 不同的 GPU 虽然处于同一个 fabric 中，彼此仍无法通信，因此仅比较 ID 的消费方
+		// 会把任务共置到无法互相通信的设备上。
 		CliqueID string `json:"cliqueId,omitempty" yaml:"cliqueId,omitempty" protobuf:"bytes,4,opt,name=cliqueId"`
 
-		// MemberCount is how many members the domain reports having. Zero means the manufacturer
-		// does not report it, never a domain with no members.
+		// MemberCount 是互联域上报的成员总数。为 0 表示厂商未上报该值，绝不表示域内没有成员。
 		//
-		// Ascend only, from the super pod's own scale. It says how large the domain is without
-		// enumerating it, which is what a scheduler needs before it has seen every worker in it.
-		// Published under the rule ID is, and withheld on top of that where the driver marks the
-		// scale itself invalid: a domain may be identified while its size is not.
+		// 仅适用于 Ascend，取自超节点自身的规模字段。它无需枚举全部成员即可说明域的规模，
+		// 这正是调度器在尚未观测到域内所有 worker 时所需的信息。发布规则与 ID 相同，此外
+		// 若驱动将规模本身标记为无效则不予发布：域可能已被识别，但其规模尚未确定。
 		//
-		// Not named Size: every protobuf message carries a generated Size() method, and a field of
-		// that name collides with it.
+		// 字段未命名为 Size：每个 protobuf 消息都会生成 Size() 方法，同名字段会与之冲突。
 		MemberCount uint32 `json:"memberCount,omitempty" yaml:"memberCount,omitempty" protobuf:"bytes,5,opt,name=memberCount"` // nolint: lll
 
-		// NodeIndex is this worker's index within the domain, as the domain numbers its machines —
-		// not a Kubernetes node name and not comparable to one.
+		// NodeIndex 是当前 worker 在互联域内的编号（按域对机器的编号方式），并非 Kubernetes Node
+		// 名称，也不可与之比较。
 		//
-		// Ascend only, from the super pod's server id. Published under the rule ID is, and withheld
-		// on top of that where the driver marks this coordinate invalid: a machine can be in a
-		// domain that has not told it where.
+		// 仅适用于 Ascend，取自超节点的 server id。发布规则与 ID 相同，此外若驱动将该坐标
+		// 标记为无效则不予发布：机器可能已处于某个域中，但尚未获知自身所在位置。
 		NodeIndex string `json:"nodeIndex,omitempty" yaml:"nodeIndex,omitempty" protobuf:"bytes,6,opt,name=nodeIndex"`
 
-		// RackID is the rack this worker sits in, as the domain numbers its racks.
+		// RackID 是当前 worker 所在的机架编号（按域对机架的编号方式）。
 		//
-		// Ascend only, from the super pod's chassis id. Published under the rule NodeIndex is, and
-		// withheld on the same terms.
+		// 仅适用于 Ascend，取自超节点的 chassis id。发布与省略规则与 NodeIndex 相同。
 		RackID string `json:"rackId,omitempty" yaml:"rackId,omitempty" protobuf:"bytes,7,opt,name=rackId"`
 
-		// Endpoints are this device's own addresses on the fabric, in the manufacturer's own
-		// encoding.
+		// Endpoints 是该设备在 fabric 上的自身地址列表，采用厂商自有编码。
 		//
-		// Ascend only, where each entry is a UB endpoint identifier as 32 lowercase hex characters.
-		// The bytes are published unparsed on purpose: the function entity, the die, the port and
-		// whether an endpoint carries device-to-device traffic are all bit fields inside them, so a
-		// consumer derives whichever it needs rather than this API tracking a vendor bit layout that
-		// only the vendor may change.
+		// 仅适用于 Ascend，其中每一项均为 32 位小写十六进制字符表示的 UB 端点标识符。
+		// 这些字节故意以未解析的原始形式发布：功能实体（function entity）、die、端口以及端点是否
+		// 承载设备间流量均作为位字段编码在其中，由消费方按需自行解析，避免本 API 绑定可能仅由
+		// 厂商变更的位布局。
 		//
-		// Ordered by construction, so two consecutive reads of unchanged hardware are byte-identical.
+		// 构造时即已排好序，因此硬件未变更时连续两次读取的结果在字节上完全一致。
 		//
 		// +listType=atomic
 		Endpoints []string `json:"endpoints,omitempty" yaml:"endpoints,omitempty" protobuf:"bytes,8,rep,name=endpoints"`
 	}
 
-	// DeviceEthernet describes the Ethernet information of the device.
+	// DeviceEthernet 描述设备的以太网信息。
 	DeviceEthernet struct {
-		// IP is the IP address of the Ethernet interface of the device.
+		// IP 是设备以太网接口的 IP 地址。
 		IP string `json:"ip" yaml:"ip" protobuf:"bytes,1,name=ip"`
 
-		// SubnetMask is the subnet mask of the Ethernet interface of the device.
+		// SubnetMask 是设备以太网接口的子网掩码。
 		SubnetMask string `json:"subnetMask" yaml:"subnetMask" protobuf:"bytes,2,name=subnetMask"`
 
-		// Gateway is the gateway of the Ethernet interface of the device.
+		// Gateway 是设备以太网接口的网关地址。
 		Gateway string `json:"gateway" yaml:"gateway" protobuf:"bytes,3,name=gateway"`
 	}
 
-	// DeviceInterface describes one network interface of the worker.
+	// DeviceInterface 描述 worker 上的一个网络接口。
 	//
-	// Enumeration is interface-first: the interface is the identity and its PCI device is resolved
-	// as an attribute, which is the inverse of walking the PCI bus and correlating back. An
-	// interface reached over a non-PCI interconnect is invisible to a PCI-rooted walk, and that is
-	// exactly the case this record must not lose — so every PCI field here is optional and their
-	// joint absence is a KIND of interface, not a hole in the record.
+	// 枚举采用接口优先（interface-first）策略：以网络接口作为主标识，将其 PCI 设备解析为
+	// 附属属性，这与先遍历 PCI 总线再反向关联的做法相反。通过非 PCI 互联接入的接口在以 PCI
+	// 为根的遍历中是不可见的，而这正是本记录不能遗漏的场景——因此此处所有 PCI 字段均为可选，
+	// 它们同时缺省代表一种特定类型的接口，而非记录缺失。
 	DeviceInterface struct {
-		// Name is the kernel interface name, and is this interface's identity.
+		// Name 是内核网络接口名称，同时作为该接口的唯一标识。
 		Name string `json:"name" yaml:"name" protobuf:"bytes,1,name=name"`
 
-		// Bus names the interconnect the interface was found on, so an interface with no PCI
-		// coordinates reports what it is instead of reading as a failed PCI lookup.
+		// Bus 指明发现该接口的总线/互联类型，从而使没有 PCI 坐标的接口能够明确上报自身类型，
+		// 而不会被误判为 PCI 查找失败。
 		Bus string `json:"bus,omitempty" yaml:"bus,omitempty" protobuf:"bytes,2,opt,name=bus"`
 
-		// PciBusID is the PCI bus ID of the interface. Absent for a non-PCI interface.
+		// PciBusID 是接口的 PCI 总线 ID。对于非 PCI 接口该字段缺省。
 		PciBusID string `json:"pciBusId,omitempty" yaml:"pciBusId,omitempty" protobuf:"bytes,3,opt,name=pciBusId"`
 
-		// PciRootID is the address of the OUTERMOST PCI BRIDGE above the interface, or the
-		// interface's own address when no bridge sits above it. Despite the name it is not a root
-		// complex, and reading it as one advertises closeness nobody measured. Absent for a
-		// non-PCI interface. It comes from the same walk the accelerator side uses, so the two
-		// values are comparable.
+		// PciRootID 是位于接口上方最外层 PCI 桥的地址；如果上方没有桥，则为接口自身的地址。
+		// 尽管字段名称如此，但它并非根复合体（root complex），将其当作根复合体会虚报未实际测得的
+		// 亲近关系。对于非 PCI 接口该字段缺省。该值与加速器侧使用同一套遍历方式获得，因此两者可直接比较。
 		PciRootID string `json:"pciRootId,omitempty" yaml:"pciRootId,omitempty" protobuf:"bytes,4,opt,name=pciRootId"`
 
-		// PciSwitches is the upstream PCI bridge/switch path, innermost first — the same
-		// coordinate DeviceTopology carries, so an accelerator and an interface can be compared
-		// without a translation layer. Absent for a non-PCI interface.
+		// PciSwitches 是上游的 PCI 桥/交换机路径，按由内到外的顺序排列——与 DeviceTopology 中的
+		// 坐标一致，因此无需转换层即可将加速器与网络接口直接对比。对于非 PCI 接口该字段缺省。
 		//
 		// +listType=atomic
 		PciSwitches []string `json:"pciSwitches,omitempty" yaml:"pciSwitches,omitempty" protobuf:"bytes,5,rep,name=pciSwitches"`
 
-		// PciVendor and PciDevice are the raw hex PCI ids, deliberately not resolved to a model
-		// name: resolving one reads a host data file a minimal image may not carry, and a name
-		// that resolves on one worker but not another is worse than a hex id that always does.
+		// PciVendor 和 PciDevice 为原始十六进制 PCI ID，有意不解析为型号名称：解析名称需要
+		// 读取精简镜像中可能不存在的宿主机数据文件，而在一个 worker 上能解析、在另一个上无法解析的
+		// 名称反而不如始终可用的十六进制 ID 可靠。
 		PciVendor string `json:"pciVendor,omitempty" yaml:"pciVendor,omitempty" protobuf:"bytes,6,opt,name=pciVendor"`
 
-		// PciDevice is the raw hex PCI device id. See PciVendor.
+		// PciDevice 是原始十六进制 PCI 设备 ID。参见 PciVendor。
 		PciDevice string `json:"pciDevice,omitempty" yaml:"pciDevice,omitempty" protobuf:"bytes,7,opt,name=pciDevice"`
 
-		// NumaAffinity is the NUMA node the interface is attached to. Empty means UNKNOWN and is
-		// never normalised to node 0 — that would report an affinity nobody read.
+		// NumaAffinity 是接口所属的 NUMA 节点。为空表示未知（UNKNOWN），绝不会规范化为节点 0，
+		// 否则会报告实际未读取到的亲和性。
 		NumaAffinity string `json:"numaAffinity,omitempty" yaml:"numaAffinity,omitempty" protobuf:"bytes,8,opt,name=numaAffinity"`
 
-		// CpuAffinity is the CPU cores close to the interface. Empty means unknown.
+		// CpuAffinity 是与接口亲近的 CPU 核心。为空表示未知。
 		CpuAffinity string `json:"cpuAffinity,omitempty" yaml:"cpuAffinity,omitempty" protobuf:"bytes,9,opt,name=cpuAffinity"`
 
-		// MTU is the link MTU. Zero means it was not read, not an MTU of zero — no operational
-		// interface reports zero, so the absent value carries no ambiguity.
+		// MTU 是链路 MTU。为 0 表示未能读取到该值，而非 MTU 等于 0——正常运行的接口绝不会
+		// 上报 0，因此用 0 表示缺省不存在歧义。
 		MTU int32 `json:"mtu,omitempty" yaml:"mtu,omitempty" protobuf:"varint,10,opt,name=mtu"`
 
-		// Up reports the interface's operational state.
+		// Up 报告接口的运行状态（是否处于启用状态）。
 		Up bool `json:"up,omitempty" yaml:"up,omitempty" protobuf:"varint,11,opt,name=up"`
 
-		// Virtual marks an interface with no device behind it (loopback, bridge, veth). Such an
-		// interface is RECORDED AND MARKED, never dropped: a worker whose only interface is a
-		// bridge must read as "one virtual interface", not as "no interfaces".
+		// Virtual 标记背后没有物理设备的虚拟接口（如 loopback、bridge、veth）。此类接口会被
+		// 记录并加以标记，而绝不会丢弃：如果一个 worker 上只有网桥接口，必须呈现为“存在一个
+		// 虚拟接口”，而不是“没有接口”。
 		Virtual bool `json:"virtual,omitempty" yaml:"virtual,omitempty" protobuf:"varint,12,opt,name=virtual"`
 
-		// RDMA reports that an RDMA device is bound to this interface. It says nothing about
-		// whether the link works — that is Link below, and the two differ on real hardware.
+		// RDMA 报告该接口是否绑定了 RDMA 设备。它不反映链路是否真正可用——链路可用性由下方的
+		// Link 表示，在真实硬件上这两者可能并不一致。
 		RDMA bool `json:"rdma,omitempty" yaml:"rdma,omitempty" protobuf:"varint,13,opt,name=rdma"`
 
-		// RDMADevice is the bound RDMA device's name. Empty when RDMA is false.
+		// RDMADevice 是所绑定的 RDMA 设备名称。当 RDMA 为 false 时为空。
 		RDMADevice string `json:"rdmaDevice,omitempty" yaml:"rdmaDevice,omitempty" protobuf:"bytes,14,opt,name=rdmaDevice"`
 
-		// SRIOV reports that this interface is an SR-IOV physical function. It is a SEPARATE fact
-		// from the length of VirtualFunctions: "a PF with zero VFs configured" and "not a PF at
-		// all" are different states, and deriving the second from an empty VF list collapses them.
+		// SRIOV 报告该接口是否为 SR-IOV 物理功能（PF）。这是一个独立于 VirtualFunctions 长度
+		// 的事实：“配置了 0 个 VF 的 PF”与“根本不是 PF”是两种不同的状态，若仅通过空 VF 列表
+		// 来推断后者会将这两种状态混为一谈。
 		SRIOV bool `json:"sriov,omitempty" yaml:"sriov,omitempty" protobuf:"varint,15,opt,name=sriov"`
 
-		// VirtualFunctions are this physical function's virtual functions, NESTED here rather
-		// than listed as siblings: a PF with eight VFs is one entry with eight nested, never nine
-		// top-level entries. Ordered by bus id, so two consecutive reads are byte-identical.
+		// VirtualFunctions 是该物理功能（PF）下的虚拟功能（VF）列表，采用嵌套形式存储而非
+		// 作为平级条目列出：拥有 8 个 VF 的 PF 表现为 1 个顶层条目及其嵌套的 8 个子条目，
+		// 绝不是 9 个顶层条目。按总线 ID 排序，因此连续两次读取的结果在字节上完全一致。
 		//
 		// +listType=atomic
 		VirtualFunctions []DeviceInterfaceVirtualFunction `json:"virtualFunctions,omitempty" yaml:"virtualFunctions,omitempty" protobuf:"bytes,16,rep,name=virtualFunctions"` // nolint: lll
 
-		// Link is the result of verifying that this interface's RDMA link is usable. Nil when
-		// there is no RDMA link to verify.
+		// Link 是验证该接口 RDMA 链路是否可用的检查结果。如果没有可供验证的 RDMA 链路，则为 nil。
 		Link *DeviceInterfaceLink `json:"link,omitempty" yaml:"link,omitempty" protobuf:"bytes,17,opt,name=link"`
 	}
 
-	// DeviceInterfaceVirtualFunction describes one SR-IOV virtual function of a physical function.
+	// DeviceInterfaceVirtualFunction 描述物理功能（PF）下的一个 SR-IOV 虚拟功能（VF）。
 	//
-	// It is a type of its own rather than a nested DeviceInterface because SR-IOV nests exactly
-	// one level deep — a virtual function cannot itself be partitioned into virtual functions — so
-	// a self-referential shape would carry a level nothing can ever fill.
+	// 它被定义为独立类型而非嵌套的 DeviceInterface，因为 SR-IOV 严格只有一层嵌套——VF
+	// 本身不能再被划分为 VF——若使用自引用结构就会多出一个永远无法填充的层级。
 	//
-	// What a VF shares with its parent is the UPSTREAM BRIDGE PATH — `pciRootId` (the outermost
-	// bridge, not a root complex) and `pciSwitches` — so those are read from the parent and not
-	// repeated here. A VF is its own PCI function with its own address, so that sharing is a claim
-	// about the path above both of them and nothing more. What can differ per VF is recorded:
-	// its own address, its own NUMA node and CPU list, and its own RDMA device and link verdict.
+	// VF 与父级共享的是上游桥路径——即 `pciRootId`（最外层桥，而非根复合体）和
+	// `pciSwitches`——因此这些字段直接从父级读取而不再重复存储。VF 是具有独立地址的
+	// PCI 功能，上述共享仅说明两者之上的路径相同，别无他意。每个 VF 可能不同的属性则在此
+	// 单独记录：各自的地址、各自的 NUMA 节点与 CPU 列表，以及各自的 RDMA 设备和链路检查结果。
 	DeviceInterfaceVirtualFunction struct {
-		// Name is the kernel interface name of the virtual function.
+		// Name 是虚拟功能的内核接口名称。
 		Name string `json:"name" yaml:"name" protobuf:"bytes,1,name=name"`
 
-		// PciBusID is the PCI bus ID of the virtual function, which is what distinguishes it from
-		// its siblings and from its parent.
+		// PciBusID 是虚拟功能的 PCI 总线 ID，用于将其与同级设备及父设备区分开来。
 		PciBusID string `json:"pciBusId,omitempty" yaml:"pciBusId,omitempty" protobuf:"bytes,2,opt,name=pciBusId"`
 
-		// NumaAffinity is the NUMA node the virtual function is attached to. Empty means unknown.
+		// NumaAffinity 是虚拟功能所连接的 NUMA 节点。为空表示未知。
 		NumaAffinity string `json:"numaAffinity,omitempty" yaml:"numaAffinity,omitempty" protobuf:"bytes,3,opt,name=numaAffinity"`
 
-		// CpuAffinity is the CPU cores close to the virtual function. Empty means unknown.
+		// CpuAffinity 是靠近该虚拟功能的 CPU 核心。为空表示未知。
 		CpuAffinity string `json:"cpuAffinity,omitempty" yaml:"cpuAffinity,omitempty" protobuf:"bytes,4,opt,name=cpuAffinity"`
 
-		// MTU is the link MTU. Zero means it was not read. See DeviceInterface.MTU.
+		// MTU 是链路 MTU。为 0 表示未读取。参见 DeviceInterface.MTU。
 		MTU int32 `json:"mtu,omitempty" yaml:"mtu,omitempty" protobuf:"varint,5,opt,name=mtu"`
 
-		// Up reports the virtual function's operational state.
+		// Up 报告虚拟功能的运行状态。
 		Up bool `json:"up,omitempty" yaml:"up,omitempty" protobuf:"varint,6,opt,name=up"`
 
-		// RDMA reports that an RDMA device is bound to this virtual function.
+		// RDMA 报告是否有 RDMA 设备绑定到此虚拟功能。
 		RDMA bool `json:"rdma,omitempty" yaml:"rdma,omitempty" protobuf:"varint,7,opt,name=rdma"`
 
-		// RDMADevice is the bound RDMA device's name. Empty when RDMA is false.
+		// RDMADevice 是绑定的 RDMA 设备名称。当 RDMA 为 false 时为空。
 		RDMADevice string `json:"rdmaDevice,omitempty" yaml:"rdmaDevice,omitempty" protobuf:"bytes,8,opt,name=rdmaDevice"`
 
-		// Link is the result of verifying this virtual function's RDMA link. Nil when there is no
-		// RDMA link to verify.
+		// Link 是验证该虚拟功能 RDMA 链路的结果。当没有需要验证的 RDMA 链路时为 nil。
 		Link *DeviceInterfaceLink `json:"link,omitempty" yaml:"link,omitempty" protobuf:"bytes,9,opt,name=link"`
 	}
 
-	// DeviceInterfaceLink is the outcome of verifying that an RDMA-capable interface's link is
-	// actually usable.
+	// DeviceInterfaceLink 是验证支持 RDMA 的接口链路是否实际可用的结果。
 	//
-	// Reporting and enforcement are separated by making the outcome an explicit state rather than
-	// a boolean: only Failed withholds the node's RDMA label, because "we have no check for this
-	// interface" must not be published as "this worker has no RDMA".
+	// 通过将结果设为显式状态而非布尔值，将状态上报与调度限制解耦：只有 Failed 状态
+	// 会阻止发布节点的 RDMA 标签，因为“无法检查此接口”绝不应被发布为“此 worker 没有 RDMA”。
 	DeviceInterfaceLink struct {
-		// State is the verification outcome.
+		// State 是验证结果。
 		// +k8s:validation:enum=["OK","Unverified","Failed"]
 		State DeviceInterfaceLinkState `json:"state" yaml:"state" protobuf:"bytes,1,name=state,casttype=DeviceInterfaceLinkState"`
 
-		// Reason carries the checker's own words, verbatim — including the attribute values it
-		// read. A state other than OK without a reason leaves the operator's question ("why?")
-		// unanswerable from the record alone.
+		// Reason 原样携带检查器的原始输出文本，包括其读取到的属性值。若状态非 OK
+		// 却没有 Reason，运维人员将无法仅凭该记录回答“为什么？”。
 		Reason string `json:"reason,omitempty" yaml:"reason,omitempty" protobuf:"bytes,2,opt,name=reason"`
 
-		// FirstSeenTime is when an ONGOING FAILED state was first observed. It is stable across
-		// passes for as long as the failure persists, and is cleared the moment the state is
-		// anything else. Refreshing it every pass would make "how long has this been down?"
-		// unanswerable, which is the question the field exists to answer.
+		// FirstSeenTime 是首次观测到持续 Failed 状态的时间。只要故障持续存在，该值
+		// 在多轮检查间保持不变，并在状态变为其他任何值时立即清除。若每轮检查都刷新该值，
+		// 将无法回答“该故障已持续多久？”，而这正是该字段存在的意义。
 		//
-		// Nil for both other states, Unverified included: a state that reached no verdict has no
-		// outage for a clock to be the start of, so this is not "the current non-OK state" but
-		// specifically the failed one.
+		// 对于其他两种状态（包括 Unverified）均为 nil：未得出结论的状态不存在需要计时
+		// 起点的中断故障，因此该字段并非表示“当前的非 OK 状态”，而是专指失败状态。
 		FirstSeenTime *meta.Time `json:"firstSeenTime,omitempty" yaml:"firstSeenTime,omitempty" protobuf:"bytes,3,opt,name=firstSeenTime"`
 	}
 
-	// DevicesAllocationGroup describes the allocated device group.
+	// DevicesAllocationGroup 描述已分配的设备组。
 	DevicesAllocationGroup struct {
-		// ID is the universally unique identifier for this device group.
+		// ID 是该设备组的全局唯一标识符。
 		ID string `json:"id" yaml:"id" protobuf:"bytes,1,opt,name=id"`
 
-		// Manufacturer is the name of the device manufacturer.
+		// Manufacturer 是设备制造商的名称。
 		Manufacturer string `json:"manufacturer" yaml:"manufacturer" protobuf:"bytes,2,name=manufacturer"`
 
-		// Accelerators is the list of the allocated accelerator devices in this group.
+		// Accelerators 是该设备组中已分配的加速器设备列表。
 		//
 		// +listType=map
 		// +listMapKey=id
@@ -448,54 +406,49 @@ type (
 	}
 )
 
-// DeviceInterfaceLinkState is the outcome of an interface's RDMA link verification.
+// DeviceInterfaceLinkState 是接口 RDMA 链路验证的结果。
 //
-// The three states exist because "the link is fine" and "nobody could ask" are different facts
-// with different consequences, and collapsing them into a boolean forces one of them to be a lie.
+// 之所以设计三种状态，是因为“链路正常”与“无法探测”是具有不同后果的截然不同的事实，
+// 将它们压缩为一个布尔值必然迫使其中之一失真。
 // +enum
 type DeviceInterfaceLinkState string
 
 const (
-	// DeviceInterfaceLinkStateOK indicates the link was checked and verified.
+	// DeviceInterfaceLinkStateOK 表示链路已检查并通过验证。
 	DeviceInterfaceLinkStateOK DeviceInterfaceLinkState = "OK"
-	// DeviceInterfaceLinkStateUnverified indicates the check reached no verdict: an attribute it
-	// needs was unreadable, the port directory could not be listed, or the RDMA tree is present
-	// and could not be read at all. There is no per-manufacturer checker to be missing — the
-	// check reads the RDMA subsystem's own port attributes and dispatches on nothing.
+	// DeviceInterfaceLinkStateUnverified 表示检查未得出结论：所需属性不可读、无法列出
+	// 端口目录，或存在 RDMA 目录树但完全无法读取。此处并不存在按制造商区分而缺失检查器
+	// 的情况——检查直接读取 RDMA 子系统自身的端口属性，不依赖任何分发逻辑。
 	//
-	// It is REPORTED, and it does not withhold the node's RDMA label: a link we cannot interrogate
-	// must not silently exclude its worker from scheduling.
+	// 该状态会上报，且不会阻止发布节点的 RDMA 标签：无法探测的链路绝不能静默地将其
+	// worker 排除在调度之外。
 	DeviceInterfaceLinkStateUnverified DeviceInterfaceLinkState = "Unverified"
-	// DeviceInterfaceLinkStateFailed indicates a check ran and the link is not usable. This is
-	// the only state that withholds the node's RDMA label, and it is never reached from a missing
-	// or unreadable file — an unreadable attribute is Unverified.
+	// DeviceInterfaceLinkStateFailed 表示检查已执行且链路不可用。这是唯一会阻止发布
+	// 节点 RDMA 标签的状态，且绝不会因文件缺失或不可读而触发——不可读的属性对应
+	// Unverified 状态。
 	DeviceInterfaceLinkStateFailed DeviceInterfaceLinkState = "Failed"
 )
 
-// DeviceAllocationMode describes the allocation mode of the accelerator device.
+// DeviceAllocationMode 描述加速器设备的分配模式。
 // +enum
 type DeviceAllocationMode uint32
 
 const (
-	// DeviceAllocationModeNone indicates that the allocation mode of the device is unknown.
+	// DeviceAllocationModeNone 表示设备的分配模式未知。
 	DeviceAllocationModeNone DeviceAllocationMode = iota
-	// DeviceAllocationModeExclusive indicates that the device is allocated exclusively to a single consumer.
+	// DeviceAllocationModeExclusive 表示设备独占分配给单个消费者。
 	DeviceAllocationModeExclusive
-	// DeviceAllocationModeShared indicates that the device is allocated to multiple consumers,
-	// and the resources are shared among them.
+	// DeviceAllocationModeShared 表示设备分配给多个消费者，且资源在它们之间共享。
 	DeviceAllocationModeShared
-	// DeviceAllocationModeSliced indicates that the device is allocated to multiple consumers,
-	// and the resources are partitioned among them.
+	// DeviceAllocationModeSliced 表示设备分配给多个消费者，且资源在它们之间切分隔离。
 	DeviceAllocationModeSliced
-	// DeviceAllocationModePartitioned indicates that the device is carved into hardware
-	// partitions (e.g. NVIDIA MIG GPU instances), each allocated to one consumer. Unlike
-	// Sliced, the isolation is enforced by the hardware, the accelerator must be put into a
-	// partitioning mode first, and it can then serve no other mode.
+	// DeviceAllocationModePartitioned 表示设备被切分为硬件分区（例如 NVIDIA MIG
+	// GPU 实例），每个分区分配给一个消费者。与 Sliced 不同，该模式下隔离由硬件强制实施，
+	// 加速器必须先进入分区模式，且之后不能再服务于其他分配模式。
 	DeviceAllocationModePartitioned
-	// DeviceAllocationModeVisibility is an internal-only mode: it grants a container
-	// device-cgroup visibility to the physical device(s) another container in the same Pod
-	// was allocated, without a real device selection or any resource accounting. It is never
-	// advertised on an InstanceType and never written to Devices status.
+	// DeviceAllocationModeVisibility 是一种仅限内部使用的模式：它授予容器对同一 Pod 内
+	// 其他容器所分配物理设备的 device-cgroup 可见性，而不进行真实的设备选择或任何资源
+	// 计量。该模式永不在 InstanceType 上通告，也永不写入 Devices 状态。
 	DeviceAllocationModeVisibility
 )
 
@@ -517,285 +470,266 @@ func (in DeviceAllocationMode) String() string {
 }
 
 type (
-	// Accelerator describes the information of an accelerator device.
+	// Accelerator 描述加速器设备的信息。
 	Accelerator struct {
-		// ID is the universally unique identifier for this device.
+		// ID 是该设备的全局唯一标识符。
 		ID string `json:"id" yaml:"id" protobuf:"bytes,1,opt,name=id"`
 
-		// Index is the logic number of the device, starting from 0.
+		// Index 是设备的逻辑编号，从 0 开始。
 		Index uint32 `json:"index" yaml:"index" protobuf:"varint,2,name=index"`
 
-		// PhysicalIndexes is the device char list for the device, constructed by the manufacturer.
+		// PhysicalIndexes 是由制造商构建的设备字符设备索引列表。
 		PhysicalIndexes []uint32 `json:"physicalIndexes" yaml:"physicalIndexes" protobuf:"varint,3,rep,name=physicalIndexes"`
 
-		// Topology is the topology information of the device.
+		// Topology 是设备的拓扑信息。
 		Topology DeviceTopology `json:"topology" yaml:"topology" protobuf:"bytes,4,name=topology"`
 
-		// Status is the current status of the device.
+		// Status 是设备的当前状态。
 		Status AcceleratorStatus `json:"status" yaml:"status" protobuf:"bytes,5,name=status"`
 	}
 
-	// AcceleratorPlacement is one contiguous run [Start, Start+Length) an allocation occupies on
-	// an accelerator. It is one record carrier for both placement ledgers; the unit it counts
-	// depends on the field carrying it:
+	// AcceleratorPlacement 表示单次分配在加速器上占用的连续区间 [Start, Start+Length)。
+	// 它作为两类放置台账的通用记录载体，其计数单位取决于承载它的字段：
 	//
-	//   - memory slices, for the physical-partition ledger — the interval a hardware GPU
-	//     partition (e.g. an NVIDIA MIG GPU instance) occupies, which is what both the
-	//     capability's empty-accelerator legal-slot cache and the annotation-transported
-	//     occupied slot are expressed in.
-	//   - the manufacturer's own compute units, for the logical-slice ledger — on AMD, CU-mask
-	//     bit indexes exactly as they appear in HSA_CU_MASK. A logical slice occupies a POSITION
-	//     on the accelerator, not only a share of it: two slices handed the same run share those
-	//     compute units instead of the accelerator.
+	//   - 显存切片（memory slices），用于物理分区台账——即硬件 GPU 分区（例如
+	//     NVIDIA MIG GPU 实例）所占用的区间；能力的空加速器合法槽位缓存以及通过
+	//     注解传递的已占用槽位均以此为单位表示。
+	//   - 制造商自身的计算单元，用于逻辑切片台账——在 AMD 上即与 HSA_CU_MASK 中
+	//     完全一致的 CU 掩码位索引。逻辑切片在加速器上占用的是一个具体位置，而非仅占
+	//     一份配额：被分配到相同区间的两个切片会共享这些计算单元，而非共享整个加速器。
 	AcceleratorPlacement struct {
-		// Start is the first unit the run covers (0-based).
+		// Start 是该区间覆盖的起始单元（从 0 开始）。
 		Start int32 `json:"start" yaml:"start" protobuf:"varint,1,opt,name=start"`
 
-		// Length is the number of units the run spans; the run is [Start, Start+Length).
-		// Named Length, not Size, to avoid colliding with the protobuf-generated Size()
-		// method on this message.
+		// Length 是该区间跨越的单元数量；区间范围为 [Start, Start+Length)。
+		// 命名为 Length 而非 Size，是为了避免与 protobuf 为该消息生成的 Size()
+		// 方法冲突。
 		Length int32 `json:"length" yaml:"length" protobuf:"varint,2,opt,name=length"`
 	}
 
-	// AcceleratorPhysicalSlicedProfile describes one hardware partition profile of a device
-	// model, such as an NVIDIA MIG profile (e.g. "1g.5gb"). The compute/memory slice counts
-	// express the request granularity on each axis, one dimension richer than a scalar step.
+	// AcceleratorPhysicalSlicedProfile 描述设备型号的一种硬件分区规格（profile），
+	// 例如 NVIDIA MIG 规格（如 "1g.5gb"）。计算与显存切片数表达了各个维度上的请求
+	// 粒度，比单一标量步长更丰富一个维度。
 	AcceleratorPhysicalSlicedProfile struct {
-		// Name is the profile identifier, e.g. "1g.5gb". It is the display name and the
-		// future resource-key suffix for a physical-slice request.
+		// Name 是规格标识符，例如 "1g.5gb"。它既是显示名称，也是物理切片请求
+		// 未来的资源键后缀。
 		Name string `json:"name" yaml:"name" protobuf:"bytes,1,opt,name=name"`
 
-		// MemoryMib is the memory of one instance of this profile, in MiB.
+		// MemoryMib 是该规格单个实例的显存大小，单位为 MiB。
 		MemoryMib int64 `json:"memoryMib" yaml:"memoryMib" protobuf:"varint,2,opt,name=memoryMib"`
 
-		// ComputeSlices is the number of compute slices one instance occupies — the request
-		// granularity on the compute axis (1..7 on current hardware).
+		// ComputeSlices 是单个实例占用的计算切片数——即计算维度上的请求粒度
+		// （在当前硬件上为 1..7）。
 		ComputeSlices int32 `json:"computeSlices" yaml:"computeSlices" protobuf:"varint,3,opt,name=computeSlices"` // nolint: lll
 
-		// MemorySlices is the number of memory slices one instance occupies — the request
-		// granularity on the memory axis (1..8 on current hardware).
+		// MemorySlices 是单个实例占用的显存切片数——即显存维度上的请求粒度
+		// （在当前硬件上为 1..8）。
 		MemorySlices int32 `json:"memorySlices" yaml:"memorySlices" protobuf:"varint,4,opt,name=memorySlices"` // nolint: lll
 
-		// Count is the maximum number of instances of this profile on a single accelerator.
+		// Count 是单个加速器上该规格实例的最大数量。
 		Count int32 `json:"count" yaml:"count" protobuf:"varint,5,opt,name=count"`
 
-		// Placements is the profile's full empty-accelerator legal placement set (start:size in
-		// memory-slice units), enumerated once at detect time. The reconciler subtracts the
-		// occupied intervals it reconstructs from Pod annotations from this cached set to derive
-		// the accelerator's RemainingProfiles, so no device query runs per reconcile. Caching the
-		// full empty-accelerator set makes the subtraction correct regardless of whether the
-		// manufacturer's possible-placements query is itself occupancy-aware. Empty for an
-		// accelerator with no physical-slice profiles.
+		// Placements 是该规格在空加速器上的完整合法放置集合（以显存切片为单位的
+		// start:size），在设备探测时一次性枚举。调谐器（reconciler）从该缓存集合中
+		// 减去根据 Pod 注解重建的已占用区间，即可推导出加速器的 RemainingProfiles，
+		// 从而避免每次调谐都执行设备查询。缓存完整的空加速器集合可确保无论制造商的
+		// 可用放置查询自身是否感知占用状态，减法推导都能保持正确。对于无物理切片规格的
+		// 加速器，该字段为空。
 		//
 		// +listType=atomic
 		Placements []AcceleratorPlacement `json:"placements,omitempty" yaml:"placements,omitempty" protobuf:"bytes,6,rep,name=placements"` // nolint: lll
 	}
 
-	// AcceleratorLogicalSliced describes an accelerator's logical (software) slicing capability.
+	// AcceleratorLogicalSliced 描述加速器的逻辑（软件）切片能力。
 	AcceleratorLogicalSliced struct {
-		// CoresPercentageOvercommit reports whether each slice may claim up to 100% of the
-		// device compute (time-sharing / weighted sharing); false means compute is partitioned.
+		// CoresPercentageOvercommit 报告每个切片是否可声明使用高达 100% 的设备算力
+		// （时间片共享 / 加权共享）；为 false 表示算力是划分隔离的。
 		CoresPercentageOvercommit bool `json:"coresPercentageOvercommit,omitempty" yaml:"coresPercentageOvercommit,omitempty" protobuf:"varint,1,opt,name=coresPercentageOvercommit"` // nolint: lll
 
-		// Count is the maximum number of logical slices this accelerator can host. An accelerator
-		// whose MIG mode is currently enabled is always 0, which excludes it from the logical
-		// capacity keys; a pending-enable accelerator is not partitioned yet and still reports
-		// its logical count.
+		// Count 是该加速器可承载的最大逻辑切片数量。当前已启用 MIG 模式的加速器
+		// 该值始终为 0，从而将其排除在逻辑容量键之外；处于待启用（pending-enable）状态的
+		// 加速器尚未分区，仍会上报其逻辑切片数量。
 		Count int32 `json:"count,omitempty" yaml:"count,omitempty" protobuf:"varint,2,opt,name=count"`
 	}
 
-	// AcceleratorPhysicalSliced describes an accelerator's physical (hardware) slicing capability.
+	// AcceleratorPhysicalSliced 描述加速器的物理（硬件）切片能力。
 	AcceleratorPhysicalSliced struct {
-		// Profiles is empty when the accelerator does not support, or has not enabled, hard
-		// slicing.
+		// Profiles 在加速器不支持或未启用硬件切片时为空。
 		//
 		// +listType=map
 		// +listMapKey=name
 		Profiles []AcceleratorPhysicalSlicedProfile `json:"profiles,omitempty" yaml:"profiles,omitempty" protobuf:"bytes,1,rep,name=profiles"` // nolint: lll
 
-		// Count is the accelerator's physical-slice ceiling — the largest Count across Profiles
-		// (e.g. 7 on A100, from 7x 1g.5gb). It sizes the device-plugin's bare ".partitioned"
-		// token pool for a partitioned accelerator, which is the family that serves it; a
-		// partitioned accelerator offers no logical slicing and so leaves the ".sliced" pool
-		// entirely. Zero when Profiles is empty.
+		// Count 是加速器的物理切片上限——即 Profiles 中的最大 Count 值（例如
+		// A100 上来自 7 个 1g.5gb 的 7）。它决定了处于分区状态的加速器在 DevicePlugin 中
+		// 裸 ".partitioned" 令牌池的大小，后者正是服务于它的资源族；已分区的加速器
+		// 不提供逻辑切片，因此完全退出 ".sliced" 资源池。当 Profiles 为空时该值为 0。
 		Count int32 `json:"count,omitempty" yaml:"count,omitempty" protobuf:"varint,2,opt,name=count"`
 	}
 
-	// AcceleratorStatus describes the observed state of the accelerator device.
+	// AcceleratorStatus 描述加速器设备的观测状态。
 	AcceleratorStatus struct {
-		// Unhealthy indicates whether the device is healthy or not.
+		// Unhealthy 指示设备是否不健康。
 		Unhealthy bool `json:"unhealthy" yaml:"unhealthy" protobuf:"varint,1,name=unhealthy"`
 
-		// LogicalSliced is the accelerator's logical (software) slicing capability.
+		// LogicalSliced 是加速器的逻辑（软件）切片能力。
 		LogicalSliced AcceleratorLogicalSliced `json:"logicalSliced,omitempty" yaml:"logicalSliced,omitempty" protobuf:"bytes,2,opt,name=logicalSliced"` // nolint: lll
 
-		// PhysicalSliced is the accelerator's physical (hardware) slicing capability.
+		// PhysicalSliced 是加速器的物理（硬件）切片能力。
 		PhysicalSliced AcceleratorPhysicalSliced `json:"physicalSliced,omitempty" yaml:"physicalSliced,omitempty" protobuf:"bytes,3,opt,name=physicalSliced"` // nolint: lll
 	}
 
-	// AcceleratorSlicedLogicalDetail aggregates the group's logical slicing capability. The
-	// per-accelerator LogicalSliced is what an accelerator-level decision reads; this group view
-	// is what external queries read to learn whether the node accepts logical-slice requests at
-	// all (Count > 0) and whether it permits compute overcommit.
+	// AcceleratorSlicedLogicalDetail 聚合了设备组的逻辑切片能力。单卡级别的
+	// LogicalSliced 供加速器级决策读取；而该设备组视图供外部查询读取，以了解节点
+	// 是否接受逻辑切片请求（Count > 0）以及是否允许算力超卖。
 	AcceleratorSlicedLogicalDetail struct {
-		// CoresPercentageOvercommit is a per-model property (uniform within a group), taken from
-		// any logically sliceable accelerator; false and meaningless when no accelerator is
-		// logically sliceable.
+		// CoresPercentageOvercommit 是按型号定义的属性（同一组内一致），取自任意支持逻辑切分的
+		// 加速器；当没有加速器支持逻辑切分时为 false 且无意义。
 		CoresPercentageOvercommit bool `json:"coresPercentageOvercommit,omitempty" yaml:"coresPercentageOvercommit,omitempty" protobuf:"varint,1,opt,name=coresPercentageOvercommit"` // nolint: lll
 
-		// Count is the sum of per-accelerator LogicalSliced.Count across the group.
+		// Count 是组内各加速器 LogicalSliced.Count 的总和。
 		Count int32 `json:"count,omitempty" yaml:"count,omitempty" protobuf:"varint,2,opt,name=count"`
 	}
 
-	// AcceleratorSlicedPhysicalDetailProfile aggregates one profile across the group's
-	// accelerators.
+	// AcceleratorSlicedPhysicalDetailProfile 汇总组内加速器上的单个 profile。
 	AcceleratorSlicedPhysicalDetailProfile struct {
-		// Name is the profile identifier, e.g. "1g.5gb".
+		// Name 是 profile 标识符，例如 "1g.5gb"。
 		Name string `json:"name" yaml:"name" protobuf:"bytes,1,opt,name=name"`
 
-		// Count is the sum of per-accelerator Count for this profile name across the group.
+		// Count 是组内各加速器上该 profile 名称对应的 Count 总和。
 		Count int32 `json:"count,omitempty" yaml:"count,omitempty" protobuf:"varint,2,opt,name=count"`
 
-		// MemoryMib is the memory of one instance of this profile, in MiB. It is uniform
-		// per profile name within a group, so it is carried through (not summed). It is the
-		// VRAM-anchored input the Pod webhook folds into ".sliced.units" (MemoryMibToUnits)
-		// for a MIG request, which is why the aggregate — reachable from the InstanceType
-		// Detail, unlike per-accelerator Devices — must carry it. Optional in the schema (a real
-		// profile always carries a non-zero value); the Pod webhook treats a not-yet-populated
-		// detail as a retryable not-ready state rather than relying on schema-required presence.
+		// MemoryMib 是该 profile 单个实例的显存大小，单位为 MiB。同一组内相同 profile 名称的
+		// 该值一致，因此直接透传（不累加）。它是 Pod webhook 针对 MIG 请求将其折算进
+		// ".sliced.units"（MemoryMibToUnits）的显存基准输入，这也是为什么可从 InstanceType
+		// Detail 访问到的聚合视图（不同于单加速器粒度的 Devices）必须携带该字段的原因。
+		// 在 schema 中为可选字段（真实 profile 始终携带非零值）；Pod webhook 会将尚未填充
+		// 的 detail 视为可重试的未就绪状态，而非依赖 schema 必填校验。
 		MemoryMib int64 `json:"memoryMib,omitempty" yaml:"memoryMib,omitempty" protobuf:"varint,3,opt,name=memoryMib"`
 	}
 
-	// AcceleratorSlicedPhysicalDetail aggregates the group's physical slicing capability.
+	// AcceleratorSlicedPhysicalDetail 汇总该组的物理切分能力。
 	AcceleratorSlicedPhysicalDetail struct {
-		// Profiles is the group's physical profiles, summed by name.
+		// Profiles 是该组的物理 profile 列表，按名称累加统计。
 		//
 		// +listType=map
 		// +listMapKey=name
 		Profiles []AcceleratorSlicedPhysicalDetailProfile `json:"profiles,omitempty" yaml:"profiles,omitempty" protobuf:"bytes,1,rep,name=profiles"` // nolint: lll
 
-		// Count is the sum of per-accelerator PhysicalSliced.Count across the group.
+		// Count 是组内各加速器 PhysicalSliced.Count 的总和。
 		Count int32 `json:"count,omitempty" yaml:"count,omitempty" protobuf:"varint,2,opt,name=count"`
 	}
 
-	// AcceleratorSlicedDetail is the group-level slicing capability view, aggregated from
-	// the group's per-accelerator slicing status.
+	// AcceleratorSlicedDetail 是组级别的切分能力视图，由组内各加速器的切分状态聚合而成。
 	AcceleratorSlicedDetail struct {
-		// Logical is the aggregated logical (software) slicing capability.
+		// Logical 是聚合后的逻辑（软件）切分能力。
 		Logical AcceleratorSlicedLogicalDetail `json:"logical,omitempty" yaml:"logical,omitempty" protobuf:"bytes,1,opt,name=logical"`
 
-		// Physical is the aggregated physical (hardware) slicing capability.
+		// Physical 是聚合后的物理（硬件）切分能力。
 		Physical AcceleratorSlicedPhysicalDetail `json:"physical,omitempty" yaml:"physical,omitempty" protobuf:"bytes,2,opt,name=physical"`
 	}
 
-	// AcceleratorProfileCount pairs a physical-slice profile name with a count of
-	// instances — allocated (bound) or remaining (still buildable) per the field carrying
-	// it. It is a status-only type (never a map key), so the profile ledger and the
-	// capability inventory (AcceleratorSlicedPhysicalDetailProfile) stay independently
-	// evolvable.
+	// AcceleratorProfileCount 将物理切分 profile 名称与实例数量配对——具体含义取决于
+	// 承载它的字段，可表示已分配（已绑定）或剩余（仍可创建）。该类型仅用于状态展示
+	// （绝不作为 map 键），从而使 profile 账本与能力清单
+	// （AcceleratorSlicedPhysicalDetailProfile）保持各自独立演进。
 	AcceleratorProfileCount struct {
-		// Name is the profile identifier, e.g. "1g.10gb".
+		// Name 是 profile 标识符，例如 "1g.10gb"。
 		Name string `json:"name" yaml:"name" protobuf:"bytes,1,opt,name=name"`
 
-		// Count is the number of instances of this profile.
+		// Count 是该 profile 的实例数量。
 		Count int32 `json:"count,omitempty" yaml:"count,omitempty" protobuf:"varint,2,opt,name=count"`
 	}
 
-	// AcceleratorAllocation describes the allocated accelerator device.
+	// AcceleratorAllocation 描述已分配的加速器设备。
 	AcceleratorAllocation struct {
-		// ID is the universally unique identifier for this device.
+		// ID 是该设备的全局唯一标识符。
 		ID string `json:"id" yaml:"id" protobuf:"bytes,1,opt,name=id"`
 
-		// Index is the logic number of the device, starting from 0.
+		// Index 是设备的逻辑编号，从 0 开始。
 		Index uint32 `json:"index" yaml:"index" protobuf:"varint,2,name=index"`
 
-		// Mode is the allocation mode of the device.
+		// Mode 是设备的分配模式。
 		Mode DeviceAllocationMode `json:"mode" yaml:"mode" protobuf:"varint,3,name=mode,casttype=DeviceAllocationMode"`
 
-		// Allocated is the allocated units of the device.
+		// Allocated 是设备已分配的单元数。
 		Allocated int32 `json:"allocated,omitempty" yaml:"allocated,omitempty" protobuf:"varint,4,opt,name=allocated"`
 
-		// Remaining is the remaining allocatable units of the device.
+		// Remaining 是设备剩余可分配的单元数。
 		Remaining int32 `json:"remaining,omitempty" yaml:"remaining,omitempty" protobuf:"varint,5,opt,name=remaining"`
 
-		// AllocatedSlices is how many logical slices the device currently hosts: one per container
-		// holding a slice of it. A logically sliceable device hosts at most LogicalSliced.Count of
-		// them whatever its Remaining says, so a slice fits only where both have room. Zero, the
-		// value a ledger written before this field existed reads as, counts as no slices.
+		// AllocatedSlices 表示设备当前承载的逻辑切片数量：每个持有其切片的容器计为一个。
+		// 无论 Remaining 为多少，支持逻辑切分的设备最多只能承载 LogicalSliced.Count 个切片，
+		// 因此只有当两者均有余量时才能容纳新切片。在该字段引入前写入的账本会读取为零值，
+		// 按无切片处理。
 		AllocatedSlices int32 `json:"allocatedSlices,omitempty" yaml:"allocatedSlices,omitempty" protobuf:"varint,12,opt,name=allocatedSlices"` // nolint: lll
 
-		// AllocatedProfiles and RemainingProfiles are the per-accelerator physical-slice ledger
-		// the AdmissionCheck reads — the aggregated OUTPUT the reconciler computes from the
-		// per-Pod AllocatedPhysicalProfile/AllocatedPhysicalPlacements transport fields below
-		// (unioning every Pod's occupied slots on this accelerator). Both are empty (omitted) for
-		// an accelerator with no physical-slice profiles, so it serializes byte-identically to
-		// before they existed.
+		// AllocatedProfiles 和 RemainingProfiles 是供 AdmissionCheck 读取的单加速器物理切分
+		// 账本——即调谐器根据下方单 Pod 的 AllocatedPhysicalProfile/AllocatedPhysicalPlacements
+		// 传输字段（对该加速器上每个 Pod 已占用的槽位取并集）计算出的聚合输出。对于没有
+		// 物理切分 profile 的加速器，两者均为空（省略），以确保其序列化结果与引入这些字段前
+		// 完全一致。
 		//
-		// AllocatedProfiles lists, by profile name, how many instances are currently created
-		// and bound on this accelerator (the count of the Pods' recorded placements).
+		// AllocatedProfiles 按 profile 名称列出当前在该加速器上已创建并绑定的实例数量
+		// （即各 Pod 已记录的放置数量）。
 		//
 		// +listType=map
 		// +listMapKey=name
 		AllocatedProfiles []AcceleratorProfileCount `json:"allocatedProfiles,omitempty" yaml:"allocatedProfiles,omitempty" protobuf:"bytes,6,rep,name=allocatedProfiles"` // nolint: lll
 
-		// RemainingProfiles lists, by profile name, how many more instances of each profile can
-		// still be created given the accelerator's occupied placement slots — the placement-aware
-		// remaining capacity (the per-profile analog of the scalar Remaining) the
-		// AdmissionCheck gates on.
+		// RemainingProfiles 按 profile 名称列出在给定加速器已占用放置槽位的情况下，每种
+		// profile 还能创建的实例数量——即 AdmissionCheck 用来做准入判定的放置感知剩余容量
+		// （标量 Remaining 的按 profile 对应版本）。
 		//
 		// +listType=map
 		// +listMapKey=name
 		RemainingProfiles []AcceleratorProfileCount `json:"remainingProfiles,omitempty" yaml:"remainingProfiles,omitempty" protobuf:"bytes,7,rep,name=remainingProfiles"` // nolint: lll
 
-		// AllocatedPhysicalProfile and AllocatedPhysicalPlacements are the per-Pod annotation
-		// TRANSPORT the reconciler consumes to build the ledger above — not status output. The
-		// device-plugin Allocate records, in the Pod's own allocation annotation, the single
-		// physical partition that Pod holds on this accelerator (e.g. an NVIDIA MIG instance):
-		// its profile name and the memory-slice interval(s) it occupies. A Pod holds one instance of
-		// one profile per accelerator.
+		// AllocatedPhysicalProfile 和 AllocatedPhysicalPlacements 是供调谐器消费以构建上述
+		// 账本的单 Pod 注解传输字段，而非状态输出。device-plugin 在 Allocate 时会在 Pod
+		// 自身的分配注解中记录该 Pod 在此加速器上持有的单个物理分区（例如 NVIDIA MIG 实例）：
+		// 包含其 profile 名称及占用的显存切片区间。每个 Pod 在每张加速器上仅持有一种
+		// profile 的一个实例。
 		//
-		// Every field in this transport group is omitted from the aggregated Devices.Status — but
-		// none of them is hidden: Instance.status.allocations reports each Pod's own record
-		// verbatim, and that is where an operator reads which partition their Instance holds.
+		// 该传输组中的所有字段在聚合后的 Devices.Status 中都会被省略——但它们并非不可见：
+		// Instance.status.allocations 会原样上报每个 Pod 自身的记录，运维人员可在此查看
+		// 其 Instance 持有的具体分区。
 		AllocatedPhysicalProfile string `json:"allocatedPhysicalProfile,omitempty" yaml:"allocatedPhysicalProfile,omitempty" protobuf:"bytes,8,opt,name=allocatedPhysicalProfile"` // nolint: lll
 
-		// AllocatedPhysicalPlacements is the memory-slice interval(s) the Pod's partition occupies
-		// on this accelerator. The reconciler unions these across the node's Pods to derive
-		// RemainingProfiles.
+		// AllocatedPhysicalPlacements 是 Pod 的分区在此加速器上占用的显存切片区间。
+		// 调谐器会对节点上所有 Pod 的这些区间取并集，以推导出 RemainingProfiles。
 		//
 		// +listType=atomic
 		AllocatedPhysicalPlacements []AcceleratorPlacement `json:"allocatedPhysicalPlacements,omitempty" yaml:"allocatedPhysicalPlacements,omitempty" protobuf:"bytes,9,rep,name=allocatedPhysicalPlacements"` // nolint: lll
 
-		// AllocatedPhysicalID is the partition's own identifier, as the driver named it at the moment
-		// it was created (an NVIDIA MIG UUID, a T-Head PPU MIG UUID). Part of the same annotation
-		// TRANSPORT, empty (omitted) in the aggregated Devices.Status.
+		// AllocatedPhysicalID 是分区自身的标识符，即其在创建时由驱动赋予的名称（如 NVIDIA MIG
+		// UUID、平头哥 PPU MIG UUID）。它同属上述注解传输字段，在聚合后的 Devices.Status 中
+		// 为空（省略）。
 		//
-		// It is recorded because the allocator holds it already and the reader would otherwise have to
-		// EARN it back: without it, naming a partition means translating the recorded profile name
-		// into a driver profile id, enumerating every instance of that profile, and matching on the
-		// placement — dozens of driver calls per card per monitor period, to recover something that
-		// was in hand at Allocate time. So it is also the ONLY way a partition is addressed: an
-		// allocation carrying none is reported as an absence rather than derived.
+		// 记录该字段是因为分配器在分配时已持有它，否则读取方需要耗费额外代价反查：若无此
+		// 字段，定位一个分区就需要将记录的 profile 名称转换为驱动 profile ID、枚举该 profile
+		// 下的所有实例并按放置位置匹配——每个监控周期每张卡都要执行数十次驱动调用，只为找回
+		// 在 Allocate 时原本就已掌握的信息。因此，它也是寻址分区的唯一方式：未携带该字段的
+		// 分配记录会直接按缺失处理，而不会尝试推导。
 		//
-		// It is NOT a generation marker. These UUIDs are name-based, derived from the parent device
-		// and the instance's own identity, so destroying a partition and creating another at the same
-		// placement yields the SAME identifier. Treat a recorded id as a fast way to FIND the
-		// partition, never as proof that the one found is the one that was granted.
+		// 它并非代次标记（generation marker）。这些 UUID 基于名称生成，由父设备与实例自身
+		// 标识推导而来，因此在同一放置位置销毁分区并重建另一个分区会产生相同的标识符。
+		// 应将记录的 ID 视为快速查找分区的手段，绝不能将其当作“找到的分区就是当初授予的
+		// 那个分区”的证明。
 		AllocatedPhysicalID string `json:"allocatedPhysicalID,omitempty" yaml:"allocatedPhysicalID,omitempty" protobuf:"bytes,11,opt,name=allocatedPhysicalID"` // nolint: lll
 
-		// AllocatedLogicalPlacements is the per-Pod annotation TRANSPORT of the logical-slice
-		// ledger: the compute geometry the Pod's logical slice holds on this accelerator, in the
-		// manufacturer's own compute units (on AMD, CU-mask bit indexes exactly as they appear in
-		// HSA_CU_MASK). The device-plugin Allocate records it so a later placement decision reads
-		// what the node's live slices already occupy. Empty (omitted) in the aggregated
-		// Devices.Status, and for a manufacturer whose logical slice has no position.
+		// AllocatedLogicalPlacements 是逻辑切片账本的单 Pod 注解传输字段：表示 Pod 的逻辑切片
+		// 在此加速器上持有的计算几何布局，以厂商自身的计算单元表示（在 AMD 上即与
+		// HSA_CU_MASK 中完全一致的 CU 掩码位索引）。device-plugin 在 Allocate 时记录该字段，
+		// 以便后续放置决策读取节点上现有切片已占用的位置。在聚合后的 Devices.Status 中以及
+		// 逻辑切片无位置概念的厂商设备上均为空（省略）。
 		//
 		// +listType=atomic
 		AllocatedLogicalPlacements []AcceleratorPlacement `json:"allocatedLogicalPlacements,omitempty" yaml:"allocatedLogicalPlacements,omitempty" protobuf:"bytes,10,rep,name=allocatedLogicalPlacements"` // nolint: lll
 	}
 )
 
-// DevicesList holds the list of Devices.
+// DevicesList 包含 Devices 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type DevicesList struct {

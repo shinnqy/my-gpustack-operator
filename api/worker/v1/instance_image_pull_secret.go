@@ -5,10 +5,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstanceImagePullSecret is the schema for worker.gpustack.ai.
+// InstanceImagePullSecret 是 worker.gpustack.ai 的资源 schema。
 //
-// Underhood, an InstanceImagePullSecret is mapping to a Kubernetes Secret,
-// and the InstanceImagePullSecret's name is the same as the Kubernetes Secret's name.
+// 在底层，InstanceImagePullSecret 对应一个 Kubernetes Secret，
+// 且 InstanceImagePullSecret 的名称与该 Kubernetes Secret 的名称相同。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -20,50 +20,50 @@ type InstanceImagePullSecret struct {
 	Spec InstanceImagePullSecretSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 }
 
-// InstanceImagePullSecretSpec defines the desired state of InstanceImagePullSecret.
+// InstanceImagePullSecretSpec 定义 InstanceImagePullSecret 的期望状态。
 type InstanceImagePullSecretSpec struct {
-	// DisplayName is the display name of the InstanceImagePullSecret.
+	// DisplayName 是 InstanceImagePullSecret 的显示名称。
 	//
 	// +k8s:validation:maxLength=64
 	DisplayName string `json:"displayName,omitempty" protobuf:"bytes,1,opt,name=displayName"`
 
-	// Description is the description of the InstanceImagePullSecret.
+	// Description 是 InstanceImagePullSecret 的描述信息。
 	//
 	// +k8s:validation:maxLength=1024
 	Description string `json:"description,omitempty" protobuf:"bytes,2,opt,name=description"`
 
-	// Registry is the registry of the image pull secret.
+	// Registry 是镜像拉取凭证对应的镜像仓库地址。
 	//
-	// Write-only input, it is required in create or update operations.
+	// 该字段为只写输入，在创建或更新操作中必填。
 	//
-	// It must be provided with Username, Password, and optionally Email in once operation.
+	// 必须在同一次操作中与 Username、Password 以及可选的 Email 一并提供。
 	Registry string `json:"registry,omitempty" protobuf:"bytes,3,opt,name=registry"`
 
-	// Username is the username of the image pull secret.
+	// Username 是镜像拉取凭证的用户名。
 	//
-	// Write-only input, it is required in create or update operations.
+	// 该字段为只写输入，在创建或更新操作中必填。
 	//
-	// It must be provided with Registry, Password, and optionally Email in once operation.
+	// 必须在同一次操作中与 Registry、Password 以及可选的 Email 一并提供。
 	Username string `json:"username,omitempty" protobuf:"bytes,4,opt,name=username"`
 
-	// Password is the password of the image pull secret.
+	// Password 是镜像拉取凭证的密码。
 	//
-	// Write-only input, it is required in create or update operations.
+	// 该字段为只写输入，在创建或更新操作中必填。
 	//
-	// It must be provided with Registry, Username, and optionally Email in once operation.
+	// 必须在同一次操作中与 Registry、Username 以及可选的 Email 一并提供。
 	Password string `json:"password,omitempty" protobuf:"bytes,5,opt,name=password"`
 
-	// Email is the email of the image pull secret.
+	// Email 是镜像拉取凭证的邮箱地址。
 	//
-	// Write-only input, it is required in create or update operations.
+	// 该字段为只写输入，在创建或更新操作中必填。
 	//
-	// It can be provided with Registry, Username, and Password in once operation.
+	// 可在同一次操作中与 Registry、Username 和 Password 一并提供。
 	Email string `json:"email,omitempty" protobuf:"bytes,6,opt,name=email"`
 }
 
 var _ runtime.Object = (*InstanceSSHPublicKey)(nil)
 
-// InstanceImagePullSecretList holds the list of InstanceImagePullSecret.
+// InstanceImagePullSecretList 包含 InstanceImagePullSecret 列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceImagePullSecretList struct {

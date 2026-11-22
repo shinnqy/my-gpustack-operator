@@ -10,13 +10,13 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionroute/swagger"
 )
 
-// Route registers OpenAPI and Swagger routes,
-// and extends the OpenAPI spec with the given extenders.
+// Route 注册 OpenAPI 和 Swagger 路由，
+// 并使用给定的 extender 扩展 OpenAPI 规范。
 func Route(gvs []meta.GroupVersion, r *mux.Router, extenders ...openapi.Extender) {
-	// OpenAPI.
+	// OpenAPI。
 	openapi.Route(gvs, r.PathPrefix("/openapi").Methods(http.MethodGet), extenders...)
 
-	// Swagger.
+	// Swagger。
 	r.Path("/swagger").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/swagger/", http.StatusMovedPermanently)
 	})

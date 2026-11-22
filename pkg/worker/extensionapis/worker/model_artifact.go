@@ -14,13 +14,11 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// ModelArtifactHandler exposes the v1 view of a v1alpha1.ModelArtifact and its progress
-// subresource.
+// ModelArtifactHandler 暴露 v1alpha1.ModelArtifact 的 v1 视图及其 progress 子资源。
 //
-// NO STATUS SUBRESOURCE IS SERVED: the proxy writes with the worker's identity, which the
-// ModelArtifact status guard admits, so a writable v1 status would let any caller write what mounts
-// are authorized by. An update through the main resource leaves the status as it is, the way the
-// resource's status subresource makes the API server treat it.
+// 不提供 STATUS 子资源：代理使用 worker 身份写入（ModelArtifact status 守卫允许该身份），
+// 因此可写的 v1 status 会让任意调用方篡改挂载授权依据。通过主资源更新会保持 status
+// 原状不变，这与资源的 status 子资源在 API server 中的行为一致。
 type ModelArtifactHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -56,7 +54,7 @@ func (h *ModelArtifactHandler) SetupHandler(
 	}, nil
 }
 
-// modelArtifactSourceColumn names the model repository, claim or image reference.
+// modelArtifactSourceColumn 返回模型仓库、声明或镜像引用的名称。
 func modelArtifactSourceColumn(obj *worker.ModelArtifact) string {
 	switch s := obj.Spec.Source; {
 	case s.HuggingFace != nil:

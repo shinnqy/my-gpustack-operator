@@ -21,84 +21,77 @@ import (
 
 type (
 	Chart struct {
-		// Name is the name of the chart.
+		// Name 是 Chart 的名称。
 		Name string
-		// Version is the version of the chart, a SemVer 2 conformant string.
+		// Version 是 Chart 的版本，为符合 SemVer 2 规范的字符串。
 		Version string
-		// Release is the name of the release.
+		// Release 是 Release 的名称。
 		Release string
-		// Path is the path of the chart tar ball.
+		// Path 是 Chart 压缩包的路径。
 		Path string
-		// DownloadURL is the URL to download the chart tar ball.
-		// If the Path is not existed, the chart will be downloaded from this URL.
+		// DownloadURL 是下载 Chart 压缩包的 URL。
+		// 如果 Path 不存在，将从该 URL 下载 Chart。
 		DownloadURL string
-		// Values is the values to be passed to the chart.
+		// Values 是要传递给 Chart 的配置值。
 		Values ChartValues
-		// SkippedCRDsInstallation defines whether to skip the installation of CRDs of this chart.
+		// SkippedCRDsInstallation 定义是否跳过此 Chart 的 CRD 安装。
 		//
-		// Sometimes, the cluster has already installed the CRDs of the same API,
-		// this function is a chance to disable the installation of CRDs on this fresh installation.
+		// 有时集群中已经安装了相同 API 的 CRD，
+		// 该选项用于在全新安装时禁用 CRD 的安装。
 		SkippedCRDsInstallation bool
-		// SkippedInstallationIfApiServiceReady is the APIService name,
-		// if specified, the installation will be skipped if an APIService with this name already exists in the cluster.
+		// SkippedInstallationIfApiServiceReady 是 APIService 的名称，
+		// 如果指定该字段，当集群中已存在同名 APIService 时将跳过安装。
 		//
-		// Sometimes, the cluster has already installed a same chart but not the same release,
-		// this function is a chance to check whether to continue installation on this fresh installation,
-		// or just skip.
+		// 有时集群中已经安装了相同的 Chart 但并非同一个 Release，
+		// 该选项用于在全新安装时检查是继续安装还是直接跳过。
 		SkippedInstallationIfApiServiceReady string
-		// RepairViaUpgradeOnly repairs a bad-status release with a Helm upgrade instead
-		// of the destructive uninstall+install path.
+		// RepairViaUpgradeOnly 通过 Helm upgrade 修复处于异常状态的 Release，
+		// 而非采用具有破坏性的卸载后重装路径。
 		//
-		// A chart whose CRDs are Helm-managed templates and whose custom resources carry
-		// controller finalizers (e.g. Kueue) can deadlock on the uninstall path: the
-		// uninstall removes the controller while its finalizers still pin the CRs, so the
-		// CRDs get stuck Terminating and the reinstall can never recreate them. An upgrade
-		// keeps the controller alive to clear the finalizers and recreates any missing
-		// resources, so the release converges without stranding.
+		// 如果某个 Chart 的 CRD 由 Helm 模板管理，且其自定义资源带有控制器 finalizer（例如 Kueue），
+		// 走卸载路径可能会导致死锁：卸载会移除控制器，但 finalizer 仍会锁住 CR，
+		// 导致 CRD 卡在 Terminating 状态而无法在重装时重新创建。使用 upgrade
+		// 可以保留控制器以清理 finalizer 并重建缺失的资源，从而使 Release 收敛而不致滞留。
 		//
-		// The same destructiveness rules the rollback out of pending-record repair: a
-		// rollback re-applies the last deployed revision's manifest, deleting whatever the
-		// pending operation had already adopted (taken-over CRDs included), so an
-		// abandoned pending-upgrade or pending-rollback is repaired by discarding the
-		// record and upgrading from the revision beneath it.
+		// 同样的破坏性问题也排除了在修复 pending 记录时使用回滚：回滚会重新应用
+		// 上一个已部署修订版本的清单，从而删除 pending 操作已经接管的资源（包括被接管的 CRD），
+		// 因此对于被遗弃的 pending-upgrade 或 pending-rollback，修复方式是丢弃该记录
+		// 并基于其底层的修订版本执行升级。
 		RepairViaUpgradeOnly bool
-		// TakeOwnership adopts pre-existing live objects that this release does not own
-		// yet, instead of failing the action on them.
+		// TakeOwnership 会接管集群中已存在但尚未归属此 Release 的对象，
+		// 而不是在这些对象上导致操作失败。
 		//
-		// Helm refuses to install or upgrade over an object whose ownership metadata does
-		// not name this release, aborting with "invalid ownership metadata". That check runs
-		// before any pre-install/pre-upgrade hook, so a hook can never repair it. With this
-		// set, Helm skips the check and rewrites the ownership metadata of every matching
-		// live object as part of the apply, transferring an object that another release
-		// created into this one.
+		// Helm 默认拒绝在所有权元数据未指向当前 Release 的对象上执行安装或升级，
+		// 并以 "invalid ownership metadata" 中止操作。该检查在任何 pre-install/pre-upgrade hook
+		// 之前运行，因此 hook 无法修复此问题。启用此选项后，Helm 会跳过该检查，
+		// 并在应用变更时重写每个匹配的现有对象的所有权元数据，从而将另一个 Release
+		// 创建的对象转移到当前 Release 名下。
 		//
-		// Adoption matches on name, namespace and kind only, so it cannot tell a former
-		// release's object from one a user created by hand. Set it only for a migration
-		// whose previous owner has been positively identified, never unconditionally.
+		// 接管仅依据名称、Namespace 和 Kind 进行匹配，因此无法区分旧 Release
+		// 创建的对象与用户手动创建的对象。仅在明确确认了先前所有者的迁移场景下设置该选项，
+		// 切勿无条件启用。
 		TakeOwnership bool
-		// ExclusiveAccess declares that whatever last acted on this release has stopped, and
-		// that nothing else can act on it while this call runs.
+		// ExclusiveAccess 声明上一个操作此 Release 的执行方已停止，
+		// 且在本次调用运行期间不会有其他方对其进行操作。
 		//
-		// It is what makes a pending release record actionable. A record left
-		// pending-install, pending-upgrade or pending-rollback is either an operation still
-		// in flight or the wreckage of a process that died mid-flight, and nothing in the
-		// record itself tells the two apart — so without this the record is waited out by
-		// age, which is why one left behind survives every later attempt.
+		// 正是该字段使处于 pending 状态的 Release 记录变得可处理。遗留为
+		// pending-install、pending-upgrade 或 pending-rollback 的记录，要么是仍在进行中的操作，
+		// 要么是进程在中途崩溃后的残余，而记录本身无法区分这两种情况——因此若没有此标志，
+		// 系统只能按存活时间等待该记录过期，这也是遗留记录会在后续每次尝试中持续存在的原因。
 		//
-		// Holding a lock is not on its own enough to set it: a lock says peers cannot start,
-		// not that the one before them finished. Set it only on evidence that the previous
-		// actor is gone — it released the lock after its own call returned, or its process
-		// is observably no longer running. Repairing a live operation corrupts it.
+		// 仅持有锁本身并不足以设置该标志：锁只能保证并发方无法启动，
+		// 而不能说明前一个执行方已经结束。只有在有明确证据表明前一个执行方已退出时才可设置——
+		// 例如它在自身调用返回后释放了锁，或者可以观察到其进程已不再运行。修复正在执行的操作会破坏其状态。
 		ExclusiveAccess bool
 	}
 
 	ChartValues interface {
-		// GetValues returns the values for chart installation.
+		// GetValues 返回用于 Chart 安装的配置值。
 		GetValues(ctx context.Context) (map[string]any, error)
 	}
 )
 
-// Validate validates the chart.
+// Validate 校验 Chart。
 func (ch Chart) Validate() error {
 	if ch.Name == "" {
 		return fmt.Errorf("name is required")
@@ -112,7 +105,7 @@ func (ch Chart) Validate() error {
 	return nil
 }
 
-// Load loads the chart from local path or remote URL.
+// Load 从本地路径或远程 URL 加载 Chart。
 func (ch Chart) Load(_ context.Context, cfg *helmaction.Configuration) (*helmchart.Chart, error) {
 	f := ch.Path
 	if f != "" && osx.IsEmptyFile(f) {
@@ -140,7 +133,7 @@ func (ch Chart) Load(_ context.Context, cfg *helmaction.Configuration) (*helmcha
 	return helmloader.Load(f)
 }
 
-// GetValues returns the values for chart installation.
+// GetValues 返回用于 Chart 安装的配置值。
 func (ch Chart) GetValues(ctx context.Context) (map[string]any, error) {
 	if ch.Values == nil {
 		return nil, nil
@@ -148,26 +141,25 @@ func (ch Chart) GetValues(ctx context.Context) (map[string]any, error) {
 	return ch.Values.GetValues(ctx)
 }
 
-// configureInstall applies the chart-declared options to the given install action.
+// configureInstall 将 Chart 声明的选项应用到指定的 install 操作。
 //
-// Only the options the Chart declares are set; the caller still owns the action's
-// release name, namespace, timeout and atomicity.
+// 仅设置 Chart 声明的选项；调用方仍需负责该操作的
+// release 名称、Namespace、超时时间和原子性设置。
 func (ch Chart) configureInstall(i *helmaction.Install) {
-	// SkipCRDs is the flag that gates installing a chart's crds/ directory; IncludeCRDs only
-	// renders those files into the manifest as well, which is a different thing entirely. Setting
-	// the latter makes Helm install every crds/ CRD twice over: once in its CRD phase, which
-	// creates them with no ownership metadata, and once as a release resource, whose ownership
-	// check then rejects the very objects that phase just created. Leaving IncludeCRDs false keeps
-	// the CRD phase the only installer, and it already tolerates a CRD that exists — which is what
-	// lets a cluster keep the copy its own operator installed.
+	// SkipCRDs 是控制是否安装 Chart 的 crds/ 目录的标志；而 IncludeCRDs 只是
+	// 将这些文件一并渲染进清单，两者完全不同。设置后者会导致 Helm 对 crds/ 中的每个 CRD
+	// 安装两次：一次在 CRD 阶段（创建时不带所有权元数据），另一次作为 Release 资源
+	// （其所有权检查随后会拒绝刚才阶段创建出来的对象）。将 IncludeCRDs 保持为 false
+	// 可使 CRD 阶段成为唯一的安装入口，而且该阶段本身允许 CRD 已存在——
+	// 这正是集群能够保留其自身 Operator 所安装 CRD 副本的原因。
 	i.SkipCRDs = ch.SkippedCRDsInstallation
 	i.TakeOwnership = ch.TakeOwnership
 }
 
-// configureUpgrade applies the chart-declared options to the given upgrade action.
+// configureUpgrade 将 Chart 声明的选项应用到指定的 upgrade 操作。
 //
-// Only the options the Chart declares are set; the caller still owns the action's
-// timeout, atomicity and recreate policy.
+// 仅设置 Chart 声明的选项；调用方仍需负责该操作的
+// 超时时间、原子性和重建策略。
 func (ch Chart) configureUpgrade(u *helmaction.Upgrade) {
 	u.TakeOwnership = ch.TakeOwnership
 }
@@ -215,11 +207,11 @@ func templateFuncMap(extend template.FuncMap) template.FuncMap {
 	return fm
 }
 
-// toYAML borrows from helm.sh/helm/pkg/engine/engine.go.
+// toYAML 借鉴自 helm.sh/helm/pkg/engine/engine.go。
 func toYAML(v any) string {
 	data, err := yaml.Marshal(v)
 	if err != nil {
-		// Swallow errors inside a template.
+		// 在模板内部忽略 error。
 		return ""
 	}
 

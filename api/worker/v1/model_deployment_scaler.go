@@ -7,10 +7,10 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// ModelDeploymentScaler is the v1 view of a metric-driven replica planner.
+// ModelDeploymentScaler 是基于指标驱动的副本规划器的 v1 视图。
 //
-// Configuration changes proxy to the v1alpha1 resource. The status subresource is served, so
-// the planner's decisions are readable without going through the alpha version.
+// 配置变更会代理到 v1alpha1 资源。提供 status 子资源，因此无需通过 alpha 版本
+// 即可读取规划器的决策。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -19,7 +19,7 @@ type ModelDeploymentScaler workercore.ModelDeploymentScaler
 
 var _ runtime.Object = (*ModelDeploymentScaler)(nil)
 
-// ModelDeploymentScalerList holds the list of ModelDeploymentScalers.
+// ModelDeploymentScalerList 保存 ModelDeploymentScaler 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelDeploymentScalerList struct {

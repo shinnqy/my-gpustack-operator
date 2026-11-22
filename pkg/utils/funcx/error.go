@@ -1,14 +1,14 @@
 package funcx
 
-// NoError ignores the given error,
-// it is usually a nice helper for chain function calling.
+// NoError 忽略给定的 error，
+// 通常是用于链式函数调用的便捷辅助函数。
 func NoError[T any](t T, _ error) T {
 	return t
 }
 
-// MustNoError is similar to NoError,
-// but it panics if the given error is not nil,
-// it is usually a nice helper for chain function calling.
+// MustNoError 与 NoError 类似，
+// 但如果给定的 error 不为 nil 则会 panic，
+// 通常是用于链式函数调用的便捷辅助函数。
 func MustNoError[T any](t T, e error) T {
 	if e != nil {
 		panic(e)

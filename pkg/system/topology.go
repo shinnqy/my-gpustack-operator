@@ -12,23 +12,23 @@ import (
 )
 
 var (
-	// IPs is a set of non-loopback IP address of the system.
+	// IPs 是系统非环回 IP 地址的集合。
 	IPs = varx.NewOnce(sets.New[string]())
 
-	// Subnets is a set of subnet of the system.
+	// Subnets 是系统的子网集合。
 	Subnets = varx.NewOnce(sets.New[string]())
 
-	// PrimaryIP is the primary (outbound) IP address of the system.
+	// PrimaryIP 是系统的主（出站）IP 地址。
 	//
-	// Prefer to get the assigned IP address from environment variable "KUBERNETES_POD_IP" if exists,
-	// which is injected by downward API in Kubernetes Pod.
+	// 如果存在环境变量 "KUBERNETES_POD_IP"，则优先从中获取分配的 IP 地址，
+	// 该变量由 Kubernetes Pod 中的 downward API 注入。
 	PrimaryIP = varx.Once[string]{}
 
-	// PrimarySubnet is the primary subnet of the system.
+	// PrimarySubnet 是系统的主子网。
 	PrimarySubnet = varx.Once[string]{}
 )
 
-// ConfigureNetwork configures the network of the system.
+// ConfigureNetwork 配置系统网络。
 func ConfigureNetwork() error {
 	var (
 		hostIP, _     = knet.ChooseHostInterface()
@@ -46,7 +46,7 @@ func ConfigureNetwork() error {
 
 	for _, _if := range ifaces {
 		if _if.Flags&net.FlagUp == 0 || _if.Flags&net.FlagLoopback != 0 {
-			// Skip down or loopback interfaces.
+			// 跳过未启用或回环接口。
 			continue
 		}
 
@@ -58,8 +58,8 @@ func ConfigureNetwork() error {
 
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				// NB(thxCode): There is no NAT for IPv6,
-				// so we only need to consider IPv4.
+				// NB(thxCode): IPv6 不存在 NAT，
+				// 因此只需考虑 IPv4。
 				v4 := ipnet.IP.To4()
 				if v4 == nil || ips.Has(v4.String()) {
 					continue

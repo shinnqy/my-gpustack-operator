@@ -11,13 +11,12 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// setups is the list of all extension api handlers.
+// setups 是所有扩展 API 处理器的列表。
 //
-// A v1 VIEW OF A CRD MUST SERVE DELETE. v1 is this group's preferred version, and the garbage
-// collector watches each resource at the preferred version and only when that version can delete,
-// list and watch it: a view without delete leaves every object of that kind whose owner is gone
-// behind, such as a node's NodeModelStore after its Node is deleted (measured on Kubernetes 1.36).
-// TestEveryCRDViewServesDelete enforces it.
+// CRD 的 v1 视图必须提供 DELETE 能力。v1 是该 API 组的首选版本，而垃圾回收器仅在
+// 资源的首选版本同时支持 delete、list 和 watch 时才会监听该资源：缺少 delete 的视图
+// 会导致所有属主已删除的此类对象被遗留下来，例如在 Node 删除后残留的 NodeModelStore
+// （已在 Kubernetes 1.36 上实测验证）。TestEveryCRDViewServesDelete 强制保证该约束。
 var setups = []extensionapi.Setup{
 	extensionapi.NewSettingHandler(settings.Indexer()),
 	new(worker.DevicesHandler),
@@ -41,7 +40,7 @@ var setups = []extensionapi.Setup{
 	new(worker.InstanceTypeFlavorHandler),
 }
 
-// Setup installs the extension api handlers.
+// Setup 安装扩展 API 处理器。
 func Setup(
 	ctx context.Context,
 	srv *genericapiserver.GenericAPIServer,

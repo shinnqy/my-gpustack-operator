@@ -8,85 +8,74 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// The environment names an engine's startup caches honor, and the subdirectory of the cache
-// mount each one owns.
+// 下表列出了引擎启动缓存所使用的环境变量名，以及各自占用的缓存挂载子目录。
 //
-// An engine opens several caches before it serves its first token, and each of them defaults to
-// a path on the container's writable layer. The pod's ephemeral-storage limit measures that
-// layer, so a cache that grows there evicts the pod that is filling it, while the same bytes on
-// the host-backed cache mount do not count against the limit at all.
+// 引擎在服务第一个 token 之前会打开多个缓存，它们默认均位于容器的可写层中。
+// Pod 的 ephemeral-storage 限制会计量该可写层，因此在该层持续增长的缓存会驱逐
+// 正在写入的 Pod；而放在由主机支撑的缓存挂载点上的相同字节数则完全不计入该限制。
 //
-// The seven names below are the distinct roots those caches take at vLLM v0.32.0:
+// 下面七个环境变量是 vLLM v0.32.0 中这些缓存所使用的独立根目录：
 //
-//   - HF_HUB_CACHE is where huggingface_hub downloads model weights and tokenizer files. It
-//     is the cache that filled the container's writable layer in the recorded evictions, so it
-//     is the one this table exists for.
-//   - HF_XET_CACHE is where the Xet chunk cache lands. hf_xet reads it ahead of HF_HOME, so the
-//     chunk cache joins the hub cache on the mount while the token stays local.
-//   - PIP_CACHE_DIR is pip's download and wheel cache.
-//   - TORCH_HOME is the root torch keeps its hub checkpoints and cached state under.
-//   - FLASHINFER_WORKSPACE_BASE is the base FlashInfer builds its JIT workspace under. The
-//     workspace holds the generated sources and the compiled kernels of the attention backend,
-//     which the engine builds while it starts. FlashInfer appends its own ".cache/flashinfer"
-//     to the base, so the tree lands under <mount>/flashinfer/.cache/flashinfer.
-//   - TORCHINDUCTOR_CACHE_DIR is where torch keeps the kernels inductor compiles. Its default
-//     is a directory under the temporary directory, which is the container's writable layer.
-//   - TRITON_CACHE_DIR is where triton's compiled kernels are kept. Its default is under the
-//     home directory, beside the cache root rather than inside it.
+//   - HF_HUB_CACHE 是 huggingface_hub 下载模型权重与 tokenizer 文件的位置。
+//     在已记录的驱逐事件中，正是该缓存填满了容器可写层，因此本表主要为此而设。
+//   - HF_XET_CACHE 是 Xet 分块缓存的存放位置。hf_xet 会先于 HF_HOME 读取该变量，
+//     因此分块缓存会随 hub 缓存一同落入挂载目录，而认证令牌仍留在本地。
+//   - PIP_CACHE_DIR 是 pip 的下载与 wheel 缓存目录。
+//   - TORCH_HOME 是 torch 存放其 hub checkpoint 与缓存状态的根目录。
+//   - FLASHINFER_WORKSPACE_BASE 是 FlashInfer 构建其 JIT 工作区的基准目录。
+//     该工作区保存了引擎启动期间编译生成的 attention 后端源码与编译后内核。
+//     FlashInfer 会在该基准目录下追加 ".cache/flashinfer"，因此实际目录结构位于
+//     <mount>/flashinfer/.cache/flashinfer。
+//   - TORCHINDUCTOR_CACHE_DIR 是 torch 存放 inductor 所编译内核的位置。其默认值
+//     是临时目录下的一个子目录，位于容器的可写层中。
+//   - TRITON_CACHE_DIR 是 triton 存放已编译内核的位置。其默认值位于主目录下，
+//     在缓存根目录之外而非其中。
 //
-// THE HUB TOKEN IS DELIBERATELY NOT RELOCATED. huggingface_hub keeps its token and its datasets
-// cache under HF_HOME, which follows XDG_CACHE_HOME when nothing pins it; pointing that root at
-// the mount would carry a credential onto a host-backed directory every pod mounting the same
-// path can read. Only byte-heavy cache subtrees are relocated, and HF_HOME stays on the
-// container's own filesystem, so a token written there leaves the pod with the pod. The datasets
-// cache stays local with it: a serving replica downloads weights, not datasets.
+// HUB 认证令牌被刻意排除在迁移之外。huggingface_hub 将其令牌与数据集缓存保存在
+// HF_HOME 下（未指定时跟随 XDG_CACHE_HOME）；若将该根目录指向挂载目录，会把
+// 凭据带入由主机支撑的目录中，导致挂载同一路径的每个 Pod 都能读取。因此仅迁移
+// 体积庞大的缓存子树，HF_HOME 保留在容器自身的文件系统中，使写入其中的令牌随 Pod
+// 一同销毁。数据集缓存也随之留在本地：推理服务副本下载的是权重，而非数据集。
 //
-// NONE OF THESE IS THE ENGINE'S OWN CACHE ROOT. That one is VLLM_CACHE_ROOT or SGLANG_CACHE_DIR,
-// rendered by modelDeploymentCompileCacheDefaultedEnv, and this table does not repeat it.
+// 以上均不是引擎自身的缓存根目录。引擎自身的缓存根目录为 VLLM_CACHE_ROOT 或
+// SGLANG_CACHE_DIR，由 modelDeploymentCompileCacheDefaultedEnv 渲染，本表不作重复。
 //
-// NOTE: this mapping is coupled to where those libraries put their caches and to the variable
-// each of them reads. If a future version of vLLM, torch, triton, flashinfer or the Hugging
-// Face library changes a default location or a variable name, update this table accordingly.
+// NOTE: 此映射关系与各库存放缓存的位置及其读取的环境变量紧耦合。如果未来版本的
+// vLLM、torch、triton、flashinfer 或 Hugging Face 库更改了默认位置或变量名，请相应更新本表。
 const (
-	// modelDeploymentHFHubCacheEnv is where huggingface_hub downloads weights and tokenizers.
+	// modelDeploymentHFHubCacheEnv 是 huggingface_hub 下载权重和 tokenizer 的目录变量。
 	modelDeploymentHFHubCacheEnv = "HF_HUB_CACHE"
 
-	// modelDeploymentHFXetCacheEnv is where the Xet chunk cache lands; hf_xet reads it ahead
-	// of HF_HOME.
+	// modelDeploymentHFXetCacheEnv 是 Xet 分块缓存的存放位置；hf_xet 会先于 HF_HOME 读取它。
 	modelDeploymentHFXetCacheEnv = "HF_XET_CACHE"
 
-	// modelDeploymentPIPCacheDirEnv is pip's download and wheel cache.
+	// modelDeploymentPIPCacheDirEnv 是 pip 的下载与 wheel 缓存目录变量。
 	modelDeploymentPIPCacheDirEnv = "PIP_CACHE_DIR"
 
-	// modelDeploymentTorchHomeEnv is the root torch keeps its hub checkpoints and cached
-	// state under.
+	// modelDeploymentTorchHomeEnv 是 torch 存放其 hub checkpoint 与缓存状态的根目录变量。
 	modelDeploymentTorchHomeEnv = "TORCH_HOME"
 
-	// modelDeploymentFlashInferWorkspaceBaseEnv is the base FlashInfer builds its JIT
-	// workspace under.
+	// modelDeploymentFlashInferWorkspaceBaseEnv 是 FlashInfer 构建其 JIT 工作区的基准目录变量。
 	modelDeploymentFlashInferWorkspaceBaseEnv = "FLASHINFER_WORKSPACE_BASE"
 
-	// modelDeploymentTorchInductorCacheDirEnv is where torch keeps the kernels inductor
-	// compiles.
+	// modelDeploymentTorchInductorCacheDirEnv 是 torch 存放 inductor 所编译内核的目录变量。
 	modelDeploymentTorchInductorCacheDirEnv = "TORCHINDUCTOR_CACHE_DIR"
 
-	// modelDeploymentTritonCacheDirEnv is where triton keeps its compiled kernels.
+	// modelDeploymentTritonCacheDirEnv 是 triton 存放已编译内核的目录变量。
 	modelDeploymentTritonCacheDirEnv = "TRITON_CACHE_DIR"
 )
 
-// modelDeploymentRuntimeCache is one cache environment name and the subdirectory of the cache
-// mount it owns.
+// modelDeploymentRuntimeCache 表示一个缓存环境变量名及其在缓存挂载点下占用的子目录。
 type modelDeploymentRuntimeCache struct {
-	// Name is the environment variable the library reads.
+	// Name 是库读取的环境变量名。
 	Name string
 
-	// SubDir is the directory under the cache mount the name is rendered to.
+	// SubDir 是该变量渲染后指向缓存挂载点下的子目录。
 	SubDir string
 }
 
-// modelDeploymentRuntimeCaches is the table of the caches an engine opens while it starts, in
-// the order they are rendered. The order is fixed so that a rendered environment is the same
-// document every time.
+// modelDeploymentRuntimeCaches 是引擎启动期间打开的各缓存表，按渲染顺序排列。
+// 顺序固定，以确保每次渲染出的环境变量列表完全一致。
 var modelDeploymentRuntimeCaches = []modelDeploymentRuntimeCache{
 	{Name: modelDeploymentHFHubCacheEnv, SubDir: "hf-hub"},
 	{Name: modelDeploymentHFXetCacheEnv, SubDir: "xet"},
@@ -97,8 +86,8 @@ var modelDeploymentRuntimeCaches = []modelDeploymentRuntimeCache{
 	{Name: modelDeploymentTritonCacheDirEnv, SubDir: "triton"},
 }
 
-// modelDeploymentRuntimeCacheEnvNames are the names of the table, for the registry that
-// decides which environment variables the operator merely defaults.
+// modelDeploymentRuntimeCacheEnvNames 是缓存表中的环境变量名列表，供判断
+// 哪些环境变量仅由 operator 提供默认值的注册表使用。
 var modelDeploymentRuntimeCacheEnvNames = []string{
 	modelDeploymentHFHubCacheEnv,
 	modelDeploymentHFXetCacheEnv,
@@ -109,16 +98,16 @@ var modelDeploymentRuntimeCacheEnvNames = []string{
 	modelDeploymentTritonCacheDirEnv,
 }
 
-// modelDeploymentRuntimeCacheDefaultedEnv returns the defaulted environment entries that point
-// an engine's startup caches at the host-backed cache mount.
+// modelDeploymentRuntimeCacheDefaultedEnv 返回将引擎启动缓存指向主机支撑的
+// 缓存挂载点的默认环境变量条目。
 //
-// IT IS A DEFAULT AND NOT AN OWNERSHIP. A role that sets one of these names keeps its own
-// value: the operator claims only the default, and the volume mounted at
-// ModelDeploymentCompileCacheMountPath is what makes that default true.
+// 这里提供的是默认值而非所有权接管。若某个角色显式设置了其中任一变量名，则保留
+// 其自有值：operator 仅负责填充默认值，而挂载在 ModelDeploymentCompileCacheMountPath
+// 的卷使该默认值生效。
 //
-// An engine the operator does not know gets nothing rather than a wrong path. The names belong
-// to the libraries an engine may or may not carry, so a name the operator cannot vouch for
-// would be a claim about an engine it has never seen.
+// 对于 operator 不认识的引擎，不返回任何条目，以免给出错误路径。这些变量名属于
+// 引擎可能携带也可能不携带的库，operator 无法为其担保的引擎设置这些变量等同于
+// 对未知引擎做出不实假定。
 func modelDeploymentRuntimeCacheDefaultedEnv(engine string) []core.EnvVar {
 	switch engine {
 	case workercore.ModelDeploymentEngineVLLM, workercore.ModelDeploymentEngineSGLang:

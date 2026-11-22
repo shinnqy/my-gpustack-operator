@@ -9,17 +9,17 @@ import (
 )
 
 const (
-	// ResourceTypeLabel is the label key to indicate the system type of delegated resource.
+	// ResourceTypeLabel 是用于标识托管资源系统类型的 label key。
 	ResourceTypeLabel = "resource." + systemname.LabelPrefix + "type"
 
-	// ResourceNoteAnnoPrefix is the annotation prefix to indicate the note of resource.
+	// ResourceNoteAnnoPrefix 是用于标识资源备注的 annotation 前缀。
 	ResourceNoteAnnoPrefix = "note." + systemname.LabelPrefix
 )
 
-// NoteResource armors the resource by adding a label if Resource Type(resType) is not empty and setting an annotation if notes is not empty.
+// NoteResource 为资源添加标记：若资源类型（resType）不为空则添加 label，若 notes 不为空则设置 annotation。
 //
-// Resource Type is an internal identify for gpustack, it can be used to indicate the system type of delegated resource.
-// Returns true if the resource is noted, false otherwise.
+// 资源类型是 gpustack 的内部标识，可用于指明托管资源的系统类型。
+// 若资源已添加标记则返回 true，否则返回 false。
 func NoteResource(obj MetaObject, resType string, notes map[string]string) bool {
 	if obj == nil {
 		panic("object is nil")
@@ -57,7 +57,7 @@ func NoteResource(obj MetaObject, resType string, notes map[string]string) bool 
 	return noted
 }
 
-// DescribeResource explains the details of resource, resource type and notes may be empty.
+// DescribeResource 提取资源的详细信息，资源类型和 notes 可能为空。
 func DescribeResource(obj MetaObject) (resType string, notes map[string]string) {
 	if obj == nil {
 		panic("object is nil")
@@ -78,7 +78,7 @@ func DescribeResource(obj MetaObject) (resType string, notes map[string]string) 
 	return resType, notes
 }
 
-// DescribeResourceType explains the resource type of resource, resource type may be empty.
+// DescribeResourceType 提取资源的资源类型，资源类型可能为空。
 func DescribeResourceType(obj MetaObject) string {
 	if obj == nil {
 		panic("object is nil")
@@ -92,7 +92,7 @@ func DescribeResourceType(obj MetaObject) string {
 	return ""
 }
 
-// DescribeResourceNote explains the note of a resource with the given key.
+// DescribeResourceNote 提取资源中指定 key 对应的备注。
 func DescribeResourceNote(obj MetaObject, noteKey string) string {
 	if obj == nil {
 		panic("object is nil")
@@ -110,8 +110,8 @@ func DescribeResourceNote(obj MetaObject, noteKey string) string {
 	return ""
 }
 
-// UnnoteResource is similar to DescribeResource,
-// but it removes the resource labels and annotations.
+// UnnoteResource 与 DescribeResource 类似，
+// 但会移除资源的 label 和 annotation。
 func UnnoteResource(obj MetaObject) (resType string, notes map[string]string) {
 	if obj == nil {
 		panic("object is nil")
@@ -140,21 +140,21 @@ func UnnoteResource(obj MetaObject) (resType string, notes map[string]string) {
 	return resType, notes
 }
 
-// GetResourcesLabelSelectorOfType returns a label selector for the resources of the specified type.
+// GetResourcesLabelSelectorOfType 返回指定类型资源的 label selector。
 func GetResourcesLabelSelectorOfType(resType string) labels.Selector {
 	return labels.SelectorFromSet(labels.Set{
 		ResourceTypeLabel: resType,
 	})
 }
 
-// GetResourcesLabelSetOfType returns a label set for the resources of the specified type.
+// GetResourcesLabelSetOfType 返回指定类型资源的 label set。
 func GetResourcesLabelSetOfType[T ~map[string]string](resType string) T {
 	return map[string]string{
 		ResourceTypeLabel: resType,
 	}
 }
 
-// MatchResource returns true if the given resource matched by resource type and notes.
+// MatchResource 在给定资源与资源类型及 notes 匹配时返回 true。
 func MatchResource(obj MetaObject, resType string, noteKeyAndValues ...string) bool {
 	if obj == nil {
 		panic("object is nil")
@@ -176,7 +176,7 @@ func MatchResource(obj MetaObject, resType string, noteKeyAndValues ...string) b
 	return true
 }
 
-// EqualResourceTypeAndNotes returns true if the given two resources have the same resource type and notes.
+// EqualResourceTypeAndNotes 在两个资源具有相同的资源类型和 notes 时返回 true。
 func EqualResourceTypeAndNotes(expected, actual MetaObject) bool {
 	if expected == nil || actual == nil {
 		panic("object is nil")
@@ -197,7 +197,7 @@ func EqualResourceTypeAndNotes(expected, actual MetaObject) bool {
 	return true
 }
 
-// SyncResourceTypeAndNotes synchronizes the resource type and notes of actual to expected.
+// SyncResourceTypeAndNotes 将 actual 的资源类型和 notes 同步为 expected。
 func SyncResourceTypeAndNotes(expected, actual MetaObject) {
 	if expected == nil || actual == nil {
 		panic("object is nil")

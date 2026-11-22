@@ -31,10 +31,10 @@ const (
 	_InstancePersistentVolumeKind     = "InstancePersistentVolume"
 )
 
-// InstancePersistentVolumeHandler handles v1.InstancePersistentVolume objects.
+// InstancePersistentVolumeHandler 处理 v1.InstancePersistentVolume 对象。
 //
-// InstancePersistentVolumeHandler maps the v1.InstancePersistentVolume to a Kubernetes PersistentVolumeClaim resource,
-// which is named as the InstancePersistentVolume's name.
+// InstancePersistentVolumeHandler 将 v1.InstancePersistentVolume 映射到 Kubernetes PersistentVolumeClaim 资源，
+// 该资源与 InstancePersistentVolume 同名。
 type InstancePersistentVolumeHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -47,7 +47,7 @@ func (h *InstancePersistentVolumeHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &core.PersistentVolumeClaim{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -60,10 +60,10 @@ func (h *InstancePersistentVolumeHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_InstancePersistentVolumeResource)
 
-	// Create table convertor to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 的输出。
 	tc, err := extensionapi.NewJSONPathTableConvertor(
 		extensionapi.JSONPathColumn("Type", ".spec.type"),
 		extensionapi.JSONPathColumn("Capacity", ".spec.capacity"),
@@ -75,15 +75,15 @@ func (h *InstancePersistentVolumeHandler) SetupHandler(
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储。
 	h.ObjectInfo = &worker.InstancePersistentVolume{}
 	h.CurdOperations = extensionapi.WithCurd(tc, h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 
-	// Create subresource handlers.
+	// 创建子资源处理器。
 	srs = map[string]rest.Storage{
 		"events": newInstancePersistentVolumeEventsHandler(h.ObjectInfo, opts),
 	}
@@ -112,8 +112,8 @@ func (h *InstancePersistentVolumeHandler) New() runtime.Object {
 func (h *InstancePersistentVolumeHandler) Destroy() {
 }
 
-// SupportsDryRun reports true: OnCreate and OnUpdate write the PersistentVolumeClaim once each, and
-// pass the options on to that write.
+// SupportsDryRun 返回 true：OnCreate 和 OnUpdate 各自只写入一次 PersistentVolumeClaim，
+// 并将选项传递给该写入操作。
 func (h *InstancePersistentVolumeHandler) SupportsDryRun() bool {
 	return true
 }
@@ -126,7 +126,7 @@ const (
 func (h *InstancePersistentVolumeHandler) OnCreate(ctx context.Context, obj runtime.Object, opts ctrlcli.CreateOptions) (runtime.Object, error) {
 	instPV := obj.(*worker.InstancePersistentVolume)
 
-	// Validate.
+	// 校验。
 	var stgClass *storage.StorageClass
 	if ptr.Deref(instPV.Spec.Type, "") == "" {
 		stgClassList := new(storage.StorageClassList)
@@ -167,7 +167,7 @@ func (h *InstancePersistentVolumeHandler) OnCreate(ctx context.Context, obj runt
 		}
 	}
 
-	// Default.
+	// 设置默认值。
 	if instPV.Spec.Capacity.IsZero() {
 		instPV.Spec.Capacity = *resource.NewQuantity(20*1<<30, resource.BinarySI)
 	}
@@ -183,7 +183,7 @@ func (h *InstancePersistentVolumeHandler) OnCreate(ctx context.Context, obj runt
 		}
 	}
 
-	// Create.
+	// 创建。
 	pvc := convertPersistentVolumeClaimFromInstancePersistentVolume(instPV)
 	err := h.Client.Create(ctx, pvc, &opts)
 	if err != nil {
@@ -199,7 +199,7 @@ func (h *InstancePersistentVolumeHandler) NewList() runtime.Object {
 }
 
 func (h *InstancePersistentVolumeHandler) OnList(ctx context.Context, opts ctrlcli.ListOptions) (runtime.Object, error) {
-	// List.
+	// 列出。
 	pvcList := new(core.PersistentVolumeClaimList)
 	err := h.APIReader.List(ctx, pvcList,
 		convertPersistentVolumeClaimListOptsFromInstancePersistentVolumeListOpts(opts))
@@ -207,13 +207,13 @@ func (h *InstancePersistentVolumeHandler) OnList(ctx context.Context, opts ctrlc
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	itList := convertInstancePersistentVolumeListFromPersistentVolumeClaimList(pvcList, opts)
 	return itList, nil
 }
 
 func (h *InstancePersistentVolumeHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) (watch.Interface, error) {
-	// Watch.
+	// 监听。
 	uw, err := h.Client.(ctrlcli.WithWatch).Watch(ctx, new(core.PersistentVolumeClaimList),
 		convertPersistentVolumeClaimListOptsFromInstancePersistentVolumeListOpts(opts))
 	if err != nil {
@@ -229,31 +229,31 @@ func (h *InstancePersistentVolumeHandler) OnWatch(ctx context.Context, opts ctrl
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 由上下文取消。
 				return
 			case <-dw.StopChan():
-				// Stop by downstream.
+				// 由下游停止。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 由上游关闭。
 					return
 				}
 
-				// Nothing to do.
+				// 无需处理。
 				if e.Object == nil {
 					c <- e
 					continue
 				}
 
-				// Type assert.
+				// 类型断言。
 				pvc, ok := e.Object.(*core.PersistentVolumeClaim)
 				if !ok {
 					c <- e
 					continue
 				}
 
-				// Process bookmark.
+				// 处理 bookmark 事件。
 				if e.Type == watch.Bookmark {
 					systemmeta.UnnoteResource(pvc)
 					e.Object = &worker.InstancePersistentVolume{ObjectMeta: pvc.ObjectMeta}
@@ -261,18 +261,18 @@ func (h *InstancePersistentVolumeHandler) OnWatch(ctx context.Context, opts ctrl
 					continue
 				}
 
-				// Convert.
+				// 转换。
 				instPV := convertInstancePersistentVolumeFromPersistentVolumeClaim(pvc)
 				if instPV == nil {
 					continue
 				}
 
-				// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+				// 如果未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 				if !instancePersistentVolumeMatchFieldSelector(opts, instPV) {
 					continue
 				}
 
-				// Dispatch.
+				// 分发。
 				e.Object = instPV
 				c <- e
 			}
@@ -283,7 +283,7 @@ func (h *InstancePersistentVolumeHandler) OnWatch(ctx context.Context, opts ctrl
 }
 
 func (h *InstancePersistentVolumeHandler) OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (runtime.Object, error) {
-	// Get.
+	// 获取。
 	pvc := &core.PersistentVolumeClaim{
 		ObjectMeta: meta.ObjectMeta{
 			Name:      key.Name,
@@ -295,7 +295,7 @@ func (h *InstancePersistentVolumeHandler) OnGet(ctx context.Context, key types.N
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	instPV := convertInstancePersistentVolumeFromPersistentVolumeClaim(pvc)
 	if instPV == nil {
 		return nil, kerrors.NewNotFound(worker.Resource(_InstancePersistentVolumeResource), key.Name)
@@ -309,7 +309,7 @@ func (h *InstancePersistentVolumeHandler) OnUpdate(
 ) (runtime.Object, error) {
 	instPV, instPVOld := obj.(*worker.InstancePersistentVolume), oldObj.(*worker.InstancePersistentVolume)
 
-	// Validate.
+	// 校验。
 	var errs field.ErrorList
 	if !ptr.Equal(instPV.Spec.Type, instPVOld.Spec.Type) {
 		errs = append(errs, field.Forbidden(
@@ -330,7 +330,7 @@ func (h *InstancePersistentVolumeHandler) OnUpdate(
 		return nil, kerrors.NewInvalid(worker.Kind("InstancePersistentVolume"), instPV.Name, errs)
 	}
 
-	// Update.
+	// 更新。
 	oldPvc := new(core.PersistentVolumeClaim)
 	err := h.APIReader.Get(ctx, ctrlcli.ObjectKeyFromObject(instPV), oldPvc,
 		ctrlclix.WithoutQuorum)
@@ -358,13 +358,13 @@ func (h *InstancePersistentVolumeHandler) OnUpdate(
 func (h *InstancePersistentVolumeHandler) OnDelete(ctx context.Context, obj runtime.Object, opts ctrlcli.DeleteOptions) error {
 	instPV := obj.(*worker.InstancePersistentVolume)
 
-	// Delete.
+	// 删除。
 	pvc := &core.PersistentVolumeClaim{ObjectMeta: instPV.ObjectMeta}
 	return h.Client.Delete(ctx, pvc, &opts)
 }
 
 func convertPersistentVolumeClaimListOptsFromInstancePersistentVolumeListOpts(in ctrlcli.ListOptions) (out *ctrlcli.ListOptions) {
-	// Add necessary label selector.
+	// 添加必要的标签选择器。
 	if lbs := systemmeta.GetResourcesLabelSelectorOfType(_InstancePersistentVolumeResource); in.LabelSelector == nil {
 		in.LabelSelector = lbs
 	} else {
@@ -458,7 +458,7 @@ func convertInstancePersistentVolumeListFromPersistentVolumeClaimList(
 			continue
 		}
 
-		// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+		// 如果未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 		if !instancePersistentVolumeMatchFieldSelector(opts, instPV) {
 			continue
 		}

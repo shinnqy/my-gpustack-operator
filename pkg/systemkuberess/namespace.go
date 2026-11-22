@@ -12,7 +12,7 @@ import (
 	"gpustack.ai/gpustack/pkg/kubeclientset/review"
 )
 
-// InstallSystemNamespace creates the system namespace.
+// InstallSystemNamespace 创建系统 Namespace。
 func InstallSystemNamespace(ctx context.Context, cli kubernetes.Interface, nsName string) error {
 	err := review.CanDoCreate(ctx,
 		cli.AuthorizationV1().SelfSubjectAccessReviews(),

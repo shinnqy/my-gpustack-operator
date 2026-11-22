@@ -7,10 +7,10 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// NodeModelStore is the v1 view of one node's model cache: what the node holds, how far its
-// downloads are, and its effective configuration. Its writers, the worker and the node's plugin,
-// write the v1alpha1 resource; this view serves get, list, watch and delete, the last for the
-// garbage collector, which watches the group's preferred version.
+// NodeModelStore 是单个节点模型缓存的 v1 视图：节点持有的数据、下载进度
+// 以及生效配置。其写入方（worker 与节点插件）写入 v1alpha1 资源；此视图提供
+// get、list、watch 和 delete 操作，其中 delete 供监听该 API 组首选版本的
+// 垃圾回收器使用。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -21,7 +21,7 @@ type NodeModelStore workercore.NodeModelStore
 
 var _ runtime.Object = (*NodeModelStore)(nil)
 
-// NodeModelStoreList holds the list of NodeModelStores.
+// NodeModelStoreList 保存 NodeModelStore 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type NodeModelStoreList struct {

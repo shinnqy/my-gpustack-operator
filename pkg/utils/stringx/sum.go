@@ -6,7 +6,7 @@ import (
 	"hash/fnv"
 )
 
-// SumByFNV64a sums up the string(s) by FNV-64a hash algorithm.
+// SumByFNV64a 使用 FNV-64a 哈希算法对字符串计算摘要。
 func SumByFNV64a(s string, ss ...string) string {
 	h := fnv.New64a()
 
@@ -19,7 +19,7 @@ func SumByFNV64a(s string, ss ...string) string {
 	return hex.EncodeToString(sum)
 }
 
-// SumBySHA256 sums up the string(s) by SHA256 hash algorithm.
+// SumBySHA256 使用 SHA256 哈希算法对字符串计算摘要。
 func SumBySHA256(s string, ss ...string) string {
 	h := sha256.New()
 
@@ -32,7 +32,7 @@ func SumBySHA256(s string, ss ...string) string {
 	return hex.EncodeToString(sum)
 }
 
-// SumBytesBySHA256 sums up the byte slice(s) by SHA256 hash algorithm.
+// SumBytesBySHA256 使用 SHA256 哈希算法对字节切片计算摘要。
 func SumBytesBySHA256(bs []byte, bss ...[]byte) string {
 	h := sha256.New()
 
@@ -45,7 +45,7 @@ func SumBytesBySHA256(bs []byte, bss ...[]byte) string {
 	return hex.EncodeToString(sum)
 }
 
-// SumBytesBySHA224 sums up the byte slice(s) by SHA224 hash algorithm.
+// SumBytesBySHA224 使用 SHA224 哈希算法对字节切片计算摘要。
 func SumBytesBySHA224(bs []byte, bss ...[]byte) string {
 	h := sha256.New224()
 

@@ -17,31 +17,29 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/scaling/priors"
 )
 
-// modelDeploymentScalerPriorDeclaration is what a deployment states.
+// modelDeploymentScalerPriorDeclaration 表示部署声明的内容。
 //
-// IT IS READ FROM THE DEPLOYMENT AND NOT FROM A PROFILE, because the catalog is
-// selected by what the deployment states and not the other way round.
+// 该信息从部署中读取而非从 profile 中读取，因为目录是根据部署声明的内容来选择的，而不是相反。
 type modelDeploymentScalerPriorDeclaration struct {
-	// identity is the identity the deployment states.
+	// identity 是部署声明的标识。
 	identity priors.Identity
 
-	// topology is the shape of one scaling replica the deployment states.
+	// topology 是部署声明的单个扩缩容副本形态。
 	topology priors.Topology
 
-	// flags are the engine arguments the deployment passes.
+	// flags 是部署传入的引擎参数。
 	flags map[string]string
 
-	// engineFamily is the engine the deployment runs.
+	// engineFamily 是部署运行的引擎。
 	engineFamily string
 
-	// instance is the instance type the deployment runs on.
+	// instance 是部署运行的 InstanceType。
 	instance *workerapi.InstanceType
 }
 
-// shape returns the shape the deployment states.
+// shape 返回部署声明的形态。
 //
-// IT NAMES THE SIX ELEMENTS, because the catalog is selected by a shape and not
-// by a name.
+// 这里显式列出六个要素，因为目录是根据形态而非名称来选择的。
 func (d modelDeploymentScalerPriorDeclaration) shape(role priors.RoleKind) priors.Shape {
 	return priors.Shape{
 		Role:         role,
@@ -53,16 +51,13 @@ func (d modelDeploymentScalerPriorDeclaration) shape(role priors.RoleKind) prior
 	}
 }
 
-// modelDeploymentScalerPriorDeclarationOf reads what the deployment states.
+// modelDeploymentScalerPriorDeclarationOf 读取部署声明的内容。
 //
-// IT READS THE MODEL, THE ENGINE, THE HARDWARE AND THE SHAPE OF THE REPLICA,
-// because those four are what the catalog is selected by.
+// 它会读取模型、引擎、硬件以及副本的形态，因为目录正是根据这四项来选择的。
 func modelDeploymentScalerPriorDeclarationOf(
 	ctx context.Context, reader ctrlcli.Reader, target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 ) (declaration modelDeploymentScalerPriorDeclaration, err error) {
-	// THE REFUSAL IS REDACTED HERE, because the reader of the parallelism
-	// reports the value it read, and a value the user wrote belongs to nobody
-	// else.
+	// 此处对拒绝信息进行脱敏，因为并行度读取器会报告其读取到的值，而用户填写的值不应泄露给其他方。
 	defer func() {
 		err = modelDeploymentScalerRedactPriorRefusal(err, role, nil)
 	}()
@@ -72,9 +67,7 @@ func modelDeploymentScalerPriorDeclarationOf(
 		return declaration, modelDeploymentScalerPriorRefusal(role.Name, "%v", err)
 	}
 	declaration.flags = flags
-	// THE REPLICA IS HELD BEFORE THE SHAPE IS READ, because a deployment the
-	// operator cannot manage has no shape a measurement applies to, and the
-	// reader of the shape reports the parallelism it could not read.
+	// 在读取形态之前先拦截此类副本，因为 operator 无法托管的部署没有可供测量结果适用的形态，且形态读取器会报告其无法读取并行度。
 	if len(role.Command) != 0 || role.ReplicaSize > 1 || role.ElasticEP != nil {
 		return declaration, modelDeploymentScalerPriorRefusal(role.Name, "Catalog requires a managed single-serving-Pod replica")
 	}
@@ -102,11 +95,9 @@ func modelDeploymentScalerPriorDeclarationOf(
 	return declaration, nil
 }
 
-// modelDeploymentScalerPriorEngineImage returns the image the deployment runs.
+// modelDeploymentScalerPriorEngineImage 返回部署运行的镜像。
 //
-// IT FALLS BACK TO THE ENGINE NAME, because an engine is named by the operator
-// and a measurement names the engine family, and the family of the name is the
-// family of the engine.
+// 当未指定镜像时回退到引擎名称，因为引擎由 operator 命名，而测量记录使用引擎族，且引擎名称所属的引擎族就是该引擎的引擎族。
 func modelDeploymentScalerPriorEngineImage(target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole) string {
 	if role.Image != "" {
 		return role.Image
@@ -117,12 +108,9 @@ func modelDeploymentScalerPriorEngineImage(target *workercore.ModelDeployment, r
 	return target.Spec.Engine.Name
 }
 
-// modelDeploymentScalerPriorRequest reads the request a capacity prior is
-// resolved against.
+// modelDeploymentScalerPriorRequest 读取用于解析容量先验的请求。
 //
-// IT REDACTS EVERY ENVIRONMENT VALUE FROM EVERY REFUSAL IT RETURNS, because a
-// refusal reaches the conditions of the scaler, where the value of an
-// environment variable the user wrote belongs to nobody else.
+// 它会对返回的每条拒绝信息中的环境变量值进行脱敏，因为拒绝信息会进入扩缩容器的条件状态中，而用户设置的环境变量值不应泄露给其他方。
 func modelDeploymentScalerPriorRequest(
 	target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, profile *priors.Profile,
 	declaration modelDeploymentScalerPriorDeclaration,
@@ -134,11 +122,9 @@ func modelDeploymentScalerPriorRequest(
 	return request, modelDeploymentScalerRedactPriorRefusal(err, role, profile)
 }
 
-// modelDeploymentScalerPriorRequestMatched reads the request a capacity prior
-// is resolved against, before the refusal is redacted.
+// modelDeploymentScalerPriorRequestMatched 在对拒绝信息脱敏之前，读取用于解析容量先验的请求。
 //
-// IT HOLDS THE DEPLOYMENT AGAINST THE PROFILE, because a measurement describes
-// the deployment it was taken on and not every deployment of the shape.
+// 它将部署与 profile 进行比对校验，因为一条测量结果仅描述测量时所用的部署，而非同形态下的所有部署。
 func modelDeploymentScalerPriorRequestMatched(
 	target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, profile *priors.Profile,
 	declaration modelDeploymentScalerPriorDeclaration,
@@ -148,9 +134,7 @@ func modelDeploymentScalerPriorRequestMatched(
 		Identity: declaration.identity,
 		Topology: declaration.topology,
 	}
-	// A MOUNTED VOLUME IS ALLOWED, because a deployment mounts the weights,
-	// the caches and the logs of its own role, and the engine is matched by
-	// its family rather than by the digest of the image it runs.
+	// 允许挂载卷，因为部署需要为其自身角色挂载权重、缓存和日志；同时引擎按引擎族进行匹配，而非按所运行镜像的 digest 匹配。
 	if target.Spec.KVCache != nil || target.Spec.KVTransfer != nil || target.Spec.Router != nil {
 		return request, modelDeploymentScalerPriorRefusal(role.Name, "generated cache, transfer and router configuration is not supported by Catalog")
 	}
@@ -228,14 +212,11 @@ func modelDeploymentScalerPriorTopology(engine string, role *workercore.ModelDep
 	}, nil
 }
 
-// modelDeploymentScalerPriorModelIdentity reads the model the deployment
-// serves.
+// modelDeploymentScalerPriorModelIdentity 读取部署所服务的模型。
 //
-// IT READS THE ARTIFACT WHEN THE DEPLOYMENT NAMES ONE, because the artifact
-// resolves the repository and the weight commit the deployment runs.
+// 当部署指定了制品（artifact）时从该制品读取，因为制品解析了部署所运行的仓库及权重提交版本。
 //
-// IT NAMES NO REVISION WHEN THE DEPLOYMENT STATES NONE, because a deployment
-// that pins no weight commit says nothing about the weights it runs.
+// 当部署未指定版本（revision）时也不填写修订版本，因为未固定权重提交版本的部署并未说明其实际运行的权重。
 func modelDeploymentScalerPriorModelIdentity(
 	ctx context.Context, reader ctrlcli.Reader, target *workercore.ModelDeployment, role string,
 	flags map[string]string,
@@ -278,9 +259,7 @@ func modelDeploymentScalerPriorModelIdentity(
 	if !specified {
 		tokenizer = ""
 	}
-	// THE QUANTIZATION COMES FROM THE ENGINE ARGUMENT OR FROM THE ANNOTATION,
-	// because a deployment states its recipe in one of the two and a deployment
-	// that states neither has chosen no recipe.
+	// 量化方式来自引擎参数或注解，因为部署会在二者之一中声明其量化方案；若二者均未声明，则表示未选择任何量化方案。
 	quantization := flags["--quantization"]
 	if quantization == "" {
 		quantization = target.Annotations[workercore.ModelDeploymentScalerPrecisionAnnotationKey]
@@ -293,15 +272,11 @@ func modelDeploymentScalerPriorModelIdentity(
 	}, nil
 }
 
-// modelDeploymentScalerPriorModel refuses a deployment that states a model the
-// profile did not measure.
+// modelDeploymentScalerPriorModel 拒绝声明了 profile 未曾测量过的模型的部署。
 //
-// THE MODEL NAME IS COMPARED WITHOUT ITS ORGANIZATION AND WITHOUT ITS CASE,
-// because a deployment declares the model it serves and a source declares the
-// model it measured, and the two spell one model differently.
+// 模型名称在比较时忽略组织前缀和大小写，因为部署声明其服务的模型，而数据源声明其测量的模型，两者对同一模型的拼写方式可能不同。
 //
-// THE REVISION IS COMPARED ONLY WHEN BOTH SIDES PIN ONE, because a public
-// source pins no weight commit and a deployment pins none either.
+// 仅当双方都固定了版本（revision）时才比较修订版本，因为公开数据源不固定权重提交版本，部署通常也不固定。
 func modelDeploymentScalerPriorModel(
 	role *workercore.ModelDeploymentRole, identity priors.ModelIdentity,
 	declaration modelDeploymentScalerPriorDeclaration,
@@ -322,11 +297,9 @@ func modelDeploymentScalerPriorModel(
 	return nil
 }
 
-// modelDeploymentScalerPriorHardwareIdentity reads the hardware the deployment
-// runs on.
+// modelDeploymentScalerPriorHardwareIdentity 读取部署运行的硬件。
 //
-// IT READS THE INSTANCE TYPE, because the instance type is what names the
-// accelerator the deployment runs on.
+// 它会读取 InstanceType，因为 InstanceType 指明了部署所运行的加速器。
 func modelDeploymentScalerPriorHardwareIdentity(
 	ctx context.Context, reader ctrlcli.Reader, role *workercore.ModelDeploymentRole,
 ) (*workerapi.InstanceType, priors.HardwareIdentity, error) {
@@ -344,11 +317,9 @@ func modelDeploymentScalerPriorHardwareIdentity(
 	return instance, identity, nil
 }
 
-// modelDeploymentScalerPriorHardware refuses a deployment whose instance type
-// contradicts the hardware the profile measured.
+// modelDeploymentScalerPriorHardware 拒绝其 InstanceType 与 profile 所测硬件相矛盾的部署。
 //
-// THE PRODUCT IS COMPARED BY ITS CANONICAL NAME, because a vendor publishes the
-// same accelerator under a product line name and under a part number.
+// 产品型号按其规范名称（canonical name）进行比较，因为厂商可能同时以产品线名称和部件号来发布同一款加速器。
 func modelDeploymentScalerPriorHardware(
 	role *workercore.ModelDeploymentRole, identity priors.HardwareIdentity, instance *workerapi.InstanceType,
 ) error {
@@ -366,19 +337,13 @@ func modelDeploymentScalerPriorHardware(
 	return nil
 }
 
-// modelDeploymentScalerPriorModelAnnotation checks the model identity the
-// deployment states.
+// modelDeploymentScalerPriorModelAnnotation 检查部署声明的模型标识。
 //
-// THE ANNOTATION IS OPTIONAL, because a deployment names the model it serves
-// and that name is the model identity. The deployment also names the model in
-// the engine arguments it passes, and admission holds the served name and the
-// declared name to the same value.
+// 该注解是可选的，因为部署已指定其服务的模型名称，该名称即构成模型标识。部署也会在传入的引擎参数中指定模型，而准入控制会确保服务模型名与声明的模型名保持一致。
 //
-// WHEN THE ANNOTATION IS THERE IT STATES EITHER A NAME OR A DIGEST, because a
-// digest is the identity and a name is the model the identity names.
+// 当存在该注解时，它声明的要么是名称，要么是 digest，因为 digest 本身就是标识，而名称则是该标识所指代的模型。
 //
-// THE PRECISION IS OPTIONAL AND FOLDED, because a recipe is spelled several
-// ways and the spelling says nothing about the weights.
+// 精度（precision）是可选的且会做大小写折叠归一化，因为同一种量化方案可能有多种拼写，而拼写差异本身不影响权重。
 func modelDeploymentScalerPriorModelAnnotation(
 	target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, declared priors.Identity,
 ) error {
@@ -404,14 +369,11 @@ func modelDeploymentScalerPriorModelAnnotation(
 	return nil
 }
 
-// modelDeploymentScalerPriorHardwareAnnotation checks the hardware identity
-// the deployment states.
+// modelDeploymentScalerPriorHardwareAnnotation 检查部署声明的硬件标识。
 //
-// THE ANNOTATION IS OPTIONAL, because a deployment selects the profile it
-// wants and the profile names the hardware it was measured on.
+// 该注解是可选的，因为部署选择其所需的 profile，而 profile 本身已指明了测量所使用的硬件。
 //
-// WHEN THE ANNOTATION IS THERE IT STATES EITHER A NAME OR A DIGEST, because a
-// digest is the identity and a name is the accelerator the identity names.
+// 当存在该注解时，它声明的要么是名称，要么是 digest，因为 digest 本身就是标识，而名称则是该标识所指代的加速器。
 func modelDeploymentScalerPriorHardwareAnnotation(
 	target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, declared priors.Identity,
 ) error {
@@ -447,14 +409,11 @@ func modelDeploymentScalerPriorHardwareAnnotation(
 	return nil
 }
 
-// modelDeploymentScalerPriorEngine checks the engine the deployment runs.
+// modelDeploymentScalerPriorEngine 检查部署运行的引擎。
 //
-// THE ENGINE FAMILY MUST MATCH, because a measurement taken with one engine
-// says nothing about another one.
+// 引擎族必须匹配，因为基于某一种引擎的测量结果不能说明另一种引擎的表现。
 //
-// THE IMAGE DIGEST IS NOT REQUIRED, because a deployment names the image it
-// runs and a source names the image it measured, and the two differ in a tag
-// or a digest while the engine is the same one.
+// 不要求镜像 digest 一致，因为部署指定其运行的镜像，而数据源记录其测量的镜像，两者在 tag 或 digest 上可能不同，但底层引擎是相同的。
 func modelDeploymentScalerPriorEngine(
 	target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, declared priors.Identity,
 ) error {
@@ -466,15 +425,11 @@ func modelDeploymentScalerPriorEngine(
 	if image == "" {
 		image = target.Spec.Engine.Image
 	}
-	// THE ROLE IMAGE MUST RUN THE ENGINE THE DEPLOYMENT NAMES, when the image
-	// names a family at all.
+	// 当角色镜像标明了引擎族时，该镜像必须运行部署所指定的引擎。
 	if imageFamily := priors.EngineFamily(image); imageFamily != "" && imageFamily != family {
 		return modelDeploymentScalerPriorRefusal(role.Name, "the engine image of the role does not match the deployment engine")
 	}
-	// THE PROFILE MUST HAVE BEEN MEASURED WITH THE ENGINE THE DEPLOYMENT RUNS.
-	// A PROFILE IMAGE THAT NAMES NO FAMILY IS ACCEPTED ONLY WHEN THE
-	// DEPLOYMENT RUNS THE SAME IMAGE, because a comparison of two images that
-	// name no family says nothing about the engine behind them.
+	// profile 必须是在部署所运行的同一引擎下测得的。当 profile 镜像未标明任何引擎族时，仅在部署运行完全相同的镜像时才予接受，因为比较两个均未标明引擎族的镜像无法判断它们背后的引擎是否相同。
 	profileFamily := priors.EngineFamily(declared.Engine.Image)
 	if profileFamily == "" {
 		if declared.Engine.Image != image {
@@ -488,8 +443,7 @@ func modelDeploymentScalerPriorEngine(
 	return nil
 }
 
-// modelDeploymentScalerEngineFamily returns the engine family a deployment
-// runs.
+// modelDeploymentScalerEngineFamily 返回部署运行的引擎族。
 func modelDeploymentScalerEngineFamily(engine string) string {
 	switch engine {
 	case workercore.ModelDeploymentEngineVLLM:
@@ -501,21 +455,13 @@ func modelDeploymentScalerEngineFamily(engine string) string {
 	}
 }
 
-// modelDeploymentScalerPriorServingConfig reads the serving configuration the
-// deployment runs under.
+// modelDeploymentScalerPriorServingConfig 读取部署运行所采用的服务配置。
 //
-// IT ADOPTS THE SETTING THE MEASUREMENT RAN UNDER FOR EVERY SETTING THE
-// DEPLOYMENT DOES NOT STATE, because a flag the deployment leaves out is not a
-// statement about the engine and the operator owns the flags it renders
-// itself.
+// 对于部署未显式声明的每一项设置，采用测量运行时的对应设置，因为部署省略某个参数并不代表对引擎的声明，且 operator 负责渲染其自身控制的参数。
 //
-// IT KEEPS EVERY SETTING THE DEPLOYMENT STATES, so a deployment that states a
-// setting the measurement ran under differently is refused by the comparison
-// against the profile.
+// 保留部署显式声明的每一项设置，这样当部署声明的设置与测量运行时的设置不同时，与 profile 的比对便会拒绝该部署。
 //
-// IT KEEPS THE ROUTER OF THE DEPLOYMENT, because a deployment with a router
-// is refused before this gate and a measurement taken behind a router does
-// not describe a deployment without one.
+// 保留部署的 router 配置，因为带有 router 的部署在此关卡之前已被拒绝，而在 router 之后测得的结果也不能用来描述不带 router 的部署。
 func modelDeploymentScalerPriorServingConfig(
 	engine string, role *workercore.ModelDeploymentRole, flags map[string]string, profile priors.ServingConfig,
 ) (priors.ServingConfig, error) {
@@ -549,8 +495,7 @@ func modelDeploymentScalerPriorServingConfig(
 	return result, nil
 }
 
-// sortedEnvironmentEntries renders an effective environment as the sorted
-// KEY=value list the catalog schema stores.
+// sortedEnvironmentEntries 将有效环境变量渲染为目录 schema 所存储的、已排序的 KEY=value 列表。
 func sortedEnvironmentEntries(env map[string]string) []string {
 	entries := make([]string, 0, len(env))
 	for name, value := range env {
@@ -560,12 +505,9 @@ func sortedEnvironmentEntries(env map[string]string) []string {
 	return entries
 }
 
-// modelDeploymentScalerDeploymentEnv returns the effective literal environment
-// of a role, last-wins per name.
+// modelDeploymentScalerDeploymentEnv 返回角色的有效字面量环境变量，同名变量以最后一次出现的为准。
 //
-// EVERY ENTRY IS A LITERAL NAME=VALUE PAIR BY API SHAPE — this
-// ModelDeploymentEnvVar carries no indirection, so there is no value source to
-// refuse here.
+// 从 API 结构上看，每一项都是字面量 NAME=VALUE 对——此 ModelDeploymentEnvVar 不包含间接引用，因此此处没有需要拒绝的值来源。
 func modelDeploymentScalerDeploymentEnv(role *workercore.ModelDeploymentRole) (map[string]string, error) {
 	env := map[string]string{}
 	for i := range role.Env {
@@ -578,22 +520,13 @@ func modelDeploymentScalerDeploymentEnv(role *workercore.ModelDeploymentRole) (m
 	return env, nil
 }
 
-// modelDeploymentScalerMatchEngineEnv refuses unless the deployment's
-// effective environment agrees with the environment the prior was measured
-// under.
+// modelDeploymentScalerMatchEngineEnv 在部署的有效环境变量与先验测量时的环境变量不一致时予以拒绝。
 //
-// IT IS BIDIRECTIONAL AND EXACT FOR THE VARIABLES THE RECORD CARRIES: a
-// variable the measurement recorded and the deployment lacks, and any value
-// difference are each a refusal, because every one of them changes the engine
-// configuration the measured capacity was produced under.
+// 对于记录中包含的变量，此校验是双向且精确的：测量记录中有而部署缺少的变量，以及任何值上的差异，都会导致拒绝，因为其中每一项都会改变测得容量时所依赖的引擎配置。
 //
-// IT HOLDS THE DEPLOYMENT AGAINST NO VARIABLE THE RECORD DOES NOT CARRY WHEN
-// THE RECORD IS INCOMPLETE, because a source that could not watch the whole
-// environment says nothing about the variables it did not see, and an
-// environment that was not observed is not an environment that was empty.
+// 当记录不完整时，不会依据记录未包含的变量来限制部署，因为无法观测全部环境的来源无法说明其未观测到的变量，未被观测到的环境也不等同于空环境。
 //
-// IT NAMES NO VALUE, because a refusal reaches the conditions of the scaler
-// and a value the user wrote belongs to nobody else.
+// 拒绝信息中不列出任何变量值，因为拒绝信息会进入扩缩容器的条件状态中，而用户填写的值不应泄露给其他方。
 func modelDeploymentScalerMatchEngineEnv(recorded, deployed []string, complete bool) error {
 	measured := map[string]string{}
 	for _, entry := range recorded {
@@ -648,18 +581,11 @@ func modelDeploymentScalerMatchEngineEnv(recorded, deployed []string, complete b
 	return nil
 }
 
-// modelDeploymentScalerPriorOmittedDefaultsGate refuses a deployment that
-// omits an engine argument the catalog records a contradicting effective
-// default for.
+// modelDeploymentScalerPriorOmittedDefaultsGate 拒绝省略了某引擎参数、但目录为该参数记录了相互矛盾的有效默认值的部署。
 //
-// AN OMITTED ARGUMENT IS NOT A REFUSAL, because a flag the deployment leaves
-// at the engine default is not a statement about the engine and the catalog
-// says nothing about a default it did not record. The setting the catalog
-// recorded is adopted for it.
+// 省略参数本身不会触发拒绝，因为部署将参数保留为引擎默认值并不构成对引擎的声明，且目录对未记录的默认值也不作约束。此时会采用目录中记录的设置。
 //
-// IT REFUSES A DEFAULT THAT CONTRADICTS THE SERVING CONFIGURATION, because a
-// measurement that offloaded the KV cache to the host while the catalog says
-// the offload was none describes a different engine.
+// 若默认值与服务配置相矛盾则会拒绝，例如测量时将 KV cache 卸载到主机内存，而目录记录卸载策略为 none，这描述的是不同的引擎行为。
 func modelDeploymentScalerPriorOmittedDefaultsGate(
 	engine string, profile priors.ServingConfig, flags map[string]string,
 ) error {
@@ -694,36 +620,22 @@ func modelDeploymentScalerPriorOmittedDefaultsGate(
 	return nil
 }
 
-// modelDeploymentScalerDtypeSpellings are the dtype spellings the engines
-// accept.
+// modelDeploymentScalerDtypeSpellings 是引擎接受的 dtype 拼写列表。
 //
-// IT IS A CLOSED LIST AND NOT A SHAPE CHECK, because a spelling the list does
-// not carry is a spelling this operator cannot vouch for, and an unvouched
-// default is not a default the engine ran under.
+// 这是一个封闭列表而非形态校验，因为不在该列表中的拼写是本 operator 无法保证的拼写，而未经确认的默认值不能视为引擎实际运行所依据的默认值。
 var modelDeploymentScalerDtypeSpellings = []string{
 	"auto", "half", "bfloat16", "bf16", "float16", "fp16", "float32", "fp32",
 }
 
-// modelDeploymentScalerOperatorEnvGate refuses a deployment whose engine would
-// carry an environment variable the catalog cannot account for.
+// modelDeploymentScalerOperatorEnvGate 拒绝其引擎会携带目录无法解释的环境变量的部署。
 //
-// THE OPERATOR WRITES VARIABLES INTO THE ENGINE CONTAINER, and a variable it
-// writes and the measurement did not run under is a difference between the two
-// engine configurations. The operator knows every name it writes, so the names
-// it writes are declared capacity-neutral below, and a name it starts writing
-// that the declaration does not carry refuses the prior until an operator says
-// the variable is neutral.
+// operator 会向引擎容器写入环境变量；凡是它写入而测量运行时并未包含的变量，都会造成两套引擎配置之间的差异。operator 清楚自己写入的每一个变量名，因此下面将这些写入的名称声明为容量中立（capacity-neutral）；如果它开始写入未在声明列表中的新名称，在 operator 确认该变量为中立之前，该关卡将拒绝使用此先验。
 //
-// IT CHECKS THE DECLARED TABLE AND THE ACTUAL RENDER, because the render is
-// what reaches the container. A table the operator writes by hand says nothing
-// about the render that runs, and a name the render writes and the table does
-// not carry is a name the measurement did not run under.
+// 该关卡同时检查声明表和实际渲染结果，因为最终进入容器的是渲染结果。仅靠手写声明表无法约束实际执行的渲染逻辑，任何由渲染器写入但声明表未包含的变量名，都是测量运行时未曾出现的变量。
 //
-// IT ACCOUNTS FOR THE DEFAULTED NAMES AND THE ARTIFACT NAMES, because the
-// connector is refused before this gate and the rank names belong to an
-// instance that spans several Pods, which is refused as well.
+// 此处已考虑默认值注入的变量名和制品（artifact）相关变量名，因为连接器在此关卡之前已被拒绝，而 rank 相关变量名属于跨多个 Pod 的实例，同样已被拒绝。
 //
-// IT NAMES NO VALUE, because a value is a secret and a name is not.
+// 拒绝信息中不列出任何变量值，因为变量值属于私密信息，而变量名不是。
 func modelDeploymentScalerOperatorEnvGate(
 	engine string, target *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 ) error {
@@ -735,20 +647,13 @@ func modelDeploymentScalerOperatorEnvGate(
 	return modelDeploymentScalerAccountForInjectedEnv(append(declared, rendered...))
 }
 
-// modelDeploymentScalerRenderedOperatorEnv returns the names the operator
-// writes into the engine container, as the renderer writes them.
+// modelDeploymentScalerRenderedOperatorEnv 返回由渲染器实际写入引擎容器的 operator 环境变量名称。
 //
-// IT READS THE RENDER, because the render is the document the engine runs
-// with. A gate that reads a table cannot see a name the renderer starts
-// writing.
+// 它直接读取渲染结果，因为渲染结果才是引擎实际运行所依据的配置。只读取声明表的关卡无法发现渲染器新开始写入的变量名。
 //
-// IT LEAVES OUT THE NAMES THE ROLE SETS, because those are the deployment's
-// own variables. The recorded environment covers them, and the gate is about
-// what the operator adds to them.
+// 它会排除角色自身设置的变量名，因为那些属于部署自身的变量。测量记录的环境已覆盖这些变量，而此关卡关注的是 operator 额外注入的变量。
 //
-// IT RENDERS WITHOUT A CONNECTOR AND WITHOUT AN ARTIFACT, because the
-// connector and the artifact are refused before this gate and their names are
-// accounted for where they are refused.
+// 渲染时不传入连接器和制品（artifact），因为带有连接器和制品的情况在此关卡之前已被拒绝，其涉及的变量名已在被拒绝的位置得到处理。
 func modelDeploymentScalerRenderedOperatorEnv(engine string, role *workercore.ModelDeploymentRole) []string {
 	env := mergeModelDeploymentEnv(engine, role, ModelDeploymentConnectorRender{}, nil, false)
 	names := make([]string, 0, len(env))
@@ -761,12 +666,9 @@ func modelDeploymentScalerRenderedOperatorEnv(engine string, role *workercore.Mo
 	return names
 }
 
-// modelDeploymentScalerAccountForInjectedEnv refuses an injected environment
-// variable the operator has not declared capacity-neutral.
+// modelDeploymentScalerAccountForInjectedEnv 拒绝尚未被 operator 声明为容量中立（capacity-neutral）的注入环境变量。
 //
-// IT IS A SEPARATE FUNCTION SO THE GATE CAN BE EXERCISED WITH A NAME THE
-// OPERATOR DOES NOT WRITE YET, because a gate that cannot be exercised with
-// the case it exists for cannot be trusted.
+// 将其拆分为独立函数，是为了能够使用 operator 尚未实际写入的变量名来测试该关卡，因为一个无法针对其设计目标场景进行测试的关卡是不可信的。
 func modelDeploymentScalerAccountForInjectedEnv(names []string) error {
 	for _, name := range names {
 		if !slices.Contains(modelDeploymentScalerCapacityNeutralEnvNames, name) {
@@ -778,22 +680,17 @@ func modelDeploymentScalerAccountForInjectedEnv(names []string) error {
 	return nil
 }
 
-// modelDeploymentScalerCapacityNeutralEnvNames are the environment variables
-// the operator writes into the engine container that the operator declares not
-// to change the engine's measured capacity.
+// modelDeploymentScalerCapacityNeutralEnvNames 是 operator 写入引擎容器、且声明
+// 不会影响引擎实测容量的环境变量名称列表。
 //
-// IT IS A LIST OF NAMES AND NOT OF VALUES, because a value is a secret and a
-// name is not.
+// 这里仅记录变量名而非变量值，因为值可能包含敏感凭据，而变量名不会。
 //
-// IT IS WRITTEN OUT RATHER THAN DERIVED FROM THE RENDER, because a list taken
-// from the render would grow with the render and would never notice that a
-// new variable was written. The gate above compares the two, and the
-// disagreement is the signal: an operator who writes a new variable has to say
-// here that the variable does not change the capacity.
+// 该列表采用显式列举而非从渲染结果推导，因为若从渲染结果提取，列表会随渲染
+// 内容自动增长，无法察觉新增变量的写入。上方的校验门会比对两者，差异本身就是
+// 信号：编写新变量的开发者必须在此明确声明该变量不会改变容量。
 //
-// THE CACHE DIRECTORIES SAY WHERE THE ENGINE KEEPS WHAT IT COMPILED, and the
-// credentials and the endpoints say WHERE THE WEIGHTS COME FROM, and neither
-// says how the engine serves.
+// 缓存目录指明引擎存放编译产物的位置，凭据与端点指明权重来源，两者均不决定
+// 引擎的服务方式。
 var modelDeploymentScalerCapacityNeutralEnvNames = []string{
 	"HF_HUB_CACHE", "HF_XET_CACHE", "PIP_CACHE_DIR", "TORCH_HOME",
 	"FLASHINFER_WORKSPACE_BASE", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR",
@@ -806,19 +703,15 @@ var modelDeploymentScalerCapacityNeutralEnvNames = []string{
 	"VLLM_USE_MODELSCOPE", "SGLANG_USE_MODELSCOPE",
 }
 
-// modelDeploymentScalerRedactPriorRefusal removes the environment values from
-// a refusal.
+// modelDeploymentScalerRedactPriorRefusal 从拒绝错误中移除环境变量的值。
 //
-// IT REDACTS THE WHOLE CHAIN, because a value can reach the message through the
-// reader that parsed it, and a refusal that is scrubbed in one place is
-// scrubbed in every place the value could have entered.
+// 它会对整条错误链进行脱敏，因为变量值可能经由解析它的读取器进入错误消息，
+// 只要在一处完成清理，值可能渗入的所有位置都会被一并清理。
 //
-// IT KEEPS THE NAME OF THE VARIABLE, because the name says which variable the
-// refusal is about and a name is not the value.
+// 它会保留变量名称，因为名称仅用于指明拒绝错误涉及的变量，本身并非敏感值。
 //
-// IT LEAVES AN ERROR THAT IS NOT A REFUSAL ALONE, because a reader failure
-// keeps its own type for the admission and the retry, and it carries no
-// environment value.
+// 对于非拒绝类的 error，它会保持原样，因为读取器故障需要保留自身类型以供
+// 准入控制和重试逻辑使用，且其自身不携带环境变量值。
 func modelDeploymentScalerRedactPriorRefusal(
 	err error, role *workercore.ModelDeploymentRole, profile *priors.Profile,
 ) error {
@@ -839,12 +732,10 @@ func modelDeploymentScalerRedactPriorRefusal(
 	return &redacted
 }
 
-// modelDeploymentScalerEnvValues returns the values the role's environment and
-// the recorded environment carry.
+// modelDeploymentScalerEnvValues 返回角色环境变量及已记录环境变量中所携带的值。
 //
-// IT ACCEPTS A PROFILE THAT IS NOT YET KNOWN, because the declaration is read
-// before the catalog is searched and the reader of the parallelism reports a
-// value of the deployment.
+// 它接受尚未确定的 profile（可为 nil），因为声明在检索目录前就已读取，且并行度
+// 读取器会报告部署中配置的变量值。
 func modelDeploymentScalerEnvValues(role *workercore.ModelDeploymentRole, profile *priors.Profile) []string {
 	values := make([]string, 0, len(role.Env))
 	for i := range role.Env {
@@ -864,16 +755,14 @@ func modelDeploymentScalerEnvValues(role *workercore.ModelDeploymentRole, profil
 	return values
 }
 
-// modelDeploymentScalerRedactEnvValues removes the values from a message.
+// modelDeploymentScalerRedactEnvValues 从消息中移除指定的变量值。
 //
-// IT REMOVES THE QUOTED FORM AND THE WHOLE TOKEN, because a value of one
-// character stands inside every number and every identifier, and a message with
-// every number removed says less than the message did.
+// 它仅移除带引号的形式及完整独立的 token，因为单字符的值可能出现在任意数字
+// 和标识符内部，若把所有数字都删掉会导致消息丢失过多有效信息。
 //
-// IT FINDS THE TOKEN BY ITS NEIGHBORS AND NOT BY A WORD BOUNDARY, because a
-// word boundary exists next to a word character, and a value that starts with
-// a minus sign or a dot has none at its front. A negative number is a value
-// like any other, and it reaches the message the same way.
+// 它通过相邻字符而非单词边界来定位 token，因为单词边界仅存在于单词字符旁，
+// 而以负号或小数点开头的值前端并不存在单词边界。负数与普通值一样，也会以
+// 相同方式进入消息。
 func modelDeploymentScalerRedactEnvValues(message string, values []string) string {
 	for _, value := range values {
 		if value == "" {
@@ -890,11 +779,10 @@ func modelDeploymentScalerRedactEnvValues(message string, values []string) strin
 	return message
 }
 
-// modelDeploymentScalerRedactWholeToken replaces the value where it stands as
-// a token of its own.
+// modelDeploymentScalerRedactWholeToken 将作为独立 token 出现的变量值替换为脱敏标记。
 //
-// IT LEAVES A VALUE THAT IS PART OF A LONGER WORD ALONE, because a value of
-// one character stands inside every identifier and every number.
+// 它不会改动作为更长单词一部分出现的值，因为单字符的值可能出现在各类标识符
+// 和数字内部。
 func modelDeploymentScalerRedactWholeToken(message, value string) string {
 	var b strings.Builder
 	b.Grow(len(message))
@@ -921,8 +809,8 @@ func modelDeploymentScalerRedactWholeToken(message, value string) string {
 	}
 }
 
-// modelDeploymentScalerTokenStandsAlone reports whether the value stands
-// between two characters that do not make it part of a longer word.
+// modelDeploymentScalerTokenStandsAlone 判断给定值两侧的字符是否使其保持独立，
+// 而不会与相邻字符共同组成更长的单词。
 func modelDeploymentScalerTokenStandsAlone(message string, start, end int, value string) bool {
 	before := byte(0)
 	if start > 0 {
@@ -936,13 +824,10 @@ func modelDeploymentScalerTokenStandsAlone(message string, start, end int, value
 		modelDeploymentScalerTokenEdge(value[len(value)-1], after)
 }
 
-// modelDeploymentScalerTokenEdge reports whether the character beside the
-// value leaves the value a token of its own.
+// modelDeploymentScalerTokenEdge 判断值边缘侧的相邻字符是否仍使其构成独立 token。
 //
-// A WORD CHARACTER NEEDS A NON-WORD CHARACTER BESIDE IT, because a word
-// character beside a word character makes one longer word. A CHARACTER THAT IS
-// NOT A WORD CHARACTER STANDS NEXT TO ANYTHING, because a minus sign belongs
-// to the number it precedes.
+// 单词字符旁必须是非单词字符，因为两个单词字符相邻会组合成更长的单词。
+// 非单词字符则可与任意字符相邻，例如负号属于其后紧跟的数字。
 func modelDeploymentScalerTokenEdge(edge, neighbor byte) bool {
 	if modelDeploymentScalerWordByte(edge) {
 		return !modelDeploymentScalerWordByte(neighbor)
@@ -950,18 +835,17 @@ func modelDeploymentScalerTokenEdge(edge, neighbor byte) bool {
 	return true
 }
 
-// modelDeploymentScalerWordByte reports whether the byte is a letter, a digit
-// or an underscore.
+// modelDeploymentScalerWordByte 判断字节是否为字母、数字或下划线。
 func modelDeploymentScalerWordByte(b byte) bool {
 	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-// modelDeploymentScalerRedactedValue is what a redacted value is replaced with.
+// modelDeploymentScalerRedactedValue 是脱敏值被替换后的占位文本。
 const modelDeploymentScalerRedactedValue = "[redacted]"
 
-// modelDeploymentScalerPriorFlags reads identity-sensitive flags with the engine's spelling rules.
-// The full ordered argv remains in the catalog match, including unrecognized performance arguments.
+// modelDeploymentScalerPriorFlags 按引擎的参数拼写规则读取身份敏感的标志。
+// 完整的有序 argv（包括未识别的性能参数）仍保留在目录匹配中。
 func modelDeploymentScalerPriorFlags(engine string, args []string) (map[string]string, error) {
-	// Implement this function in chapter 23.
+	// 在第 23 章实现此函数。
 	return nil, nil
 }

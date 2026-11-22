@@ -10,16 +10,16 @@ type WatchBookmark struct {
 	rv *atomic.String
 }
 
-// NewWatchBookmark creates a new WatchBookmark.
+// NewWatchBookmark 创建一个新的 WatchBookmark。
 func NewWatchBookmark() WatchBookmark {
 	return WatchBookmark{
 		rv: atomic.NewString("0"),
 	}
 }
 
-// SwapResourceVersion swaps the current resource version with the new one if the new one is greater.
+// SwapResourceVersion 在新资源版本更大时将当前资源版本替换为新版本。
 //
-// SwapResourceVersion returns false if the new resource version is not swapped.
+// 如果未发生替换，SwapResourceVersion 返回 false。
 func (c WatchBookmark) SwapResourceVersion(newRv string) bool {
 	for {
 		oldRv := c.rv.Load()
@@ -31,16 +31,16 @@ func (c WatchBookmark) SwapResourceVersion(newRv string) bool {
 		if c.rv.CompareAndSwap(oldRv, newRv) {
 			return true
 		}
-		runtime.Gosched() // Yield to other goroutines.
+		runtime.Gosched() // 让出调度权给其他 goroutine。
 	}
 }
 
-// GetResourceVersion returns the latest resource version.
+// GetResourceVersion 返回最新的资源版本。
 func (c WatchBookmark) GetResourceVersion() string {
 	return c.rv.Load()
 }
 
-// DeepCopy returns a deep copy of the WatchBookmark.
+// DeepCopy 返回 WatchBookmark 的深拷贝。
 func (c WatchBookmark) DeepCopy() WatchBookmark {
 	return WatchBookmark{
 		rv: atomic.NewString(c.rv.Load()),

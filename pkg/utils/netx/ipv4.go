@@ -21,7 +21,7 @@ func IPv4FromCIDR(cidr string) (IPv4, error) {
 		return IPv4{}, err
 	}
 
-	// NB(thxCode): returns result that defined in RFC 4632 and RFC 4291.
+	// NB(thxCode): 返回 RFC 4632 和 RFC 4291 中定义的结果。
 	return IPv4FromIPNet(*n), nil
 }
 
@@ -32,21 +32,21 @@ func IPv4FromIPNet(n net.IPNet) IPv4 {
 	})
 }
 
-// Contains returns true if the given net.IP is contained in the IPv4.
+// Contains 在给定的 net.IP 包含于该 IPv4 网段中时返回 true。
 func (l IPv4) Contains(ip net.IP) bool {
 	return (*net.IPNet)(&l).Contains(ip)
 }
 
-// String returns the string representation of the IPv4.
+// String 返回该 IPv4 的字符串表示形式。
 func (l IPv4) String() string {
 	return (*net.IPNet)(&l).String()
 }
 
-// Next returns a IPv4 with the same mask.
+// Next 返回具有相同掩码的下一个 IPv4 网段。
 //
-// For example,
-// returns 172.16.192.0/18 if given 172.16.128.0/18,
-// returns 172.17.0.0/18 if given 172.16.192.0/18.
+// 例如，
+// 给定 172.16.128.0/18 时返回 172.16.192.0/18，
+// 给定 172.16.192.0/18 时返回 172.17.0.0/18。
 func (l IPv4) Next() IPv4 {
 	var (
 		o, s = l.Mask.Size()

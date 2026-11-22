@@ -14,35 +14,35 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/json"
 )
 
-// ModelScope resolves ModelScope repositories.
+// ModelScope 用于解析 ModelScope 仓库。
 //
-// Every method takes the token rather than holding one, so a client is shared across namespaces
-// without ever carrying a namespace's credential beyond one call.
+// 每个方法均通过参数接收 token 而非持有 token，从而使客户端可在多个 Namespace 间共享，
+// 且不会在单次调用之外保留任何 Namespace 的凭据。
 type ModelScope struct {
-	// Endpoint is the hub's base URL, e.g. "https://www.modelscope.cn".
+	// Endpoint 是 Hub 的基础 URL，例如 "https://www.modelscope.cn"。
 	Endpoint string
-	// Client sends the requests; see NewHTTPClient.
+	// Client 用于发送请求；参见 NewHTTPClient。
 	Client *http.Client
-	// MaxEntries bounds the tree entries of one resolution. Zero uses
-	// DefaultHuggingFaceMaxEntries, the bound the two hubs share.
+	// MaxEntries 限制单次解析的树条目上限。为零时使用
+	// DefaultHuggingFaceMaxEntries，两个 Hub 共用此上限。
 	MaxEntries int
 
-	// lsRemote asks the repository's git endpoint for its refs, keyed by ref name. Tests replace
-	// it; the default speaks the HTTP smart protocol itself.
+	// lsRemote 向仓库的 git 端点查询按 ref 名称索引的 refs。测试中会替换该函数；
+	// 默认实现直接通过 HTTP smart 协议通信。
 	lsRemote func(ctx context.Context, gitURL, token string) (map[string]string, error)
 }
 
-// modelScopeCommitPattern is the shape of a full commit, which is used as is and cross-checked
-// against git only when the revision is a branch or a tag.
+// modelScopeCommitPattern 为完整 commit 的格式，完整 commit 按原样使用，
+// 仅当 revision 为分支或标签时才通过 git 进行交叉校验。
 var modelScopeCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// resolveRevision resolves a branch or a tag to the commit both the hub's index and its git name,
-// and takes a full commit as is.
+// resolveRevision 将分支或标签解析为 Hub 索引与 git 共同确认的 commit，
+// 对完整 commit 则按原样采用。
 //
-// The commits endpoint is undocumented and answers master when its Ref parameter is misspelled,
-// so its answer is never trusted alone: for a branch it must equal the commit git names for the
-// same ref, and for an annotated tag the peeled entry git names for the tag. A disagreement
-// refuses the resolution: a drift breaks toward refusal, never toward wrong content.
+// commits 端点未经文档说明，且在 Ref 参数拼写错误时会返回 master，
+// 因此绝不单独信任其结果：对于分支，返回值必须与 git 中同名 ref 指向的 commit 一致；
+// 对于附注标签，必须与 git 中该标签解引用（peeled）条目的 commit 一致。
+// 若出现不一致则拒绝解析：存在偏差时宁可拒绝，绝不返回错误内容。
 func (m *ModelScope) resolveRevision(ctx context.Context, repository, revision, token string) (string, error) {
 	if modelScopeCommitPattern.MatchString(revision) {
 		return revision, nil
@@ -86,10 +86,9 @@ func (m *ModelScope) resolveRevision(ctx context.Context, repository, revision, 
 	return commit, nil
 }
 
-// modelScopeRefCommit picks the commit git names for a revision: the peeled entry of an
-// annotated tag, the tag itself if it is lightweight, the branch's ref. HEAD is deliberately not
-// a fallback: the commits endpoint answers master for a misspelled Ref, and falling back to HEAD
-// — which points at master — would confirm exactly that silent rewrite instead of catching it.
+// modelScopeRefCommit 选取 git 为 revision 指定的 commit：附注标签的解引用条目、
+// 轻量标签本身或分支的 ref。此处刻意不回退到 HEAD：commits 端点在 Ref 拼写错误时会返回 master，
+// 而指向 master 的 HEAD 若作为回退目标，恰好会印证这种静默重写，无法将其拦截。
 func modelScopeRefCommit(refs map[string]string, revision string) string {
 	for _, name := range []string{
 		"refs/tags/" + revision + "^{}", "refs/tags/" + revision, "refs/heads/" + revision,
@@ -102,13 +101,12 @@ func modelScopeRefCommit(refs map[string]string, revision string) string {
 	return ""
 }
 
-// modelScopePageBound is the listing size at which repo/files truncates silently (measured,
-// PoC-D), whatever pagination the query names: a page of this many entries is a truncation, and
-// only a walk over direct children can recover the tree.
+// modelScopePageBound 是 repo/files 接口发生静默截断的列表大小上限（经实测，PoC-D），
+// 无论查询中指定何种分页参数均是如此：恰好返回此数量条目的分页即意味发生了截断，
+// 只能通过遍历直接子项来恢复完整目录树。
 const modelScopePageBound = 3000
 
-// Resolve resolves revision to a commit and builds the manifest of the files at it that filter
-// selects.
+// Resolve 将 revision 解析为 commit，并构建经 filter 筛选后的该 commit 文件清单。
 func (m *ModelScope) Resolve(ctx context.Context, repository, revision, token string, filter Filter) (Resolution, error) {
 	commit, err := m.resolveRevision(ctx, repository, revision, token)
 	if err != nil {
@@ -123,10 +121,9 @@ func (m *ModelScope) Resolve(ctx context.Context, repository, revision, token st
 	return Resolution{Commit: commit, Manifest: manifest}, nil
 }
 
-// ListManifest builds the manifest of the files at commit that filter selects, from the hub's
-// file listing. A node recomputes an artifact's manifest this way, with the credential of the Pod
-// that mounts it, and compares the digest with the one the controller published. Every file's
-// digest is the hub's own sha256, so a ModelScope manifest has no gitsha1 lines.
+// ListManifest 根据 Hub 的文件列表，构建 commit 下经 filter 筛选的文件清单。
+// 节点使用挂载该制品的 Pod 所持凭据按此方式重新计算清单，并与控制器发布的摘要比对。
+// 每个文件的摘要均为 Hub 自身提供的 sha256，因此 ModelScope 清单中不含 gitsha1 行。
 func (m *ModelScope) ListManifest(ctx context.Context, repository, commit, token string, filter Filter) (Manifest, error) {
 	entries, err := m.listRepoFiles(ctx, repository, commit, token)
 	if err != nil {
@@ -148,12 +145,11 @@ func (m *ModelScope) ListManifest(ctx context.Context, repository, commit, token
 	return manifest, nil
 }
 
-// listRepoFiles lists every file at the commit, recovering from the API's silent truncation.
+// listRepoFiles 列出 commit 下的所有文件，并从 API 的静默截断中恢复完整列表。
 //
-// A recursive page of exactly modelScopePageBound entries is a truncation: the walk lists that
-// level's direct children instead and descends into every directory of it, and only subtrees
-// that truncate are broken up further. A level whose direct children reach the bound cannot be
-// enumerated at all, and a partial manifest would be a silent wrong answer, so it refuses.
+// 若递归分页返回的条目数恰好等于 modelScopePageBound，则说明发生了截断：此时遍历会改为列出
+// 该层级的直接子项并逐个进入其子目录，仅对发生截断的子树继续拆分。若某一层级的直接子项数量就达到上限，
+// 则完全无法枚举；部分清单会导致静默的错误结果，因此直接拒绝。
 func (m *ModelScope) listRepoFiles(ctx context.Context, repository, commit, token string) ([]ManifestEntry, error) {
 	limit := m.MaxEntries
 	if limit <= 0 {
@@ -221,10 +217,10 @@ func (m *ModelScope) listRepoFiles(ctx context.Context, repository, commit, toke
 	return entries, nil
 }
 
-// modelScopeTypeTree is a directory entry's type; every file is a blob.
+// modelScopeTypeTree 是目录条目的类型；每个文件均为 blob。
 const modelScopeTypeTree = "tree"
 
-// modelScopeFileEntry is one entry of a repo/files page.
+// modelScopeFileEntry 是 repo/files 分页中的单个条目。
 type modelScopeFileEntry struct {
 	Type   string `json:"Type"`
 	Path   string `json:"Path"`
@@ -232,9 +228,9 @@ type modelScopeFileEntry struct {
 	Sha256 string `json:"Sha256"`
 }
 
-// modelScopeManifestEntry turns a listing entry into a manifest entry, and reports false for a
-// directory. Every file must carry the hub's sha256: ModelScope gives no alternative digest, so
-// an entry without one is a manifest the format cannot express.
+// modelScopeManifestEntry 将列表条目转换为清单条目，并在条目为目录时返回 false。
+// 每个文件都必须携带 Hub 的 sha256：ModelScope 不提供其他摘要格式，
+// 因此缺少 sha256 的条目是本清单格式无法表示的清单。
 func modelScopeManifestEntry(e modelScopeFileEntry) (ManifestEntry, bool, error) {
 	switch e.Type {
 	case modelScopeTypeTree:
@@ -254,8 +250,8 @@ func modelScopeManifestEntry(e modelScopeFileEntry) (ManifestEntry, bool, error)
 	return ManifestEntry{Path: e.Path, Size: e.Size, Digest: DigestSHA256 + ":" + e.Sha256}, true, nil
 }
 
-// listFiles lists one level: the whole subtree below root when recursive, root's direct children
-// otherwise. A page at the bound is a truncation, whatever it holds.
+// listFiles 列出单个层级：当 recursive 为 true 时列出 root 下的整棵子树，
+// 否则列出 root 的直接子项。无论其中包含什么内容，条目数达到上限的分页均视为截断。
 func (m *ModelScope) listFiles(
 	ctx context.Context, repository, commit, root string, recursive bool, token string,
 ) ([]modelScopeFileEntry, bool, error) {
@@ -277,14 +273,13 @@ func (m *ModelScope) listFiles(
 	return answer.Files, len(answer.Files) >= modelScopePageBound, nil
 }
 
-// Revalidate checks that token can still read the repository at commit: one HEAD of the
-// repo endpoint for the first file, with redirects not followed.
+// Revalidate 检查 token 在指定 commit 下是否仍可读取该仓库：对仓库端点中首个文件
+// 发起一次不跟随重定向的 HEAD 请求。
 //
-// Measured against the hub: a HEAD of an accessible file answers 200 — an LFS file's too, where
-// the GET would redirect to the CDN, so a redirect confirms as well — and a missing commit, path
-// or repository and a gated repository without a grant all answer 404 with no envelope. The
-// first file comes from one listing of the root, so the check costs two requests whatever the
-// repository's size.
+// 根据 Hub 实测表现：对可访问文件发起 HEAD 请求会返回 200——对 LFS 文件亦然
+// （其 GET 请求会重定向至 CDN，因此返回重定向同样可确认权限）——而缺少 commit、路径或仓库，
+// 以及未获授权的受限（gated）仓库均会返回不带信封结构的 404。
+// 首个文件来自一次根目录列表请求，因此无论仓库规模多大，该检查仅需两次请求。
 func (m *ModelScope) Revalidate(ctx context.Context, repository, commit, token string) error {
 	first, err := m.firstRootFile(ctx, repository, commit, token)
 	if err != nil {
@@ -301,15 +296,15 @@ func (m *ModelScope) Revalidate(ctx context.Context, repository, commit, token s
 	case resp.StatusCode == http.StatusOK:
 		return nil
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
-		// A redirect names a CDN path the hub only grants for a readable repository.
+		// 重定向指向仅对可读仓库授予的 CDN 路径。
 		return nil
 	default:
 		return classifyModelScope(resp.StatusCode, 0, resp.Request.URL.Path)
 	}
 }
 
-// firstRootFile names the file the revalidation HEADs: the first file of the root by path, from
-// one direct-children listing; a root holding no file falls back to the recursive listing.
+// firstRootFile 确定用于重新校验发起 HEAD 请求的目标文件：从一次直接子项列表中
+// 按路径选取根目录的第一个文件；若根目录不含文件，则回退到递归列表。
 func (m *ModelScope) firstRootFile(ctx context.Context, repository, commit, token string) (string, error) {
 	page, _, err := m.listFiles(ctx, repository, commit, "", false, token)
 	if err != nil {
@@ -346,9 +341,8 @@ func (m *ModelScope) fileURL(repository, commit, path string) string {
 		"?Revision=" + url.QueryEscape(commit) + "&FilePath=" + url.QueryEscape(path)
 }
 
-// ValidToken reports whether the hub accepts token at all: an answered users/me. A token the hub
-// rejects is silently ignored on a public repository, so this is the only way such a mistake
-// becomes visible.
+// ValidToken 报告 Hub 是否接受该 token：即 users/me 是否返回正常响应。Hub 会静默忽略
+// 公开仓库上的无效 token，因此这是发现此类错误配置的唯一途径。
 func (m *ModelScope) ValidToken(ctx context.Context, token string) (bool, error) {
 	target := strings.TrimSuffix(m.Endpoint, "/") + "/openapi/v1/users/me"
 	resp, err := m.doNoRedirect(ctx, http.MethodGet, target, token)
@@ -367,7 +361,7 @@ func (m *ModelScope) ValidToken(ctx context.Context, token string) (bool, error)
 	}
 }
 
-// gitURL is the repository's git endpoint, the hub's host serving the same id.
+// gitURL 是仓库对应的 git 端点，即托管同一仓库 ID 的 Hub 主机地址。
 func (m *ModelScope) gitURL(repository string) (string, error) {
 	base, err := url.Parse(m.Endpoint)
 	if err != nil {
@@ -379,7 +373,7 @@ func (m *ModelScope) gitURL(repository string) (string, error) {
 	return base.String(), nil
 }
 
-// runLsRemote runs the git cross-check for one repository.
+// runLsRemote 为单个仓库执行 git 交叉校验。
 func (m *ModelScope) runLsRemote(ctx context.Context, repository, token string) (map[string]string, error) {
 	run := m.lsRemote
 	if run == nil {
@@ -397,19 +391,17 @@ func (m *ModelScope) runLsRemote(ctx context.Context, repository, token string) 
 	return refs, nil
 }
 
-// lsRemoteOverHTTP asks the repository's git endpoint for its refs over the HTTP smart protocol —
-// the same request `git ls-remote` answers — so the cross-check needs no git binary in the image
-// and no subprocess: the endpoint's client is the one the Settings configure, and a private
-// repository authenticates as the user oauth2 with the token as the password, an HTTP header
-// rather than anything another process could read.
+// lsRemoteOverHTTP 通过 HTTP smart 协议向仓库的 git 端点查询 refs——与 `git ls-remote` 所请求的接口相同——
+// 从而使交叉校验无需在镜像中内置 git 二进制文件，也无需启动子进程：使用的客户端由 Settings 配置，
+// 私有仓库以 oauth2 作为用户名、token 作为密码进行认证，凭据置于 HTTP 请求头中，
+// 而非其他进程可读取的形式。
 func (m *ModelScope) lsRemoteOverHTTP(ctx context.Context, gitURL, token string) (map[string]string, error) {
 	target := gitURL + "/info/refs?service=git-upload-pack"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
-	// The endpoint answers a git client and refuses others with 421 (measured), so the request
-	// names itself the protocol it speaks.
+	// 该端点仅响应 git 客户端并对其余请求返回 421（经实测），因此请求需标明自身所用的协议。
 	req.Header.Set("User-Agent", "git/2.39")
 	req.Header.Set("Accept", "application/x-git-upload-pack-advertisement")
 	if token != "" {
@@ -436,10 +428,9 @@ func (m *ModelScope) lsRemoteOverHTTP(ctx context.Context, gitURL, token string)
 	return parseGitAdvertisement(resp.Body)
 }
 
-// parseGitAdvertisement reads a smart protocol advertisement: pkt-lines of `<commit> <ref>`, the
-// first carrying the server's capabilities after a NUL and an annotated tag's commit named by the
-// peeled entry with a trailing `^{}`. A packet that does not parse is an error — a truncated
-// answer must not shrink the cross-check.
+// parseGitAdvertisement 读取 smart 协议通告：格式为 `<commit> <ref>` 的 pkt-line，
+// 其中首行在 NUL 字节后携带服务端能力列表，附注标签的 commit 由带 `^{}` 后缀的解引用条目给出。
+// 无法解析的数据包均视为错误——绝不允许被截断的响应缩减交叉校验范围。
 func parseGitAdvertisement(r io.Reader) (map[string]string, error) {
 	buf, err := io.ReadAll(io.LimitReader(r, modelScopeMaxResponseBytes+1))
 	if err != nil {
@@ -460,7 +451,7 @@ func parseGitAdvertisement(r io.Reader) (map[string]string, error) {
 		}
 		i += 4
 		if n == 0 {
-			continue // a flush packet
+			continue // flush 数据包
 		}
 		if n < 4 {
 			return nil, fmt.Errorf("unparsable packet length %q", string(buf[i-4:i]))
@@ -474,7 +465,7 @@ func parseGitAdvertisement(r io.Reader) (map[string]string, error) {
 			continue
 		}
 		if z := strings.IndexByte(line, 0); z >= 0 {
-			line = line[:z] // the first ref carries the server's capabilities after a NUL
+			line = line[:z] // 首个 ref 在 NUL 字节后携带服务端能力列表
 		}
 		commit, ref, ok := strings.Cut(line, " ")
 		if !ok || !modelScopeCommitPattern.MatchString(commit) || ref == "" {
@@ -489,12 +480,12 @@ func parseGitAdvertisement(r io.Reader) (map[string]string, error) {
 	return refs, nil
 }
 
-// modelScopeMaxResponseBytes bounds one response body. A commits page of one entry is a few
-// hundred bytes; a repo/files page of 3000 is a few hundred kilobytes.
+// modelScopeMaxResponseBytes 限制单个响应体的大小。单条目的 commits 分页通常为几百字节；
+// 包含 3000 个条目的 repo/files 分页通常为几百千字节。
 const modelScopeMaxResponseBytes = 16 << 20
 
-// modelScopeEnvelope is every answer's shape, errors included: the Code inside the body, not the
-// HTTP status, is what distinguishes a missing revision from a forbidden one.
+// modelScopeEnvelope 是所有响应（包括错误响应）的统一结构：真正区分 revision 不存在与权限被拒的
+// 是响应体中的 Code 字段，而非 HTTP 状态码。
 type modelScopeEnvelope struct {
 	Code    int             `json:"Code"`
 	Message string          `json:"Message"`
@@ -520,14 +511,12 @@ func (m *ModelScope) getJSON(ctx context.Context, target, token string, into any
 	return decodeModelScope(resp, into)
 }
 
-// do sends one request. A transport failure is SourceUnavailable; the caller classifies the
-// status code.
+// do 发送一次请求。传输层失败归类为 SourceUnavailable；状态码由调用方分类处理。
 func (m *ModelScope) do(ctx context.Context, method, target, token string) (*http.Response, error) {
 	return m.doRequest(ctx, method, target, token, false)
 }
 
-// doNoRedirect sends one request whose redirects stay unanswered: a redirect is an answer about
-// access, not a page to follow.
+// doNoRedirect 发送一次不跟随重定向的请求：重定向本身即代表关于访问权限的响应，而非需要跟随的页面。
 func (m *ModelScope) doNoRedirect(ctx context.Context, method, target, token string) (*http.Response, error) {
 	return m.doRequest(ctx, method, target, token, true)
 }
@@ -551,16 +540,15 @@ func (m *ModelScope) doRequest(ctx context.Context, method, target, token string
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// The URL is the only part of a transport error that names the request, and it carries no
-		// credential; the error is rebuilt so nothing else of the request can ride along.
+		// URL 是传输错误中唯一指明请求的部分，且不携带凭据；此处重建 error，避免请求的其他信息随之传出。
 		return nil, sourceErrorf(ReasonSourceUnavailable, "%s %s: %v", method, target, unwrapURLError(err))
 	}
 
 	return resp, nil
 }
 
-// decodeModelScope reads the envelope of one answer. A non-200 — or a 200 whose own Code is not
-// 200 — is classified; only a clean answer's Data is decoded into.
+// decodeModelScope 读取单个响应的信封结构。非 200 状态码，或 HTTP 状态为 200 但其自身 Code 不为 200 的
+// 响应都会被归类为错误；仅当响应正常时才将其 Data 解码到目标对象中。
 func decodeModelScope(resp *http.Response, into any) error {
 	defer httpx.Close(resp)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, modelScopeMaxResponseBytes+1))
@@ -592,16 +580,14 @@ func decodeModelScope(resp *http.Response, into any) error {
 	return nil
 }
 
-// classifyModelScope maps a non-success answer onto a reason, as measured against ModelScope
-// (PoC-D): every access failure is a 404, so the envelope Code classifies, with the HTTP status
-// as the fallback.
+// classifyModelScope 根据 ModelScope 的实测行为（PoC-D）将非成功响应映射为对应原因：所有访问失败
+// 均返回 404，因此优先依据信封中的 Code 进行分类，并以 HTTP 状态码作为兜底。
 //
-//   - 10990101004 is a repository with no file tree at the revision: RevisionNotFound.
-//   - 10010205001 (not found) and 10010200001 (no access — private without the token, or gated
-//     without a grant) are AccessDenied, and so is every other 404, 401 and 403: the hub answers
-//     a repository that does not exist and one the caller cannot read alike, so the message does
-//     not guess which.
-//   - Anything else, 5xx and 429 among it, is SourceUnavailable.
+//   - 10990101004 表示仓库在该修订版本下没有文件树：映射为 RevisionNotFound。
+//   - 10010205001（未找到）和 10010200001（无权限——私有仓库未提供令牌或受限仓库未获授权）
+//     均映射为 AccessDenied，其余所有 404、401 和 403 亦然：仓库中心对不存在的仓库与调用方
+//     无权读取的仓库返回相同的响应，因此错误消息不对此作猜测。
+//   - 其他所有情况（包括 5xx 和 429）均映射为 SourceUnavailable。
 func classifyModelScope(status, code int, what string) error {
 	switch {
 	case code == 10990101004:

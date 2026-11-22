@@ -12,7 +12,7 @@ import (
 
 type Template string
 
-// Render renders the template with the given values and extended function map, and returns the rendered string.
+// Render 使用给定的模板上下文和扩展函数映射渲染模板，并返回渲染后的字符串。
 func (t Template) Render(context any, extendFuncMap template.FuncMap) (string, error) {
 	tmpl, err := template.New("yaml-template").
 		Funcs(templateFuncMap(extendFuncMap)).
@@ -43,11 +43,11 @@ func templateFuncMap(extend template.FuncMap) template.FuncMap {
 	return fm
 }
 
-// toYAML borrows from helm.sh/helm/pkg/engine/engine.go.
+// toYAML 借鉴自 helm.sh/helm/pkg/engine/engine.go。
 func toYAML(v any) string {
 	data, err := yaml.Marshal(v)
 	if err != nil {
-		// Swallow errors inside a template.
+		// 在模板内部忽略序列化错误。
 		return ""
 	}
 

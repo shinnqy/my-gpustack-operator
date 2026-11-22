@@ -19,7 +19,7 @@ func Index() http.Handler {
 		gpustack.GroupVersion,
 	}
 
-	// Extend routes.
+	// 扩展路由。
 	extensionroute.Route(openapiGVs, r)
 
 	return r

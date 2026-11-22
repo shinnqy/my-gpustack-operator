@@ -7,28 +7,23 @@ import (
 	"gpustack.ai/gpustack/pkg/device"
 )
 
-// MonitorSnapshotMaxAge is the accepted age of a snapshot that does not report the period it
-// was taken on, which only an older device manager produces.
+// MonitorSnapshotMaxAge 是未上报采样周期的快照可接受的最大存活时长，仅较旧版本的 device manager 会产生此类快照。
 const MonitorSnapshotMaxAge = 45 * time.Second
 
-// AllocatedAcceleratorMetric is one allocated device's metrics together with what a caller needs
-// in order to label or key them: the manufacturer whose group carried the metrics, and the
-// device's index as the allocation records it. The index comes from the allocation rather than
-// from the snapshot, which carries only the ID — it is the ordinal the manufacturer's own tools
-// name the device by, so a reader can line a figure up with what they see on the host.
+// AllocatedAcceleratorMetric 包含单个已分配设备的指标及调用方用于打标签或建立索引的元数据：
+// 所属指标分组的厂商名称，以及分配记录中登记的设备索引。
+// 该索引取自分配记录而非仅包含 ID 的快照——它是厂商自身工具用来命名设备的序号，便于读取方将指标数值与宿主机上看到的设备对应起来。
 type AllocatedAcceleratorMetric struct {
 	Manufacturer string
 	Index        uint32
 	Metrics      device.AcceleratorMetrics
 }
 
-// MonitorSnapshotFresh reports whether a snapshot is recent enough to report figures from.
+// MonitorSnapshotFresh 报告快照是否足够新鲜以用于上报指标。
 //
-// A snapshot older than three monitor periods means the monitor is failing: the loop only
-// replaces the snapshot after a successful non-empty sample, so an old one is the last thing
-// that worked rather than the current state. The bound scales with the period the snapshot
-// reports so a slower cadence is not mistaken for a failure, falling back to
-// MonitorSnapshotMaxAge when the field is absent.
+// 快照若超过三个监控周期仍未更新，说明监控已发生故障：采样循环仅在成功获取非空样本后才会替换快照，
+// 因此过期的快照反映的是最后一次成功时的状态，而非当前状态。
+// 该时间上限随快照上报的周期按比例缩放，以免将较慢的采集频率误判为故障；当该字段缺失时回退为 MonitorSnapshotMaxAge。
 func MonitorSnapshotFresh(snapshot *MonitorSnapshot) bool {
 	if snapshot == nil {
 		return false
@@ -41,13 +36,10 @@ func MonitorSnapshotFresh(snapshot *MonitorSnapshot) bool {
 	return time.Since(snapshot.Timestamp) <= maxAge
 }
 
-// AllocatedAcceleratorMetricsOf filters a monitor snapshot to the devices an allocation records,
-// matched by manufacturer and device ID, and yields nothing from a snapshot that is not fresh.
+// AllocatedAcceleratorMetricsOf 按厂商和设备 ID 从监控快照中筛选出分配记录对应的设备指标；若快照不再新鲜则返回空。
 //
-// A manufacturer the snapshot does not carry yields nothing for its devices. That is what makes
-// this safe to call on any single device manager's snapshot: the chart rolls one per
-// manufacturer and each samples only its own cards, so a snapshot answers for the devices it
-// knows and stays silent about the rest rather than reporting them as missing.
+// 快照未包含的厂商不会为其设备产出任何指标。这使得对任意单个 device manager 的快照调用此函数都是安全的：
+// chart 为每个厂商部署一个独立实例且各自仅采集自家加速卡，因此每个快照只响应其已知的设备，对其余设备保持静默而非报告缺失。
 func AllocatedAcceleratorMetricsOf(
 	snapshot *MonitorSnapshot,
 	allocGroups []workercore.DevicesAllocationGroup,

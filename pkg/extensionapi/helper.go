@@ -19,7 +19,7 @@ type _APIOptions struct {
 	SubResourceStorages map[string]rest.Storage
 }
 
-// ExecuteSetup executes the given setup to install the extension API.
+// ExecuteSetup 执行给定的 setup 以安装扩展 API。
 func ExecuteSetup(
 	ctx context.Context,
 	srv *genericapiserver.GenericAPIServer,
@@ -29,7 +29,7 @@ func ExecuteSetup(
 	mgr ctrl.Manager,
 	setups []Setup,
 ) error {
-	// Setup all handlers.
+	// 初始化所有 handler。
 	apiOpts := make(map[string]map[string]map[string]_APIOptions)
 	for i := range setups {
 		opts := SetupOptions{Manager: mgr}
@@ -62,54 +62,54 @@ func ExecuteSetup(
 				igv := schema.GroupVersion{Group: gn, Version: runtime.APIVersionInternal}
 				egv := schema.GroupVersion{Group: gn, Version: vn}
 				stg := apiOpts[gn][vn][rn].ResourceStorage
-				// TODO(thxCode): Remove this hack after we adopt conversion-gen.
-				// Register internal version.
+				// TODO(thxCode): 引入 conversion-gen 后移除此临时处理。
+				// 注册内部版本。
 				srvScheme.AddKnownTypes(igv, stg.New())
 				if v, ok := stg.(rest.Lister); ok {
 					srvScheme.AddKnownTypes(igv, v.NewList())
 				}
-				// Register primary storage.
+				// 注册主存储。
 				agi.VersionedResourcesStorageMap[vn][rn] = stg
-				// Register status subresource if existed.
+				// 若存在 status 子资源则进行注册。
 				if _, ok := stg.New().(ObjectWithStatusSubResource); ok {
 					pstg := stg.(StatusSubResourceParentStore)
 					stg := AsStatusSubResourceStorage(pstg)
 					agi.VersionedResourcesStorageMap[vn][rn+"/status"] = stg
 				}
-				// Register scale subresource if existed.
+				// 如果存在 scale 子资源，则注册。
 				if _, ok := stg.New().(ObjectWithScaleSubResource); ok {
 					pstg := stg.(ScaleSubResourceParentStore)
 					stg := AsScaleSubResourceStorage(pstg)
 					agi.VersionedResourcesStorageMap[vn][rn+"/scale"] = stg
 				}
-				// Register arbitrary subresources if existed.
+				// 如果存在任意子资源，则注册。
 				{
 					srs := apiOpts[gn][vn][rn].SubResourceStorages
 					for srn := range srs {
 						sstg := srs[srn]
-						// Register internal version.
+						// 注册内部版本。
 						srvScheme.AddKnownTypes(igv, sstg.New())
-						// Register external version.
+						// 注册外部版本。
 						srvScheme.AddKnownTypes(egv, sstg.New())
-						// Register storage.
+						// 注册存储。
 						agi.VersionedResourcesStorageMap[vn][rn+"/"+srn] = sstg
-						// Register optional getter options.
+						// 注册可选的 getter 选项。
 						if v, ok := sstg.(rest.GetterWithOptions); ok {
 							optionsObj, _, _ := v.NewGetOptions()
 							if optionsObj != nil {
-								// Register internal version.
+								// 注册内部版本。
 								srvScheme.AddKnownTypes(igv, optionsObj)
-								// Register external version.
+								// 注册外部版本。
 								srvScheme.AddKnownTypes(egv, optionsObj)
 							}
 						}
-						// Register optional connector options.
+						// 注册可选的 connector 选项。
 						if v, ok := sstg.(rest.Connecter); ok {
 							optionsObj, _, _ := v.NewConnectOptions()
 							if optionsObj != nil {
-								// Register internal version.
+								// 注册内部版本。
 								srvScheme.AddKnownTypes(igv, optionsObj)
-								// Register external version.
+								// 注册外部版本。
 								srvScheme.AddKnownTypes(egv, optionsObj)
 							}
 						}
@@ -120,6 +120,6 @@ func ExecuteSetup(
 		agis = append(agis, &agi)
 	}
 
-	// Install.
+	// 安装。
 	return srv.InstallAPIGroups(agis...)
 }

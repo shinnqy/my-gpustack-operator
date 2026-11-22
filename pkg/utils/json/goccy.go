@@ -16,8 +16,8 @@ var (
 	NewEncoder    = json.NewEncoder
 )
 
-// MustMarshal is similar to Marshal,
-// but panics if found error.
+// MustMarshal 与 Marshal 类似，
+// 但遇到 error 时会 panic。
 func MustMarshal(v any) []byte {
 	bs, err := Marshal(v)
 	if err != nil {
@@ -27,8 +27,8 @@ func MustMarshal(v any) []byte {
 	return bs
 }
 
-// MustUnmarshal is similar to Unmarshal,
-// but panics if found error.
+// MustUnmarshal 与 Unmarshal 类似，
+// 但遇到 error 时会 panic。
 func MustUnmarshal(data []byte, v any) {
 	err := Unmarshal(data, v)
 	if err != nil {
@@ -36,8 +36,8 @@ func MustUnmarshal(data []byte, v any) {
 	}
 }
 
-// MustMarshalIndent is similar to MarshalIndent,
-// but panics if found error.
+// MustMarshalIndent 与 MarshalIndent 类似，
+// 但遇到 error 时会 panic。
 func MustMarshalIndent(v any, prefix, indent string) []byte {
 	bs, err := MarshalIndent(v, prefix, indent)
 	if err != nil {
@@ -47,21 +47,21 @@ func MustMarshalIndent(v any, prefix, indent string) []byte {
 	return bs
 }
 
-// ShouldMarshal is similar to Marshal,
-// but never return error.
+// ShouldMarshal 与 Marshal 类似，
+// 但从不返回 error。
 func ShouldMarshal(v any) []byte {
 	bs, _ := Marshal(v)
 	return bs
 }
 
-// ShouldUnmarshal is similar to Unmarshal,
-// but never return error.
+// ShouldUnmarshal 与 Unmarshal 类似，
+// 但从不返回 error。
 func ShouldUnmarshal(data []byte, v any) {
 	_ = Unmarshal(data, v)
 }
 
-// ShouldMarshalIndent is similar to MarshalIndent,
-// but never return error.
+// ShouldMarshalIndent 与 MarshalIndent 类似，
+// 但从不返回 error。
 func ShouldMarshalIndent(v any, prefix, indent string) []byte {
 	bs, _ := MarshalIndent(v, prefix, indent)
 	return bs

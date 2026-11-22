@@ -6,15 +6,13 @@ import (
 	"strings"
 )
 
-// ParseCatalog reads a catalog and checks it.
+// ParseCatalog 读取并校验目录。
 //
-// IT IS STRICT, because a field the reader does not know is a field the
-// reader cannot check, and it is BOUNDED, because a catalog read from a
-// ConfigMap must not be able to grow the controller's memory without limit.
+// 解析过程采用严格模式，因为读取方无法识别的字段就无法进行校验；
+// 同时限制了大小，因为从 ConfigMap 读取的目录绝不能使控制器的内存无限增长。
 //
-// IT READS YAML, because YAML is a superset of JSON and one reader then serves
-// both formats. The document it reads is the flat catalog, and the catalog it
-// returns is the one the resolver reads.
+// 该函数解析 YAML，因为 YAML 是 JSON 的超集，一个读取器即可同时支持两种格式。
+// 它读取的是扁平化的目录文档，返回的则是供解析器使用的目录结构。
 func ParseCatalog(data []byte) (*Catalog, error) {
 	if len(data) > MaxCatalogBytes {
 		return nil, fmt.Errorf("catalog is %d bytes, which is over the %d byte limit", len(data), MaxCatalogBytes)
@@ -34,16 +32,15 @@ func ParseCatalog(data []byte) (*Catalog, error) {
 	return catalog, nil
 }
 
-// field is a named value a validation checks.
+// field 表示校验过程所检查的命名值。
 type field struct {
 	name  string
 	value string
 }
 
-// requireNonEmpty returns an error naming the first empty field.
+// requireNonEmpty 返回包含第一个空字段名称的 error。
 //
-// THE FIELDS ARE CHECKED IN THE ORDER THEY ARE GIVEN, so the error names the
-// same field every run.
+// 字段按传入顺序依次检查，从而确保每次运行报错时都指向同一个字段。
 func requireNonEmpty(fields ...field) error {
 	for _, entry := range fields {
 		if strings.TrimSpace(entry.value) == "" {
@@ -53,11 +50,10 @@ func requireNonEmpty(fields ...field) error {
 	return nil
 }
 
-// Validate checks a catalog.
+// Validate 校验目录。
 //
-// IT REJECTS DUPLICATE SHAPES, UNSUPPORTED SCHEMA VERSIONS AND INVALID
-// MEASUREMENTS, because a catalog that carries any of those cannot decide which
-// measurement is usable.
+// 该函数会拒绝重复的 shape、不受支持的 schema 版本以及无效的测量数据，
+// 因为包含上述任意问题的目录都无法确定哪条测量数据可用。
 func Validate(catalog Catalog) error {
 	if catalog.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("catalog schema version %q is not supported", catalog.SchemaVersion)
@@ -135,15 +131,14 @@ func Validate(catalog Catalog) error {
 	return nil
 }
 
-// validateProfile checks one profile.
+// validateProfile 校验单个 profile。
 //
-// IT REQUIRES THE IDENTITY AND THE TOPOLOGY, because a profile that does not
-// name the deployment it measured cannot decide which measurement is usable.
+// 该函数要求必须包含标识信息与拓扑信息，因为未标明所测部署的 profile
+// 无法确定哪条测量数据可用。
 //
-// IT DOES NOT REQUIRE THE SERVING CONFIGURATION, because the catalog is a
-// measurement and not a configuration: a profile that states no serving
-// setting constrains nothing, and a profile that states one is compared on
-// that one alone.
+// 该函数不强制要求推理服务配置，因为目录记录的是测量数据而非配置：
+// 未声明服务配置的 profile 不施加任何约束，而声明了某项配置的 profile
+// 则仅针对该项进行比较。
 func validateProfile(profile Profile) error {
 	if _, known := requirementFor(profile.Role); !known {
 		return fmt.Errorf("carries the unknown role %q", profile.Role)
@@ -171,12 +166,10 @@ func validateProfile(profile Profile) error {
 	if profile.MeasuredReplicas <= 0 {
 		return fmt.Errorf("measured replicas %d is not positive", profile.MeasuredReplicas)
 	}
-	// THE TENSOR, PIPELINE, DATA AND LOCAL DATA PARALLEL WIDTHS ARE REQUIRED,
-	// because a scaling replica is defined by them and a zero width must not
-	// match a deployment by both sides leaving it out.
+	// 张量并行、流水线并行、数据并行和本地数据并行宽度为必填项，
+	// 因为扩缩容副本由这些宽度共同定义，必须防止双方都省略该字段时因宽度为 0 而误匹配。
 	//
-	// CONTEXT AND EXPERT PARALLEL MAY BE ZERO, because a measured system that
-	// does not use them states so with a zero width.
+	// 上下文并行和专家并行宽度允许为 0，因为未使用它们的被测系统会以宽度 0 来明确表示。
 	for _, entry := range []struct {
 		name  string
 		width int
@@ -234,9 +227,8 @@ func validateProfile(profile Profile) error {
 		return fmt.Errorf("load axis is incoherent: %s", incoherent)
 	}
 
-	// THE DIGEST IS NOT DERIVED, because the catalog is written by a person and a
-	// reader has to be able to tell whether the content is the content that was
-	// measured.
+	// 摘要不会自动派生，因为目录由人工编写，读取方需要能够据此判断
+	// 当前内容是否与实际测量时的内容一致。
 	digest, err := ProfileDigest(profile)
 	if err != nil {
 		return fmt.Errorf("compute profile digest: %w", err)
@@ -247,7 +239,7 @@ func validateProfile(profile Profile) error {
 	return nil
 }
 
-// validatePoint checks one measured load point.
+// validatePoint 校验单个实测负载点。
 func validatePoint(point MeasuredPoint) error {
 	switch point.Load.Kind {
 	case LoadKindConcurrency, LoadKindRequestRate:
@@ -334,7 +326,7 @@ func validatePoint(point MeasuredPoint) error {
 	return nil
 }
 
-// isFinite says whether a number is neither infinite nor not a number.
+// isFinite 判断数值是否既非无穷大也非 NaN。
 func isFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }

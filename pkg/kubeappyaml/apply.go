@@ -24,14 +24,14 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/funcx"
 )
 
-// Apply applies the given YAML content to the cluster specified by the given REST config.
+// Apply 将指定的 YAML 内容应用到由给定 REST 配置指向的集群。
 func Apply(ctx context.Context, content string, restCfg rest.Config) error {
 	restCliGetter := kubeconfig.ConvertRestConfigToRestClientGetter(&restCfg)
 
 	return ApplyWithRestClientGetter(ctx, content, restCliGetter)
 }
 
-// ApplyWithRestClientGetter applies the given YAML content to the cluster specified by the given REST client getter.
+// ApplyWithRestClientGetter 将指定的 YAML 内容应用到由给定 RESTClientGetter 指向的集群。
 func ApplyWithRestClientGetter(ctx context.Context, content string, restCliGetter genericclioptions.RESTClientGetter) error {
 	restDisCli := funcx.NoError(restCliGetter.ToDiscoveryClient())
 
@@ -67,7 +67,7 @@ func applyOneObject(info *resource.Info, openapiGetter kubectlopenapi.OpenAPIRes
 		return fmt.Errorf("get modified configuration: %w", err)
 	}
 
-	// If it doesn't exist, we create it.
+	// 如果资源不存在，则创建它。
 	if err = info.Get(); err != nil {
 		if !kerrors.IsNotFound(err) {
 			return fmt.Errorf("get object: %w", err)
@@ -86,7 +86,7 @@ func applyOneObject(info *resource.Info, openapiGetter kubectlopenapi.OpenAPIRes
 		return nil
 	}
 
-	// If the object already exists, we need to patch it.
+	// 如果对象已存在，则需要对其执行 patch 更新。
 	patcher := &kubectlapply.Patcher{
 		Mapping:           info.Mapping,
 		Helper:            helper,

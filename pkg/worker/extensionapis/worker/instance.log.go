@@ -19,10 +19,10 @@ import (
 	"gpustack.ai/gpustack/pkg/system"
 )
 
-// InstanceLogHandler handles the "log" subresource of v1.Instance objects.
+// InstanceLogHandler 处理 v1.Instance 对象的 "log" 子资源。
 //
-// InstanceLogHandler streams logs from the v1.Instance's backing Kubernetes Pod,
-// which is named as the Instance's name.
+// InstanceLogHandler 从 v1.Instance 对应的底层 Kubernetes Pod 流式传输日志，
+// 该 Pod 与 Instance 同名。
 type InstanceLogHandler struct {
 	ClientCfg restcli.Config
 }
@@ -30,7 +30,7 @@ type InstanceLogHandler struct {
 func newInstanceLogHandler(_ rest.Scoper, _ extensionapi.SetupOptions) *InstanceLogHandler {
 	h := &InstanceLogHandler{}
 
-	// Set client.
+	// 设置客户端。
 	h.ClientCfg = system.LoopbackKubeRestConfig.Get()
 
 	return h
@@ -59,7 +59,7 @@ func (h *InstanceLogHandler) Get(ctx context.Context, name string, opts runtime.
 		return nil, kerrors.NewInternalError(errors.New("invalid options type"))
 	}
 
-	// Validate.
+	// 校验。
 	var errs field.ErrorList
 	if instLogOpts.TailLines != nil && *instLogOpts.TailLines < 0 {
 		errs = append(errs, field.Invalid(

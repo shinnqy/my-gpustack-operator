@@ -25,8 +25,8 @@ type modelDeploymentScrape struct {
 	windows  map[string]modelDeploymentWindowPair
 }
 
-// parseModelDeploymentMetrics accepts only the pinned engine and router metric families.
-// Other Prometheus series stay on the Pod's own endpoint.
+// parseModelDeploymentMetrics 仅接收已固定的引擎与路由器指标族。
+// 其他 Prometheus 序列保留在 Pod 自身的端点上。
 func parseModelDeploymentMetrics(body []byte, engine, router string) (modelDeploymentScrape, error) {
 	parser := expfmt.NewTextParser(model.LegacyValidation)
 	families, err := parser.TextToMetricFamilies(bytes.NewReader(body))

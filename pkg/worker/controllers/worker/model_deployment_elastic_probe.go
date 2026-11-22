@@ -7,33 +7,31 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// The elastic master stays alive while it re-forms its collective, and the engine says so by
-// answering 503 on every endpoint for the length of the resize. The kubelet's own HTTP gate does
-// not read that: it treats anything outside 200-399 as a failure, so a resize long enough to reach
-// the liveness threshold reads as a dead engine and the kubelet restarts the very process that is
-// mid-resize. Withdrawing traffic is the gate's job during a resize, and readiness still does it.
+// 弹性 master 在重组其集合通信组期间保持存活，引擎会在整个扩缩容期间对所有端点返回 503 以示该状态。
+// kubelet 自带的 HTTP 探针无法理解这一点：它把 200-399 之外的所有状态都视为失败，
+// 因此只要扩缩容耗时达到存活阈值，就会被判定为引擎死亡，kubelet 进而重启正在扩缩容的进程。
+// 在扩缩容期间摘除流量由就绪探针负责，readiness 探针仍会正常履行该职责。
 //
-// So the liveness gate is an exec of the image's own python3, which reads the status code itself
-// and passes on exactly two answers: 200 for a serving engine, and 503 for one that is alive and
-// re-forming. A refused connection, a timeout, or any other status is a failure, because an engine
-// that is gone or broken gives those same answers and must be restarted.
+// 因此存活探针通过 exec 调用镜像自带的 python3 实现，由其自行读取状态码，
+// 并仅在两种响应下通过：200 表示引擎正常提供服务，503 表示引擎存活且正在重组。
+// 连接被拒、超时或任何其他状态码均视为失败，因为已退出或损坏的引擎也会给出这些响应，必须予以重启。
 const (
-	// modelDeploymentElasticLivenessURL is the engine's own health address on the master
-	// container, reached over the loopback interface so the gate never leaves the Pod.
+	// modelDeploymentElasticLivenessURL 是 master 容器上引擎自身的健康检查地址，
+	// 通过回环接口访问以确保探针流量不离开 Pod。
 	modelDeploymentElasticLivenessURL = "http://127.0.0.1:8000/health"
 
-	// modelDeploymentElasticLivenessRequestSeconds bounds one read inside the program. It is below
-	// the probe's kubelet timeout so the program answers first and its exit code is what the
-	// kubelet reads, rather than a kill that arrives before the code does.
+	// modelDeploymentElasticLivenessRequestSeconds 限制脚本内部单次读取的超时时间。
+	// 该值低于 kubelet 探针的超时设置，以便程序先返回结果并让 kubelet 读取其退出码，
+	// 而不是在返回退出码之前被提前终止。
 	modelDeploymentElasticLivenessRequestSeconds = 1
 )
 
-// modelDeploymentElasticLivenessProbe is the liveness gate the master container runs. It is the
-// only one of the three that changes: startup still waits for the engine to load, and readiness
-// still withholds traffic for the whole resize window.
+// modelDeploymentElasticLivenessProbe 是 master 容器运行的存活探针。
+// 它是三类探针中唯一改变的探针：startup 仍等待引擎加载完成，
+// readiness 仍会在整个扩缩容窗口期内拦截流量。
 //
-// It reads the engine directly and takes no option from the spec, so a deployment cannot widen the
-// accepted set into a gate that never restarts a broken engine.
+// 它直接读取引擎状态且不从 spec 接收配置项，从而防止部署通过放宽可接受状态码集合
+// 使探针变成永不重启异常引擎的无效检查。
 func modelDeploymentElasticLivenessProbe() *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
@@ -50,17 +48,16 @@ func modelDeploymentElasticLivenessProbe() *corev1.Probe {
 	}
 }
 
-// modelDeploymentElasticLivenessScript renders the program. It takes the address as an argument so
-// a test can point the same program at a test server; the probe passes the production one.
+// modelDeploymentElasticLivenessScript 生成检测脚本。它接收地址作为参数，
+// 以便测试将同一脚本指向测试服务器；生产探针则传入实际地址。
 //
-// HTTPError is caught before the general case because it is a subclass of URLError, and the 503
-// this file exists to accept arrives as an exception rather than as a response. The code is read
-// from whichever attribute the interpreter's response object carries, so an older image that
-// exposes only code is read the same way. That object is a response too, so it is closed the same
-// way the success path closes its own, and every path that opened a connection releases it.
+// HTTPError 在通用异常之前捕获，因为它是 URLError 的子类，且本文件需要接受的 503
+// 会作为异常而非正常响应抛出。脚本会从解释器响应对象所携带的任意属性中读取状态码，
+// 从而兼容仅暴露 code 属性的旧版本镜像。该异常对象本身也是响应对象，
+// 因此会与成功路径一样被关闭，确保每条打开连接的路径都释放资源。
 //
-// A program that cannot run is a failed gate, not a passing one: every path that does not learn a
-// code exits non-zero, and the accepted set is written out rather than implied by a range.
+// 无法运行的脚本代表探针失败而非通过：任何未获取到状态码的路径均以非零状态退出，
+// 且可接受的状态码集合采用显式列举而非隐式区间判断。
 func modelDeploymentElasticLivenessScript(url string) string {
 	return fmt.Sprintf(`import sys, urllib.error, urllib.request
 try:

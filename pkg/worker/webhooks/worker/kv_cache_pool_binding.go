@@ -20,11 +20,11 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kvcache/mooncake"
 )
 
-// KVCachePoolBindingWebhook validates a v1alpha1.KVCachePoolBinding.
+// KVCachePoolBindingWebhook 校验 v1alpha1.KVCachePoolBinding。
 //
-// It is validating only. What it holds is what a schema cannot: a shape rule on a name, a cross-object
-// read for the ceiling this Binding may ask for, a per-master uniqueness check on the reuse domain,
-// and the immutability that keeps a warm cache from being reinterpreted underneath itself.
+// 它仅做校验（validating），承担 schema 无法表达的约束：名称格式规则、读取关联对象以确认本
+// Binding 可申请的上限、按 master 维度的复用域唯一性检查，以及防止预热缓存在底层被重新解释的
+// 不可变性约束。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="kvcachepoolbindings",scope="Namespaced"
@@ -48,19 +48,17 @@ var (
 	_ webhook.ReceiveDeletionUpdate           = (*KVCachePoolBindingWebhook)(nil)
 )
 
-// ReceiveDeletionUpdate keeps this webhook validating updates to a Binding that is being deleted.
+// ReceiveDeletionUpdate 使本 Webhook 在 Binding 处于删除中状态时仍继续校验其更新。
 //
-// The freeze is worth most in exactly that window. The finalizer holds while status.usedBy is
-// non-empty, so a Binding stays for as long as workloads run against it, and the pool publishes this
-// object's spec.domain as its authoritative registry entry the whole time. Skipped there, a blockSize
-// or dtype edit is admitted and then reported back as the truth about blocks written at the old
-// shape.
+// 不可变冻结恰恰在那个时间窗口内最有价值。只要 status.usedBy 非空，finalizer 就会一直保留，因此
+// 只要还有工作负载在使用它，Binding 就会持续存在，而 Pool 在此期间也始终将本对象的 spec.domain
+// 作为权威注册条目对外发布。若在该窗口跳过校验，修改 blockSize 或 dtype 的操作就会被放行，进而
+// 被当作按旧格式写入的缓存块的真实属性上报。
 //
-// FORBIDDEN: adding a rule to ValidateUpdate that reads another object unconditionally. The guard
-// this opts out of exists because update validation depending on state that may already be gone must
-// not be able to reject a finalizer-clearing update, and a pool deleted before its Bindings is the
-// ordinary teardown order. The one cross-object read here is gated on the ceiling having moved, which
-// the update that releases this object does not do.
+// 禁止：向 ValidateUpdate 添加无条件读取其他对象的规则。此处选择退出的默认保护机制，其存在的
+// 意义在于：依赖可能已消失状态的更新校验绝不能拒绝清理 finalizer 的更新，而在 Binding 之前删除
+// Pool 正是常见的清理顺序。本处唯一的一处跨对象读取仅在配额上限发生变动时才触发，而释放本对象的
+// 更新不会修改配额上限。
 func (r *KVCachePoolBindingWebhook) ReceiveDeletionUpdate() {}
 
 func (r *KVCachePoolBindingWebhook) ValidateCreate(
@@ -74,9 +72,8 @@ func (r *KVCachePoolBindingWebhook) ValidateCreate(
 	errs = append(errs, validateKVCachePoolBindingDtypeBinds(
 		kvcpb, workerctrl.ModelDeploymentOwnsKVCacheDtype(ctx),
 	)...)
-	// The cross-object questions are asked only once the object's own shape holds. A malformed
-	// domain name would otherwise be reported alongside "no other Binding claims it", which is true
-	// and useless.
+	// 仅当对象自身结构合法后才执行跨对象校验。否则格式非法的 domain 名称会同时伴随“没有其他 Binding
+	// 占用它”的结论一起上报，这虽然符合事实却毫无意义。
 	if len(errs) == 0 {
 		errs = append(errs, r.validateKVCachePoolBindingDomainIsUnclaimed(ctx, kvcpb)...)
 		errs = append(errs, r.validateKVCachePoolBindingCeilingFitsPool(ctx, kvcpb)...)
@@ -85,8 +82,8 @@ func (r *KVCachePoolBindingWebhook) ValidateCreate(
 		warnings, errs = separableWarnings, append(errs, separableErrs...)
 	}
 	if len(errs) > 0 {
-		// A warning is dropped alongside a refusal on purpose. It describes what an ADMITTED object
-		// would leave standing, and a reader whose object was rejected has no such object.
+		// 在拒绝请求时刻意丢弃警告信息。警告描述的是已准入对象会遗留的状态，而对象被拒的调用方根本不会
+		// 创建出这样的对象。
 		return nil, kerrors.NewInvalid(workercore.Kind("KVCachePoolBinding"), kvcpb.Name, errs)
 	}
 
@@ -101,16 +98,14 @@ func (r *KVCachePoolBindingWebhook) ValidateUpdate(
 	errs := validateKVCachePoolBindingSpec(newKvcpb)
 	errs = append(errs, validateKVCachePoolBindingImmutable(oldKvcpb, newKvcpb)...)
 
-	// The pool is re-read only when this update MOVED the ceiling. spec.poolRef is immutable, so the
-	// pool cannot have changed identity — but its total may have, and asking about it on every update
-	// would put a different object in the path of removing this Binding's finalizer. A pool deleted
-	// before its Bindings is the ordinary teardown order, and a Binding that could not then be
-	// updated would be undeletable.
+	// 仅当本次更新改动了配额上限时才重新读取 Pool。spec.poolRef 是不可变的，因此 Pool 的身份不可能
+	// 改变——但其总配额可能已经变化，若在每次更新时都去查询 Pool，就会让另一个对象挡在移除本 Binding
+	// finalizer 的路径上。在 Binding 之前删除 Pool 是正常的清理顺序，而此时若无法更新 Binding，就会
+	// 导致 Binding 无法被删除。
 	//
-	// A ceiling left where it was is therefore not re-checked against a pool total that shrank. That
-	// is deliberate and not a hole: the reconciler observes the effective quota the master actually
-	// grants, and a request above what the pool can serve is already reported as a shortfall there.
-	// Admission refuses what could never work; a ceiling that stopped fitting is a state to report.
+	// 因此，保持未变的上限不会针对已经缩容的 Pool 总配额重新校验。这是刻意的设计而非漏洞：协调器会
+	// 观测 master 实际授予的有效配额，超出 Pool 可分配范围的申请已在协调器中以配额不足的形式上报。
+	// 准入校验负责拒绝绝对无法工作的配置；而原本合法但后来不再匹配的上限则属于需要上报的状态。
 	if len(errs) == 0 && ceilingMoved(oldKvcpb, newKvcpb) {
 		errs = append(errs, r.validateKVCachePoolBindingCeilingFitsPool(ctx, newKvcpb)...)
 	}
@@ -124,12 +119,12 @@ func (r *KVCachePoolBindingWebhook) ValidateUpdate(
 func (r *KVCachePoolBindingWebhook) ValidateDelete(
 	_ context.Context, _ runtime.Object,
 ) (ctrladmission.Warnings, error) {
-	// Deletion is refused by the reconciler's finalizer while status.usedBy is non-empty, and the
-	// tenant's own objects are drained before the ledger entry goes: this handler sees neither.
+	// 当 status.usedBy 非空时，删除操作由协调器的 finalizer 拦截，且在账本条目移除前会先排空该租户
+	// 自身的对象：本处理器既看不到也不处理这两者。
 	return nil, nil
 }
 
-// validateKVCachePoolBindingSpec holds every rule answerable from the object alone.
+// validateKVCachePoolBindingSpec 包含所有仅凭对象本身即可判定的校验规则。
 func validateKVCachePoolBindingSpec(kvcpb *workercore.KVCachePoolBinding) field.ErrorList {
 	specPath := field.NewPath("spec")
 
@@ -144,10 +139,9 @@ func validateKVCachePoolBindingSpec(kvcpb *workercore.KVCachePoolBinding) field.
 		&kvcpb.Spec.Domain, specPath.Child("domain"),
 	)...)
 
-	// Only the shape, here. Whether it fits the pool is a cross-object question, asked where the pool
-	// can be read.
-	// Asked unconditionally: the schema guarantees the key is there, so what is left to judge is the
-	// value, and the master's own rule is what judges it.
+	// 此处仅校验格式。它是否超出 Pool 容量属于跨对象问题，会在可读取 Pool 的位置进行校验。
+	// 此处无条件执行校验：schema 已确保该键存在，因此剩下的只需判断其值是否合法，而判断依据正是
+	// master 自身的规则。
 	errs = append(errs, mooncake.ValidateQuotaPolicyQuota(
 		kvcpb.Spec.Quota.Ceiling, specPath.Child("quota", "ceiling"),
 	)...)
@@ -155,12 +149,11 @@ func validateKVCachePoolBindingSpec(kvcpb *workercore.KVCachePoolBinding) field.
 	return errs
 }
 
-// validateKVCachePoolBindingDomain judges the reuse identity this Binding registers.
+// validateKVCachePoolBindingDomain 校验该 Binding 注册的复用标识。
 //
-// The name is held to TWO rules, and the redundancy is the point. A DNS-1123 label is the shape this
-// API accepts, and it happens to satisfy every rule the master has — but the master's rules are the
-// ones that decide whether the rendered policy file loads, so they are asked from the one place that
-// states them rather than assumed to be covered.
+// 名称需同时满足两条规则，这种冗余是有意为之。DNS-1123 标签是该 API 接受的格式，它恰好也
+// 满足 master 的所有规则——但最终决定渲染出的策略文件能否加载的是 master 的规则，因此
+// 直接向声明这些规则的唯一出处进行校验，而非假定其已被覆盖。
 func validateKVCachePoolBindingDomain(
 	domain *workercore.KVCachePoolBindingDomain, fldPath *field.Path,
 ) field.ErrorList {
@@ -177,14 +170,14 @@ func validateKVCachePoolBindingDomain(
 		}
 	}
 
-	// A block holding no tokens is not a smaller block, it is a cache shape nothing can write into.
+	// 不容纳任何 token 的块并不是更小的块，而是一种无法写入任何内容的缓存形态。
 	if domain.BlockSize <= 0 {
 		errs = append(errs, field.Invalid(fldPath.Child("blockSize"), domain.BlockSize,
 			"must be greater than 0: it is the number of tokens one cache block holds"))
 	}
 
-	// The syntactic form only. The exhaustive set belongs to whatever spec owns workloads, and
-	// enumerating it here would make a new engine dtype an API change to this group.
+	// 仅校验语法形式。完整枚举集合属于承载工作负载的规范，若在此处枚举，每次新增引擎
+	// dtype 都会导致该 API 组发生变更。
 	switch dtype := domain.Dtype; {
 	case dtype == "":
 		errs = append(errs, field.Required(fldPath.Child("dtype"),
@@ -198,13 +191,12 @@ func validateKVCachePoolBindingDomain(
 	return errs
 }
 
-// validateKVCachePoolBindingDtypeBinds refuses a new Binding declaring "auto" while the operator
-// hands the dtype to every engine attached through it.
+// validateKVCachePoolBindingDtypeBinds 拒绝在 operator 将 dtype 透传给每个关联引擎时声明
+// 为 "auto" 的新建 Binding。
 //
-// "auto" is the one value both engines accept that binds nothing: each resolves it from its own
-// model and checkpoint, so two engines on the domain can still write two element types. It is judged
-// at creation alone, because the dtype is immutable and a Binding stored with it must stay
-// updatable, down to the update that clears its finalizer.
+// "auto" 是两个引擎都接受却不绑定具体类型的值：各自会根据自身模型与 checkpoint 解析，因此
+// 同一 domain 上的两个引擎仍可能写入两种元素类型。该检查仅在创建时执行，因为 dtype 不可变，
+// 而已存储该值的 Binding 必须保持可更新（直至清除其 finalizer 的那次更新）。
 func validateKVCachePoolBindingDtypeBinds(
 	kvcpb *workercore.KVCachePoolBinding, owned bool,
 ) field.ErrorList {
@@ -218,44 +210,38 @@ func validateKVCachePoolBindingDtypeBinds(
 			"two element types; name the type, for example bfloat16")}
 }
 
-// kvCachePoolBindingDtypeAuto is the dtype spelling both engines resolve for themselves.
+// kvCachePoolBindingDtypeAuto 是两个引擎均会自行解析的 dtype 写法。
 const kvCachePoolBindingDtypeAuto = "auto"
 
-// validateKVCachePoolBindingDomainIsUnclaimed refuses a domain another Binding already registered
-// ON A MASTER THAT ALSO SERVES THIS ONE.
+// validateKVCachePoolBindingDomainIsUnclaimed 拒绝已被另一 Binding 在同时服务当前 Binding
+// 的 master 上注册过的 domain。
 //
-// Two Bindings on one domain, WHERE ONE MASTER SERVES BOTH, would SHARE cache, which may well be what
-// somebody wanted, and would collide on one quota ledger, which never is: the master holds a single
-// entry per tenant, so the two ceilings become last-write-wins and each namespace sees a quota the
-// other one set.
+// 同一 domain 上的两个 Binding 若由同一个 master 服务，会共享缓存（这或许正是某些场景所期望的），
+// 但也会在同一个配额账本上发生冲突（这绝非预期）：master 对每个 tenant 仅保留一条记录，
+// 因此两个上限会变成后者覆盖前者，每个 namespace 看到的都会是对方设置的配额。
 //
-// Uniqueness is therefore PER MASTER — wider than per pool, because one master can serve several
-// pools and the tenant space is master-global, and narrower than cluster-wide, because two masters
-// hold two ledgers and two key spaces. The cluster-wide form of this check is what #166 measured: on
-// two independent backends only one could ever register the "default" domain that no-tenant engines
-// write under, so the other backend's injected Pods were admitted and then failed every write with
-// TENANT_NOT_REGISTERED. "One master can serve several pools" argues for uniqueness across THOSE
-// pools; it never argued for uniqueness across pools on a DIFFERENT master, and the check now reads
-// both pools' backends and refuses only on a shared one.
+// 因此唯一性是按 master 划分的——范围比按 pool 更大（因为一个 master 可服务多个 pool，
+// 且 tenant 空间在 master 内全局共享），又比集群范围更窄（因为两个 master 各自持有独立的账本与
+// 键空间）。此前按集群范围检查时曾暴露出问题（#166）：在两个独立后端上，只有一个能注册
+// 无 tenant 引擎默认写入的 "default" domain，另一个后端中被注入的 Pod 在准入后每次写入都会因
+// TENANT_NOT_REGISTERED 而失败。“一个 master 可服务多个 pool”仅说明这些 pool 之间需要唯一性，
+// 并不意味着不同 master 上的 pool 之间也需要唯一性；因此该检查现在会读取两个 pool 的后端，
+// 仅当存在共享后端时才拒绝。
 //
-// THE REFUSAL'S MESSAGE NAMES THE SHARED BACKENDS, and that is load-bearing rather than thorough:
-// the check reads neither Binding's pool until it finds a name collision, so the message is the only
-// place the operator learns which backend makes the two Bindings collide.
+// 拒绝消息中会列出共享的后端，这是关键信息而非冗余修饰：在发现名称冲突之前，检查逻辑
+// 不会读取两个 Binding 的 pool，因此该消息是运维人员得知究竟哪个后端导致两者冲突的唯一途径。
 //
-// It says the pools NAME the backend rather than that they are SERVED BY it, and the difference is
-// what this check actually read. A pool naming several backends is served by NONE of them — that is
-// the reconciler's BackendNotSingular refusal — so on that shape "served by" would assert something
-// the intersection never established. What the refusal claims is therefore exactly what was
-// computed, and the consequence keeps its condition: served by one master, the two collide.
+// 消息中表述的是 pool“声明（name）了该后端”而非“由该后端服务（served by）”，这一措辞差异
+// 反映的是检查实际读取到的信息。声明了多个后端的 pool 实际上不受其中任何一个服务（对应调谐器的
+// BackendNotSingular 拒绝条件），因此在此情形下若写“由其服务”，就断言了交集运算并未证实的事实。
+// 拒绝消息所陈述的正是实际计算出的结论，其后果也保留了前提条件：当由同一个 master 服务时，两者冲突。
 //
-// The wording is also independent of HOW MANY are shared, and no clause is inflected. Several is
-// reachable, because BackendNotSingular is reported in status rather than kept out of the spec, so
-// admission does see such a pool. A singular subject would be ungrammatical there, and a plural
-// branch would be a second code path with no test that could fail on it.
+// 措辞也与共享后端的数量无关，不随单复数变化。共享多个后端的情况是可达的，因为
+// BackendNotSingular 仅报告在 status 中而非禁止写入 spec，准入阶段确实会遇到此类 pool。
+// 若用单数主语则不合语法，而增加复数分支又会引入一条没有测试能覆盖验证的第二代码路径。
 //
-// It races: two creates admitted against one cache state both pass. That is why F9's reconcile-time
-// refusal exists, and why this check is the one that produces a good message rather than the one that
-// guarantees the invariant.
+// 该检查存在竞态：基于同一份缓存状态准入的两个创建请求都会通过。这正是调谐期拒绝逻辑（F9）
+// 存在的意义，也说明本检查的职责是提供清晰的提示信息，而非保证该不变量。
 func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsUnclaimed(
 	ctx context.Context, kvcpb *workercore.KVCachePoolBinding,
 ) field.ErrorList {
@@ -264,8 +250,8 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsUnclaimed(
 	var holder *workercore.KVCachePoolBinding
 	var shared []string
 
-	// The FIRST match ends it: any Binding holding this name over a shared master already refutes
-	// uniqueness, and a second one would change nothing about the verdict or the action.
+	// 命中第一个匹配项即终止：只要在共享 master 上已有任意 Binding 占用该名称，就已推翻
+	// 唯一性，继续查找第二个也不会改变判定结果或后续动作。
 	err := r.forEachSharedMasterClaimant(ctx, kvcpb,
 		func(domain string) bool { return domain == kvcpb.Spec.Domain.Name },
 		func(h *workercore.KVCachePoolBinding, s []string) (bool, error) {
@@ -294,36 +280,31 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsUnclaimed(
 	))}
 }
 
-// validateKVCachePoolBindingDomainIsSeparable judges a reuse domain that is DISTINCT from one already
-// registered on a master this Binding's pool shares.
+// validateKVCachePoolBindingDomainIsSeparable 判断一个与本 Binding 所属 pool 共享同一
+// master 上已注册 domain 不同的复用 domain 是否可被隔离。
 //
-// Its sibling above refuses two Bindings on ONE name. This one is the opposite shape and needs a
-// different answer: the two names are different, each is correctly claimed, and the question is
-// whether anything downstream can keep them apart. Registering a second domain is a promise of
-// separation, and the promise has two independent keepers.
+// 上面的兄弟检查拒绝两个使用同一名称的 Binding。本检查面对相反的情形，需要不同的判定逻辑：
+// 两个名称各不相同，且各自都合法占用，问题在于下游组件能否将它们相互隔离。注册第二个 domain
+// 意味着作出隔离承诺，而兑现该承诺依赖两个相互独立的守门者。
 //
-// THE STORE IS THE KEEPER THIS CAN DECIDE, so this is the half that refuses. A master running without
-// its tenant ledger puts every request into a single default tenant and degrades its shard index to a
-// plain key hash, so two callers using different tenant names read and overwrite each other's blocks
-// while both objects report themselves registered. No engine rescues that: a client that does forward
-// its identity forwards it to a master with nowhere to put it. The FIRST domain on such a master is
-// admitted and works, which is what makes the second one the object that introduces the harm — and
-// the reason the refusal lands here rather than on whoever consumes it later.
+// 存储层是本检查能够判定的一半，因此由这一半触发拒绝。未启用 tenant 账本运行的 master 会将
+// 所有请求归入同一个默认 tenant，并将分片索引退化为普通键哈希，导致使用不同 tenant 名称的
+// 两个调用方互相读取和覆盖对方的块，而两个对象却都显示已成功注册。任何引擎都无法挽救这种
+// 情况：即使客户端转发了自己的身份标识，master 也无处存放。这类 master 上的第一个 domain
+// 可以正常准入并工作，真正引入风险的是第二个 domain——这正是拒绝发生在此处而非后续使用方的原因。
 //
-// THE ENGINE IS THE KEEPER THIS CANNOT DECIDE, so that half is a warning and says so. Whether a
-// workload's writes carry its domain depends on the inference engine in its container, and no object
-// this webhook can read records which engine will consume a pool: it arrives as an annotation on a Pod
-// that does not exist yet. Refusing on a fact nobody has would refuse every second domain, including
-// the ones an engine does keep apart, and refusing the Pod instead puts the outage on an author who
-// created no domain. So the Binding's author is told, at the moment they create the second domain,
-// what it does and does not buy, and each injected Pod carries the stamp saying which happened for it.
+// 引擎层是本检查无法判定的一半，因此这一半仅发出明确说明的告警。工作负载的写入是否携带
+// domain 取决于其容器内的推理引擎，而本 Webhook 能读取的任何对象中都不包含“哪个引擎将使用
+// 该 pool”的信息：该信息以 annotation 的形式出现在尚未创建的 Pod 上。依据无人知晓的事实
+// 进行拒绝，会误拒所有第二个 domain（包括引擎实际能够隔离的情况）；而改为拒绝 Pod，又会将
+// 故障转嫁给并未创建 domain 的工作负载作者。因此，系统在 Binding 作者创建第二个 domain 的
+// 那一刻告知其实际保障范围与局限，同时每个被注入的 Pod 也会携带标记说明其自身是否做到了隔离。
 //
-// CREATE ONLY, and that is structural rather than a preference. spec.poolRef and spec.domain.name are
-// both frozen by validateKVCachePoolBindingImmutable, so no update can produce a pairing of domain and
-// master that did not exist at creation. A copy of this rule on the update path could therefore only
-// fail an unrelated quota.ceiling edit against a collision admitted before this check existed, which is
-// the hazard rather than the fix. Domains that already stand on a ledger-less master keep whatever the
-// master gives them; admission refuses what has not happened yet.
+// 仅在创建时校验，这是由结构决定的而非偏好选择。spec.poolRef 与 spec.domain.name 均已由
+// validateKVCachePoolBindingImmutable 冻结，因此更新操作不可能产生创建时不存在的 domain 与
+// master 组合。若在更新路径复制该规则，只会使原本无关的 quota.ceiling 修改因本检查上线前就
+// 已准入的冲突而失败，这反而成了隐患而非修复。已存在于无账本 master 上的 domain 维持现状；
+// 准入只拦截尚未发生的情况。
 func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsSeparable(
 	ctx context.Context, kvcpb *workercore.KVCachePoolBinding,
 ) (ctrladmission.Warnings, field.ErrorList) {
@@ -333,11 +314,10 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsSeparable(
 	var firstShared []string
 	var refusal field.ErrorList
 
-	// EVERY neighbor is examined, not only the first one found. The question this rule asks is whether
-	// ANY master the two Bindings share fails to separate, and a first neighbor whose shared master is
-	// fine says nothing about a second neighbor sharing a different one. Its sibling above may stop at
-	// the first match because any duplicate already refutes it; the two questions are not the same
-	// shape, and one early return serving both would admit exactly the case this exists to refuse.
+	// 必须检查每一个相邻 Binding，而不仅是找到的第一个。本规则要回答的问题是：两个 Binding
+	// 共享的所有 master 中是否存在任意一个无法隔离；第一个邻居的共享 master 正常，并不能说明
+	// 共享另一个 master 的第二个邻居也正常。上面的兄弟检查可以在首个匹配处停止，因为任一重复项
+	// 就足以推翻唯一性；这两个问题的结构不同，若共用提前返回逻辑，恰恰会放过本检查旨在拦截的情形。
 	err := r.forEachSharedMasterClaimant(ctx, kvcpb,
 		func(domain string) bool { return domain != kvcpb.Spec.Domain.Name },
 		func(holder *workercore.KVCachePoolBinding, shared []string) (bool, error) {
@@ -384,14 +364,12 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsSeparable(
 		return nil, nil
 	}
 
-	// Admitted, and the warning is what the admission does not cover. It names the other domain rather
-	// than speaking generally, because "some other domain exists" is not something an operator can act
-	// on and "team-b/batch holds beta" is.
+	// 允许准入，而告警指出了准入校验未能覆盖的部分。告警会点名具体的另一个 domain 而非泛泛而谈，
+	// 因为“存在其他 domain”无法指导运维人员采取行动，而“team-b/batch 持有 beta”可以。
 	//
-	// IT CLAIMS NOTHING ABOUT THE STORE, and that is a correction rather than brevity. Admitting here
-	// means no master was OBSERVED OR DECLARED to be ledger-less, which includes an external master
-	// nobody has scraped yet — so a sentence saying the master keeps the two apart would assert the very
-	// thing the fall-through did not establish, in the one place an operator reads at that moment.
+	// 该告警不对存储层作任何断言，这是为了准确性而非图省事。走到此处放行仅意味着没有发现任何
+	// 被观测到或声明为无账本的 master，其中也包含尚未被采集过的外部 master——因此若在运维人员
+	// 此时最关注的告警信息中声称 master 会将两者隔开，就等于断言了降级放行路径并未证实的事情。
 	return ctrladmission.Warnings{fmt.Sprintf(
 		"reuse domain %q stands beside %q, which %s/%s registers on %s. Keeping two domains apart "+
 			"needs both a master holding a tenant ledger and an engine that forwards the identity, "+
@@ -404,35 +382,31 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingDomainIsSeparable(
 	)}, nil
 }
 
-// masterSeparatesDomains reports whether the master behind one backend can hold two reuse domains
-// apart, reading the OBSERVATION before the DECLARATION.
+// masterSeparatesDomains 报告一个后端背后的 master 是否能够隔离两个复用 domain，读取优先级为
+// 先读观测状态、再读声明配置。
 //
-// The pool's QuotaLedgerAvailable condition is what a controller measured against the running master,
-// so it answers for a backend this operator did not start. It is consulted only on the one reason that
-// is a configuration fact: False also carries LedgerUnreachable, which is a master that cannot be
-// reached right now, and refusing an object because of an outage would send an operator to reconfigure
-// something that is correct. Everything other than that one reason falls through.
+// pool 的 QuotaLedgerAvailable 状态条件是控制器针对运行中的 master 实测得到的，因此可用于
+// 判定非本 operator 启动的后端。此处仅采信代表配置事实的那个 reason：False 状态也可能是
+// LedgerUnreachable（表示 master 当前不可达），因瞬时故障而拒绝对象会误导运维人员去修改本就
+// 正确的配置。除该特定 reason 外的所有情况均继续向后回落。
 //
-// EVERY POOL NAMING THE MASTER IS ASKED, not only the one this Binding points at. One backend may be
-// named by several pools, and the observation lives on whichever of them a controller has already
-// reconciled — so reading this Binding's pool alone would miss a verdict that exists, purely because
-// of which pool the new object happens to name. A Binding created in the same breath as its pool is
-// the ordinary case, and that pool is the one with no conditions yet.
+// 会查询声明了该 master 的每一个 pool，而不只是当前 Binding 指向的那个。一个后端可能被
+// 多个 pool 声明，而观测状态位于控制器已经调谐过的任意一个 pool 上——若仅读取当前 Binding
+// 的 pool，就会纯粹因为新对象恰好指向了另一个 pool 而漏掉已有的判定结论。Binding 与其 pool
+// 同步创建是常见情形，而那个新 pool 此时尚未写入任何 condition。
 //
-// The declaration answers for a managed backend no pool has converged for yet, and it is exact there:
-// this operator renders that flag onto the leader's own command line.
+// 对于尚未有任何 pool 收敛的托管后端，则由声明配置给出答案，且在此场景下它是精确的：本
+// operator 会将该标志直接渲染到 leader 自身的命令行参数中。
 //
-// AN OBJECT THAT IS NOT THERE IS ANSWERED "separates", which is the side that claims less. An
-// external backend nobody has scraped, a backend the pool names and nobody created, a pool that no
-// longer exists — none of them is evidence that two domains collapse, and a refusal built on the
-// absence of a reading would refuse a correct object for want of a controller pass. The admission
-// warning on that path is worded to claim nothing the fall-through did not establish.
+// 对象不存在时按“可隔离”作答，即选择断言更弱的一侧。尚未被采集的外部后端、pool 声明但无人
+// 创建的后端、已不存在的 pool——这些都不能作为两个 domain 会混用的证据；若基于缺失读数而拒绝，
+// 就会仅仅因为控制器尚未执行一轮调谐而拒掉正确的对象。该路径上的准入告警措辞也经过斟酌，不会
+// 断言回落逻辑未能证实的结论。
 //
-// AN OBJECT THAT CANNOT BE READ IS NOT THAT CASE, and the two are easy to fold together because both
-// end in no data. Only a NotFound means absent; a timeout, an RBAC denial or a 5xx says nothing about
-// whether the object exists, so it travels up and the create fails as an InternalError — the same
-// answer every other cross-object read in this webhook gives, and the one this webhook's
-// failurePolicy of Fail already implies.
+// 对象无法读取则不属于上述情况，尽管两者最终都没有拿到数据而容易被混为一谈。只有 NotFound
+// 代表对象不存在；超时、RBAC 拒绝或 5xx 错误无法说明对象是否存在，因此会将错误向上传播并使
+// 创建请求以 InternalError 失败——这与本 Webhook 中所有其他跨对象读取的响应一致，也是其
+// failurePolicy 为 Fail 所固有的语义。
 func (r *KVCachePoolBindingWebhook) masterSeparatesDomains(
 	ctx context.Context, backend string, pools ...string,
 ) (bool, error) {
@@ -448,9 +422,8 @@ func (r *KVCachePoolBindingWebhook) masterSeparatesDomains(
 		if err != nil {
 			return false, err
 		}
-		// No membership test on the pool's backend list, and that is because the caller already made
-		// one unnecessary: backend came out of the INTERSECTION of these two pools' lists, so both name
-		// it by construction. A check here would be a branch no input can take.
+		// 此处不对 pool 的后端列表做成员检查，因为调用方已使其成为多余：backend 来自这两个 pool
+		// 列表的交集，按构造逻辑两者必然都声明了它。在此检查只会形成任何输入都无法命中的死分支。
 		if kvcp == nil {
 			continue
 		}
@@ -466,8 +439,8 @@ func (r *KVCachePoolBindingWebhook) masterSeparatesDomains(
 		if !kerrors.IsNotFound(err) {
 			return false, fmt.Errorf("get kv cache backend %q: %w", backend, err)
 		}
-		// A backend created in the same breath as the objects naming it is ordinary, so a cache miss is
-		// re-asked of the API server before it decides anything.
+		// 后端与引用它的对象同步创建十分常见，因此在缓存未命中时会先向 API server 重新查询，再做
+		// 后续判定。
 		if err = r.APIReader.Get(ctx, key, kvcb); err != nil {
 			if !kerrors.IsNotFound(err) {
 				return false, fmt.Errorf("get kv cache backend %q: %w", backend, err)
@@ -482,27 +455,24 @@ func (r *KVCachePoolBindingWebhook) masterSeparatesDomains(
 	return true, nil
 }
 
-// forEachSharedMasterClaimant walks the OTHER Bindings whose reuse domain satisfies matchDomain and
-// whose pool is served by a master this Binding's pool also names, handing each to visit together with
-// the masters the two pools share. A visit returning true stops the walk.
+// forEachSharedMasterClaimant 遍历复用 domain 满足 matchDomain、且所属 pool 由当前 Binding
+// 的 pool 也声明了的同一 master 所服务的其他 Binding，将每个对象连同两个 pool 共享的 master
+// 列表一并交给 visit 处理。visit 返回 true 时停止遍历。
 //
-// It is ONE scan serving two rules that ask opposite questions of the same neighbors — whether a
-// domain is already claimed, and whether a DIFFERENT domain stands beside it on a master that cannot
-// tell the two apart. A second copy of the walk would have to keep agreeing about which Bindings are
-// neighbors, and the two rules would drift in the ADMITTING direction, which is the one nothing
-// reports.
+// 这一次扫描同时服务于对同一组邻居提出相反问题的两条规则——domain 是否已被占用，以及是否有
+// 另一个不同的 domain 并存于一个无法区分二者的 master 上。若复制第二份遍历代码，就必须持续
+// 保持双方对“哪些 Binding 属于邻居”的判定一致，否则两条规则很容易在放行方向上发生漂移，而
+// 错误放行是不会产生任何报错的。
 //
-// WHERE THEY DIFFER IS WHEN TO STOP, which is why that is the caller's and not this function's: one
-// duplicate refutes uniqueness, while "can every shared master separate these domains" is only
-// answered by asking all of them. A shared early return would have been correct for one rule and
-// silently wrong for the other.
+// 二者的差异在于何时停止，因此停止条件交由调用方而非本函数决定：发现一个重复项即可推翻
+// 唯一性，而“每个共享 master 是否都能隔离这些 domain”必须询问全部对象才能回答。若共享同一个
+// 提前返回条件，对一条规则是正确的，对另一条则会静默出错。
 //
-// IT RACES, exactly as the uniqueness rule it shares does: the list is read from the informer cache,
-// so two creates admitted against one cache state both pass, and the API server is asked only when
-// the cache ERRORS rather than when it merely lags. For the uniqueness rule the reconciler's
-// contested-domain pass is the backstop. THE SEPARATION RULE HAS NO SUCH BACKSTOP — a pair admitted
-// together stays admitted — so this is an early refusal with a good message rather than an invariant,
-// and saying so here is what keeps the next reader from taking it for one.
+// 该遍历与唯一性规则一样存在竞态：列表读取自 informer 缓存，因此基于同一缓存状态准入的
+// 两个创建请求都会通过，且仅当缓存返回错误而非仅仅存在延迟时才会回退查询 API server。对于
+// 唯一性规则，调谐器的冲突 domain 检查阶段可作为兜底；而隔离规则没有此类兜底——同时准入的一对
+// 对象会保持已准入状态——因此这只是一次附带清晰提示信息的早期拦截，而非强不变量；在此说明
+// 是为了避免后续读者将其误认为不变量。
 func (r *KVCachePoolBindingWebhook) forEachSharedMasterClaimant(
 	ctx context.Context, kvcpb *workercore.KVCachePoolBinding, matchDomain func(domain string) bool,
 	visit func(holder *workercore.KVCachePoolBinding, shared []string) (stop bool, err error),
@@ -522,7 +492,7 @@ func (r *KVCachePoolBindingWebhook) forEachSharedMasterClaimant(
 		if !matchDomain(holder.Spec.Domain.Name) {
 			continue
 		}
-		// The object under admission itself, seen through the cache on a re-admitted update.
+		// 这是当前正在接受准入检查的对象本身，在更新重入准入时从缓存中读取到。
 		if holder.Namespace == kvcpb.Namespace && holder.Name == kvcpb.Name {
 			continue
 		}
@@ -548,22 +518,19 @@ func (r *KVCachePoolBindingWebhook) forEachSharedMasterClaimant(
 	return nil
 }
 
-// poolsSharedMasters returns the backends serving BOTH pools two Bindings name, which is the only
-// configuration in which their claims on one domain collide: a master holds one ledger entry per
-// tenant, so two Bindings on one domain over one master overwrite each other's ceiling, while two
-// masters hold two ledgers and collide on nothing. A pool's masters are its spec.backends, so the
-// answer is an intersection; a pool naming several is served by NONE of them (the reconciler's
-// BackendNotSingular refusal), but the intersection is still the safe answer — admission refuses
-// rather than reasoning about a shape its sibling webhook is already reporting.
+// poolsSharedMasters 返回同时服务两个 Binding 所指向的 pool 的后端列表，这也是它们对同一
+// domain 的声明发生冲突的唯一配置：一个 master 为每个 tenant 维护一条账本记录，因此同一
+// master 上同一 domain 的两个 Binding 会互相覆盖配额上限，而两个 master 各自持有独立账本，
+// 互不冲突。pool 的 master 即其 spec.backends，因此结果取交集；声明了多个后端的 pool 实际
+// 不受其中任何一个服务（对应调谐器的 BackendNotSingular 拒绝条件），但取交集依然是安全的选择——
+// 准入阶段宁可拒绝，也不对兄弟 Webhook 已经在报错的配置形态做额外推断。
 //
-// A pool with no masters is answered as sharing NOTHING, and that covers a pool which cannot be
-// read as well as one which names no backend, including an explicitly empty list — poolBackends
-// normalizes all of them to nil. For this Binding's own pool the
-// refusal is the ceiling check's to make, one call later, and a domain verdict computed against a
-// missing pool would be noise ahead of it; for the holder's, a gone pool means no master serves the
-// holder, so its claim collides with nothing — the reconciler's per-master contested set agrees.
-// ownBackends caches this Binding's own pool across claimants, so a cluster holding N Bindings on
-// one domain costs N+1 pool reads, not 2N.
+// 没有 master 的 pool 视作不共享任何后端，涵盖无法读取的 pool 以及未声明后端（包括显式为空列表）
+// 的 pool——poolBackends 会将它们统一归一化为 nil。对于当前 Binding 自身的 pool，找不到 pool
+// 的拒绝将在紧随其后的上限检查中给出，在此之前基于缺失 pool 算出的 domain 结论只是干扰噪声；
+// 对于既有持有者而言，pool 消失意味着没有 master 服务该持有者，因此其声明不会与任何对象冲突——
+// 这与调谐器按 master 计算冲突集合的语义一致。ownBackends 在遍历持有者期间缓存当前 Binding
+// 自身的 pool，因此集群中同一 domain 上存在 N 个 Binding 时仅需 N+1 次 pool 读取，而非 2N 次。
 func (r *KVCachePoolBindingWebhook) poolsSharedMasters(
 	ctx context.Context, ownPool, holderPool string,
 	ownBackends *[]string, ownBackendsRead *bool,
@@ -597,17 +564,16 @@ func (r *KVCachePoolBindingWebhook) poolsSharedMasters(
 	return shared, nil
 }
 
-// poolBackends answers WHICH MASTERS SERVE ONE POOL. A nil slice with no error means NONE DO, and
-// every way that happens is normalized to it: the pool is gone, or it exists carrying no backend.
+// poolBackends 返回服务指定 pool 的 master 列表。无 error 时返回 nil 切片表示没有任何
+// master 服务它，所有此类情形均归一化为 nil：无论是 pool 已不存在，还是 pool 存在但未携带后端。
 //
-// The normalization is load-bearing rather than tidy. spec.backends is required but carries no
-// minItems, so an explicit empty list is a shape the API server accepts, and returning it verbatim
-// would make the caller's `== nil` early return a NEAR equivalence instead of a real one — the
-// verdict would still come out right, by way of an intersection against an empty set, after a
-// second pool read that answers nothing.
+// 这一归一化处理并非单纯为了整洁，而是关键逻辑。spec.backends 为必填字段但未设置 minItems，
+// 因此显式空列表也是 API server 会接受的形态；若原样返回空切片，调用方的 `== nil` 提前返回
+// 就只能算近似等价而非真正等价——虽然之后通过与空集合求交集仍能得出正确结果，但会白白多出
+// 一次毫无作用的第二次 pool 读取。
 //
-// The read falls back to the API server for the reason the ceiling check's does: a Binding created
-// in the same breath as its pool is ordinary, and a cache miss must not become a wrong scope verdict.
+// 读取会回退到 API server，原因与上限检查相同：Binding 与其 pool 同步创建十分常见，不能因
+// 缓存未命中而得出错误的作用域判定。
 func (r *KVCachePoolBindingWebhook) poolBackends(
 	ctx context.Context, name string,
 ) ([]string, error) {
@@ -618,13 +584,11 @@ func (r *KVCachePoolBindingWebhook) poolBackends(
 	return kvcp.Spec.Backends, nil
 }
 
-// poolOrNil reads one pool, cache first and API server second, and answers a nil pool with no error
-// when it genuinely does not exist.
+// poolOrNil 读取单个 pool（先查缓存，再查 API server），当其确实不存在时返回 nil 且不返回 error。
 //
-// It is one function rather than a read at each site that wants a pool, because the two-step is the
-// part that is easy to get subtly wrong: only a NotFound from the SECOND read means absent, and a
-// timeout or an RBAC denial reported as absent turns a cluster fault into a verdict about the object
-// being admitted. Two copies would agree on the day they were written.
+// 将其收拢为单一函数而非在各使用处分别编写读取逻辑，是因为这两步查询极易出现细微错误：只有
+// 第二次读取返回 NotFound 才代表不存在，若将超时或 RBAC 拒绝误报为不存在，就会把集群故障
+// 转化为针对待准入对象的错误判定。在两处分别实现或许在编写当天表现一致，但后续极易产生分歧。
 func (r *KVCachePoolBindingWebhook) poolOrNil(
 	ctx context.Context, name string,
 ) (*workercore.KVCachePool, error) {
@@ -644,12 +608,11 @@ func (r *KVCachePoolBindingWebhook) poolOrNil(
 	return kvcp, nil
 }
 
-// validateKVCachePoolBindingCeilingFitsPool refuses a request the pool could not have granted.
+// validateKVCachePoolBindingCeilingFitsPool 拒绝 pool 无论如何都无法满足的配额请求。
 //
-// The ceiling is a REQUEST rather than a grant — the master reduces every tenant in proportion when
-// the requests together exceed capacity — so this is not a reservation check and no arithmetic across
-// the pool's other Bindings happens here. It refuses only the one thing that is meaningless on its
-// face: asking for more than the whole pool declares.
+// 上限是一个请求值（request）而非授予值（grant）——当所有请求总量超出容量时，master 会按
+// 比例缩减每个 tenant 的额度——因此这里不是预留容量检查，也不会跨 pool 中的其他 Binding
+// 做加总计算。它仅拒绝一种显而易见毫无意义的请求：申请量超过了整个 pool 声明的总容量。
 func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingCeilingFitsPool(
 	ctx context.Context, kvcpb *workercore.KVCachePoolBinding,
 ) field.ErrorList {
@@ -662,12 +625,11 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingCeilingFitsPool(
 			return field.ErrorList{field.InternalError(poolPath,
 				fmt.Errorf("get kv cache pool: %w", err))}
 		}
-		// A Binding created in the same breath as its pool is ordinary, so a cache miss is re-asked
-		// of the API server before it becomes a refusal.
+		// Binding 与其 pool 同步创建十分常见，因此在缓存未命中时会先向 API server 重新查询，而不会
+		// 直接拒绝。
 		//
-		// Only a NotFound from that read is the refusal, for the reason the pool webhook gives: under
-		// failurePolicy Fail, reporting a timeout or an RBAC denial as "pool not found" sends the
-		// author looking for a typo in a name that is correct.
+		// 仅当该次查询返回 NotFound 时才予以拒绝，原因与 pool Webhook 一致：在 failurePolicy 为 Fail
+		// 的配置下，若将超时或 RBAC 拒绝报告为“未找到 pool”，会误导提交者在原本正确的名称中排查拼写错误。
 		if err = r.APIReader.Get(ctx, key, kvcp); err != nil {
 			if !kerrors.IsNotFound(err) {
 				return field.ErrorList{field.InternalError(poolPath,
@@ -688,21 +650,19 @@ func (r *KVCachePoolBindingWebhook) validateKVCachePoolBindingCeilingFitsPool(
 			kvcp.Spec.Quota.Total.String(), kvcp.Name))}
 }
 
-// ceilingMoved reports whether an update changed what this Binding asks for.
+// ceilingMoved 报告一次更新是否改变了该 Binding 所申请的配额大小。
 //
-// Cmp and not equality of the string: 1Ti and 1099511627776 are the same request written two ways,
-// and re-reading the pool for a rewritten spelling would put it back in the path of every apply from
-// a templating tool that normalises quantities.
+// 使用 Cmp 而非字符串相等比较：1Ti 与 1099511627776 是同一请求量的两种写法，若因写法改写
+// 就重新读取 pool，会导致所有对容量单位做归一化处理的模板工具在每次 apply 时都触发该路径。
 func ceilingMoved(oldKvcpb, newKvcpb *workercore.KVCachePoolBinding) bool {
 	return oldKvcpb.Spec.Quota.Ceiling.Cmp(newKvcpb.Spec.Quota.Ceiling) != 0
 }
 
-// validateKVCachePoolBindingImmutable freezes what a warm cache cannot survive being told again.
+// validateKVCachePoolBindingImmutable 冻结那些一旦变更便会导致热缓存无法继续正确工作的字段。
 //
-// The pool is frozen because re-pointing moves a namespace's grant silently and leaves its
-// bytes on the old master. The domain is frozen field by field, and the last two are the dangerous
-// ones: a blockSize or a dtype changed under blocks already written is not an error anywhere. The
-// writes succeed, the reads succeed, and the tensors come back wrong.
+// pool 被冻结是因为重新指向会静默迁移 namespace 的配额并使其数据滞留在旧 master 上。domain
+// 则逐字段冻结，其中最后两个字段尤为危险：在已有块写入的情况下修改 blockSize 或 dtype 并不会
+// 在任何地方触发报错——写入会成功，读取也会成功，但取回来的 tensor 数据却是错的。
 func validateKVCachePoolBindingImmutable(
 	oldKvcpb, newKvcpb *workercore.KVCachePoolBinding,
 ) field.ErrorList {

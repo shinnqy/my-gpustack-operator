@@ -7,9 +7,9 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// Devices is the schema for worker.gpustack.ai.
+// Devices 是 worker.gpustack.ai 的结构定义。
 //
-// Devices proxies the v1alpha1.Devices.
+// Devices 代理转发 v1alpha1.Devices。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -19,7 +19,7 @@ type Devices workercore.Devices
 
 var _ runtime.Object = (*Devices)(nil)
 
-// DevicesList holds the list of Devices.
+// DevicesList 保存 Devices 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type DevicesList struct {

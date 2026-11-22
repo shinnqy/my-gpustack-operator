@@ -7,21 +7,21 @@ import (
 )
 
 var (
-	// BootstrapPassword is the password for bootstrapping the system.
+	// BootstrapPassword 是用于引导初始化系统的密码。
 	BootstrapPassword = varx.NewOnce("")
 
-	// DisableAuths is a flag to disable authentication.
+	// DisableAuths 是用于禁用认证的标志。
 	DisableAuths = varx.NewOnce(false)
 
-	// DisableApplications is a set of applications that are not allowed to be installed.
+	// DisableApplications 是不允许安装的应用集合。
 	DisableApplications = varx.NewOnce(sets.New[string]())
 
-	// ModelManagerServiceAccount is the ServiceAccount, in the system namespace, the model-manager
-	// plugin runs as: the only identity that may write a NodeModelStore's status.
+	// ModelManagerServiceAccount 是系统 Namespace 中 model-manager 插件运行所使用的
+	// ServiceAccount：它是唯一允许写入 NodeModelStore 状态的身份。
 	ModelManagerServiceAccount = varx.NewOnce("gpustack-operator-model-manager")
 )
 
-// ConfigureControl configures the function of the system.
+// ConfigureControl 配置系统控制功能。
 func ConfigureControl(
 	bootstrapPassword string,
 	disableAuths bool,

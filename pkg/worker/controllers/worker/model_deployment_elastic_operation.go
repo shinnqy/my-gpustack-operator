@@ -1,15 +1,12 @@
 package worker
 
-// The elastic resize operation is a durable record plus a pure decision function over it. The record
-// exists because a resize cannot be recovered by asking the engine what it thinks is happening: a
-// request that timed out, a gateway that answered 408 or 500, and a request that was never sent at
-// all are the same three states to every observer, and answering them differently is how a resize
-// gets replayed against an engine that has already applied it.
+// 弹性扩缩容操作由持久化记录及作用于其上的纯决策函数构成。之所以需要记录，
+// 是因为无法通过询问引擎当前状况来恢复扩缩容：请求超时、网关返回 408 或 500，
+// 以及请求根本未发出，在任何观测者看来都是无法区分的三种状态；若对其作不同处理，
+// 就可能对已经应用过变更的引擎重放扩缩容请求。
 //
-// So the command intent is written BEFORE the request leaves, and a record that says a command was
-// sent is never evidence that it may be sent again. Reconstruction after a restart reads that
-// record and the fresh facts, and derives the same next action it would have derived before.
+// 因此，命令意图会在请求发出之前写入，且记录命令已发送绝不能作为再次发送的依据。
+// 重启后的重建逻辑会读取该记录与最新事实，推导出与重启前完全一致的下一步动作。
 
-// elasticOperationLabel marks the stored object so it is findable and cannot be mistaken for an
-// ordinary ConfigMap.
+// elasticOperationLabel 标记存储对象，使其可被检索且不会被误认为普通 ConfigMap。
 const elasticOperationLabel = "gpustack.ai/elastic-operation"

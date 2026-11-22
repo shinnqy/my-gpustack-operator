@@ -8,19 +8,17 @@ import (
 	gpustack "gpustack.ai/gpustack/api/v1"
 )
 
-// KVCachePool is the schema for worker.gpustack.ai.
+// KVCachePool 是 worker.gpustack.ai 的架构定义。
 //
-// A KVCacheBackend declares the physical cache; this declares which namespaces are granted a quota on
-// it, how much of it, and under which reuse identity. It is Kueue's ClusterQueue to
-// KVCachePoolBinding's LocalQueue: the quota domain over exactly one backend, and the registry of the
-// reuse domains its Bindings have claimed.
+// KVCacheBackend 声明物理缓存，而本资源声明授予哪些命名空间配额、配额大小以及使用何种
+// 复用身份。它之于 KVCachePoolBinding，犹如 Kueue 中的 ClusterQueue 之于 LocalQueue：
+// 作为单个后端上的配额域，以及其下各 Binding 所声明复用域的注册表。
 //
-// It GRANTS AND ACCOUNTS; IT DOES NOT ADMIT — nothing here keeps a pod that knows a reuse domain's
-// name from reaching that domain on the store, and KVCachePoolBinding says what the grant is not. It
-// is cluster-scoped for the reason its backend is: only an admin declares a privileged physical
-// resource, pools must be shareable across namespaces, and a cross-namespace reference FROM a
-// namespaced object is an anti-pattern. Data-plane isolation is a different axis, solved by the
-// storage layer's tenant rather than by this object's scope.
+// 它负责授权与记账，但不负责准入控制——此处没有任何机制阻止知晓复用域名称的 Pod 访问
+// 存储层上的该域，KVCachePoolBinding 说明了此项授权的边界所在。其之所以为集群作用域，
+// 原因与后端相同：只有管理员才能声明特权物理资源，池必须能够跨命名空间共享，且从
+// 命名空间作用域对象发起跨命名空间引用属于反模式。数据平面隔离属于另一维度，应由存储层的
+// 租户机制而非本对象的作用域来解决。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -41,50 +39,50 @@ type KVCachePool struct {
 
 var _ runtime.Object = (*KVCachePool)(nil)
 
-// KVCachePoolSpec defines the desired spec of KVCachePool.
+// KVCachePoolSpec 定义 KVCachePool 的期望规格。
 type KVCachePoolSpec struct {
-	// Backends names the KVCacheBackend this pool draws from. Each entry is the backend's NAME, not
-	// an object reference: there is no kind or namespace to write alongside it.
+	// Backends 指定该池所依托的 KVCacheBackend 名称。每一项均为后端的 NAME，而非
+	// 对象引用：旁边无需填写 kind 或 namespace。
 	//
-	//   - Exactly one entry is admitted, and the rule is the webhook's rather than the schema's so the
-	//     refusal can carry its reason: quota lands on a single master's per-tenant ledger, and one
-	//     master cannot account for bytes held in another backend.
-	//   - It is IMMUTABLE, webhook-enforced. Moving a pool to another backend would strand every
-	//     tenant quota on the old master's ledger with nothing left to delete them with.
-	//   - The reverse is NOT exclusive: one backend may be referenced by several pools, which is why
-	//     the ledger and the rendered policy converge per MASTER rather than per pool.
+	//   - 仅允许填写一项，该规则由 webhook 而非 schema 强制执行，以便在拒绝时能附带
+	//     明确原因：配额落账在单个 master 的按租户账本上，一个 master 无法统计存储在
+	//     另一后端中的字节数。
+	//   - 该字段由 webhook 强制保持不可变。将池迁移到另一个后端会使原 master 账本上的
+	//     所有租户配额成为孤儿记录，且后续无法再进行清理。
+	//   - 反向关系并非排他：同一个后端可被多个池引用，因此账本与渲染后的策略均按
+	//     MASTER 而非按池维度收敛。
 	//
 	// +required
 	// +listType=atomic
 	Backends []string `json:"backends" protobuf:"bytes,1,rep,name=backends"`
 
-	// Quota is the ceiling this pool declares over its backend.
+	// Quota 是该池在其后端上声明的容量上限。
 	//
 	// +required
 	Quota KVCachePoolQuota `json:"quota" protobuf:"bytes,2,name=quota"`
 }
 
-// KVCachePoolQuota is the pool's declared ceiling.
+// KVCachePoolQuota 是该池声明的容量上限。
 //
-// It is OUR number, not the master's. The master reports its own allocatable capacity and the two
-// can disagree; the case where the disagreement is total — a ceiling declared over a backend that
-// has mounted nothing — is a Condition rather than a silence.
+// 它是本 API 侧设定的数值，而非 master 上报的值。master 会上报自身的可分配容量，
+// 两者可能不一致；当冲突达到极端情况（即在尚未挂载任何介质的后端上声明了上限）时，
+// 会通过 Condition 予以提示，而不会静默忽略。
 type KVCachePoolQuota struct {
-	// Total is required: a pool with no declared ceiling has nothing to write into any ledger.
+	// Total 为必填项：未声明上限的池没有可写入任何账本的配额基数。
 	//
 	// +required
 	Total resource.Quantity `json:"total" protobuf:"bytes,1,name=total"`
 }
 
-// KVCachePoolStatus defines the observed state of KVCachePool.
+// KVCachePoolStatus 定义 KVCachePool 的观测状态。
 type KVCachePoolStatus struct {
-	// Phase summarizes the conditions: Provisioning, Ready, Error, Deleting.
+	// Phase 汇总各项条件的状态：Provisioning、Ready、Error、Deleting。
 	Phase string `json:"phase,omitempty" protobuf:"bytes,1,opt,name=phase"`
 
-	// PhaseMessage carries the reason for the phase.
+	// PhaseMessage 携带当前 Phase 的原因说明。
 	PhaseMessage string `json:"phaseMessage,omitempty" protobuf:"bytes,2,opt,name=phaseMessage"`
 
-	// Conditions is the finer view, one condition per axis.
+	// Conditions 提供更细粒度的状态视图，每个维度对应一项条件。
 	//
 	// +patchMergeKey=type
 	// +patchStrategy=merge
@@ -92,40 +90,39 @@ type KVCachePoolStatus struct {
 	// +listMapKey=type
 	Conditions []gpustack.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,3,rep,name=conditions"` // nolint: lll
 
-	// ClientEndpoint is the address an inference engine connects to, echoed from the backend's
-	// Client endpoint.
+	// ClientEndpoint 是推理引擎连接的地址，直接回显后端的 Client 端点。
 	//
-	// It is absent, with a Condition saying why, whenever the backend has published no endpoints yet,
-	// and is never filled from a Service name derived from the backend's own — a guessed address that
-	// happens to resolve is how a pool would silently drive the wrong master.
+	// 每当后端尚未发布任何端点时，该字段为空，并伴随一条说明原因的 Condition；同时绝不会
+	// 根据后端自身的名称去拼接猜测 Service 名称来填充——如果猜出的地址恰巧能够解析，
+	// 池就会静默地连接到错误的 master。
 	//
-	// The backend's ADMIN address is deliberately republished NOWHERE. That one port serves the
-	// Prometheus exposition and the HTTP admin API both, so it is the write face of the quota ledger,
-	// while this object is cluster-scoped and readable by anyone holding a pool RBAC rule.
+	// 后端的 ADMIN 地址刻意不在任何地方转发暴露。该端口同时提供 Prometheus 指标暴露与
+	// HTTP 管理 API，因此属于配额账本的写入面，而本对象为集群作用域，任何拥有池 RBAC
+	// 权限的主体均可读取。
 	//
 	// +k8s:validation:maxLength=259
 	ClientEndpoint string `json:"clientEndpoint,omitempty" protobuf:"bytes,4,opt,name=clientEndpoint"`
 
-	// Usage is what this pool's own tenants are holding. It is ABSENT until a scrape succeeds, and
-	// absent is not the same as reporting zero.
+	// Usage 表示本池所属租户当前占用的空间。在一次抓取成功之前该字段不存在，
+	// 字段缺失与上报为零具有完全不同的语义。
 	Usage *KVCachePoolUsage `json:"usage,omitempty" protobuf:"bytes,5,opt,name=usage"`
 
-	// Domains is the registry of reuse identities claimed against this pool, one entry per Binding.
+	// Domains 是针对本池注册的复用身份表，每个 Binding 对应一条记录。
 	//
-	// It is AUTHORITATIVE rather than advisory: an entry exists because a Binding declares it, not
-	// because a workload announced itself, so assembling it is one pass over the Binding index and
-	// needs no watch on any workload kind.
+	// 该列表具有权威性而非仅供参考：某条记录存在是因为有 Binding 声明了它，而不是因为
+	// 工作负载自行上报了存在，因此只需遍历一次 Binding 索引即可构建该列表，无需 watch
+	// 任何工作负载资源类型。
 	//
 	// +listType=map
 	// +listMapKey=name
 	Domains []KVCachePoolDomain `json:"domains,omitempty" protobuf:"bytes,6,rep,name=domains"`
 
-	// UsedBy names the Bindings that hold this pool. A non-empty UsedBy is what the finalizer
-	// refuses deletion on, so the field is the enforcement input and not a display.
+	// UsedBy 列出占用本池的 Binding。非空的 UsedBy 是 finalizer 拒绝删除的依据，
+	// 因此该字段是实际生效的约束输入，而不仅仅是展示信息。
 	//
-	// Unlike the Binding's own list, THIS one is written by this API's reconciler, which already
-	// lists the Bindings of a pool through its index. The two levels of usedBy therefore have
-	// different writers, and only this one is self-contained.
+	// 与 Binding 自身的列表不同，本字段由本 API 的 reconciler 写入，该 reconciler 已通过
+	// 索引列出了池对应的 Binding。因此两级 usedBy 各自拥有不同的写入方，且只有本字段是
+	// 自洽维护的。
 	//
 	// +listType=map
 	// +listMapKey=kind
@@ -134,19 +131,19 @@ type KVCachePoolStatus struct {
 	UsedBy []KVCacheObjectReference `json:"usedBy,omitempty" protobuf:"bytes,7,rep,name=usedBy"`
 }
 
-// KVCacheObjectReference names an object that consumes another one in this group. It is the ONE
-// shape every usedBy in this family carries, so a reader learns it once.
+// KVCacheObjectReference 指定消费本组中另一对象的资源。它是本系列资源中所有 usedBy
+// 字段统一采用的结构，读者只需了解一次即可。
 //
-// It names NO API GROUP, and that is a constraint rather than an omission: a usedBy entry may only
-// name a kind in this API group, within which kind and name identify an object. The constraint is
-// what lets the list be keyed at all — core.TypedLocalObjectReference carries an optional,
-// defaultless apiGroup, which a structural schema refuses as a list map key, so keying on kind and
-// name alone would silently merge two objects that differ only by group.
+// 该结构不含 API GROUP，这是一种刻意约束而非遗漏：usedBy 条目只能引用本 API 组内的
+// 类型，在该组内仅凭 kind 和 name 即可唯一确定对象。正是这一约束使得列表能够正常
+// 建立主键——core.TypedLocalObjectReference 带有无默认值的可选 apiGroup，结构化
+// schema 拒绝将其用作列表 map 键；而如果仅按 kind 和 name 建键，则会静默合并
+// 仅在组名上存在差异的两个对象。
 //
-// All three fields are REQUIRED, and all three are list map keys: a structural schema accepts a key
-// only where it is required or defaulted, and two consumers collapsing into one entry would let a
-// finalizer release while a consumer still holds. Namespace carries the EMPTY STRING when the
-// referent is in the holder's own scope, so empty is a value here, not an absence.
+// 三个字段均为必填项，且共同构成列表 map 键：结构化 schema 仅允许必填或有默认值的
+// 字段作为键，若两个消费者合并为一条记录，就会导致消费者仍持有引用时 finalizer 便提前
+// 释放。当被引用对象与持有者处于同一作用域时，Namespace 填入空字符串，因此此处空字符串
+// 代表有效取值而非缺失。
 type KVCacheObjectReference struct {
 	// +required
 	Kind string `json:"kind" protobuf:"bytes,1,name=kind"`
@@ -158,45 +155,43 @@ type KVCacheObjectReference struct {
 	Name string `json:"name" protobuf:"bytes,3,name=name"`
 }
 
-// KVCachePoolUsage is what the pool's tenants hold, as the master reports it.
+// KVCachePoolUsage 是由 master 上报的池内租户实际占用量。
 type KVCachePoolUsage struct {
-	// Total is the sum of the occupancy the master reports for the tenants THIS pool owns — never its
-	// whole ledger, which a shared backend makes larger than this pool. An unobserved total is ABSENT
-	// rather than zero, because a zero here would read as an empty cache.
+	// Total 是 master 为本池所拥有租户上报的占用量总和——绝非其整个账本的总量，因为
+	// 共享后端会使账本总量大于单个池。未观测到的 total 保持缺失状态而非置为零，因为零值
+	// 会被误读为空缓存。
 	//
-	// WHAT occupancy means is the master's choice, not this API's, and it changed: a master exposing
-	// used bytes apart from reservations is summed as committed bytes, while one exposing a single
-	// charged figure — the shape 0.3.13 introduced — charges at the start of a write, so in-flight
-	// reservations are already inside this total. Do not read it as committed usage without knowing
-	// which the backend runs.
+	// 占用量的具体含义取决于 master 的实现而非本 API，且发生过变更：将已用字节与预留空间
+	// 分开暴露的 master 按已提交字节汇总；而暴露单一计费数值的 master（0.3.13 引入的形态）
+	// 会在写入开始时即计入费用，因此进行中的预留空间已包含在此总量内。在不清楚后端所运行
+	// 版本行为的情况下，切勿将其直接视为已提交用量。
 	Total *resource.Quantity `json:"total,omitempty" protobuf:"bytes,1,opt,name=total"`
 }
 
-// KVCachePoolDomain is one reuse identity registered against this pool: what it is, who declared it,
-// and what the master reports about it.
+// KVCachePoolDomain 是注册到本池的一条复用身份记录：包括其名称、声明者以及
+// master 上报的相关信息。
 type KVCachePoolDomain struct {
-	// Name is the reuse identity, and it is the storage layer's tenant_id.
+	// Name 是复用身份标识，对应存储层的 tenant_id。
 	//
 	// +required
 	// +k8s:validation:maxLength=63
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// Binding is the object that declared this domain. It is the only place a domain can be
-	// declared, which is what keeps naming one a privileged act.
+	// Binding 是声明该域的对象。它是唯一可以声明域的地方，从而确保命名一个域属于
+	// 受控的特权操作。
 	//
 	// +required
 	Binding KVCachePoolBindingReference `json:"binding" protobuf:"bytes,2,name=binding"`
 
-	// BlockSize and Dtype are echoed from the Binding that registered the domain, so a reader of
-	// the registry does not have to fetch every Binding to learn what a domain's blocks are.
+	// BlockSize 和 Dtype 直接回显自注册该域的 Binding，使注册表的读取方无需逐一拉取
+	// 每个 Binding 即可获知该域的数据块规格。
 	//
-	// Both are REQUIRED, unlike the observed figures below, because they are copied from a Binding
-	// that already requires them: an entry missing one could only be a writer bug, and leaving them
-	// optional would let the registry answer "this domain's blocks are of unknown shape", which is
-	// not a state that exists.
+	// 与下方的观测指标不同，这两项均为必填：它们复制自已要求这两项必填的 Binding，若条目
+	// 缺少其中任一项只能说明写入方存在 bug；如果将其设为可选，则意味着注册表允许出现
+	// “该域数据块形状未知”的回答，而这在实际上是不存在的状态。
 	//
-	// Dtype is spelled to match its JSON name exactly. DType would not, and the openapi generator
-	// records every such mismatch as a checked-in API rule violation.
+	// Dtype 的拼写严格匹配其 JSON 名称。写成 DType 则会不一致，openapi 生成器会将此类
+	// 大小写不匹配记录为受检的 API 规则违规。
 	//
 	// +required
 	BlockSize int32 `json:"blockSize" protobuf:"varint,3,name=blockSize"`
@@ -204,29 +199,29 @@ type KVCachePoolDomain struct {
 	// +required
 	Dtype string `json:"dtype" protobuf:"bytes,4,name=dtype"`
 
-	// Blocks and HitRate are OBSERVED, never declared, and they are ABSENT when the scrape does not
-	// carry this domain. A fabricated zero hit rate on a warm cache is worse than no number, and
-	// zero blocks is a different fact from "not in the scrape".
+	// Blocks 和 HitRate 属于观测值而非声明值，当抓取结果中不包含该域时保持缺失状态。
+	// 在热缓存上伪造一个零命中率比没有数值更糟，而块数为零与“未出现在抓取结果中”是
+	// 两个完全不同的事实。
 	//
-	// This operator writes neither today, so both are always absent: the current store generation
-	// exports no per-domain object count, and its hit rate is per master rather than per domain.
+	// 当前版本的 operator 均不写入这两个字段，因此它们始终保持缺失：现阶段的存储层
+	// 不导出按域划分的对象计数，且其命中率是按 master 而非按域统计的。
 	Blocks *int64 `json:"blocks,omitempty" protobuf:"varint,5,opt,name=blocks"`
 
-	// HitRate is a ratio held as a STRING with a pattern, never a float, matching the shape the
-	// measured surface itself uses. The pattern is safe here in a way an enum on an echoed vendor
-	// value would not be, because this ratio is COMPUTED by this operator. It does oblige whoever
-	// writes it to format to this shape: a value that fails the pattern fails the WHOLE status write,
-	// freezing every other field at its last value, not just this one.
+	// HitRate 是以带正则约束的 STRING 形式保存的比率（绝不使用浮点数），与被测接口
+	// 自身的格式保持一致。相比在透传的厂商字段上使用枚举，在此使用正则约束是安全的，因为
+	// 该比率由本 operator 计算生成。但这也要求写入方必须严格按该格式输出：任何不符合正则
+	// 的值都会导致整个 status 写入失败，使其他所有字段都停留在上一次的值上，而不仅仅是
+	// 这一个字段。
 	//
 	// +k8s:validation:pattern="^(0(\\.[0-9]{1,4})?|1(\\.0{1,4})?)$"
 	HitRate string `json:"hitRate,omitempty" protobuf:"bytes,6,opt,name=hitRate"`
 }
 
-// KVCachePoolBindingReference names one KVCachePoolBinding.
+// KVCachePoolBindingReference 指定一个 KVCachePoolBinding。
 //
-// It carries no kind, unlike KVCacheObjectReference, because it is not a usedBy: it is the back
-// pointer from a registered domain to the one object that could have declared it, and only a
-// KVCachePoolBinding ever can. Both fields are required, a Binding being namespaced.
+// 与 KVCacheObjectReference 不同，它不携带 kind，因为它并非 usedBy 引用：它是从
+// 已注册域指回唯一声明对象的反向指针，而只有 KVCachePoolBinding 才能声明域。
+// 由于 Binding 属于命名空间作用域，两个字段均为必填。
 type KVCachePoolBindingReference struct {
 	// +required
 	Namespace string `json:"namespace" protobuf:"bytes,1,name=namespace"`
@@ -235,7 +230,7 @@ type KVCachePoolBindingReference struct {
 	Name string `json:"name" protobuf:"bytes,2,name=name"`
 }
 
-// KVCachePoolList holds the list of KVCachePool.
+// KVCachePoolList 包含 KVCachePool 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type KVCachePoolList struct {

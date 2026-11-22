@@ -25,10 +25,10 @@ import (
 
 const _InstanceImagePullSecretResource = "instanceimagepullsecrets"
 
-// InstanceImagePullSecretHandler handles v1.InstanceImagePullSecret objects.
+// InstanceImagePullSecretHandler 处理 v1.InstanceImagePullSecret 对象。
 //
-// InstanceImagePullSecretHandler maps the v1.InstanceImagePullSecret to a Kubernetes Secret resource,
-// which is named as the InstanceImagePullSecret's name.
+// InstanceImagePullSecretHandler 将 v1.InstanceImagePullSecret 映射为 Kubernetes Secret 资源，
+// 该 Secret 与 InstanceImagePullSecret 同名。
 type InstanceImagePullSecretHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -41,7 +41,7 @@ func (h *InstanceImagePullSecretHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &core.Secret{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -54,20 +54,20 @@ func (h *InstanceImagePullSecretHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_InstanceImagePullSecretResource)
 
-	// Create table convertor to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 输出。
 	tc, err := extensionapi.NewJSONPathTableConvertor()
 	if err != nil {
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储。
 	h.ObjectInfo = &worker.InstanceImagePullSecret{}
 	h.CurdOperations = extensionapi.WithCurd(tc, h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 
@@ -95,8 +95,7 @@ func (h *InstanceImagePullSecretHandler) New() runtime.Object {
 func (h *InstanceImagePullSecretHandler) Destroy() {
 }
 
-// SupportsDryRun reports true: OnCreate and OnUpdate write the Secret once each, and pass the
-// options on to that write.
+// SupportsDryRun 返回 true：OnCreate 和 OnUpdate 各自仅写入一次 Secret，并将请求选项透传给该写入操作。
 func (h *InstanceImagePullSecretHandler) SupportsDryRun() bool {
 	return true
 }
@@ -104,7 +103,7 @@ func (h *InstanceImagePullSecretHandler) SupportsDryRun() bool {
 func (h *InstanceImagePullSecretHandler) OnCreate(ctx context.Context, obj runtime.Object, opts ctrlcli.CreateOptions) (runtime.Object, error) {
 	instImgPullSec := obj.(*worker.InstanceImagePullSecret)
 
-	// Validate.
+	// 校验。
 	if instImgPullSec.Spec.Registry == "" {
 		return nil, field.Required(field.NewPath("spec.registry"), "registry is required")
 	}
@@ -115,7 +114,7 @@ func (h *InstanceImagePullSecretHandler) OnCreate(ctx context.Context, obj runti
 		return nil, field.Required(field.NewPath("spec.password"), "password is required")
 	}
 
-	// Create.
+	// 创建。
 	sec := convertSecretFromInstanceImagePullSecret(instImgPullSec)
 	err := h.Client.Create(ctx, sec, &opts)
 	if err != nil {
@@ -131,20 +130,20 @@ func (h *InstanceImagePullSecretHandler) NewList() runtime.Object {
 }
 
 func (h *InstanceImagePullSecretHandler) OnList(ctx context.Context, opts ctrlcli.ListOptions) (runtime.Object, error) {
-	// List.
+	// 查询列表。
 	secList := new(core.SecretList)
 	err := h.APIReader.List(ctx, secList, &opts)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	itList := convertInstanceImagePullSecretListFromSecretList(secList, opts)
 	return itList, nil
 }
 
 func (h *InstanceImagePullSecretHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) (watch.Interface, error) {
-	// Watch.
+	// 监听。
 	uw, err := h.Client.(ctrlcli.WithWatch).Watch(ctx, new(core.SecretList), &opts)
 	if err != nil {
 		return nil, err
@@ -159,31 +158,31 @@ func (h *InstanceImagePullSecretHandler) OnWatch(ctx context.Context, opts ctrlc
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 因 context 取消而退出。
 				return
 			case <-dw.StopChan():
-				// Stop by downstream.
+				// 因下游停止。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 因上游关闭。
 					return
 				}
 
-				// Nothing to do.
+				// 无需处理。
 				if e.Object == nil {
 					c <- e
 					continue
 				}
 
-				// Type assert.
+				// 类型断言。
 				sec, ok := e.Object.(*core.Secret)
 				if !ok {
 					c <- e
 					continue
 				}
 
-				// Process bookmark.
+				// 处理书签事件。
 				if e.Type == watch.Bookmark {
 					systemmeta.UnnoteResource(sec)
 					e.Object = &worker.InstanceImagePullSecret{ObjectMeta: sec.ObjectMeta}
@@ -191,18 +190,18 @@ func (h *InstanceImagePullSecretHandler) OnWatch(ctx context.Context, opts ctrlc
 					continue
 				}
 
-				// Convert.
+				// 转换。
 				instImgPullSec := convertInstanceImagePullSecretFromSecret(sec)
 				if instImgPullSec == nil {
 					continue
 				}
 
-				// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+				// 如果未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 				if !instanceImagePullSecretMatchFieldSelector(opts, instImgPullSec) {
 					continue
 				}
 
-				// Dispatch.
+				// 分发。
 				e.Object = instImgPullSec
 				c <- e
 			}
@@ -213,7 +212,7 @@ func (h *InstanceImagePullSecretHandler) OnWatch(ctx context.Context, opts ctrlc
 }
 
 func (h *InstanceImagePullSecretHandler) OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (runtime.Object, error) {
-	// Get.
+	// 获取。
 	sec := &core.Secret{
 		ObjectMeta: meta.ObjectMeta{
 			Name:      key.Name,
@@ -225,7 +224,7 @@ func (h *InstanceImagePullSecretHandler) OnGet(ctx context.Context, key types.Na
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	instImgPullSec := convertInstanceImagePullSecretFromSecret(sec)
 	if instImgPullSec == nil {
 		return nil, kerrors.NewNotFound(worker.Resource(_InstanceImagePullSecretResource), key.Name)
@@ -239,7 +238,7 @@ func (h *InstanceImagePullSecretHandler) OnUpdate(
 ) (runtime.Object, error) {
 	instImgPullSec := obj.(*worker.InstanceImagePullSecret)
 
-	// Validate.
+	// 校验。
 	if instImgPullSec.Spec.Registry == "" {
 		return nil, field.Required(field.NewPath("spec.registry"), "registry is required")
 	}
@@ -250,7 +249,7 @@ func (h *InstanceImagePullSecretHandler) OnUpdate(
 		return nil, field.Required(field.NewPath("spec.password"), "password is required")
 	}
 
-	// Update.
+	// 更新。
 	{
 		sec := convertSecretFromInstanceImagePullSecret(instImgPullSec)
 		err := h.Client.Update(ctx, sec, &opts)
@@ -266,7 +265,7 @@ func (h *InstanceImagePullSecretHandler) OnUpdate(
 func (h *InstanceImagePullSecretHandler) OnDelete(ctx context.Context, obj runtime.Object, opts ctrlcli.DeleteOptions) error {
 	instImgPullSec := obj.(*worker.InstanceImagePullSecret)
 
-	// Delete.
+	// 删除。
 	sec := &core.Secret{ObjectMeta: instImgPullSec.ObjectMeta}
 	return h.Client.Delete(ctx, sec, &opts)
 }
@@ -286,7 +285,7 @@ func convertSecretFromInstanceImagePullSecret(instImgPullSec *worker.InstanceIma
 		},
 	}
 	dcrCfgJson := json.MustMarshal(dcrCfg)
-	// Example:
+	// 示例:
 	// {"auths":{"your.private.registry.example.com":{"email":"jdoe@example.com","auth":"c3R...zE2"}}}
 
 	sec := &core.Secret{
@@ -341,7 +340,7 @@ func convertInstanceImagePullSecretListFromSecretList(secList *core.SecretList, 
 			continue
 		}
 
-		// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+		// 如果未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 		if !instanceImagePullSecretMatchFieldSelector(opts, instImgPullSec) {
 			continue
 		}
@@ -352,7 +351,7 @@ func convertInstanceImagePullSecretListFromSecretList(secList *core.SecretList, 
 	return instImgPullSecList
 }
 
-// instanceImagePullSecretMatchFieldSelector checks if the InstanceImagePullSecret matches the field selector in list options.
+// instanceImagePullSecretMatchFieldSelector 检查 InstanceImagePullSecret 是否匹配列表选项中的字段选择器。
 func instanceImagePullSecretMatchFieldSelector(opts ctrlcli.ListOptions, instImgPullSec *worker.InstanceImagePullSecret) bool {
 	fs := opts.FieldSelector
 	if fs == nil {

@@ -15,7 +15,7 @@ type (
 		rest.Storage
 		rest.Getter
 		rest.Updater
-		// GetStatusSubResourceUpdater returns an Updater for the status subresource.
+		// GetStatusSubResourceUpdater 返回用于 status 子资源的 Updater。
 		GetStatusSubResourceUpdater() UpdateOperation
 	}
 
@@ -30,7 +30,7 @@ var (
 	_ rest.Updater = (*StatusSubResourceStorage)(nil)
 )
 
-// AsStatusSubResourceStorage returns a default status SubResourceStorage for the given SubResourceObject.
+// AsStatusSubResourceStorage 为给定的 SubResourceObject 返回默认的 status SubResourceStorage。
 func AsStatusSubResourceStorage(s StatusSubResourceParentStore) StatusSubResourceStorage {
 	return StatusSubResourceStorage{StatusSubResourceParentStore: s}
 }
@@ -64,7 +64,7 @@ var (
 	_ rest.Updater = (*ScaleSubResourceStorage)(nil)
 )
 
-// AsScaleSubResourceStorage returns a default scale SubResourceStorage for the given SubResourceObject.
+// AsScaleSubResourceStorage 为给定的 SubResourceObject 返回默认的 scale SubResourceStorage。
 func AsScaleSubResourceStorage(s ScaleSubResourceParentStore) ScaleSubResourceStorage {
 	return ScaleSubResourceStorage{ScaleSubResourceParentStore: s}
 }

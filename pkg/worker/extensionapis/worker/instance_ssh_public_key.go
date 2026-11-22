@@ -25,10 +25,10 @@ import (
 
 const _InstanceSSHPublicKeyResource = "instancesshpublickeys"
 
-// InstanceSSHPublicKeyHandler handles v1.InstanceSSHPublicKey objects.
+// InstanceSSHPublicKeyHandler 处理 v1.InstanceSSHPublicKey 对象。
 //
-// InstanceSSHPublicKeyHandler maps the v1.InstanceSSHPublicKey to a Kubernetes Secret resource,
-// which is named as the InstanceSSHPublicKey's name.
+// InstanceSSHPublicKeyHandler 将 v1.InstanceSSHPublicKey 映射为一个 Kubernetes Secret 资源，
+// 该 Secret 的名称与 InstanceSSHPublicKey 相同。
 type InstanceSSHPublicKeyHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -41,7 +41,7 @@ func (h *InstanceSSHPublicKeyHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &core.Secret{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -54,10 +54,10 @@ func (h *InstanceSSHPublicKeyHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_InstanceSSHPublicKeyResource)
 
-	// Create table convertor to pretty the kubectl's output.
+	// 创建表转换器以美化 kubectl 输出。
 	tc, err := extensionapi.NewJSONPathTemplateTableConvertor(
 		extensionapi.RenderColumn("Data", func(obj *worker.InstanceSSHPublicKey) string {
 			const tailLen = 27
@@ -72,11 +72,11 @@ func (h *InstanceSSHPublicKeyHandler) SetupHandler(
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储。
 	h.ObjectInfo = &worker.InstanceSSHPublicKey{}
 	h.CurdOperations = extensionapi.WithCurd(tc, h)
 
-	// Set client.
+	// 设置客户端。
 	h.Client = opts.Manager.GetClient()
 	h.APIReader = opts.Manager.GetAPIReader()
 
@@ -104,8 +104,8 @@ func (h *InstanceSSHPublicKeyHandler) New() runtime.Object {
 func (h *InstanceSSHPublicKeyHandler) Destroy() {
 }
 
-// SupportsDryRun reports true: OnCreate and OnUpdate write the Secret once each, and pass the
-// options on to that write.
+// SupportsDryRun 返回 true：OnCreate 和 OnUpdate 各自写入一次 Secret，
+// 并将选项透传给该写入操作。
 func (h *InstanceSSHPublicKeyHandler) SupportsDryRun() bool {
 	return true
 }
@@ -113,7 +113,7 @@ func (h *InstanceSSHPublicKeyHandler) SupportsDryRun() bool {
 func (h *InstanceSSHPublicKeyHandler) OnCreate(ctx context.Context, obj runtime.Object, opts ctrlcli.CreateOptions) (runtime.Object, error) {
 	instSSHKey := obj.(*worker.InstanceSSHPublicKey)
 
-	// Create.
+	// 创建。
 	sec := convertSecretFromInstanceSSHPublicKey(instSSHKey)
 	err := h.Client.Create(ctx, sec, &opts)
 	if err != nil {
@@ -129,7 +129,7 @@ func (h *InstanceSSHPublicKeyHandler) NewList() runtime.Object {
 }
 
 func (h *InstanceSSHPublicKeyHandler) OnList(ctx context.Context, opts ctrlcli.ListOptions) (runtime.Object, error) {
-	// List.
+	// 列出。
 	secList := new(core.SecretList)
 	err := h.APIReader.List(ctx, secList,
 		convertSecretListOptsFromInstanceSSHPublicKeyListOpts(opts))
@@ -137,13 +137,13 @@ func (h *InstanceSSHPublicKeyHandler) OnList(ctx context.Context, opts ctrlcli.L
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	instSSHKeyList := convertInstanceSSHPublicKeyListFromSecretList(secList, opts)
 	return instSSHKeyList, nil
 }
 
 func (h *InstanceSSHPublicKeyHandler) OnWatch(ctx context.Context, opts ctrlcli.ListOptions) (watch.Interface, error) {
-	// Watch.
+	// 监听。
 	uw, err := h.Client.(ctrlcli.WithWatch).Watch(ctx, new(core.SecretList),
 		convertSecretListOptsFromInstanceSSHPublicKeyListOpts(opts))
 	if err != nil {
@@ -159,31 +159,31 @@ func (h *InstanceSSHPublicKeyHandler) OnWatch(ctx context.Context, opts ctrlcli.
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 上下文取消。
 				return
 			case <-dw.StopChan():
-				// Stop by downstream.
+				// 由下游停止。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 由上游关闭。
 					return
 				}
 
-				// Nothing to do.
+				// 无需处理。
 				if e.Object == nil {
 					c <- e
 					continue
 				}
 
-				// Type assert.
+				// 类型断言。
 				sec, ok := e.Object.(*core.Secret)
 				if !ok {
 					c <- e
 					continue
 				}
 
-				// Process bookmark.
+				// 处理 Bookmark 事件。
 				if e.Type == watch.Bookmark {
 					systemmeta.UnnoteResource(sec)
 					e.Object = &worker.InstanceSSHPublicKey{ObjectMeta: sec.ObjectMeta}
@@ -191,18 +191,18 @@ func (h *InstanceSSHPublicKeyHandler) OnWatch(ctx context.Context, opts ctrlcli.
 					continue
 				}
 
-				// Convert.
+				// 转换。
 				instSSHKey := convertInstanceSSHPublicKeyFromSecret(sec)
 				if instSSHKey == nil {
 					continue
 				}
 
-				// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+				// 若未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 				if !instanceSSHPublicKeyMatchFieldSelector(opts, instSSHKey) {
 					continue
 				}
 
-				// Dispatch.
+				// 分发。
 				e.Object = instSSHKey
 				c <- e
 			}
@@ -213,7 +213,7 @@ func (h *InstanceSSHPublicKeyHandler) OnWatch(ctx context.Context, opts ctrlcli.
 }
 
 func (h *InstanceSSHPublicKeyHandler) OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (runtime.Object, error) {
-	// Get.
+	// 获取。
 	sec := &core.Secret{
 		ObjectMeta: meta.ObjectMeta{
 			Name:      key.Name,
@@ -225,7 +225,7 @@ func (h *InstanceSSHPublicKeyHandler) OnGet(ctx context.Context, key types.Names
 		return nil, err
 	}
 
-	// Convert.
+	// 转换。
 	instSSHKey := convertInstanceSSHPublicKeyFromSecret(sec)
 	if instSSHKey == nil {
 		return nil, kerrors.NewNotFound(worker.Resource(_InstanceSSHPublicKeyResource), key.Name)
@@ -239,7 +239,7 @@ func (h *InstanceSSHPublicKeyHandler) OnUpdate(
 ) (runtime.Object, error) {
 	instSSHKey := obj.(*worker.InstanceSSHPublicKey)
 
-	// Update.
+	// 更新。
 	{
 		sec := convertSecretFromInstanceSSHPublicKey(instSSHKey)
 		err := h.Client.Update(ctx, sec, &opts)
@@ -255,13 +255,13 @@ func (h *InstanceSSHPublicKeyHandler) OnUpdate(
 func (h *InstanceSSHPublicKeyHandler) OnDelete(ctx context.Context, obj runtime.Object, opts ctrlcli.DeleteOptions) error {
 	instSSHKey := obj.(*worker.InstanceSSHPublicKey)
 
-	// Delete.
+	// 删除。
 	sec := &core.Secret{ObjectMeta: instSSHKey.ObjectMeta}
 	return h.Client.Delete(ctx, sec, &opts)
 }
 
 func convertSecretListOptsFromInstanceSSHPublicKeyListOpts(in ctrlcli.ListOptions) (out *ctrlcli.ListOptions) {
-	// Add necessary label selector.
+	// 添加必要的标签选择器。
 	if lbs := systemmeta.GetResourcesLabelSelectorOfType(_InstanceSSHPublicKeyResource); in.LabelSelector == nil {
 		in.LabelSelector = lbs
 	} else {
@@ -327,7 +327,7 @@ func convertInstanceSSHPublicKeyListFromSecretList(secList *core.SecretList, opt
 			continue
 		}
 
-		// Ignore if not be selected by `kubectl get --field-selector=metadata.namespace=...`.
+		// 若未被 `kubectl get --field-selector=metadata.namespace=...` 选中则忽略。
 		if !instanceSSHPublicKeyMatchFieldSelector(opts, instSSHKey) {
 			continue
 		}
@@ -338,7 +338,7 @@ func convertInstanceSSHPublicKeyListFromSecretList(secList *core.SecretList, opt
 	return instSSHKeyList
 }
 
-// instanceSSHPublicKeyMatchFieldSelector checks if the InstanceSSHPublicKey matches the field select in list options.
+// instanceSSHPublicKeyMatchFieldSelector 检查 InstanceSSHPublicKey 是否匹配列表选项中的字段选择器。
 func instanceSSHPublicKeyMatchFieldSelector(opts ctrlcli.ListOptions, instSSHKey *worker.InstanceSSHPublicKey) bool {
 	fs := opts.FieldSelector
 	if fs == nil {

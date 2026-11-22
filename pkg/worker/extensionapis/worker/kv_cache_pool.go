@@ -13,12 +13,11 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// KVCachePoolHandler proxies a v1alpha1.KVCachePool as the public KVCachePool resource.
+// KVCachePoolHandler 将 v1alpha1.KVCachePool 代理为公开的 KVCachePool 资源。
 //
-// No status proxy is exposed because the status carries the granted quota, the usage and the
-// domain registry the pool's finalizer enforces on, all written by the pool's controller, while
-// the proxy writes with the worker's identity. The storage resource's status subresource keeps
-// the status as it is on main-resource writes, so the status is read through the main resource.
+// 此处不暴露 status 子资源代理，因为 status 承载了由资源池控制器写入的已授配额、
+// 使用量以及资源池 finalizer 校验所依赖的域注册表，而代理以 worker 身份执行写入。
+// 底层存储资源的 status 子资源会在主资源写入时保持原状，因此 status 通过主资源读取。
 type KVCachePoolHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations

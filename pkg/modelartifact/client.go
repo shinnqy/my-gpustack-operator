@@ -14,34 +14,32 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/httpx"
 )
 
-// The reasons a source refuses or fails a resolution. They are the Resolved condition's reasons
-// verbatim, so a caller maps nothing.
+// 数据源拒绝或解析失败的原因。它们与 Resolved condition 的 reason 完全一致，
+// 调用方无需进行映射。
 const (
-	// ReasonRevisionNotFound is a branch, tag or commit the repository does not have.
+	// ReasonRevisionNotFound 表示仓库中不存在的分支、标签或提交。
 	ReasonRevisionNotFound = "RevisionNotFound"
-	// ReasonAccessDenied is a repository the credential cannot read, including one that does not
-	// exist: the Hub answers the two alike to a caller without access.
+	// ReasonAccessDenied 表示凭据无法读取的仓库，包括不存在的仓库：
+	// Hub 对无权限的调用方会返回相同的响应。
 	ReasonAccessDenied = "AccessDenied"
-	// ReasonSourceUnavailable is a failure to get an answer at all, which says nothing about the
-	// artifact and is retried.
+	// ReasonSourceUnavailable 表示完全未能获得响应的失败情况，这与制品本身无关，会进行重试。
 	ReasonSourceUnavailable = "SourceUnavailable"
 
-	// ReasonDigestMismatch is a source whose content digests to something other than the
-	// artifact's expectedDigest: the assertion the user made and the content the source
-	// serves disagree.
+	// ReasonDigestMismatch 表示数据源内容的摘要与制品的 expectedDigest 不符：
+	// 用户声明的断言与数据源提供的内容不一致。
 	ReasonDigestMismatch = "DigestMismatch"
-	// ReasonInvalidManifest is an answer that violates the manifest format.
+	// ReasonInvalidManifest 表示响应内容违反了清单格式。
 	ReasonInvalidManifest = "InvalidManifest"
-	// ReasonEmptyManifest is a commit with no files.
+	// ReasonEmptyManifest 表示不包含任何文件的提交。
 	ReasonEmptyManifest = "EmptyManifest"
-	// ReasonManifestTooLarge is a tree above the client's entry bound.
+	// ReasonManifestTooLarge 表示目录树超出了客户端的条目上限。
 	ReasonManifestTooLarge = "ManifestTooLarge"
 )
 
-// SourceError is a resolution failure with the reason it maps to.
+// SourceError 是带有对应映射原因的解析失败错误。
 //
-// Its message is built from status codes and the source's error codes alone, never from a
-// response body or a request header, so no credential can reach it.
+// 其消息仅由状态码和数据源的错误码构造，绝不包含响应体或请求头，
+// 因此不会泄露任何凭据。
 type SourceError struct {
 	Reason  string
 	Message string
@@ -55,9 +53,8 @@ func sourceErrorf(reason, format string, args ...any) *SourceError {
 	return &SourceError{Reason: reason, Message: fmt.Sprintf(format, args...)}
 }
 
-// ReasonOf returns the reason of a SourceError anywhere in err's chain, and
-// ReasonSourceUnavailable for any other error: an error that is not a verdict of the source is a
-// failure to reach one.
+// ReasonOf 返回 err 错误链中任意位置的 SourceError 原因，
+// 对任何其他错误则返回 ReasonSourceUnavailable：非数据源判定产生的错误属于访问数据源失败。
 func ReasonOf(err error) string {
 	if se, ok := errors.AsType[*SourceError](err); ok {
 		return se.Reason
@@ -66,30 +63,28 @@ func ReasonOf(err error) string {
 	return ReasonSourceUnavailable
 }
 
-// HTTPClientOptions is how the resolution client reaches a source. Every field is administrator
-// configuration; nothing a tenant writes reaches it.
+// HTTPClientOptions 定义解析客户端如何访问数据源。每个字段均为管理员配置；
+// 租户编写的任何内容都不会传入其中。
 type HTTPClientOptions struct {
-	// HTTPSProxy is the proxy for HTTPS requests. Empty keeps the worker's own environment.
+	// HTTPSProxy 是 HTTPS 请求使用的代理。为空时沿用 worker 自身的环境变量。
 	HTTPSProxy string
-	// NoProxy is the comma-separated list of hosts that bypass HTTPSProxy.
+	// NoProxy 是绕过 HTTPSProxy 的逗号分隔主机列表。
 	NoProxy string
-	// CABundle is PEM certificates trusted in addition to the system pool. Empty trusts the system
-	// pool alone.
+	// CABundle 是在系统证书池之外额外信任的 PEM 证书。为空时仅信任系统证书池。
 	CABundle []byte
-	// Timeout bounds one request. Zero uses DefaultRequestTimeout.
+	// Timeout 限制单次请求的超时时间。为零时使用 DefaultRequestTimeout。
 	Timeout time.Duration
 }
 
-// DefaultRequestTimeout bounds one request to a source when the options name none. A tree page of
-// a thousand entries answers in well under a second; the bound is for a source that hangs.
+// DefaultRequestTimeout 在选项未指定时限制对数据源的单次请求时间。
+// 包含一千个条目的目录树分页响应远低于一秒；该上限用于防范挂起的数据源。
 const DefaultRequestTimeout = 30 * time.Second
 
-// ValidateProxy checks a proxy URL before it is dialed or rendered: an http or https URL with a
-// host and no credentials. The value is also rendered into tenant Pods as HTTPS_PROXY, where
-// anyone who can read a Pod reads it.
+// ValidateProxy 在拨号或渲染前校验代理 URL：必须是包含主机且不含凭据的 http 或 https URL。
+// 该值还会作为 HTTPS_PROXY 渲染到租户 Pod 中，任何能读取 Pod 的人都能看到它。
 //
-// It is checked where the value is used, not only where it is written: a Setting's default comes
-// from the worker's environment, and that path runs no admission.
+// 该检查会在使用处执行，而非仅在写入处执行：Setting 的默认值来自 worker 的环境变量，
+// 而该路径不经过准入校验。
 func ValidateProxy(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -108,7 +103,7 @@ func ValidateProxy(raw string) error {
 	return nil
 }
 
-// NewHTTPClient returns the client resolution requests are sent with.
+// NewHTTPClient 返回用于发送解析请求的客户端。
 func NewHTTPClient(opts HTTPClientOptions) (*http.Client, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	if len(opts.CABundle) > 0 {

@@ -22,17 +22,15 @@ import (
 
 var (
 	knownScopes = sets.New(apiext.NamespaceScoped, apiext.ClusterScoped)
-	// Mirrors the API server's own printerColumnDatatypes, which is what actually decides whether a
-	// column is accepted — apiextensions validation lists exactly these five, and its table converter
-	// has a case for "date". Leaving "date" out here dropped every attempt at the Age column kubectl
-	// shows by default on a CRD that declares no columns of its own, and dropped it QUIETLY: an
-	// unknown type is logged and the column skipped, so `make generate` still succeeded.
+	// 与 API server 自身的 printerColumnDatatypes 保持一致，它才是实际决定列是否被接受的依据——
+	// apiextensions 校验恰好列出了这五种类型，且其表格转换器包含针对 "date" 的分支。
+	// 此处遗漏 "date" 会导致在未自定义列的 CRD 上生成 kubectl 默认显示的 Age 列时全部被静默丢弃：
+	// 遇到未知类型时仅记录日志并跳过该列，因此 `make generate` 仍能正常成功。
 	knownDataTypes   = sets.New("integer", "number", "string", "boolean", "date")
 	knownDataFormats = sets.New("int32", "int64", "float", "double", "byte", "binary", "date", "date-time", "password")
 )
 
-// reflectType reflects the given package and type into a CRDTypeDefinition,
-// according to the given package.
+// reflectType 根据给定 package 和类型将其反射为 CRDTypeDefinition。
 func reflectType(p *types.Package, t *types.Type) *CRDTypeDefinition {
 	if p == nil || t == nil {
 		return nil
@@ -42,7 +40,7 @@ func reflectType(p *types.Package, t *types.Type) *CRDTypeDefinition {
 		WithName("$").
 		WithValues("gen", "crd-gen", "type", t.String())
 
-	// Collect package markers.
+	// 收集 package 标记。
 	//
 	// +groupName=
 	// +versionName=
@@ -89,7 +87,7 @@ func reflectType(p *types.Package, t *types.Type) *CRDTypeDefinition {
 		},
 	}
 
-	// Collect type markers.
+	// 收集类型标记。
 	//
 	// +k8s:crd-gen:resource:scope=,categories=,shortName=,plural=,subResources=
 	// +k8s:crd-gen:printcolumn:name=,type=,jsonPath=,description=,format=,priority=
@@ -204,8 +202,8 @@ func reflectType(p *types.Package, t *types.Type) *CRDTypeDefinition {
 					logger.Error(err, "unmarshal priority", "value", mv)
 				}
 			default:
-				// Without this an unrecognized key is dropped in silence, and a marker that looks
-				// like it configures something produces output where it configured nothing.
+				// 若缺少此处理，无法识别的 key 会被静默丢弃，导致看似配置了某些内容的标记
+				// 在输出中实际未生效。
 				logger.Error(nil, "unknown print column key", "key", mk, "value", mv)
 			}
 		}
@@ -366,7 +364,7 @@ var (
 	)
 )
 
-// schemeType reflects the given type into a JSONSchemaProps .
+// schemeType 将给定类型反射为 JSONSchemaProps。
 func schemeType(logger klog.Logger, visited map[*types.Type]struct{}, t *types.Type, lvl int) (props *apiext.JSONSchemaProps) {
 	if t == nil {
 		return nil
@@ -386,7 +384,7 @@ func schemeType(logger klog.Logger, visited map[*types.Type]struct{}, t *types.T
 		}
 	case types.Map:
 		if !isString(t.Key) {
-			// Fallback to byte slices if map key is not string.
+			// 如果 map 的键不是 string，则回退为字节切片。
 			props = ptr.To(bytesProps)
 			logger.Error(nil, "invalid map key type, must be string, fallback to byte slice",
 				"type", t.Key.String())
@@ -505,7 +503,7 @@ func schemeType(logger klog.Logger, visited map[*types.Type]struct{}, t *types.T
 					props.Required = append(props.Required, name)
 				}
 
-				// Collect member markers.
+				// 收集成员标记。
 				//
 				// +k8s:validation:default=
 				// +k8s:validation:example=
@@ -811,15 +809,15 @@ func schemeType(logger klog.Logger, visited map[*types.Type]struct{}, t *types.T
 
 					switch length := int64(len(subProps.XValidations)); {
 					case subProps.XValidations == nil && idx == 0:
-						// Initialize.
+						// 初始化。
 						subProps.XValidations = apiext.ValidationRules{{}}
 					case subProps.XValidations != nil && idx == length-1:
-						// Update.
+						// 更新。
 					case subProps.XValidations != nil && idx == length:
-						// Increase.
+						// 增加。
 						subProps.XValidations = append(subProps.XValidations, apiext.ValidationRule{})
 					default:
-						// Clean.
+						// 清空。
 						subProps.XValidations = apiext.ValidationRules{}
 						logger.Error(nil, "invalid cel index, must be incremental", "value", cel)
 						continue
@@ -945,7 +943,7 @@ func schemeType(logger klog.Logger, visited map[*types.Type]struct{}, t *types.T
 	}
 
 	if props == nil {
-		// Fallback to byte slices if type is not supported.
+		// 如果类型不受支持，则回退为字节切片。
 		props = ptr.To(bytesProps)
 		logger.Info("unsupported type, fallback to byte slice", "type", t.String())
 	}
@@ -953,7 +951,7 @@ func schemeType(logger klog.Logger, visited map[*types.Type]struct{}, t *types.T
 	return props
 }
 
-// isNumber returns true if the given type is a number.
+// isNumber 在给定类型为数值时返回 true。
 func isNumber(t *types.Type) bool {
 	if t != nil {
 		if r, found := knownTypedProps[t.String()]; found {
@@ -974,7 +972,7 @@ func isNumber(t *types.Type) bool {
 	return false
 }
 
-// isString returns true if the given type is a string.
+// isString 在给定类型为 string 时返回 true。
 func isString(t *types.Type) bool {
 	if t != nil {
 		if r, found := knownTypedProps[t.String()]; found {
@@ -998,7 +996,7 @@ func isString(t *types.Type) bool {
 	return false
 }
 
-// isSlice returns true if the given type is a slice.
+// isSlice 在给定类型为 slice 时返回 true。
 func isSlice(t *types.Type) bool {
 	if t != nil {
 		switch t.Kind {
@@ -1014,7 +1012,7 @@ func isSlice(t *types.Type) bool {
 	return false
 }
 
-// isMap returns true if the given type is a map.
+// isMap 在给定类型为 map 时返回 true。
 func isMap(t *types.Type) bool {
 	if t != nil {
 		switch t.Kind {
@@ -1030,7 +1028,7 @@ func isMap(t *types.Type) bool {
 	return false
 }
 
-// isStruct returns true if the given type is a struct.
+// isStruct 在给定类型为 struct 时返回 true。
 func isStruct(t *types.Type) bool {
 	if t != nil {
 		switch t.Kind {
@@ -1049,18 +1047,18 @@ func isStruct(t *types.Type) bool {
 const (
 	groupMarker       = "+groupName="
 	versionMarker     = "+versionName="
-	nullableMarker    = "+nullable" // By default, this is nullable.
+	nullableMarker    = "+nullable" // 默认情况下可为空。
 	defaultMarker     = "+default="
 	optionalMarker    = "+optional"
 	listTypeMarker    = "+listType="
 	listMapKeyMarker  = "+listMapKey="
 	mapTypeMarker     = "+mapType="
 	crdGenMarker      = "+k8s:crd-gen:"
-	validationMarker  = "+k8s:validation:"         // Compatibility with openapi-gen.
-	kubebuilderMarker = "+kubebuilder:validation:" // Compatibility with kubebuilder.
+	validationMarker  = "+k8s:validation:"         // 与 openapi-gen 兼容。
+	kubebuilderMarker = "+kubebuilder:validation:" // 与 kubebuilder 兼容。
 )
 
-// collectMarkers collects markers from the given comments into a map.
+// collectMarkers 从给定注释中收集标记并写入 map。
 func collectMarkers(comments []string, into map[string][]string) {
 	for _, line := range comments {
 		line = strings.TrimSpace(line)
@@ -1161,7 +1159,7 @@ func isGoQuoteString(s string) bool {
 	return strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"")
 }
 
-// parseStructTags returns the struct tags of the given type.
+// parseStructTags 返回给定类型的 struct tag。
 func parseStructTags(st string) StructTags {
 	p, _ := reflect.ParseStructTags(st)
 	return StructTags(p)

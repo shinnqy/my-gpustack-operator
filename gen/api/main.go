@@ -14,12 +14,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// projectModule is this repository's module import path.
-//
-// One constant serves two uses, because a mismatch between them is silent:
-//   - the value the generators are configured with (builder.Config.Project);
-//   - the suffix the working directory must carry, since the output base is that
-//     directory with this trimmed off.
+// projectModule 是本仓库的模块导入路径。\n//\n// 使用同一常量兼顾两处用途，因为两处不一致时不会显式报错：\n//   - 生成器配置的值（builder.Config.Project）；\n//   - 工作目录必须携带的后缀，因为输出基准目录就是将该目录去掉该后缀后\n//     得到的结果。
 const projectModule = "gpustack.ai/gpustack"
 
 func main() {
@@ -29,21 +24,7 @@ func main() {
 	}
 }
 
-// resolveProjectDir returns the path the generators may write against, or refuses.
-//
-// The output base is this path with projectModule trimmed off, so a directory not ending
-// in it sends every generator one module path too shallow.
-//
-// WARNING: the failure is not clean. go-to-protobuf rewrites the generated files before
-// the bad path is noticed, so this must run above the first write.
-//
-// Three properties carry the check:
-//   - resolved first, since os.Getwd may return the logical $PWD and a symlink named
-//     after the module path would otherwise pass while the toolchain runs elsewhere;
-//   - the separator is part of the suffix, so "/tmp/mygpustack.ai/gpustack" is refused
-//     rather than trimmed to "/tmp/my";
-//   - the return value is slash-normalized, because the trim downstream is a plain
-//     string operation against a slash-delimited path.
+// resolveProjectDir 返回允许生成器写入的路径，或在不符合条件时拒绝执行。\n//\n// 输出基准目录由该路径去掉 projectModule 后缀得到，因此若目录不以该后缀\n// 结尾，所有生成器的输出层级都会浅一层模块路径。\n//\n// WARNING: 失败时不会干脆中止。go-to-protobuf 会在检测到错误路径前就重写\n// 生成文件，因此该检查必须在首次写入前执行。\n//\n// 该检查依赖以下三个条件：\n//   - 先解析符号链接，因为 os.Getwd 可能返回逻辑路径 $PWD，若存在以模块路径\n//     命名的符号链接，虽能通过检查但工具链实际会在别处运行；\n//   - 将路径分隔符作为后缀的一部分，从而拒绝 "/tmp/mygpustack.ai/gpustack"\n//     而不是将其截断为 "/tmp/my"；\n//   - 返回值使用正斜杠规范化，因为下游的裁剪逻辑是针对斜杠分隔路径的纯字符串\n//     操作。
 func resolveProjectDir(pwd string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(pwd)
 	if err != nil {
@@ -65,13 +46,13 @@ func resolveProjectDir(pwd string) (string, error) {
 }
 
 func generate() error {
-	// Prepare.
+	// 准备工作。
 	pwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("get working directory: %w", err)
 	}
 
-	// REQUIRED: refuse above the first write; all later paths derive from the result.
+	// REQUIRED: 必须在首次写入前拒绝错误路径；后续所有路径均由该结果派生。
 	pwd, err = resolveProjectDir(pwd)
 	if err != nil {
 		return err
@@ -88,22 +69,16 @@ func generate() error {
 		ClientsName:   "kubeclients",
 		ClientSetName: "kubernetes",
 		Header:        stringx.FromBytes(ptr.To(bytes.TrimSpace(header))),
-		/*
-			Specify the package paths of the CRD APIs.
-		*/
+		/*\n\t\t\t指定 CRD API 的包路径。\n\t\t*/
 		APIs: []string{
 			"gpustack.ai/gpustack/api/worker/v1alpha1",
 		},
-		/*
-			Specify the package paths of the Extension APIs.
-		*/
+		/*\n\t\t\t指定 Extension API 的包路径。\n\t\t*/
 		ExtensionAPIs: []string{
 			"gpustack.ai/gpustack/api/v1",
 			"gpustack.ai/gpustack/api/worker/v1",
 		},
-		/*
-			Specify the package paths of the 3rd-party packages which APIs and ExtensionAPIs rely on.
-		*/
+		/*\n\t\t\t指定 APIs 与 ExtensionAPIs 所依赖的第三方包路径。\n\t\t*/
 		MachineryAPIs: []string{
 			"k8s.io/apimachinery/pkg/api/resource",
 			"k8s.io/apimachinery/pkg/apis/meta/v1",
@@ -115,11 +90,9 @@ func generate() error {
 			"k8s.io/apimachinery/pkg/util/intstr",
 			"k8s.io/api/core/v1",
 		},
-		/*
-			Specify the package paths of the External APIs which embed into the clientset.
-		*/
+		/*\n\t\t\t指定嵌入 clientset 的外部 API 包路径。\n\t\t*/
 		ExternalAPIs: []string{
-			// Kubernetes.
+			// Kubernetes。
 			"k8s.io/api/admission/v1",
 			"k8s.io/api/admissionregistration/v1",
 			"k8s.io/api/apidiscovery/v2",
@@ -147,38 +120,38 @@ func generate() error {
 			"k8s.io/api/storagemigration/v1beta1",
 			"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1",
 			"k8s.io/kube-aggregator/pkg/apis/apiregistration/v1",
-			// Kueue.
+			// Kueue。
 			"sigs.k8s.io/kueue/apis/kueue/v1beta2",
-			// Node Feature Discovery.
+			// Node Feature Discovery。
 			"sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1",
 		},
 		/*
-			Specify the package paths of the Admission webhooks.
+			指定 Admission Webhook 的包路径。
 		*/
 		Webhooks: []string{
 			"gpustack.ai/gpustack/pkg/worker/webhooks/worker",
 		},
 		/*
-			Specify the exceptions to the plural form.
+			指定复数形式的例外映射。
 		*/
 		PluralExceptions: map[string]string{
 			"Endpoints": "Endpoints",
 			"Devices":   "Devices",
 		},
 		/*
-			The physical location to provide the protobuf files for proto generation.
+			为 proto 生成提供 protobuf 文件的物理路径。
 		*/
 		ProtoImports: []string{
-			// NB(thxCode): the go-to-protobuf under code-generator relies on a deprecated project,
-			// https://github.com/gogo/protobuf.
-			// The upstream already filed an issue about this,
-			// https://github.com/kubernetes/kubernetes/issues/96564.
-			// In order to support generating protobuf code for extension APIs,
-			// we need to tell protoc where to find the gogo/protobuf.
+			// NB(thxCode): code-generator 下的 go-to-protobuf 依赖一个已废弃的项目：
+			// https://github.com/gogo/protobuf。
+			// 上游已就此提交过 Issue：
+			// https://github.com/kubernetes/kubernetes/issues/96564。
+			// 为了支持为扩展 API 生成 protobuf 代码，
+			// 需要告知 protoc 在何处查找 gogo/protobuf。
 			filepath.Join(pwd, "staging"),
 		},
 	}
 
-	// Generate.
+	// 执行生成。
 	return builder.Generate(cfg)
 }

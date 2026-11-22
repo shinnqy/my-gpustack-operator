@@ -2,8 +2,8 @@ package kubemeta
 
 import "k8s.io/apimachinery/pkg/api/equality"
 
-// DeepEqual is a wrapper around equality.Semantic.DeepEqual that can be used to compare any two objects for deep equality,
-// taking into account Kubernetes-specific semantics for certain types.
+// DeepEqual 是对 equality.Semantic.DeepEqual 的封装，用于对任意两个对象进行深度相等性比较，
+// 并考虑特定类型上的 Kubernetes 语义。
 func DeepEqual(a, b any) bool {
 	return equality.Semantic.DeepEqual(a, b)
 }

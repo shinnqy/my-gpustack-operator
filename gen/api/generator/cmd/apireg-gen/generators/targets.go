@@ -11,24 +11,22 @@ import (
 	"gpustack.ai/gpustack/gen/api/generator/utils"
 )
 
-// NameSystems returns the name system used by the generators in this package.
+// NameSystems 返回此包中生成器使用的命名系统。
 func NameSystems() namer.NameSystems {
 	return namer.NameSystems{
 		"public": namer.NewPublicNamer(0),
 	}
 }
 
-// DefaultNameSystem returns the default name system for ordering the types to be
-// processed by the generators in this package.
+// DefaultNameSystem 返回默认命名系统，用于对此包中生成器待处理的类型进行排序。
 func DefaultNameSystem() string {
 	return "public"
 }
 
-// GetTargets returns the targets the apireg generator writes to.
+// GetTargets 返回 apireg 生成器写入的目标。
 //
-// There is one target per input package. A target writes into the directory of
-// the package it describes, so the generated file lands next to the types it
-// was generated from.
+// 每个输入包对应一个目标。目标会写入其所描述包的目录中，因此生成的文件会
+// 位于其源类型定义所在的同一目录。
 func GetTargets(context *generator.Context, arguments *args.Args) []generator.Target {
 	header, err := utils.Header(gengov2.StdBuildTag, arguments.GoHeaderFile)
 	if err != nil {
@@ -40,7 +38,7 @@ func GetTargets(context *generator.Context, arguments *args.Args) []generator.Ta
 		klog.V(5).Infof("considering pkg %q", context.Inputs[i])
 		pkg := context.Universe[context.Inputs[i]]
 		if pkg == nil {
-			// If the input had no Go files, for example.
+			// 例如，当输入中没有 Go 文件时。
 			continue
 		}
 

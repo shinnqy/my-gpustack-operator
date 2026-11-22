@@ -13,18 +13,17 @@ import (
 )
 
 const (
-	// nodeDevicesAdmissionCheckTimeout bounds the wait for Kueue's AdmissionCheck CRD.
-	// Kueue ships its CRDs as chart templates, so they land with the rest of the
-	// release rather than ahead of it, and a worker booting alongside that rollout can
-	// reach this step before the CRD is served.
+	// nodeDevicesAdmissionCheckTimeout 限制等待 Kueue 的 AdmissionCheck CRD 就绪的超时时间。
+	// Kueue 将其 CRD 作为 chart 模板发布，因此它们会随 release 的其余部分一同安装而非提前就绪，
+	// 与该发布并行启动的 worker 可能会在 CRD 提供服务之前就执行到此步骤。
 	nodeDevicesAdmissionCheckTimeout = 5 * time.Minute
-	// nodeDevicesAdmissionCheckInterval is the retry interval within that bound.
+	// nodeDevicesAdmissionCheckInterval 是上述超时等待期间的重试间隔。
 	nodeDevicesAdmissionCheckInterval = 5 * time.Second
 )
 
-// nodeDevicesAdmissionCheckYAML is the gate-3 AdmissionCheck object. Its name and
-// controllerName are the contract shared with the worker's NodeDevicesAdmission
-// controllers (_NodeDevicesAdmissionCheckName / _NodeDevicesControllerName).
+// nodeDevicesAdmissionCheckYAML 是第三道准入关（gate-3）的 AdmissionCheck 对象。
+// 其 name 和 controllerName 是与 worker 的 NodeDevicesAdmission 控制器共享的契约
+// （_NodeDevicesAdmissionCheckName / _NodeDevicesControllerName）。
 const nodeDevicesAdmissionCheckYAML = `
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: AdmissionCheck
@@ -36,15 +35,12 @@ spec:
   controllerName: worker.gpustack.ai/node-devices
 `
 
-// InstallNodeDevicesAdmissionCheck applies the node-devices AdmissionCheck, retrying
-// until Kueue's CRD is established.
+// InstallNodeDevicesAdmissionCheck 应用 node-devices AdmissionCheck，并持续重试直至 Kueue 的 CRD 建立完成。
 //
-// The chart cannot ship this object: its CRD belongs to Kueue, and Kueue templates its
-// CRDs, so nothing orders the CRD ahead of a custom resource in the same render. Apply
-// only sets spec, so it never clobbers the controller-owned Active condition, and the
-// step is safe to repeat. The worker's NodeDevicesAdmissionCheckReconciler marks the
-// check Active and NodeQueueReconciler references it from accelerated ClusterQueues,
-// so the scheduling chain does not materialize without it.
+// chart 无法直接下发该对象：其 CRD 属于 Kueue，且 Kueue 通过模板渲染 CRD，因此同一次渲染中
+// 无法保证 CRD 排在自定义资源之前。Apply 仅设置 spec，因此不会覆盖由控制器维护的 Active 状态条件，
+// 且该步骤可安全重复执行。worker 的 NodeDevicesAdmissionCheckReconciler 会将该检查标记为 Active，
+// 而 NodeQueueReconciler 会在带加速器的 ClusterQueue 中引用它，因此缺少该对象时调度链无法成形。
 func InstallNodeDevicesAdmissionCheck(ctx context.Context) error {
 	restCfg := system.LoopbackKubeRestConfig.Get()
 
@@ -53,9 +49,8 @@ func InstallNodeDevicesAdmissionCheck(ctx context.Context) error {
 		func(ctx context.Context) error {
 			err := kubeappyaml.Apply(ctx, nodeDevicesAdmissionCheckYAML, restCfg)
 			if err != nil {
-				// Report every attempt. This wait runs before the server answers a probe, so
-				// a container can be killed inside it, and the error below only prints if the
-				// poll gives up — without this the wait is indistinguishable from a hang.
+				// 记录每次尝试。该等待在服务响应探针之前执行，容器可能会在此期间被终止，
+				// 而下方的错误仅在轮询放弃时才会打印——没有此日志，等待过程将与卡死无异。
 				klog.InfoS("waiting for kueue's AdmissionCheck CRD", "err", err)
 			}
 
@@ -69,23 +64,22 @@ func InstallNodeDevicesAdmissionCheck(ctx context.Context) error {
 }
 
 const (
-	// ModelDeploymentJointAdmissionCheckName is the AdmissionCheck object every operator-owned
-	// ClusterQueue references, and ModelDeploymentJointAdmissionControllerName is what claims it.
+	// ModelDeploymentJointAdmissionCheckName 是每个由 operator 管理的 ClusterQueue 所引用的
+	// AdmissionCheck 对象名称，ModelDeploymentJointAdmissionControllerName 则是认领它的控制器名称。
 	//
-	// THEY LIVE HERE BECAUSE THIS PACKAGE INSTALLS THE OBJECT and the controllers package already
-	// imports this one, so the contract can be a single definition the compiler enforces rather than
-	// two strings that agree today. Spelling them twice is the failure this prevents: a rename in one
-	// place leaves workloads ungated or leaves the check permanently inactive, and nothing reports
-	// either -- the queues go on admitting, and the deployment that needed the barrier is the only
-	// thing that notices.
+	// 它们定义在此处是因为本包负责安装该对象且 controllers 包已导入本包，
+	// 从而使这一契约成为编译器强制校验的单一定义，而非目前恰好一致的两个字符串。
+	// 这样可避免在两处重复拼写带来的故障：若仅修改其中一处，会导致 Workload 失去准入屏障
+	// 或该检查永久处于非激活状态，且没有任何组件会报错——队列会继续放行，只有需要该屏障的
+	// 部署才会受到影响。
 	ModelDeploymentJointAdmissionCheckName = "gpustack-model-deployment-joint"
 
-	// ModelDeploymentJointAdmissionControllerName routes the check to the controller declaring it.
+	// ModelDeploymentJointAdmissionControllerName 将该检查路由至声明它的控制器。
 	ModelDeploymentJointAdmissionControllerName = "worker.gpustack.ai/model-deployment-joint"
 )
 
-// modelDeploymentJointAdmissionCheckYAML is the AdmissionCheck that gates every group of one
-// ModelDeployment on the whole set.
+// modelDeploymentJointAdmissionCheckYAML 是用于控制单个 ModelDeployment 中所有分组
+// 联合准入的 AdmissionCheck。
 var modelDeploymentJointAdmissionCheckYAML = fmt.Sprintf(`
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: AdmissionCheck
@@ -97,12 +91,11 @@ spec:
   controllerName: %s
 `, ModelDeploymentJointAdmissionCheckName, ModelDeploymentJointAdmissionControllerName)
 
-// InstallModelDeploymentJointAdmissionCheck applies the joint-admission AdmissionCheck, retrying
-// until Kueue's CRD is established.
+// InstallModelDeploymentJointAdmissionCheck 应用联合准入 AdmissionCheck，并持续重试直至 Kueue 的 CRD 建立完成。
 //
-// It waits on the same CRD, under the same bound, and for the same reason as the node-devices check
-// above: Kueue templates its CRDs, so nothing orders them ahead of a custom resource in the same
-// render. Apply only sets spec, so it never clobbers the controller-owned Active condition.
+// 它与上方的 node-devices 检查出于相同原因、以相同的超时上限等待同一个 CRD：
+// Kueue 通过模板渲染其 CRD，因此同一次渲染中无法保证 CRD 排在自定义资源之前。
+// Apply 仅设置 spec，因此不会覆盖由控制器维护的 Active 状态条件。
 func InstallModelDeploymentJointAdmissionCheck(ctx context.Context) error {
 	restCfg := system.LoopbackKubeRestConfig.Get()
 

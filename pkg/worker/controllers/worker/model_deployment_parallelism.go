@@ -11,96 +11,83 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// ModelDeploymentDeclaredParallelism is the parallel shape one role's author wrote on the
-// books: the degree flags of the role's engine parsed from the role's own argument stream --
-// its ExtraArgs, or its Command when that replaces the line, never both -- plus the one degree
-// the engine accepts as a literal environment entry. A degree nothing declares stays at its
-// engine's own default of one -- the operator composes no degree of its own, because the
-// transfer document must agree with the engine, and only the author's numbers can be right.
+// ModelDeploymentDeclaredParallelism 表示角色作者声明的并行形态：从该角色自身的参数流
+// （ExtraArgs，或在替换命令行时为其 Command，绝不同时取两者）中解析出的引擎并行度参数，
+// 再加上引擎接受的以字面环境变量形式传入的那个并行度。未声明的并行度保持引擎自身的默认值 1——
+// operator 不会自行构造任何并行度，因为传输文档必须与引擎保持一致，唯有作者提供的数值才是正确的。
 type ModelDeploymentDeclaredParallelism struct {
-	// NodeCount retains an explicit --nnodes value; zero means absent or unreadable.
+	// NodeCount 保存显式指定的 --nnodes 值；0 表示未指定或无法读取。
 	NodeCount        int
 	TensorParallel   int
 	PipelineParallel int
 	DataParallel     int
-	// DataParallelLocal is vLLM's --data-parallel-size-local: the share of the DP width placed
-	// on this member. Zero means undeclared -- the engine then places the full width here and
-	// the size check multiplies. A declared share above zero IS the per-member data-parallel
-	// width -- with no wiring flag it is exactly the ranks this member runs -- so the check
-	// multiplies that instead. A DECLARED zero stores the same zero: it is the engine's own
-	// sentinel for DP specified externally, the check reads it as undeclared, and the env
-	// precedence still honors it.
+	// DataParallelLocal 对应 vLLM 的 --data-parallel-size-local：分配到当前成员上的 DP 宽度份额。
+	// 0 表示未声明——此时引擎会将完整宽度放在此处，且规模检查会按此相乘。声明为大于 0 的份额即是每成员的
+	// 数据并行宽度——在没有编排参数（wiring flag）时，它恰好等于该成员运行的 rank 数量——因此检查改为乘以该值。
+	// 显式声明的 0 同样存储为 0：这是引擎自身用于表示由外部指定 DP 的哨兵值，规模检查将其视为未声明，
+	// 而环境变量优先级仍会遵循该值。
 	DataParallelLocal int
-	// ElasticEPMaxDataParallel is vLLM's startup DP capacity, not the running degree.
-	// Zero means no explicit --elastic-ep-max-dp-size declaration.
+	// ElasticEPMaxDataParallel 表示 vLLM 的启动 DP 容量，而非运行时并行度。
+	// 0 表示未显式声明 --elastic-ep-max-dp-size。
 	ElasticEPMaxDataParallel int
-	// The degrees below have no key in today's transfer document; they are carried so the size
-	// check and any future consumer read the full picture without a parser change.
+	// 以下并行度在当前的传输文档中没有对应字段；保留它们是为了让规模检查以及未来的任何消费方
+	// 无需修改解析器即可读取完整信息。
 	PrefillContextParallel int
 	DecodeContextParallel  int
-	// ExpertParallel is SGLang's degree. vLLM's same-named concept is a mode, so it lands in
-	// Modes instead -- the two spellings are never merged into one field. The four after it
-	// are SGLang's remaining degrees: the size check branches on their presence, a future
-	// consumer on their values.
+	// ExpertParallel 是 SGLang 的并行度。vLLM 中同名的概念是一种模式，因此会写入 Modes 中——
+	// 这两种形式绝不会合并到同一个字段中。其后的四个字段为 SGLang 其余的并行度：
+	// 规模检查根据它们是否存在进行分支判断，未来的消费方则可使用其具体数值。
 	ExpertParallel int
-	// AttentionDataParallel is SGLang's attention-DP width: the number of attention groups
-	// inside the TP group, one scheduler each, while the FFN stays tensor-parallel across
-	// them. It is NOT a data-parallel multiplier, and the size check does not multiply by it:
-	// the groups share one model, so the width they occupy is the TP width, already counted.
-	// One means no explicit --attn-dp-size declaration.
+	// AttentionDataParallel 是 SGLang 的 attention-DP 宽度：TP 组内的注意力分组数量，
+	// 每组对应一个调度器，而 FFN 在各组之间保持张量并行。它不是数据并行乘数，规模检查不会乘以该值：
+	// 这些分组共享同一个模型，因此它们占用的宽度即已被计入的 TP 宽度。
+	// 1 表示未显式声明 --attn-dp-size。
 	AttentionDataParallel    int
 	AttentionContextParallel int
 	MoEDataParallel          int
 	DWDPSize                 int
-	// Modes records the mode flags seen, by canonical spelling (expert-parallel, DP
-	// attention, prefill CP); consumers branch on them, as the size check does.
+	// Modes 按规范拼写记录已出现的模式参数（expert-parallel、DP attention、prefill CP）；
+	// 消费方（如规模检查）会根据这些参数进行分支处理。
 	Modes []string
-	// Wiring records the wiring flags seen, by canonical spelling (--nnodes and its family,
-	// the --data-parallel-* collective flags, --dist-init-addr): any of them means some of
-	// the width may live off this member, so the size check stays silent.
+	// Wiring 按规范拼写记录已出现的组网参数（--nnodes 及其同类参数、--data-parallel-* 集合通信参数、
+	// --dist-init-addr）：出现其中任意一个都意味着部分并行宽度可能位于当前成员之外，因此规模检查将保持静默。
 	Wiring []string
 }
 
-// modelDeploymentParallelFlag is one table row: every accepted spelling of one flag, its kind
-// (degree, mode or wiring) and its arity. A row is exactly one kind.
+// modelDeploymentParallelFlag 表示参数表中的一行：单个参数的所有受支持拼写、所属类别
+// （degree、mode 或 wiring）及其参数个数。每一行仅属于一种类别。
 type modelDeploymentParallelFlag struct {
-	// names carries every ENGINE-REGISTERED spelling in dash form, the canonical long spelling
-	// first: it is what Modes, Wiring and error messages record. A registered spelling matches
-	// an exact token and its "--flag=value" form; a single-letter one also matches the
-	// concatenated form ("-n2"), argparse's short-option rule.
+	// names 保存引擎注册的所有带短横线拼写形式，规范的长拼写排在首位：Modes、Wiring 和错误消息均记录该拼写。
+	// 已注册拼写会匹配完整 token 及其 "--flag=value" 形式；单字母拼写还会匹配紧连形式（"-n2"），
+	// 即 argparse 的短选项规则。
 	names []string
-	// abbr carries single-dash ABBREVIATIONS argparse resolves to this row: not registered
-	// spellings but unique prefixes of one ("-t" of "-tp"), which argparse's single-dash
-	// branch prefix-matches on every supported Python. They match a BARE token only: glued
-	// to "=" the form forks by interpreter version -- 3.12 and up read "-t=2" as this row
-	// while 3.10 and 3.11 refuse the token -- so a degree abbreviation carrying "=" is an
-	// error at parse, and a mode one passes through because every version refuses it. Glued
-	// to a bare value ("-t2") every version refuses the token as well, and that is an error
-	// at parse too: a crash certain to happen at engine start is better refused at
-	// admission, where the message can name the registered spelling. Each abbreviation was
-	// verified unique against the engine's full single-dash option set
-	// (today: -q -n -r -tp -pp -dcp -pcp -dp -dpn -dpr -dpl -dpa -dpp -dpb -dph -dpe -dpm -ep
-	// -sc -dc -cc -ac); a future engine option that collides turns the form into the
-	// engine's own ambiguous refusal, the loud direction.
+	// abbr 保存 argparse 会解析为此行的单短横线缩写形式：它们不是已注册的拼写，而是其唯一前缀
+	// （例如 "-tp" 的 "-t"），在所有受支持的 Python 版本中都会被 argparse 的单短横线分支进行前缀匹配。
+	// 它们仅匹配独立 token：若紧跟 "="，不同解释器版本的行为会出现分歧——3.12 及以上版本会将 "-t=2"
+	// 解析为此行，而 3.10 和 3.11 会拒绝该 token——因此带 "=" 的并行度缩写会在解析时报错，
+	// 而模式缩写会直接放行（因为所有版本都会拒绝它）。紧跟裸值（"-t2"）在所有版本中同样会被拒绝，
+	// 因此在解析时也会报错：引擎启动时必然发生的崩溃最好在准入阶段就予以拒绝，以便错误消息能指明已注册的拼写。
+	// 每个缩写均已对照引擎完整的单短横线选项集（当前为：-q -n -r -tp -pp -dcp -pcp -dp -dpn -dpr
+	// -dpl -dpa -dpp -dpb -dph -dpe -dpm -ep -sc -dc -cc -ac）验证过唯一性；若未来新增的引擎选项发生冲突，
+	// 该形式会触发引擎自身的歧义拒绝错误（即显式报错方向）。
 	abbr []string
-	// degree marks a flag whose integer value is validated and stored. A degree always takes
-	// a value.
+	// degree 标记需要校验并存储整数值的参数。degree 参数总是需要携带参数值。
 	degree bool
-	// min is the lower bound a degree value is refused below: one everywhere but vLLM's
-	// local data-parallel share, whose engine accepts zero as a sentinel.
+	// min 为并行度值的下界，除 vLLM 的本地数据并行份额（其引擎接受 0 作为哨兵值）外，
+	// 其余参数下界均为 1。
 	min int
-	// mode marks a flag that takes no value and is recorded in Modes by presence.
+	// mode 标记不带参数值且按是否出现记录到 Modes 中的参数。
 	mode bool
-	// wiring marks a flag recorded in Wiring by presence; takesValue says whether a value
-	// token follows, which the scan must skip to keep the stream aligned.
+	// wiring 标记在 Wiring 中按是否出现来记录的参数；takesValue 表示其后是否跟随值
+	// token，扫描时必须跳过该值以保持参数流对齐。
 	wiring     bool
 	takesValue bool
 }
 
-// modelDeploymentParallelFlags is the recognition table, one per engine the API accepts. The
-// rows are built from the engines' own parsers (vllm/engine/arg_utils.py,
-// sglang/srt/arg_groups/fields/parallel.py); an engine with no entry parses to all ones
-// without error, and recognizing a new flag is adding a row, not touching the parser.
+// modelDeploymentParallelFlags 是参数识别表，API 支持的每个引擎各占一项。各行
+// 依据引擎自身的解析器（vllm/engine/arg_utils.py、
+// sglang/srt/arg_groups/fields/parallel.py）构建；未配置条目的引擎默认全部
+// 解析为 1 且不报错，而新增支持的参数只需添加一行，无需修改解析器。
 var modelDeploymentParallelFlags = map[string][]modelDeploymentParallelFlag{
 	workercore.ModelDeploymentEngineVLLM: {
 		{names: []string{"--tensor-parallel-size", "-tp"}, abbr: []string{"-t"}, degree: true, min: 1},
@@ -143,22 +130,18 @@ var modelDeploymentParallelFlags = map[string][]modelDeploymentParallelFlag{
 	},
 }
 
-// ParseModelDeploymentDeclaredParallelism reads one role's books the way the role's engine
-// would: both value forms, last-wins on a repeat, underscore spellings only where the engine's
-// own parser rewrites them, a unique prefix resolving and an ambiguous one passing through for
-// the engine itself to refuse, the single-dash abbreviations the engine itself resolves and a
-// concatenated value on a single-letter registered spelling, a bare "--" ending recognition,
-// and a negative number consumed as a value exactly as argparse consumes it. Values parse with
-// the engine's own integer alphabet. It errors only on a KNOWN degree flag whose value is
-// missing, non-integer, out of range or below its bound, and on a VLLM_DP_SIZE that is
-// unreadable while being the effective DP source -- every other token is the engine's own
-// business and passes through, which is what keeps an unknown flag from ever becoming a wrong
-// answer here.
+// ParseModelDeploymentDeclaredParallelism 按角色所用引擎的方式读取其参数配置：支持
+// 两种传值形式、重复出现时后者覆盖前者、仅在引擎自身解析器会改写时支持下划线拼写、
+// 唯一前缀正常解析而歧义前缀透传交由引擎拒绝、支持引擎自身可解析的单短横线缩写及
+// 单字母注册拼写的拼接传值、单独的 "--" 终止参数识别，以及像 argparse 那样将负数
+// 作为参数值消费。数值按引擎自身的整数字符集解析。仅当已知并行度参数缺少值、
+// 非整数、越界或低于下限时，以及作为有效 DP 来源的 VLLM_DP_SIZE 无法解析时才会
+// 报错；其余所有 token 均由引擎自行处理并直接透传，从而避免未知参数在此处产生
+// 错误结果。
 //
-// The DP env precedence mirrors the engine (parallel.py: data_parallel_size above one, or a
-// local size declared as zero, takes the CLI path and the variable is never read; otherwise
-// the variable supplies the degree), so a doubly stated DP cannot put the relay and the engine
-// on different numbers.
+// DP 环境变量的优先级与引擎一致（parallel.py：当 data_parallel_size 大于 1 或
+// 声明的本地大小为 0 时走 CLI 路径且不读取该环境变量；否则由环境变量提供并行度），
+// 因此同时指定两处 DP 时，中继与引擎不会得出不同的数值。
 func ParseModelDeploymentDeclaredParallelism(
 	engine string, extraArgs []string, env []workercore.ModelDeploymentEnvVar,
 ) (ModelDeploymentDeclaredParallelism, error) {
@@ -166,18 +149,16 @@ func ParseModelDeploymentDeclaredParallelism(
 	return reading.declared, err
 }
 
-// modelDeploymentParallelReading is what one argument stream yields: the numeric books the
-// transfer document reads, plus the presence record the status read needs — which degrees the
-// stream itself declared.
+// modelDeploymentParallelReading 表示单个参数流的解析结果：供传输文档读取的数值记录，
+// 以及供状态读取使用的存在性记录，即该参数流自身声明了哪些并行度。
 type modelDeploymentParallelReading struct {
 	declared ModelDeploymentDeclaredParallelism
-	// present marks the degree slots the stream itself declared, in the status struct's
-	// field order; a slot the stream never mentions stays absent, which is the fact the
-	// numeric defaults above deliberately erase.
+	// present 按状态结构体字段顺序标记参数流自身声明了哪些并行度槽位；参数流从未提及
+	// 的槽位保持缺失，而上述数值默认值会刻意抹除这一事实。
 	present [modelDeploymentDegreeSlotCount]bool
 }
 
-// modelDeploymentDegreeSlot names one status degree field, in that struct's declaration order.
+// modelDeploymentDegreeSlot 按状态结构体的声明顺序标识一个并行度字段。
 type modelDeploymentDegreeSlot int
 
 const (
@@ -233,8 +214,7 @@ func scanModelDeploymentParallelism(
 
 		switch {
 		case flag.mode:
-			// A mode flag takes no value; an explicit one is the engine's own refusal, so it
-			// passes through unrecorded.
+			// 模式参数不接受值；若显式附带了值，则由引擎自行拒绝，因此不予记录直接透传。
 			if hasValue {
 				continue
 			}
@@ -242,8 +222,7 @@ func scanModelDeploymentParallelism(
 				declared.Modes = append(declared.Modes, canonical)
 			}
 		case flag.wiring:
-			// A wiring flag that takes no value is the engine's own refusal when one is
-			// attached; it passes through unrecorded.
+			// 不接收值的连线参数若附带了值，则由引擎自行拒绝，因此不予记录直接透传。
 			if hasValue && !flag.takesValue {
 				continue
 			}
@@ -289,9 +268,8 @@ func scanModelDeploymentParallelism(
 				declared.DataParallel = degree
 				reading.present[modelDeploymentSlotDataParallel] = true
 			case "--attn-dp-size", "--attention-data-parallel-size":
-				// THE ATTENTION WIDTH IS NOT A STATUS DEGREE. It has no slot in the
-				// transfer document, so it is carried for the balance vote alone and
-				// never enters the size check's multiplication.
+				// 注意力并行宽度不是状态中的并行度。它在传输文档中没有对应槽位，
+				// 因此仅用于负载均衡判定，绝不参与规模校验的乘法计算。
 				declared.AttentionDataParallel = degree
 			case "--data-parallel-size-local":
 				declared.DataParallelLocal = degree
@@ -325,8 +303,8 @@ func scanModelDeploymentParallelism(
 		return reading, nil
 	}
 
-	// The engine reads the variable only when the CLI did not drive data parallelism; mirror
-	// that rather than rank the two sources ourselves.
+	// 引擎仅在 CLI 未驱动数据并行时才读取该环境变量；此处遵循相同逻辑，而不自行
+	// 对两种来源排定优先级。
 	if declared.DataParallel > 1 || localZeroDeclared {
 		return reading, nil
 	}
@@ -350,8 +328,8 @@ func scanModelDeploymentParallelism(
 	return reading, nil
 }
 
-// modelDeploymentDegreeSlots bridges one numeric degree to its status field: the canonical
-// spelling for messages, the numeric book it is read from, and the status field it lands in.
+// modelDeploymentDegreeSlots 将数值并行度映射到其状态字段：包含用于提示消息的
+// 规范拼写、读取数值的字段以及写入的目标状态字段。
 var modelDeploymentDegreeSlots = [modelDeploymentDegreeSlotCount]struct {
 	name string
 	of   func(*ModelDeploymentDeclaredParallelism) int
@@ -409,10 +387,10 @@ var modelDeploymentDegreeSlots = [modelDeploymentDegreeSlotCount]struct {
 	},
 }
 
-// statusDegrees converts the reading's presence record into the status struct: one pointer per
-// declared degree, exact values including an explicit 1 and an explicit local 0. A degree the
-// host int accepted but no status field can hold refuses the whole reading with the flag named,
-// rather than wrap into a number the role never declared.
+// statusDegrees 将解析结果的存在性记录转换为状态结构体：每个已声明的并行度对应一个
+// 指针，保留包括显式 1 和显式本地 0 在内的精确值。若某个并行度虽被宿主机 int 接受
+// 但超出状态字段可容纳范围，则直接报错并指明对应参数，拒绝整份解析结果，而不回绕
+// 成角色从未声明的数值。
 func (r modelDeploymentParallelReading) statusDegrees() (
 	workercore.ModelDeploymentParallelismDeclaredStatus, string,
 ) {
@@ -433,16 +411,14 @@ func (r modelDeploymentParallelReading) statusDegrees() (
 	return out, ""
 }
 
-// ReadModelDeploymentRoleParallelism is the status read of one role's own argument stream --
-// its ExtraArgs, with the same engine rules the transfer parser applies, and the role's
-// environment read only where the engine would. A degree is present only when the stream
-// declares it; the balance shape derives from the stream's own wiring; a stream that cannot
-// be read keeps every degree absent and says why in the source.
+// ReadModelDeploymentRoleParallelism 读取单个角色自身参数流的状态：即其 ExtraArgs
+// （沿用与传输解析器相同的引擎规则），且仅在引擎会读取环境变量时才读取角色的
+// 环境变量。仅当参数流声明了某并行度时该并行度才存在；负载均衡形态由参数流自身的
+// 连线参数推导得出；无法读取的参数流会使所有并行度保持缺失，并在来源字段中说明原因。
 //
-// A ROLE THAT REPLACED ITS COMMAND LINE IS NOT READ. The replaced argv is the role's own
-// book -- the operator synthesized no argument for it, so status claims no degree from it
-// and names the source unmanaged instead; the transfer check still reads that book where
-// admission must agree with what would run.
+// 已替换命令行的角色不在此读取。被替换后的 argv 属于角色自身配置——operator 并未
+// 为其合成参数，因此状态不会从中提取并行度，而是将来源标记为非托管；在准入必须与
+// 实际运行内容一致的场景下，传输校验仍会读取该配置。
 func ReadModelDeploymentRoleParallelism(
 	engine string, role *workercore.ModelDeploymentRole,
 ) workercore.ModelDeploymentRoleParallelismStatus {
@@ -474,8 +450,8 @@ func ReadModelDeploymentRoleParallelism(
 	}
 }
 
-// modelDeploymentParallelismUnreadable is the answer of a stream that produced no trustworthy
-// reading: nothing declared, nothing derived, and the reason carried where the wire asks for it.
+// modelDeploymentParallelismUnreadable 表示未能产出可信解析结果的参数流返回值：
+// 无任何已声明内容、无任何推导结果，并在接口要求的位置携带原因。
 func modelDeploymentParallelismUnreadable(reason string) workercore.ModelDeploymentRoleParallelismStatus {
 	return workercore.ModelDeploymentRoleParallelismStatus{
 		LoadBalance: workercore.ModelDeploymentLoadBalanceUnknown,
@@ -486,10 +462,9 @@ func modelDeploymentParallelismUnreadable(reason string) workercore.ModelDeploym
 	}
 }
 
-// modelDeploymentBalanceShapes are the vLLM wiring flags that vote a load-balance shape. The
-// rank family is the external-lb-via-rank derivation: a member launched with an assigned
-// data-parallel rank is balanced from outside its process. An engine with no row here
-// balances internally.
+// modelDeploymentBalanceShapes 是用于判定负载均衡形态的 vLLM 连线参数。rank 系列
+// 参数表示通过 rank 推导的外部负载均衡：携带指定数据并行 rank 启动的成员由进程外部
+// 进行负载均衡。此处未列出的引擎均采用内部负载均衡。
 var modelDeploymentBalanceShapes = map[string]workercore.ModelDeploymentLoadBalance{
 	"--data-parallel-external-lb":            workercore.ModelDeploymentLoadBalanceExternal,
 	"--data-parallel-rank":                   workercore.ModelDeploymentLoadBalanceExternal,
@@ -497,26 +472,24 @@ var modelDeploymentBalanceShapes = map[string]workercore.ModelDeploymentLoadBala
 	"--data-parallel-multi-port-external-lb": workercore.ModelDeploymentLoadBalanceMultiPort,
 }
 
-// modelDeploymentSGLangRustServerEnv is the variable that puts SGLang in Rust-server mode, where
-// every attention-DP group hosts a listener of its own.
+// modelDeploymentSGLangRustServerEnv 是使 SGLang 进入 Rust-server 模式的环境变量，
+// 该模式下每个注意力 DP 组都会托管各自独立的监听器。
 const modelDeploymentSGLangRustServerEnv = "SGLANG_RUST_SERVER"
 
-// modelDeploymentSGLangExternalDP reports whether an SGLang role declares the external
-// attention-data-parallel shape: an attention-DP launch across members under the Rust server.
+// modelDeploymentSGLangExternalDP 报告 SGLang 角色是否声明了外部注意力数据并行形态：
+// 即在 Rust server 下跨成员启动的注意力 DP。
 //
-// THE THREE FACTS ARE ONE SHAPE AND EACH IS NECESSARY. An attention width above one is what
-// makes more than one attention group; a node count above one is what puts those groups on
-// different members; the Rust server is what gives every group a listener of its own, so the
-// group can be reached from outside. Without the Rust server the groups share one frontend and
-// the group is balanced inside itself.
+// 这三个条件共同构成同一形态，缺一不可。大于 1 的注意力宽度决定存在多个注意力组；
+// 大于 1 的节点数决定这些组分布在不同成员上；Rust server 则为每个组提供独立的
+// 监听器，使其可以从外部访问。若未启用 Rust server，各组共享同一个前端，并在组内
+// 自行完成负载均衡。
 //
-// THE ROLE MUST BE A SERVER ROLE. A prefill or decode role is served through its own leg, and
-// the balance of that leg is the leg's own business: a launch that reads externally on a server
-// role says nothing about how a prefill is balanced, so a disaggregated role stays unclassified.
+// 角色必须是 server 角色。prefill 或 decode 角色各自通过自身链路提供服务，该链路的
+// 负载均衡由链路自身决定：在 server 角色上表现为外部均衡的启动方式并不能说明
+// prefill 如何均衡，因此分离式角色保持未分类状态。
 //
-// THE VALUE IS READ THE ENGINE'S WAY, because the engine refuses a value it cannot parse and an
-// operator that voted on such a value would only be guessing. A value the engine would refuse
-// votes nothing, and the engine stops the launch itself.
+// 参数值按引擎的方式读取，因为引擎会拒绝无法解析的值，operator 若基于此类值
+// 做判定只能是猜测。引擎会拒绝的值不参与判定，由引擎自行中止启动。
 func modelDeploymentSGLangExternalDP(
 	engine string, kind workercore.ModelDeploymentRoleKind,
 	env []workercore.ModelDeploymentEnvVar, declared ModelDeploymentDeclaredParallelism,
@@ -537,9 +510,9 @@ func modelDeploymentSGLangExternalDP(
 	return modelDeploymentEngineBool(value)
 }
 
-// modelDeploymentEngineBool reads a boolean the way SGLang's own environment reader reads it:
-// only the spellings that reader accepts as true, compared without regard to case. Every other
-// value is false, which is the same silence the engine itself answers an unknown spelling with.
+// modelDeploymentEngineBool 按 SGLang 自身的环境变量读取器方式解析布尔值：
+// 仅该读取器视为 true 的拼写（不区分大小写）返回 true。其余所有值均返回 false，
+// 与引擎自身遇到未知拼写时的静默处理一致。
 func modelDeploymentEngineBool(value string) bool {
 	switch strings.ToLower(value) {
 	case modelDeploymentTrueValue, "1":
@@ -549,18 +522,17 @@ func modelDeploymentEngineBool(value string) bool {
 	}
 }
 
-// modelDeploymentLoadBalance derives the balance shape from the stream's wiring flags. Flags
-// voting one shape agree (an assigned rank alongside an external balancer is still External);
-// flags voting different shapes are not derivable and name their disagreement.
+// modelDeploymentLoadBalance 根据参数流的连线参数推导负载均衡形态。指向同一形态的
+// 参数相互一致（指定 rank 的同时配置外部负载均衡器仍属于 External）；指向不同
+// 形态的参数则无法推导，并会指出冲突之处。
 //
-// THE SGLANG VOTE IS A SOURCE OF ITS OWN, because SGLang's balance is not a flag but a shape the
-// launch declares. The table above cannot see it: SGLang's wiring flags are not in it, and its
-// own flags never vote in it, so the two sources cannot disagree about one engine.
+// SGLang 的判定自成一类，因为 SGLang 的均衡方式不是单个参数，而是启动配置声明的
+// 整体形态。上方的映射表无法识别它：表中不包含 SGLang 的连线参数，且其自身参数
+// 也不在表中参与判定，因此两个来源不会针对同一引擎产生冲突。
 //
-// THE KIND IS PART OF THE ANSWER, because a shape that means one thing for a server role means
-// another for a disaggregated one: a prefill or decode role is served through its own leg, and
-// a launch that would balance externally on a server role says nothing about how that leg is
-// served.
+// 角色类型也是结果的一部分，因为同一形态对 server 角色和分离式角色含义不同：
+// prefill 或 decode 角色通过各自链路提供服务，在 server 角色上会采用外部均衡的
+// 启动配置并不能说明该链路如何提供服务。
 func modelDeploymentLoadBalance(
 	engine string, kind workercore.ModelDeploymentRoleKind,
 	env []workercore.ModelDeploymentEnvVar, declared ModelDeploymentDeclaredParallelism,
@@ -582,8 +554,8 @@ func modelDeploymentLoadBalance(
 		)
 	}
 	if len(shapes) == 0 {
-		// Headless ranks belong to an Internal group. A start rank only selects
-		// external routing when the local group is smaller than the global group.
+		// headless rank 属于 Internal 组。仅当本地组小于全局组时，start rank 才会
+		// 选择外部路由。
 		if startRank && !slices.Contains(wiring, "--headless") {
 			local := declared.DataParallelLocal
 			if local > 0 && local < declared.DataParallel {
@@ -627,17 +599,17 @@ func modelDeploymentLoadBalance(
 		fmt.Sprintf("the balance flags %s derive to different shapes", strings.Join(flags, " and "))
 }
 
-// modelDeploymentModeKeys spell the status keys of the engine mode flags, canonical concepts
-// in the vocabulary the declared fields use. A mode flag with no row here keeps its canonical
-// flag spelling as the key, so an observed mode is never dropped from the map.
+// modelDeploymentModeKeys 定义引擎模式参数对应的状态键名，即已声明字段所用
+// 术语体系中的规范概念。此处未列出的模式参数保留其规范参数拼写作为键名，
+// 从而确保观测到的模式不会从 map 中丢失。
 var modelDeploymentModeKeys = map[string]string{
 	"--enable-expert-parallel": "expertParallel",
 	"--enable-dp-attention":    "dpAttention",
 	"--enable-prefill-cp":      "prefillContextParallel",
 }
 
-// modelDeploymentModeMap converts the scan's canonical mode spellings into the status map,
-// where presence carries the boolean and absence of a key is not false.
+// modelDeploymentModeMap 将扫描得到的规范模式拼写转换为状态 map，其中键的
+// 存在即表示布尔真值，而键不存在并不等同于 false。
 func modelDeploymentModeMap(modes []string) map[string]bool {
 	if len(modes) == 0 {
 		return nil
@@ -655,21 +627,18 @@ func modelDeploymentModeMap(modes []string) map[string]bool {
 	return out
 }
 
-// matchModelDeploymentParallelFlag resolves one token against the engine's table the way the
-// engine's own parser would: vLLM rewrites underscores to dashes in long-flag keys before
-// matching, an exact registered spelling wins outright in either value form, a bare
-// single-dash abbreviation listed by the row matches next, and a long-flag key otherwise
-// resolves by unique-prefix abbreviation -- with the count taken over SPELLINGS, because
-// argparse calls a prefix matching two option strings ambiguous even when both belong to one
-// action. A token glued to a single-letter registered spelling ("-n2") is that spelling with
-// the rest of the token as its value. An ambiguous or unknown token reports no match and
-// passes through for the engine to judge. Two tokens ERROR rather than pass through: a degree
-// abbreviation carrying "=", which argparse splits for an abbreviated single-dash key only
-// from Python 3.12 while 3.10 and 3.11 refuse the token -- the image's version is not knowable
-// here, so the token is refused rather than guessed into a document the engine may not run --
-// and an abbreviation carrying a glued value ("-t2", "-tp2"), which every supported argparse
-// refuses at engine start, refused here instead so the message can name the registered
-// spelling.
+// matchModelDeploymentParallelFlag 按引擎自身解析器的方式将单个 token 与引擎参数表
+// 进行匹配：vLLM 会在匹配前将长参数键中的下划线改写为短横线；完全匹配的已注册拼写
+// 在两种传值形式下均直接胜出；其次匹配该行列表中的独立单短横线缩写；否则长参数键
+// 按唯一前缀缩写解析——且按拼写数而非动作数计数，因为即使两个选项字符串属于同一
+// action，argparse 仍会判定同时匹配两者的前缀存在歧义。紧跟在单字母已注册拼写后的
+// token（如 "-n2"）会拆分为该拼写及其余部分作为参数值。有歧义或未知的 token 报告
+// 未匹配并透传交由引擎判断。有两类 token 会直接报错而非透传：一是带 "=" 的并行度
+// 缩写，argparse 仅从 Python 3.12 起才为缩写的单短横线参数键拆分 "="，而 3.10 和
+// 3.11 会拒绝该 token——此处无法获知镜像内的 Python 版本，因此宁可拒绝也不猜测
+// 写入引擎未必能运行的文档；二是带拼接值的缩写（如 "-t2"、"-tp2"），所有受支持的
+// argparse 在引擎启动时都会拒绝此类写法，此处提前拒绝以便错误消息能够指明已注册的
+// 规范拼写。
 func matchModelDeploymentParallelFlag(
 	engine string, table []modelDeploymentParallelFlag, token string,
 ) (modelDeploymentParallelFlag, string, bool, bool, error) {
@@ -710,8 +679,7 @@ func matchModelDeploymentParallelFlag(
 		if !hasValue {
 			return flag, "", false, true, nil
 		}
-		// A mode abbreviation carrying a value is the engine's own refusal on every
-		// version; it passes through unrecorded.
+		// 携带参数值的模式缩写在所有版本上都会被引擎自身拒绝，因此不予记录直接透传。
 	}
 
 	if !long {
@@ -751,10 +719,10 @@ func matchModelDeploymentParallelFlag(
 	return table[matched], value, hasValue, true, nil
 }
 
-// modelDeploymentConsumableValue reports whether the token after a value-taking flag can be
-// its value. argparse consumes anything that does not look like an option -- and a token that
-// looks like a NEGATIVE NUMBER is not an option to a parser with no numeric option strings,
-// which neither engine's table has, so "-2" is consumed here exactly as there.
+// modelDeploymentConsumableValue 报告需带值参数后面的 token 是否可作为其参数值。
+// argparse 会消费任何看起来不像选项的 token——而对没有数字型选项字符串的解析器
+// （两个引擎的参数表均无此类选项）而言，形如负数的 token 不算选项，因此 "-2" 在
+// 此处与引擎中一样会被当作值消费。
 func modelDeploymentConsumableValue(token string) bool {
 	if token == "" || token[0] != '-' {
 		return true
@@ -763,7 +731,7 @@ func modelDeploymentConsumableValue(token string) bool {
 	return modelDeploymentLooksLikeNegativeNumber(token)
 }
 
-// modelDeploymentLooksLikeNegativeNumber is argparse's own test: ^-\d+$ or ^-\d*\.\d+$.
+// modelDeploymentLooksLikeNegativeNumber 对应 argparse 自身的判断正则：^-\d+$ 或 ^-\d*\.\d+$。
 func modelDeploymentLooksLikeNegativeNumber(token string) bool {
 	if len(token) < 2 || token[0] != '-' {
 		return false
@@ -793,17 +761,16 @@ func modelDeploymentAllDigits(s string) bool {
 }
 
 var (
-	// errModelDeploymentIntSyntax marks a degree value the engine's own int() conversion
-	// would refuse as not an integer.
+	// errModelDeploymentIntSyntax 标记引擎自身的 int() 转换会视为非整数而拒绝的并行度值。
 	errModelDeploymentIntSyntax = errors.New("not an integer")
-	// errModelDeploymentIntRange marks a degree value beyond the host's int, which the
-	// engine's arbitrary-precision int() would accept but no real deployment can mean.
+	// errModelDeploymentIntRange 标记超出宿主机 int 范围的并行度值，引擎的任意精度 int()
+	// 虽能接受，但任何实际部署都不可能使用如此大的数值。
 	errModelDeploymentIntRange = errors.New("out of range")
 )
 
-// modelDeploymentEngineInt parses a degree value with the engine's own int() alphabet:
-// surrounding whitespace is ignored, one leading sign is allowed, and single underscores may
-// sit between digits -- " 3 " is 3, "1_0" is 10, "_3" and "3_" are not integers.
+// modelDeploymentEngineInt 使用引擎自身的 int() 字符集解析并行度值：忽略首尾空白，
+// 允许一个前导符号，且数字之间可包含单个下划线——" 3 " 解析为 3，"1_0" 解析为 10，
+// 而 "_3" 和 "3_" 不属于有效整数。
 func modelDeploymentEngineInt(raw string) (int, error) {
 	s := strings.TrimSpace(raw)
 	for i := 0; i < len(s); i++ {
@@ -827,8 +794,8 @@ func modelDeploymentEngineInt(raw string) (int, error) {
 	return n, nil
 }
 
-// modelDeploymentEnvValue reads a literal environment entry last-wins, the order the container
-// runtime applies to a repeated name.
+// modelDeploymentEnvValue 按后写覆盖先写的顺序读取字面环境变量条目，这与容器运行时
+// 对重复变量名的处理顺序一致。
 func modelDeploymentEnvValue(env []workercore.ModelDeploymentEnvVar, name string) (string, bool) {
 	for i := len(env) - 1; i >= 0; i-- {
 		if env[i].Name == name {

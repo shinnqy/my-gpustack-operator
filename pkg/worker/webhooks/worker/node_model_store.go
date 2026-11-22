@@ -18,23 +18,16 @@ import (
 	"gpustack.ai/gpustack/pkg/webhook"
 )
 
-// The rules that refuse a NodeModelStore status write, named in the refusal so a test and a reader
-// can tell which one fired.
+// 用于拒绝 NodeModelStore status 写入的规则名称，在拒绝信息中显式列出，以便测试与排查人员区分触发了哪条规则。
 const (
 	nodeModelStoreRuleIdentity = "only the model-manager plugin writes a NodeModelStore's status"
 	nodeModelStoreRuleBinding  = "the plugin's token must be bound to its Pod"
 	nodeModelStoreRuleNode     = "the plugin writes only the status of the node its Pod runs on"
 )
 
-// NodeModelStoreWebhook admits a NodeModelStore status write only from the model-manager plugin Pod
-// running on the node the object is named after.
+// NodeModelStoreWebhook 仅允许运行在对象同名 Node 上的 model-manager 插件 Pod 写入 NodeModelStore 的 status。
 //
-// RBAC CANNOT DO THIS. The plugin's role must allow updating nodemodelstores/status, and a role
-// cannot narrow an update to one object name, so without this every plugin could write every node's
-// status. The API server places the Pod a bound service-account token belongs to in the request's
-// user extra, as its name and UID, on every version this operator supports; the Pod's node is then
-// one read away. From Kubernetes 1.30 the extra also names the node, and that is compared directly.
-// A token without those extras, a legacy one, is refused, so the rule never silently weakens.
+// RBAC 无法实现这一点。插件的 Role 必须允许更新 nodemodelstores/status，但 Role 无法将更新权限缩小到单个对象名称，因此若无此 Webhook，任意插件均可写入任意 Node 的 status。在本 operator 支持的所有 Kubernetes 版本中，API server 都会将绑定 ServiceAccount Token 所属 Pod 的名称和 UID 写入请求的用户 extra 字段中，从而只需读取一次即可获取该 Pod 所在 Node；自 Kubernetes 1.30 起，extra 中还会直接包含 Node 名称，可直接用于比对。缺少这些 extra 字段的旧式 Token 会被拒绝，以确保该规则不会静默降级。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="nodemodelstores",scope="Cluster"
@@ -43,9 +36,9 @@ const (
 type NodeModelStoreWebhook struct {
 	webhook.DefaultValidator
 
-	// Reader reads the plugin's Pod.
+	// Reader 用于读取插件对应的 Pod。
 	Reader ctrlcli.Reader
-	// Namespace and ServiceAccount are where the plugin runs and what it runs as.
+	// Namespace 和 ServiceAccount 指定插件运行的 Namespace 及所使用的 ServiceAccount。
 	Namespace      string
 	ServiceAccount string
 }
@@ -63,13 +56,13 @@ var (
 	_ webhook.ReceiveDeletionUpdate           = (*NodeModelStoreWebhook)(nil)
 )
 
-// ReceiveDeletionUpdate keeps the rule in force while an object drains. It has no defaulting, and a
-// main-resource update is admitted without a read, so no deletion can make it refuse one.
+// ReceiveDeletionUpdate 在对象排空期间保持规则生效。它不包含默认值设置，且
+// 主资源更新无需读取即可准入，因此任何删除操作都不会导致其拒绝更新。
 func (*NodeModelStoreWebhook) ReceiveDeletionUpdate() {}
 
 func (r *NodeModelStoreWebhook) ValidateUpdate(ctx context.Context, _, newObj runtime.Object) (ctrladmission.Warnings, error) {
 	if !isStatusRequest(ctx) {
-		// The worker writes spec; the object's lifetime and spec are not this rule's.
+		// worker 负责写入 spec；对象的生命周期和 spec 不属于此规则的职责范围。
 		return nil, nil
 	}
 	nms := newObj.(*workercore.NodeModelStore)
@@ -84,7 +77,7 @@ func (r *NodeModelStoreWebhook) ValidateUpdate(ctx context.Context, _, newObj ru
 	return nil, nil
 }
 
-// statusWriter returns the rule the request breaks and why, or "" when it is the plugin on node.
+// statusWriter 返回请求违反的规则及原因；如果发起方是 node 上的插件，则返回 ""。
 func (r *NodeModelStoreWebhook) statusWriter(ctx context.Context, node string) (rule, msg string, err error) {
 	req, err := ctrladmission.RequestFromContext(ctx)
 	if err != nil {

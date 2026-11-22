@@ -4,18 +4,16 @@ import (
 	"os"
 )
 
-// LookupEnv retrieves the value of the environment variable named
-// by the key. If the variable is present in the environment the
-// value (which may be empty) is returned and the boolean is true.
-// Otherwise, the returned value will be empty and the boolean will
-// be false.
+// LookupEnv 检索由 key 命名的环境变量的值。
+// 如果该变量存在于环境中，则返回其值（可能为空）和布尔值 true。
+// 否则，返回空字符串和布尔值 false。
 func LookupEnv(key string) (string, bool) {
 	return os.LookupEnv(key)
 }
 
-// Getenv retrieves the value of the environment variable named by the key.
-// It returns the default, which will be empty if the variable is not present.
-// To distinguish between an empty value and an unset value, use LookupEnv.
+// Getenv 检索由 key 命名的环境变量的值。
+// 如果变量不存在则返回默认值（未指定时为空）。
+// 要区分空值与未设置的值，请使用 LookupEnv。
 func Getenv(key string, def ...string) string {
 	e, ok := LookupEnv(key)
 	if !ok && len(def) != 0 {
@@ -25,8 +23,8 @@ func Getenv(key string, def ...string) string {
 	return e
 }
 
-// ExpandEnv is similar to Getenv,
-// but replaces ${var} or $var in the result.
+// ExpandEnv 与 Getenv 类似，
+// 但会替换结果中的 ${var} 或 $var。
 func ExpandEnv(key string, def ...string) string {
 	return os.ExpandEnv(Getenv(key, def...))
 }

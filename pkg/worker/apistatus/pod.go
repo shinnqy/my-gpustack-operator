@@ -7,13 +7,7 @@ import (
 	"gpustack.ai/gpustack/pkg/kubeapistatus"
 )
 
-// podStatusPaths 按调度、初始化、就绪的顺序解释 Pod 条件。三列值依次为 Unknown、False 和 True 时的阶段。
-//
-//	PodScheduled     Scheduling    Pending           Scheduled
-//	PodInitialized   Initializing  InitializeFailed  Initialized
-//	PodReady         Starting      NotReady          Ready
-//
-// 初始化和就绪条件还会根据 reason 细分，例如启动期间暂未就绪的容器仍显示 Starting。
+// podStatusPaths 按调度、初始化、就绪的顺序解释 Pod 条件。三列值依次为 Unknown、False 和 True 时的阶段。\n//\n//\tPodScheduled     Scheduling    Pending           Scheduled\n//\tPodInitialized   Initializing  InitializeFailed  Initialized\n//\tPodReady         Starting      NotReady          Ready\n//\n// 初始化和就绪条件还会根据 reason 细分，例如启动期间暂未就绪的容器仍显示 Starting。
 var podStatusPaths = kubeapistatus.NewSummarizer(
 	[][]core.PodConditionType{
 		{

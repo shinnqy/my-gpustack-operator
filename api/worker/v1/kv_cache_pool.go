@@ -7,11 +7,10 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// KVCachePool declares a backend quota shared through namespace bindings.
+// KVCachePool 声明一个通过命名空间绑定共享的后端配额。
 //
-// Configuration changes proxy to the v1alpha1 resource. Controller-owned status is read-only
-// through the main object; the public API serves no status subresource. Main-resource writes
-// preserve the backing resource's status.
+// 配置变更会代理到 v1alpha1 资源。由控制器管理的 status 通过主对象只读访问；
+// 公共 API 不提供 status 子资源。对主资源的写入会保留底层资源的 status。
 //
 // +genclient
 // +genclient:noStatus
@@ -22,7 +21,7 @@ type KVCachePool workercore.KVCachePool
 
 var _ runtime.Object = (*KVCachePool)(nil)
 
-// KVCachePoolList holds the list of KVCachePools.
+// KVCachePoolList 保存 KVCachePool 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type KVCachePoolList struct {

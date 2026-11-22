@@ -15,63 +15,63 @@ var defaultModelDeploymentScalerHTTPClient = &http.Client{
 	},
 }
 
-// modelDeploymentScalerPodSample is what one engine Pod reported in one pass.
+// modelDeploymentScalerPodSample 表示单个引擎 Pod 在一次采样轮次中上报的数据。
 type modelDeploymentScalerPodSample struct {
-	// restartCount says which process the numbers belong to.
+	// restartCount 指明这些指标数据属于哪一次进程实例。
 	restartCount int32
-	// observedAt is when the pass read the Pod.
+	// observedAt 是本轮读取该 Pod 指标的时间。
 	observedAt time.Time
 
-	// running, waiting and decodeTransfer are the request gauges.
+	// running、waiting 和 decodeTransfer 是请求数仪表盘指标（gauge）。
 	running        float64
 	waiting        float64
 	decodeTransfer float64
-	// prefillInflight is the prefill role's own backlog: the requests it has accepted and not yet
-	// scheduled. It is a queue of its own, and the ordinary waiting gauge does not count it.
+	// prefillInflight 是 prefill 角色自身的积压量：即已接收但尚未调度的请求数。
+	// 它是一个独立队列，常规的 waiting 指标并不统计这部分请求。
 	prefillInflight float64
-	// kvUsage is the engine's cache usage, as a fraction of the cache it holds.
+	// kvUsage 是引擎的缓存使用率，表示其已用缓存占总缓存的比例。
 	kvUsage float64
-	// kvUsageFound says whether the cache usage was reported at all.
+	// kvUsageFound 表示是否上报了缓存使用率指标。
 	kvUsageFound bool
-	// requestsReadable says whether the request gauges were readable.
+	// requestsReadable 表示请求数仪表盘指标（gauge）是否可读。
 	requestsReadable bool
 
-	// promptTokens, generationTokens and cacheHits are the token counters.
+	// promptTokens、generationTokens 和 cacheHits 是 token 计数器（counter）。
 	promptTokens     float64
 	generationTokens float64
 	cacheHits        float64
-	// cacheQueries is how many times the prefix cache was asked for a prompt.
+	// cacheQueries 表示向前缀缓存查询 prompt 的次数。
 	cacheQueries float64
-	// cacheQueriesFound says whether the prefix cache was asked at all.
+	// cacheQueriesFound 表示是否上报了前缀缓存查询次数指标。
 	cacheQueriesFound bool
-	// effectiveInput is the prompt token count an engine reports as actually prefilled.
+	// effectiveInput 是引擎上报的实际执行了 prefill 的 prompt token 数。
 	effectiveInput float64
-	// effectiveInputFound says whether that count was reported at all.
+	// effectiveInputFound 表示是否上报了该计数值。
 	effectiveInputFound bool
-	// effectiveDevice, effectiveHost and effectiveStorage are the cache hit counts.
+	// effectiveDevice、effectiveHost 和 effectiveStorage 是缓存命中计数。
 	effectiveDevice  float64
 	effectiveHost    float64
 	effectiveStorage float64
-	// effectiveHitsFound says whether any cache hit count was reported.
+	// effectiveHitsFound 表示是否上报了任何缓存命中计数。
 	effectiveHitsFound bool
-	// tokensReadable says whether the token counters were readable.
+	// tokensReadable 表示 token 计数器（counter）是否可读。
 	tokensReadable bool
 
-	// ttft and itl are the latency histograms.
+	// ttft 和 itl 是延迟直方图（histogram）。
 	ttft modelDeploymentScalerHistogram
 	itl  modelDeploymentScalerHistogram
-	// ttftFound and itlFound say whether the latency histograms were reported.
+	// ttftFound 和 itlFound 表示是否上报了对应的延迟直方图指标。
 	ttftFound bool
 	itlFound  bool
-	// latencyReadable says whether both latency histograms were readable.
+	// latencyReadable 表示两个延迟直方图是否均可读。
 	latencyReadable bool
 }
 
-// modelDeploymentScalerHistogram is one latency histogram as it was read.
+// modelDeploymentScalerHistogram 表示读取到的单个延迟直方图。
 type modelDeploymentScalerHistogram struct {
-	// sum and count are the histogram's own totals.
+	// sum 和 count 是直方图自身的总和与计数。
 	sum   float64
 	count float64
-	// buckets holds the cumulative count of every upper bound the histogram exports.
+	// buckets 保存直方图导出的每个上界对应的累积计数。
 	buckets map[float64]float64
 }

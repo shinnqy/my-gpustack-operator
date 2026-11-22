@@ -12,48 +12,42 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// CatalogDocument is the catalog as it is written.
+// CatalogDocument 表示按原始书写格式呈现的目录文档。
 //
-// IT IS A FLAT DOCUMENT, because a catalog is read by a person before it is read
-// by a machine, and a person reads a profile faster when the profile names the
-// model, the engine and the hardware on one line each.
+// 它采用扁平文档结构，因为目录在由机器解析前首先供人工阅读，
+// 当每个 profile 将模型、引擎和硬件各自独立成行时，人工阅读效率更高。
 //
-// IT CARRIES NO DIGEST AND NO PROVENANCE, because a digest of a document that
-// holds one is a digest of a digest, and a provenance a reader cannot check is a
-// provenance the reader has to trust. The digest of the catalog is computed at
-// load, and the source of a measurement is the name of the file it was read
-// from.
+// 它不包含摘要和来源信息，因为对包含摘要的文档再计算摘要会导致嵌套摘要，
+// 而读取方无法校验的来源信息只能被动信任。目录的摘要在加载时计算，
+// 测量数据的来源即为读取该数据的文件名。
 type CatalogDocument = workercore.ModelDeploymentScalerCapacityPriorCatalog
 
-// ProfileDocument is one profile as it is written.
+// ProfileDocument 表示按原始书写格式呈现的单个 profile。
 type ProfileDocument = workercore.ModelDeploymentScalerCapacityPriorProfile
 
-// TopologyDocument is the shape of one scaling replica as it is written.
+// TopologyDocument 表示按原始书写格式呈现的单个扩缩容副本拓扑形态。
 //
-// IT NAMES THE WIDTHS THE MEASUREMENT STATES, because a width a source did not
-// state is a width of one and a reader has to know which widths were measured.
+// 它显式列出测量结果所声明的并行宽度，因为数据源未声明的宽度默认为 1，
+// 而读取方必须明确哪些宽度经过了实际测量。
 type TopologyDocument = workercore.ModelDeploymentScalerCapacityPriorTopology
 
-// PointDocument is one measured load point as it is written.
+// PointDocument 表示按原始书写格式呈现的单个实测负载点。
 //
-// IT NAMES THE THREE RATES THE MEASUREMENT PRODUCED, because a reader asks
-// about the prompt tokens, the generated tokens and the total before it asks
-// about any one of them.
+// 它显式列出测量产出的三项速率，因为读取方通常会先关注 prompt token、
+// 生成 token 及总吞吐，再关注其中任意单一指标。
 type PointDocument = workercore.ModelDeploymentScalerCapacityPriorPoint
 
-// LatencyQuantiles holds the measured latency quantiles of one point, keyed by
-// percentile names such as p25, p50, p70, p90, p95, or p99.
+// LatencyQuantiles 保存单个负载点的实测延迟分位数，键名为 p25、p50、p70、
+// p90、p95 或 p99 等百分位名称。
 //
-// A QUANTILE THE SOURCE DID NOT PUBLISH IS ABSENT, because a zero latency is a
-// measurement and a missing one is not. The reader decides what a missing
-// quantile means.
+// 数据源未公布的分位数保持缺省，因为零延迟属于有效测量值，而缺失值不是。
+// 缺失分位数的语义由读取方自行决定。
 type LatencyQuantiles = map[string]float64
 
-// ParseCatalogDocument reads a catalog document.
+// ParseCatalogDocument 读取并解析目录文档。
 //
-// IT IS STRICT, because a field the reader does not know is a field the reader
-// cannot check, and it reads YAML, because YAML is a superset of JSON and one
-// reader then serves both formats.
+// 该解析过程采用严格模式，因为读取方不识别的字段无法进行校验；同时它按
+// YAML 解析，因为 YAML 是 JSON 的超集，单一读取器即可同时支持两种格式。
 func ParseCatalogDocument(data []byte) (CatalogDocument, error) {
 	var document CatalogDocument
 	if err := yaml.UnmarshalStrict(data, &document); err != nil {
@@ -62,7 +56,7 @@ func ParseCatalogDocument(data []byte) (CatalogDocument, error) {
 	return document, nil
 }
 
-// toCatalog turns a document into the catalog the resolver reads.
+// toCatalog 将文档转换为供解析器读取的目录结构。
 func toCatalog(d CatalogDocument) (*Catalog, error) {
 	if d.APIVersion != CatalogAPIVersion {
 		return nil, fmt.Errorf("catalog apiVersion %q is not supported, want %q", d.APIVersion, CatalogAPIVersion)
@@ -86,11 +80,10 @@ func toCatalog(d CatalogDocument) (*Catalog, error) {
 	return &catalog, nil
 }
 
-// toProfile turns one written profile into the profile the resolver reads.
+// toProfile 将单个书写格式的 profile 转换为供解析器读取的 profile。
 //
-// IT FILLS THE FIELDS THE DOCUMENT DOES NOT STATE, because the document is a
-// measurement and not a configuration: a measurement says how fast the replica
-// was, not which serving settings it ran under.
+// 它会补全文档中未声明的字段，因为文档记录的是测量结果而非配置：
+// 测量结果仅说明副本的运行速度，而不包含其所用的推理服务配置。
 func toProfile(d ProfileDocument) (Profile, error) {
 	role := RoleKind(d.Role)
 	if _, known := requirementFor(role); !known {
@@ -107,9 +100,8 @@ func toProfile(d ProfileDocument) (Profile, error) {
 				Quantization: CanonicalQuantization(d.Quantization),
 			},
 			Engine: EngineIdentity{
-				// THE DOCUMENT NAMES THE ENGINE FAMILY AND NOT THE IMAGE, because
-				// the image carries a tag and a digest that say nothing about
-				// the engine behind them.
+				// 文档指定的是引擎系列而非容器镜像，因为镜像包含的 tag 和 digest
+				// 无法反映其背后使用的实际引擎。
 				Image: d.Engine,
 			},
 			Hardware: NormalizeHardwareIdentity(HardwareIdentity{Accelerator: d.Hardware}),
@@ -118,15 +110,13 @@ func toProfile(d ProfileDocument) (Profile, error) {
 		Topology:         NormalizeTopologyDocument(d.Topology),
 		MeasuredReplicas: 1,
 		Workload: Workload{
-			// THE WORKLOAD IS NAMED AFTER THE SHAPE, because the document names
-			// no workload of its own and a measurement is identified by what it
-			// measured.
+			// Workload 以负载形态命名，因为文档本身未指定 Workload 名称，
+			// 且测量结果以其测量对象来标识。
 			ID: shape.String(),
-			// THE DOCUMENT PINS NO WEIGHT COMMIT AND NO WORKLOAD REVISION,
-			// because a public benchmark publishes a model name and a sweep.
-			// FLAT CATALOG DOCUMENTS ONLY CARRY PROFILES QUALIFIED UNDER
-			// ALL-MISS PROMPT ACCOUNTING (inputTokensPerSecond and
-			// totalTokensPerSecond count cache-missed prompt tokens).
+			// 文档不固定权重 commit 和 Workload 版本，因为公开基准测试仅发布模型名称
+			// 与扫描参数。扁平目录文档仅包含按全未命中（all-miss）prompt 计数口径
+			// 标定的 profile（inputTokensPerSecond 与 totalTokensPerSecond 统计的是
+			// 缓存未命中的 prompt token）。
 			Revision:      UnspecifiedRevision,
 			Modality:      "text",
 			CacheBehavior: CacheBehaviorAllMisses,
@@ -147,8 +137,7 @@ func toProfile(d ProfileDocument) (Profile, error) {
 				highest = i
 			}
 		}
-		// THE HIGHEST CONCURRENCY POINT OF A MULTI-POINT SWEEP CAPS THE
-		// FEASIBLE CURVE WHEN EVERY MEASURED POINT MEETS THE LATENCY TARGET.
+		// 当多点扫描中的每个实测点均满足延迟目标时，最高并发点即为可行曲线的上限。
 		profile.Points[highest].Saturation = &Saturation{
 			Measured: true,
 			Note:     "highest concurrency point of the measured sweep",
@@ -162,10 +151,9 @@ func toProfile(d ProfileDocument) (Profile, error) {
 	return profile, nil
 }
 
-// toPoint turns one written load point into the point the resolver reads.
+// toPoint 将文档中的一个负载点转换为解析器读取的点。
 //
-// IT PICKS THE RATE THE ROLE NEEDS, because the document holds the three rates
-// the measurement produced and the resolver asks for one of them.
+// 它会选取该角色所需的速率，因为文档中包含测量产生的三个速率，而解析器只请求其中一个。
 func toPoint(d PointDocument, role RoleKind) (MeasuredPoint, error) {
 	requirement, _ := requirementFor(role)
 	rate := d.TotalTokensPerSecond
@@ -203,8 +191,7 @@ func toPoint(d PointDocument, role RoleKind) (MeasuredPoint, error) {
 	return point, nil
 }
 
-// latencyReadings turns the written quantiles of one metric into latency
-// readings ordered by ascending quantile.
+// latencyReadings 将单个指标记录的分位数转换为按分位数升序排列的延迟读数。
 func latencyReadings(metric LatencyMetric, quantiles LatencyQuantiles) ([]Latency, error) {
 	if len(quantiles) == 0 {
 		return nil, nil
@@ -233,8 +220,7 @@ func latencyReadings(metric LatencyMetric, quantiles LatencyQuantiles) ([]Latenc
 	return readings, nil
 }
 
-// parseQuantileKey turns a quantile key such as p25, p50, p70, p90, p95, p99,
-// or p99.9 into its quantile level in (0, 1].
+// parseQuantileKey 将 p25、p50、p70、p90、p95、p99 或 p99.9 等分位数键转换为 (0, 1] 区间内的分位水平。
 func parseQuantileKey(key string) (float64, error) {
 	if !strings.HasPrefix(key, "p") {
 		return 0, fmt.Errorf("quantile key %q must start with \"p\"", key)

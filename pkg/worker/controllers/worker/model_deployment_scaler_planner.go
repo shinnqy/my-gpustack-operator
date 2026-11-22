@@ -9,11 +9,11 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// plan computes the replica vector of a scaler and writes the state it observed.
+// plan 计算扩缩器的副本向量并写入其观测到的状态。
 //
-// THE BEFORE SNAPSHOT IS THE ONE THE RECONCILE TOOK, because the status of the scaler is
-// written once at the end of the plan and the write has to carry every change the reconcile
-// made, not only the ones the plan made.
+// 采用的是 Reconcile 开始时获取的前置快照，因为扩缩器的 status 仅在 plan 结束时
+// 统一写入一次，而此次写入必须包含整个 Reconcile 过程所做的全部变更，而不仅仅是
+// plan 内部产生的变更。
 func (r *ModelDeploymentScalerReconciler) plan(
 	ctx context.Context,
 	before *workercore.ModelDeploymentScaler,
@@ -34,7 +34,7 @@ func (r *ModelDeploymentScalerReconciler) planWithPriors(
 	now time.Time,
 	active bool,
 ) (ctrlreconcile.Result, error) {
-	// Implement this function in chapter 24.
+	// 在第 24 章中实现此函数。
 	var result0 ctrlreconcile.Result
 	var result1 error
 	return result0, result1

@@ -1,26 +1,20 @@
-// Engine group-forward observation: the synthetic request that makes the GroupForward leg
-// verifiable for a non-disaggregated multi-rank replica.
+// 引擎 group-forward 观测：使非分离式多 rank 副本的 GroupForward 分支可被验证的合成请求。
 //
-// A REPLICA'S FORWARD PATH IS VERIFIED BY MAKING IT CARRY A REQUEST AND SEEING THAT ONE COME BACK.
-// The probe is one request per member, of one token, on the engine's own serving route, carrying a
-// request identifier this controller chose. What makes the answer evidence rather than liveness is
-// the binding: the response has to come back stamped with THAT identifier, so a server that is
-// merely alive, or one whose answer belongs to some other request, cannot be mistaken for a
-// forward that happened. Both engines expose exactly that binding on their serving routes, and
-// neither exposes it on a health route — which is why the leg could not be verified before.
+// 副本的前向路径通过让其承载一次请求并观察该请求返回来验证。
+// 探测向每个成员发送一个单 token 请求，通过引擎自身的推理服务路由，并携带由本控制器选定的请求标识符。
+// 使响应成为有效证据而非仅证明存活的关键在于绑定关系：响应必须带有该标识符返回，
+// 因此仅仅存活的服务端，或返回了其他请求响应的服务端，都不会被误判为成功完成了前向推理。
+// 两种引擎都在其服务路由上暴露了这种绑定关系，且均未在健康检查路由上暴露——这正是此前无法验证该分支的原因。
 //
-// THE PROBE COSTS THE ENGINE ONE TOKEN, and it is charged only where it buys something: this runs
-// on the qualification evaluation of a HELD replica, which is the admission or the restore of a
-// group that is currently held. An admitted replica is never probed, so a serving deployment pays
-// nothing, and re-evaluation is the next reconcile rather than a retry inside this one.
+// 该探测会消耗引擎一个 token，且仅在有收益时执行：它运行在处于 HELD 状态副本的准入资格评估期间，
+// 即当前被暂留的组在准入或恢复时。已准入的副本不会被探测，因此正在提供服务的部署没有额外开销；
+// 重新评估将在下一次 reconcile 时进行，而非在本次 reconcile 内重试。
 //
-// THE vLLM PROBE'S LOG FOOTPRINT IS ACCEPTED AND CANNOT BE SUPPRESSED PER REQUEST. vLLM's OpenAI
-// protocol at both versions this program reads carries no per-request metrics switch, so the probe
-// appears in the engine's request log and its success counters like any other request. Making it
-// disappear would mean switching off request logging for all production traffic to hide one rare
-// probe, which is a worse trade than being visible. The identifier is therefore SELF-DESCRIBING, so
-// an operator reading those logs can filter the probe out: it always begins with
-// modelDeploymentQualifyRIDPrefix. SGLang does carry a per-request switch and the probe sets it.
+// vLLM 探测的日志足迹是可接受的，且无法按请求屏蔽。本程序兼容的两个版本的 vLLM OpenAI 协议
+// 均未提供按请求关闭指标的开关，因此探测会像其他请求一样出现在引擎的请求日志和成功计数器中。
+// 若要隐藏这种极少发生的探测而关闭所有生产流量的请求日志，代价得不偿失。
+// 因此标识符采用自描述格式，便于查看日志的运维人员过滤探测请求：它始终以
+// modelDeploymentQualifyRIDPrefix 开头。SGLang 则支持按请求开关，探测会自动设置该开关。
 package worker
 
 import (
@@ -43,71 +37,60 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/json"
 )
 
-// modelDeploymentQualifyRIDPrefix marks every request this operator makes on an engine's serving
-// route, so the probe is identifiable in the engine's own logs and counters by anyone reading them.
+// modelDeploymentQualifyRIDPrefix 标记本 operator 在引擎服务路由上发起的每一次请求，
+// 以便任何查看引擎自身日志和计数器的人员都能识别该探测。
 const modelDeploymentQualifyRIDPrefix = "gpustack-qualify-"
 
-// modelDeploymentGroupForwardBound is how long the whole replica's probe may take. It is ONE
-// budget shared across every member asked, not one per member: the members are probed
-// sequentially under it, so an early member that answers slowly consumes the budget the later
-// members would have used. The bound sizes the whole pass's patience for one replica, exactly
-// like the router observation budget sizes one collection.
+// modelDeploymentGroupForwardBound 是整个副本探测允许耗费的最大时长。它是所有被探测成员共享的
+// 单一时间预算，而非每个成员各自拥有：各成员在此预算下顺序探测，因此靠前的成员若响应较慢，
+// 会消耗后续成员原本可用的预算。该上限设定了单次流程对单个副本的总等待容忍度，
+// 正如 router 观测预算限定单次采集的时长一样。
 //
-// IT IS A BOUND AND NOT A DEADLINE THE ENGINE HONORS, because neither engine's request struct
-// carries a timeout: vLLM's CompletionRequest at both versions read here has no such field, and
-// SGLang's GenerateReqInput has none either. A member that is saturated therefore queues the
-// request rather than refusing it, and the only thing standing between a busy engine and a blocked
-// reconcile is this. The budget is deliberately generous relative to one token of work, because the
-// cost of expiring early is a healthy group held for a whole pass.
+// 它只是调用方上限，而非引擎会遵守的截止时间，因为两种引擎的请求结构体均不携带超时字段：
+// 本程序适配的两个版本中，vLLM 的 CompletionRequest 和 SGLang 的 GenerateReqInput 都没有该字段。
+// 因此，处于饱和状态的成员会将请求排队而不是直接拒绝，唯一能防止繁忙引擎阻塞 reconcile 的就是此上限。
+// 相对于单 token 的工作量，该预算刻意设得较为充裕，因为过早超时的代价是导致健康组在整轮中被暂留。
 const modelDeploymentGroupForwardBound = 15 * time.Second
 
-// modelDeploymentGroupForwardMaxResponseBytes bounds what a probe will read. One token of
-// answer is a small document, and a member answering with something enormous is a member whose
-// answer cannot be bound.
+// modelDeploymentGroupForwardMaxResponseBytes 限制探测读取的响应大小。单个 token 的响应是一个很小的文档，
+// 返回超大响应的成员意味着其响应无法完成有效绑定。
 const modelDeploymentGroupForwardMaxResponseBytes = 1 << 20
 
-// modelDeploymentGroupForwardFetch performs one probe request against one member's engine and
-// returns the response body.
+// modelDeploymentGroupForwardFetch 向单个成员的引擎发起一次探测请求并返回响应体。
 //
-// IT IS A FUNCTION RATHER THAN A DIAL BECAUSE THE STATES THIS FILE HAS TO GET RIGHT ARE FAILURES,
-// and a real dial cannot be made to fail on demand. A nil fetch means the leg has no transport and
-// therefore makes no observation, which reads Unknown and holds.
+// 它被定义为函数而非直接发起网络连接，是因为本文件需要准确验证各类失败状态，
+// 而真实的网络连接无法按需触发失败。fetch 为 nil 表示该分支没有传输实现，
+// 因而无法执行观测，结果将记为 Unknown 并保持暂留。
 type modelDeploymentGroupForwardFetch func(ctx context.Context, url string, body []byte) ([]byte, error)
 
-// modelDeploymentGroupForwardEngine is everything this operator knows how to do with ONE engine:
-// the route the probe posts to, how to render the request, and how to read the binding back out
-// of the response.
+// modelDeploymentGroupForwardEngine 定义了本 operator 对单个引擎所知的全部交互方式：
+// 探测请求发送的路由、如何构造请求体，以及如何从响应中提取绑定关系。
 //
-// A MISSING ENTRY MEANS NO VERIFIED OBSERVATION EXISTS FOR THAT ENGINE, and the leg says so by
-// name rather than guessing at one.
+// 若某引擎缺少对应条目，则表示该引擎没有经过验证的观测方法，该分支会明确指出引擎名称，而不是盲目猜测。
 type modelDeploymentGroupForwardEngine struct {
-	// Path is the engine route the probe posts to.
+	// Path 是探测请求通过 POST 发送到的引擎路由。
 	Path string
-	// Binding names, in words, the property that makes a response evidence of THIS operator's
-	// request.
+	// Binding 用文字描述使响应能够证明其对应本 operator 所发请求的属性。
 	Binding string
-	// DisaggregatedReason says what a real request cannot prove on this engine's disaggregated
-	// shape. It is engine-specific because the two engines fail the proof differently, and a
-	// reader told only "P/D is unsupported" cannot tell which obstacle is in the way.
+	// DisaggregatedReason 说明在该引擎的分离式部署形态下，真实请求无法证明的内容。
+	// 它是引擎特定的，因为两种引擎无法完成证明的原因各不相同，仅告知"不支持 P/D"无法让阅读者了解具体障碍所在。
 	DisaggregatedReason string
-	// Body renders the probe request for one member.
+	// Body 为单个成员构造探测请求体。
 	Body func(rid string) ([]byte, error)
-	// Bound reads the answer. It returns an empty string when the answer is bound to this
-	// operator's own request and says the request ran to completion, and otherwise the reason the
-	// answer is not evidence of either. It is given the raw body so a malformed document reads as
-	// a refusal rather than as a parse error the caller has to distinguish.
+	// Bound 解析响应。当响应与本 operator 自身的请求绑定且表明请求已运行完成时返回空字符串；
+	// 否则返回该响应无法证明上述任一点的原因。它直接接收原始响应体，使格式错误的文档被判定为
+	// 拒绝采信的理由，而不是需要调用方单独区分的解析错误。
 	Bound func(body []byte, rid string) string
 }
 
-// modelDeploymentGroupForwardEngines is the per-engine matrix. An engine absent from it has no
-// verified observation, and the leg names it rather than holding with a guess at a reason.
+// modelDeploymentGroupForwardEngines 是按引擎划分的适配矩阵。未列入其中的引擎没有经过验证的观测方式，
+// 该分支会直接指明该引擎，而非带着猜测的原因将其暂留。
 var modelDeploymentGroupForwardEngines = map[string]modelDeploymentGroupForwardEngine{
 	workercore.ModelDeploymentEngineVLLM: {
-		// /v1/completions is the route whose request struct carries request_id, documented at both
-		// versions this program reads as "used through out the inference process and return in
-		// response", and whose serving path returns it as the response id prefixed "cmpl-". The
-		// model field is left out: it is optional at both versions, and naming a model the engine
-		// does not serve would turn a working group into a 404 and a permanent hold.
+		// /v1/completions 路由的请求结构体包含 request_id，本程序兼容的两个版本的文档均说明其
+		// "贯穿整个推理过程并在响应中返回"，其服务路径会将其作为带 "cmpl-" 前缀的响应 id 返回。
+		// 此处省略 model 字段：它在两个版本中都是可选的，且一旦指定了引擎未托管的模型名称，
+		// 就会使正常工作的组返回 404 并被永久暂留。
 		Path:    "/v1/completions",
 		Binding: `the response id is "cmpl-" + our request_id`,
 		DisaggregatedReason: "vLLM's disaggregated transfer is a client-coordinated pair of " +
@@ -147,9 +130,8 @@ var modelDeploymentGroupForwardEngines = map[string]modelDeploymentGroupForwardE
 		},
 	},
 	workercore.ModelDeploymentEngineSGLang: {
-		// /generate takes no model field, so there is nothing to get wrong there. The response
-		// carries meta_info.id, which is the rid this operator sent, plus the finish reason the
-		// engine recorded for it.
+		// /generate 不接受 model 字段，因此不存在填错模型的风险。响应中带有 meta_info.id，
+		// 即本 operator 发送的 rid，以及引擎为该请求记录的 finish_reason。
 		Path:    "/generate",
 		Binding: `the response meta_info.id is our rid`,
 		DisaggregatedReason: "a prefill or decode group is verified by a directed pair probe, " +
@@ -172,10 +154,9 @@ var modelDeploymentGroupForwardEngines = map[string]modelDeploymentGroupForwardE
 			var response struct {
 				MetaInfo struct {
 					ID string `json:"id"`
-					// The engine records its finish reason as a DOCUMENT keyed by type rather than
-					// as a string, so this is read as raw JSON: the question is whether a reason
-					// arrived, not what shape it took. A string-typed field would reject every real
-					// answer this engine gives and hold a working group forever.
+					// 引擎将 finish_reason 记录为以 type 为键的文档而非字符串，因此这里将其读取为原始 JSON：
+					// 关键在于是否收到了结束原因，而非其具体结构。若使用 string 类型字段，
+					// 将会拒绝该引擎返回的所有真实响应，并使正常工作的组被永久暂留。
 					FinishReason json.RawMessage `json:"finish_reason"`
 				} `json:"meta_info"`
 			}
@@ -198,39 +179,35 @@ var modelDeploymentGroupForwardEngines = map[string]modelDeploymentGroupForwardE
 	},
 }
 
-// modelDeploymentQualifyPrompt is the text the probe sends. It is a single token of work on either
-// engine, and its content does not matter: what is being observed is that the request came back
-// bound to its own identifier.
+// modelDeploymentQualifyPrompt 是探测发送的文本。在两种引擎上它都只对应单个 token 的工作量，
+// 其具体内容并不重要：需要观测的是请求是否带着自身的标识符返回。
 const modelDeploymentQualifyPrompt = "ok"
 
-// The refusals an answer earns when it is not evidence that the group forwarded the request. Each
-// one says what about the answer is missing, because an answer that cannot be used is a hold and a
-// hold has to say why.
+// 当响应不足以证明该组转发了请求时所给出的拒绝原因。每一条都指明了响应中缺失的要素，
+// 因为无法采信的响应会导致暂留，而暂留必须说明原因。
 const (
-	// modelDeploymentQualifyUnreadableAnswer is an answer this operator cannot read at all.
+	// modelDeploymentQualifyUnreadableAnswer 表示本 operator 完全无法解析的响应。
 	modelDeploymentQualifyUnreadableAnswer = "answered with a document this operator cannot read, " +
 		"so the answer is not evidence that this group forwarded one"
-	// modelDeploymentQualifyUnboundAnswer is an answer that carries somebody else's request.
+	// modelDeploymentQualifyUnboundAnswer 表示携带了他人请求标识的响应。
 	modelDeploymentQualifyUnboundAnswer = "answered, but not bound to this operator's own request, " +
 		"so the answer is not evidence that this group forwarded one"
-	// modelDeploymentQualifyUnfinishedAnswer is an answer that stopped without saying why.
+	// modelDeploymentQualifyUnfinishedAnswer 表示终止但未说明原因的响应。
 	modelDeploymentQualifyUnfinishedAnswer = "answered, but it recorded no finish reason, so the " +
 		"answer is not evidence that this group forwarded one"
-	// modelDeploymentQualifyAbortedAnswer is an answer whose request did not run to completion.
+	// modelDeploymentQualifyAbortedAnswer 表示请求未能运行至完成的响应。
 	modelDeploymentQualifyAbortedAnswer = "answered, but its finish reason reports the request did " +
 		"not complete, so the answer is not evidence that this group forwarded one"
 )
 
-// modelDeploymentQualifyNonceBytes is how much randomness one probe identifier carries. It is
-// enough that two attempts never collide, and small enough that the identifier stays readable in
-// an engine's own log line.
+// modelDeploymentQualifyNonceBytes 指定单个探测标识符携带的随机字节数。它足以保证两次尝试
+// 不会发生碰撞，同时又足够短小，使标识符在引擎自身的日志行中仍保持可读性。
 const modelDeploymentQualifyNonceBytes = 12
 
-// modelDeploymentQualifyRequestID builds the identifier one probe request carries.
+// modelDeploymentQualifyRequestID 构建单个探测请求携带的标识符。
 //
-// IT IS FRESH PER ATTEMPT, so a body carried over from an earlier attempt cannot satisfy the
-// binding: the prefix and the member's own identifier say which probe this is and which member it
-// was sent to, and the nonce says which attempt it belonged to.
+// 每次尝试都会生成新的标识符，从而防止复用来自身前次尝试的响应体通过绑定校验：
+// 前缀和成员自身的标识指明这是哪类探测以及发往哪个成员，nonce 则标识属于哪一次尝试。
 func modelDeploymentQualifyRequestID(member *core.Pod) (string, error) {
 	nonce, err := modelDeploymentQualifyRandom(modelDeploymentQualifyNonceBytes)
 	if err != nil {
@@ -240,11 +217,10 @@ func modelDeploymentQualifyRequestID(member *core.Pod) (string, error) {
 	return modelDeploymentQualifyRIDPrefix + string(member.UID) + "-" + nonce, nil
 }
 
-// modelDeploymentQualifyRandom returns a hexadecimal token read from the cryptographic source.
+// modelDeploymentQualifyRandom 返回从加密随机源读取的十六进制令牌。
 //
-// IT IS READ FROM THERE AND NOT FROM A COUNTER, because the identifier leaves this operator in the
-// engine's logs and in its request counters, and a predictable one would let a reader of those
-// logs write an answer that binds.
+// 这里从加密随机源而非计数器读取，是因为该标识符会随请求写入引擎的日志和请求计数器中，
+// 可预测的标识符会让读取这些日志的一方能够伪造出可通过绑定校验的响应。
 func modelDeploymentQualifyRandom(size int) (string, error) {
 	buffer := make([]byte, size)
 	if _, err := rand.Read(buffer); err != nil {
@@ -254,12 +230,10 @@ func modelDeploymentQualifyRandom(size int) (string, error) {
 	return hex.EncodeToString(buffer), nil
 }
 
-// modelDeploymentQualifyFinishRan reports whether a finish reason says the request ran to
-// completion.
+// modelDeploymentQualifyFinishRan 判断结束原因是否表明请求已运行至完成。
 //
-// A REASON THAT REPORTS THE REQUEST WAS ABORTED, OR THAT IT FAILED, IS NOT EVIDENCE THAT THIS
-// GROUP FORWARDED ONE, so it is refused rather than accepted as any reason at all. A reason that
-// says the answer was cut short is evidence: the engine ran, and it says where it stopped.
+// 报告请求被中止或失败的原因不能证明该组完成了请求转发，因此会被拒绝而非当作有效原因接受。
+// 表明输出被截断的原因则是有效证据：引擎确实运行了，并说明了停止位置。
 func modelDeploymentQualifyFinishRan(reason string) bool {
 	trimmed := strings.TrimSpace(reason)
 	if trimmed == "" || trimmed == "null" {
@@ -274,11 +248,10 @@ func modelDeploymentQualifyFinishRan(reason string) bool {
 	return true
 }
 
-// modelDeploymentQualifyFinishType reads the type out of a finish reason.
+// modelDeploymentQualifyFinishType 从结束原因中提取类型。
 //
-// THE ENGINE RECORDS THE REASON AS A DOCUMENT KEYED BY TYPE on the route this operator reads for a
-// group, so the type is what has to be judged. A reason written as a plain string is judged as
-// itself, because a reason whose shape this operator cannot read is still a reason.
+// 在本 operator 为组读取的路由上，引擎将该原因记录为以 type 为键的文档，因此需要判断的是其类型。
+// 若以纯字符串形式给出，则直接以其本身作为判断依据，因为格式无法识别的原因依然是一个结束原因。
 func modelDeploymentQualifyFinishType(reason json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(reason))
 	if trimmed == "" || trimmed == "null" {
@@ -294,12 +267,11 @@ func modelDeploymentQualifyFinishType(reason json.RawMessage) string {
 	return trimmed
 }
 
-// observeModelDeploymentGroupForward classifies the group-forward evidence for one replica.
+// observeModelDeploymentGroupForward 为单个副本判定 group-forward 证据状态。
 //
-// The order of the questions below is the order of how much they cost to be wrong. A single-member
-// replica is answered before anything else because it is the shape that must not move. A shape this
-// operator has no observation for is answered before any network call, because an observation that
-// was never read is not an observation. Only what survives both is worth a request.
+// 下方判断的顺序按照误判代价排序。单成员副本最先判定，因为这是绝对不能出错的形态。
+// 本 operator 没有观测支持的形态会在任何网络调用之前判定，因为从未读取的观测不算作观测。
+// 只有通过这两项检查的副本，才值得发起探测请求。
 func observeModelDeploymentGroupForward(
 	ctx context.Context, md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 	view modelDeploymentReplicaView, fetch modelDeploymentGroupForwardFetch,
@@ -307,11 +279,10 @@ func observeModelDeploymentGroupForward(
 	engineName := md.Spec.Engine.Name
 	engine, known := modelDeploymentGroupForwardEngines[engineName]
 
-	// A PREFILL OR DECODE GROUP IS ANSWERED BEFORE THE MEMBER COUNT, and it is never NotApplicable.
-	// Its serving path is a pair, so a group of one member still has a transfer to prove, and
-	// "there is nothing to verify" would be a claim nobody made an observation for. The directed
-	// pair probe is the path that answers it, and it needs both groups' snapshots; this call site
-	// carries one of them, so the group is held with the reason that names the probe that would.
+	// prefill 或 decode 组会在检查成员数量之前判定，且永远不会返回 NotApplicable。
+	// 其服务路径是一个配对，因此即使只有一个成员的组也仍有传输需要验证，
+	// 若称"无需验证"则相当于做出了未经过观测的断言。该场景应由定向配对探测来给出结论，
+	// 而定向配对探测需要两个组的快照；当前调用点仅携带其中一个，因此该组会被暂留，并指明负责探测的路径名称。
 	if workercore.ModelDeploymentRoleKindPrefill == ModelDeploymentEffectiveRoleKind(role) ||
 		workercore.ModelDeploymentRoleKindDecode == ModelDeploymentEffectiveRoleKind(role) {
 		if !known {
@@ -329,14 +300,12 @@ func observeModelDeploymentGroupForward(
 		}
 	}
 
-	// AN ENCODER IS ANSWERED BEFORE THE ENGINE, AND IT IS ANSWERED RATHER THAN UNSUPPORTED. It runs
-	// the multimodal encoder and produces encoder-cache output, so it serves no tokens: there is no
-	// completion request whose bound answer would prove anything about its forward path, and this
-	// leg has no question to ask of it at any engine or version. Asking anyway would spend a request
-	// against an engine that cannot answer it, and the only answer obtainable would be Unknown,
-	// which the health predicate reads as a hold on a healthy group. NotApplicable says the
-	// observation does not exist for the role, which is a different fact from the engine not
-	// offering one, and only the former keeps an encoder out of the hold.
+	// encoder 会在检查引擎之前判定，且直接给出明确结果而非 Unsupported。它运行多模态编码器
+	// 并产生 encoder-cache 输出，不直接生成 token：因此不存在能通过绑定响应来证明其前向路径的
+	// completion 请求，无论引擎或版本如何，本分支都没有问题需要向其询问。
+	// 强行请求只会向无法作答的引擎发出无效请求，唯一能得到的结果只有 Unknown，
+	// 而健康度谓词会将其判定为暂留一个健康的组。NotApplicable 表示该 role 不存在此类观测，
+	// 这与引擎未提供观测支持是不同的事实，只有前者才能避免将 encoder 置于暂留状态。
 	if workercore.ModelDeploymentRoleKindEncode == ModelDeploymentEffectiveRoleKind(role) {
 		return modelDeploymentGroupForward{
 			State: modelDeploymentGroupForwardNotApplicable,
@@ -361,8 +330,8 @@ func observeModelDeploymentGroupForward(
 	return probeModelDeploymentGroupForward(ctx, engine, view, fetch)
 }
 
-// modelDeploymentGroupForwardUnsupportedFor is the Unsupported answer with the reason that says
-// which obstacle is in the way, kept in one place so no two call sites word it differently.
+// modelDeploymentGroupForwardUnsupportedFor 构造带有具体阻碍原因的 Unsupported 结果，
+// 集中在一处定义，避免不同调用点出现不一致的表述。
 func modelDeploymentGroupForwardUnsupportedFor(reason string) modelDeploymentGroupForward {
 	return modelDeploymentGroupForward{
 		State:  modelDeploymentGroupForwardUnsupported,
@@ -370,19 +339,15 @@ func modelDeploymentGroupForwardUnsupportedFor(reason string) modelDeploymentGro
 	}
 }
 
-// probeModelDeploymentGroupForward asks EVERY member of the replica and requires every answer to
-// be bound to its own request.
+// probeModelDeploymentGroupForward 探测副本中的每一个成员，并要求每个响应都与其对应的请求绑定。
 //
-// EVERY MEMBER, because the leg is about a group and one member's success says nothing about the
-// others: a member whose peers are gone completes its own forward only for the collectives it owns,
-// and a group whose cross-member wiring has failed leaves exactly the members that can still
-// answer alone in saying so. Requiring all of them is what makes the answer a statement about the
-// replica.
+// 必须探测每个成员，因为该分支针对的是整个组，单个成员成功并不能说明其他成员正常：
+// 对端缺失的成员只能在其自身所属的集合通信范围内完成前向推理，
+// 而跨成员连线失败的组中，恰恰只有那些仍能单独应答的成员才会表现正常。要求全部成员通过才能代表整个副本的状态。
 //
-// A SINGLE UNBOUND OR UNANSWERED MEMBER IS UNKNOWN, NEVER FAILED. The engine said nothing about
-// the health of the group; this operator ran out of patience, ran into a queue, or read a document
-// it could not bind. A probe that cannot be understood is an absence of evidence, and the definite
-// health legs are where a fault belongs.
+// 只要有单个成员未绑定或未响应，结果即为 Unknown，绝不判为 Failed。此时引擎并未报告组不健康；
+// 只是本 operator 耗尽了等待时间、遇到了排队，或读到了无法绑定的文档。
+// 无法理解的探测结果属于证据缺失，明确的故障应由确定性的健康检查分支来判定。
 func probeModelDeploymentGroupForward(
 	ctx context.Context, engine modelDeploymentGroupForwardEngine,
 	view modelDeploymentReplicaView, fetch modelDeploymentGroupForwardFetch,
@@ -426,9 +391,8 @@ func probeModelDeploymentGroupForward(
 	return modelDeploymentGroupForward{
 		State:  modelDeploymentGroupForwardVerified,
 		Reason: "every member returned the one-token request this operator sent, bound to its own identifier",
-		// The observation is a point in time read inside this pass, and it is only ever read
-		// while the replica is held, so it carries no freshness state of its own: there is no
-		// later pass that could act on a stale copy of it.
+		// 该观测是在本次流程中读取的瞬时状态，且仅在副本处于暂留状态时读取，
+		// 因此它本身不携带时效性状态：不会有后续流程依据其过期副本采取行动。
 		Generation:  modelDeploymentGenerationOf(view),
 		Observation: strconv.Itoa(len(view.Members)) + " members answered, each bound to its own request",
 	}
@@ -441,20 +405,17 @@ func modelDeploymentGroupForwardUnknownFor(reason string) modelDeploymentGroupFo
 	}
 }
 
-// modelDeploymentGroupForwardURL builds the member's own serving URL from the annotations the
-// render already stamps on it, so the probe needs nothing this operator did not already write.
+// modelDeploymentGroupForwardURL 根据渲染器已写入的 annotation 构建成员自身的推理服务 URL，
+// 因此探测无需依赖本 operator 未曾写入的任何信息。
 //
-// THE ANNOTATION IS A HARD REQUIREMENT, AND A TAKE-OVER ROLE HAS NONE. The render stamps
-// prometheus.io/port only for roles running the operator's own command line: for a replaced
-// command the operator cannot know what the replacement serves, so it stamps nothing. A
-// multi-member take-over role therefore cannot be probed and reads Unknown; no port is guessed
-// from the container spec, because inventing a serving contract the command never declared
-// would turn absence of evidence into a claim.
+// 该 annotation 是硬性要求，而接管型（take-over）role 并不具备它。渲染器仅为运行 operator
+// 自身命令行的 role 写入 prometheus.io/port：对于被替换的自定义命令，operator 无法得知其服务端口，
+// 因此不会写入。所以多成员接管型 role 无法被探测，结果记为 Unknown；此处不会从容器 spec 中猜测端口，
+// 因为凭空构造命令从未声明的服务契约，会把证据缺失变成未经证实的断言。
 //
-// THE ANNOTATION NAMES THE ENGINE, AND NOT ALWAYS THE FRONT DOOR. A decoder the routing proxy
-// fronts answers on two ports: the one its Service targets, which the proxy opens, and the engine's
-// own port behind it. The annotation carries the engine's port, so a caller that wants the front
-// door names its own port with modelDeploymentGroupForwardURLOnPort.
+// 该 annotation 指代的是引擎端口，未必总是对外入口端口。前置有路由代理的 decoder 会在两个端口上应答：
+// 其 Service 指向的端口（由代理监听），以及其背后引擎自身的端口。该 annotation 记录的是引擎端口，
+// 因此需要访问入口端口的调用方应通过 modelDeploymentGroupForwardURLOnPort 指定端口。
 func modelDeploymentGroupForwardURL(member *core.Pod, path string) (string, error) {
 	if member.Status.PodIP == "" {
 		return "", fmt.Errorf("has no address to be asked at yet")
@@ -472,13 +433,10 @@ func modelDeploymentGroupForwardURL(member *core.Pod, path string) (string, erro
 	return modelDeploymentGroupForwardURLOnPort(member, int32(number), path)
 }
 
-// modelDeploymentGroupForwardURLOnPort builds the URL one member is asked at, on a port the caller
-// names.
+// modelDeploymentGroupForwardURLOnPort 使用调用方指定的端口构建向单个成员发起请求的 URL。
 //
-// THE PORT IS THE CALLER'S TO NAME, because a member behind a routing proxy answers on two: the one
-// its Service targets, which the proxy opens, and the engine's own port behind it. A caller that
-// wants the front door names the Service's port here; a caller that wants the engine names the
-// engine's own.
+// 端口由调用方指定，因为位于路由代理后的成员会在两个端口上应答：其 Service 指向的端口（由代理监听），
+// 以及背后引擎自身的端口。需要访问入口端口的调用方在此指定 Service 端口；需要直连引擎的则指定引擎自身端口。
 func modelDeploymentGroupForwardURLOnPort(member *core.Pod, port int32, path string) (string, error) {
 	if member.Status.PodIP == "" {
 		return "", fmt.Errorf("has no address to be asked at yet")
@@ -494,12 +452,11 @@ func modelDeploymentGroupForwardURLOnPort(member *core.Pod, port int32, path str
 	return fmt.Sprintf("%s://%s:%d%s", scheme, member.Status.PodIP, port, path), nil
 }
 
-// modelDeploymentGroupForwardHostPort is a member's own serving address in the form a handshake
-// names an endpoint in.
+// modelDeploymentGroupForwardHostPort 返回成员自身的服务地址，格式为握手时用于指代端点的地址形式。
 //
-// IT IS THE ENGINE'S OWN ADDRESS, read off the same annotations, so the endpoint this operator names
-// to another engine and the endpoint it would ask are the same one. It is the right address to name
-// for a prefiller, which no proxy fronts, and the wrong one to ask for a decoder a proxy fronts.
+// 它是引擎自身的地址，从相同的 annotation 中读取，因此本 operator 向另一引擎指定的端点
+// 与其直接请求的端点是同一个。对于前置无代理的 prefiller，这是应指定的正确地址；
+// 而对于前置有代理的 decoder，直接请求该地址则是不正确的。
 func modelDeploymentGroupForwardHostPort(member *core.Pod) (string, error) {
 	if member.Status.PodIP == "" {
 		return "", fmt.Errorf("has no address to be named yet")
@@ -512,13 +469,11 @@ func modelDeploymentGroupForwardHostPort(member *core.Pod) (string, error) {
 	return member.Status.PodIP + ":" + port, nil
 }
 
-// defaultGroupForwardFetch is the production transport: a plain POST against the URL built from
-// the member Pod's own IP and the serving port its render stamped, never a Service, which would
-// sample one replica and silently answer for the rest.
+// defaultGroupForwardFetch 是生产环境使用的传输实现：直接向由成员 Pod 自身 IP 及渲染器写入的
+// 服务端口构成的 URL 发送普通 POST 请求，绝不经由 Service（否则只会采样单个副本而悄悄代表其余副本应答）。
 //
-// It is the same shape the router observation uses for its own reads, and deliberately NOT the exec
-// channel the drain reader uses: that channel runs something inside a container and belongs to a
-// different task. Nothing here reaches into a member to run anything.
+// 它采用与 router 观测读取相同的模式，并刻意不使用排空读取器（drain reader）所用的 exec 通道：
+// exec 通道会在容器内部执行操作，属于另一类任务。此处不会进入成员容器内部执行任何操作。
 func defaultGroupForwardFetch(ctx context.Context, url string, body []byte) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
 	if err != nil {
@@ -534,9 +489,8 @@ func defaultGroupForwardFetch(ctx context.Context, url string, body []byte) ([]b
 		_ = response.Body.Close()
 	}()
 
-	// The bound is on the RESPONSE too. A member that answers with something enormous is not a
-	// member whose answer this operator can bind, and reading it whole would spend the reconcile's
-	// remaining budget on a document it will discard.
+	// 该上限同样约束响应大小。返回超大响应的成员无法与本 operator 的请求完成绑定，
+	// 完整读取它只会在最终会被丢弃的文档上耗尽本次 reconcile 剩余的预算。
 	payload, err := io.ReadAll(io.LimitReader(response.Body, modelDeploymentGroupForwardMaxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("probe response could not be read: %w", err)
@@ -548,11 +502,10 @@ func defaultGroupForwardFetch(ctx context.Context, url string, body []byte) ([]b
 	return payload, nil
 }
 
-// defaultGroupForwardPairFetch performs one request of a directed pair.
+// defaultGroupForwardPairFetch 执行定向配对中的一次请求。
 //
-// IT IS A SEPARATE TRANSPORT FROM THE ORDINARY ONE because a pair's request carries headers the
-// ordinary one never needs: one engine reads the rank it means from a header, and another is told
-// which prefiller to pair with through one.
+// 它是独立于普通探测的传输实现，因为配对请求需要携带普通探测从不需要的请求头：
+// 一种引擎通过请求头读取目标 rank，另一种引擎则通过请求头被告知要与哪个 prefiller 配对。
 func defaultGroupForwardPairFetch(
 	ctx context.Context, request modelDeploymentGroupForwardPairRequest,
 ) ([]byte, error) {
@@ -590,212 +543,196 @@ func defaultGroupForwardPairFetch(
 	return payload, nil
 }
 
-// modelDeploymentGroupForwardPairBound is how long one directed pair probe may take in all. It is
-// ONE budget shared by every rank pair the attempt probes, the way the ordinary probe shares one
-// budget across a replica's members: a rank pair that answers slowly consumes the budget the
-// later rank pairs would have used.
+// modelDeploymentGroupForwardPairBound 是单次定向配对探测的总允许耗时。它是本次尝试所探测的
+// 所有 rank 配对共享的单一时间预算，正如普通探测在副本各成员间共享一个预算：响应较慢的
+// rank 配对会消耗后续 rank 配对原本可用的预算。
 const modelDeploymentGroupForwardPairBound = 60 * time.Second
 
-// modelDeploymentGroupForwardPairMaxTokens is how many tokens the copied answer may take. The
-// answer is one short line, and the cap is what keeps a probe from turning into a generation.
+// modelDeploymentGroupForwardPairMaxTokens 限制复制响应可使用的最大 token 数。响应本身只是一短行文本，
+// 该上限用于防止探测演变为长文本生成。
 const modelDeploymentGroupForwardPairMaxTokens = 80
 
-// modelDeploymentGroupForwardPairPrefillerHeader names the header the decoder's routing proxy
-// reads the prefiller from.
+// modelDeploymentGroupForwardPairPrefillerHeader 指定 decoder 路由代理从中读取 prefiller 的请求头名称。
 //
-// IT IS THE ROUTER'S OWN HEADER, the one its picker writes when it chooses a prefiller, and the
-// proxy reads the same one. The operator writes it to name the prefiller it means, which is what
-// turns a proxy that picks for itself into a pair this operator chose.
+// 它是 router 自身使用的请求头，即选择器在选定 prefiller 时写入、代理负责读取的同一个请求头。
+// operator 写入该请求头以指定目标 prefiller，从而使原本自行选择的代理按本 operator 指定的配对路由。
 const modelDeploymentGroupForwardPairPrefillerHeader = "x-prefiller-host-port"
 
-// modelDeploymentGroupForwardPairRankHeader names the header a data-parallel rank is read from.
+// modelDeploymentGroupForwardPairRankHeader 指定用于读取 data-parallel rank 的请求头名称。
 const modelDeploymentGroupForwardPairRankHeader = "X-Data-Parallel-Rank"
 
-// modelDeploymentGroupForwardPairBootstrapPortAnnotation publishes the prefiller's bootstrap port
-// for whoever has to fetch its transfer endpoints from. The value is the port as a decimal string.
+// modelDeploymentGroupForwardPairBootstrapPortAnnotation 公布 prefiller 的 bootstrap 端口，
+// 供需要从中获取传输端点的组件使用。其值为十进制字符串形式的端口号。
 const modelDeploymentGroupForwardPairBootstrapPortAnnotation = "sglang.ai/bootstrap-port"
 
-// modelDeploymentGroupForwardPairShape identifies the path used by a directed pair probe.
+// modelDeploymentGroupForwardPairShape 标识有向配对探测所使用的路径。
 //
-// IT IS A VALUE AND NOT A BOOLEAN, because the two shapes answer different questions. The
-// head-to-head shape drives both heads itself and enumerates every rank pair of the two groups, and
-// the proxy shape asks the decode group's routing proxy one question and lets the proxy pick the
-// rank inside the engine it fronts. A reader that cannot tell them apart would read a proxy-shape
-// Verified as a rank-covering proof, which it is not.
+// 它采用枚举值而非布尔值，因为这两种形态回答的问题不同。点对点形态由自身驱动
+// 两个端头并枚举两个分组的每一对 rank；代理形态则向 decode 分组的路由代理发起
+// 一次请求，由代理在其前置的引擎内部自行挑选 rank。如果调用方无法区分二者，就
+// 会把代理形态的 Verified 误判为覆盖全量 rank 的证明，而事实并非如此。
 type modelDeploymentGroupForwardPairShape string
 
 const (
-	// modelDeploymentGroupForwardPairShapeHeadToHead is the path where this operator drives
-	// both heads and every rank pair of the two groups is asked.
+	// modelDeploymentGroupForwardPairShapeHeadToHead 表示由本 operator 直接驱动
+	// 两个端头并向两个分组的每一对 rank 发起请求的路径。
 	modelDeploymentGroupForwardPairShapeHeadToHead modelDeploymentGroupForwardPairShape = "HeadToHead"
 
-	// modelDeploymentGroupForwardPairShapeViaRoutingProxy is the path where the decode group's
-	// routing proxy drives the pair and picks the rank inside the engine it fronts.
+	// modelDeploymentGroupForwardPairShapeViaRoutingProxy 表示由 decode 分组的路由代理
+	// 驱动该配对并在其前置的引擎内部挑选 rank 的路径。
 	modelDeploymentGroupForwardPairShapeViaRoutingProxy modelDeploymentGroupForwardPairShape = "ViaRoutingProxy"
 )
 
-// modelDeploymentGroupForwardPairAttempt is the typed record of one directed pair probe: the two
-// group generations it bound, the identifiers it sent, and the rooms it joined the legs on.
+// modelDeploymentGroupForwardPairAttempt 是单次有向配对探测的类型化记录：包含其
+// 绑定的两个分组成员代次、发送的请求标识符以及连接两条分支所用的房间号。
 //
-// BOTH GENERATIONS ARE HERE AND NOT ONLY THE ONE THE RESULT CARRIES, because a probe speaks for
-// two groups at once and a reader has to be able to tell which two.
+// 这里同时记录双方的代次而非仅记录结果所携带的那一个，因为一次探测同时代表两个
+// 分组，读取者必须能够分辨具体是哪两个分组。
 type modelDeploymentGroupForwardPairAttempt struct {
-	// PrefillGeneration is the membership generation of the prefill group this attempt probed.
+	// PrefillGeneration 是本次探测所针对的 prefill 分组的成员代次。
 	PrefillGeneration modelDeploymentMembershipGeneration
-	// DecodeGeneration is the membership generation of the decode group this attempt probed.
+	// DecodeGeneration 是本次探测所针对的 decode 分组的成员代次。
 	DecodeGeneration modelDeploymentMembershipGeneration
-	// Shape is the shape the attempt took, so a reader can tell a proxy-shape answer from a
-	// rank-covering one without reading its reason.
+	// Shape 是本次探测采用的形态，使读取者无需查看原因即可区分代理形态与覆盖全量
+	// rank 形态的结果。
 	Shape modelDeploymentGroupForwardPairShape
-	// RequestIDs are the identifiers the attempt sent, one per pair it probed.
+	// RequestIDs 是本次探测发送的请求标识符列表，每个被探测的配对对应一个。
 	RequestIDs []string
-	// BootstrapRooms are the rooms the attempt joined the legs on, one per pair it probed. The
-	// proxy path records none, because the proxy picks the room there.
+	// BootstrapRooms 是本次探测用于连接两条分支的房间号列表，每个被探测的配对对应
+	// 一个。代理路径不记录房间号，因为该路径下由代理自行挑选房间。
 	BootstrapRooms []int64
-	// Mooncake carries the mooncake exposition lines both halves answered with, one entry per
-	// series, prefixed by the half. The prefill half's series are push evidence; the connector
-	// exports no counter for a successful read, so the copied answer stays the read-side proof.
+	// Mooncake 保存两端响应中携带的 Mooncake 暴露指标行，每个序列一条，并以所属半区
+	// 作为前缀。prefill 半区的序列是推送证据；连接器未导出成功读取的计数器，因此
+	// 复述出的响应内容仍作为读取侧的证明。
 	Mooncake []string
 }
 
-// modelDeploymentGroupForwardPairResult is the outcome of one directed pair probe: one result per
-// role, and the attempt that produced them.
+// modelDeploymentGroupForwardPairResult 是单次有向配对探测的结果：每个角色一个
+// 结果，以及产生这些结果的探测记录。
 type modelDeploymentGroupForwardPairResult struct {
-	// Prefill is the prefill group's result.
+	// Prefill 是 prefill 分组的结果。
 	Prefill modelDeploymentGroupForward
-	// Decode is the decode group's result.
+	// Decode 是 decode 分组的结果。
 	Decode modelDeploymentGroupForward
-	// Attempt is the typed record of what the probe asked and of what it sent.
+	// Attempt 是探测所发起请求与发送内容的类型化记录。
 	Attempt modelDeploymentGroupForwardPairAttempt
 }
 
-// modelDeploymentGroupForwardPairRequest is one request of a directed pair: where it goes, what it
-// carries, and what it says about the rank it means.
+// modelDeploymentGroupForwardPairRequest 表示有向配对中的单个请求：发往何处、
+// 携带什么内容以及如何声明其目标 rank。
 //
-// IT IS A SEPARATE SHAPE FROM THE ORDINARY PROBE'S REQUEST because a pair's request carries headers
-// the ordinary one never needs: one engine reads the rank it means from a header, and another is
-// told which prefiller to pair with through one.
+// 它与普通探测的请求结构分开定义，因为配对请求携带了普通探测从不需要的请求头：
+// 有的引擎从请求头读取目标 rank，还有的引擎通过请求头被告知要与哪个 prefiller 配对。
 type modelDeploymentGroupForwardPairRequest struct {
-	// Method is the HTTP method. An empty method is POST, which is what every route this operator
-	// probes reads a request on.
+	// Method 是 HTTP 方法。空值表示 POST，即本 operator 探测的所有路由读取请求时
+	// 所用的方法。
 	Method string
-	// URL is where the request goes.
+	// URL 是请求发送的目标地址。
 	URL string
-	// Body is the request document. A request that reads no document carries none.
+	// Body 是请求体内容。不读取请求体的请求不携带该字段。
 	Body []byte
-	// Headers are the request headers. A request that needs none carries none.
+	// Headers 是请求头集合。不需要请求头的请求不携带该字段。
 	Headers map[string]string
 }
 
-// modelDeploymentGroupForwardPairFetch performs one request of a directed pair and returns the
-// response body.
+// modelDeploymentGroupForwardPairFetch 执行有向配对中的单个请求并返回响应体。
 //
-// IT IS A FUNCTION RATHER THAN A DIAL BECAUSE THE STATES THIS FILE HAS TO GET RIGHT ARE FAILURES,
-// and a real dial cannot be made to fail on demand. A nil fetch means the pair has no transport
-// and therefore makes no observation, which reads Unknown and holds.
+// 将其定义为函数而非直接发起网络连接，是因为本文件需要准确处理各类失败状态，
+// 而真实的连接无法按需触发失败。fetch 为 nil 表示该配对没有传输通道，因此不会
+// 产生观测结果，其状态判定为 Unknown 并保持挂起。
 type modelDeploymentGroupForwardPairFetch func(
 	ctx context.Context, request modelDeploymentGroupForwardPairRequest,
 ) ([]byte, error)
 
-// modelDeploymentGroupForwardPairLeg is one request of a directed pair: where it goes, what it
-// carries, and what its answer must show.
+// modelDeploymentGroupForwardPairLeg 表示有向配对中的一条请求分支：发往何处、
+// 携带什么内容以及其响应必须证明什么。
 type modelDeploymentGroupForwardPairLeg struct {
-	// Name is what the leg is called in a reason.
+	// Name 是在原因说明中对该分支的称呼。
 	Name string
-	// Request is the request this leg carries.
+	// Request 是该分支携带的请求。
 	Request modelDeploymentGroupForwardPairRequest
-	// Copied says the leg's answer must carry the copied text. A leg that does not is checked for
-	// its binding alone: the prefiller hands over the KV and answers with a partial generation,
-	// which says nothing about whether the transfer happened.
+	// Copied 表示该分支的响应必须包含复述的文本。未要求复述的分支仅检查其请求绑定：
+	// prefiller 在移交 KV 后只返回部分生成结果，无法由此判断传输是否已经发生。
 	Copied bool
 }
 
-// modelDeploymentGroupForwardPairReply is what one leg's answer says.
+// modelDeploymentGroupForwardPairReply 表示单个分支响应所传达的信息。
 type modelDeploymentGroupForwardPairReply struct {
-	// Unreadable says the answer's body could not be read as the engine's own reply shape, so
-	// nothing in it can be judged, not even whether it carried the identifier.
+	// Unreadable 表示响应体无法按引擎自身的响应格式解析，因此无法判断其中任何信息，
+	// 甚至无法确认是否携带了请求标识符。
 	Unreadable bool
-	// Bound says the answer carries this operator's own request identifier.
+	// Bound 表示响应中携带了本 operator 发出的请求标识符。
 	Bound bool
-	// Reason is the finish reason the engine recorded.
+	// Reason 是引擎记录的结束原因（finish reason）。
 	Reason string
-	// Content is the text the answer produced.
+	// Content 是响应生成的文本内容。
 	Content string
 }
 
-// modelDeploymentGroupForwardPairInput is what one pair's requests are built from.
+// modelDeploymentGroupForwardPairInput 是构建单个配对请求所需的输入参数。
 type modelDeploymentGroupForwardPairInput struct {
-	// Model is the model the engine serves.
+	// Model 是引擎对外服务的模型名称。
 	Model string
-	// RequestID is the identifier the legs of this pair carry.
+	// RequestID 是该配对各分支携带的请求标识符。
 	RequestID string
-	// Expected is the text the decoder must copy back.
+	// Expected 是 decoder 必须复述返回的预期文本。
 	Expected string
-	// RequestIDField is the body field the engine reads the request identifier from.
+	// RequestIDField 是引擎从请求体中读取请求标识符的字段名。
 	RequestIDField string
-	// ChatFields are the fields beside the identifier and the messages that the engine's chat
-	// route reads.
+	// ChatFields 是除标识符与消息列表之外，引擎的 chat 路由还会读取的附加字段。
 	ChatFields map[string]any
-	// PrefillURL and DecodeURL are where the two heads are asked. The decode URL is the front door
-	// of a decoder the routing proxy fronts, and the engine's own address otherwise.
+	// PrefillURL 和 DecodeURL 分别是向两个端头发起请求的地址。当 decoder 前置有路由
+	// 代理时，DecodeURL 为该代理的入口地址，否则为引擎自身的地址。
 	PrefillURL string
 	DecodeURL  string
-	// BootstrapHost is the prefiller's own address, which the decode side is told to fetch the
-	// transfer endpoints from.
+	// BootstrapHost 是 prefiller 自身的地址，decode 侧通过该地址获取传输端点。
 	BootstrapHost string
-	// BootstrapPort is the port the prefiller's transfer endpoints are served on.
+	// BootstrapPort 是 prefiller 提供传输端点服务的端口。
 	BootstrapPort int
-	// BootstrapAddress is the prefiller's address in the form the engine's handshake names it in.
+	// BootstrapAddress 是符合引擎握手协议格式要求的 prefiller 地址表示。
 	BootstrapAddress string
-	// BootstrapRoom is the room the two legs are joined on.
+	// BootstrapRoom 是连接两条分支所用的房间号。
 	BootstrapRoom int64
-	// PrefillRank and DecodeRank are the data-parallel ranks this pair addresses.
+	// PrefillRank 和 DecodeRank 是该配对所指向的数据并行（DP）rank。
 	PrefillRank int
 	DecodeRank  int
-	// RemoteEngineID is the prefiller's engine id for this rank, where the engine's handshake
-	// names one.
+	// RemoteEngineID 是当引擎握手协议需要指定时，prefiller 在该 rank 上的引擎 ID。
 	RemoteEngineID string
-	// TransferID is the transfer's own identifier, where the engine's handshake carries one.
+	// TransferID 是当引擎握手协议携带传输标识时，本次传输自身的标识符。
 	TransferID string
 }
 
-// modelDeploymentGroupForwardPairEngine is everything one engine contributes to a directed pair
-// probe: the route its requests go to, the fields its chat route reads, and the requests the two
-// heads of one rank pair carry.
+// modelDeploymentGroupForwardPairEngine 封装了单个引擎在有向配对探测中所需的全部
+// 信息：请求发送的路由、chat 路由读取的字段，以及单个 rank 配对两端头携带的请求。
 //
-// THE ENGINE'S DIFFERENCES LIVE HERE AND NOT IN THE PROBE, because the probe is the part that has
-// to be right about failure, and a per-engine flow would be a second place where that is decided.
+// 引擎间的差异全部收敛于此而非放在探测逻辑中，因为探测逻辑必须准确判定各类失败
+// 状态，若按引擎分叉流程就会引入第二个判定入口。
 type modelDeploymentGroupForwardPairEngine struct {
-	// Path is the route the requests go to.
+	// Path 是请求发送的目标路由路径。
 	Path string
-	// RequestIDField is the body field the engine reads the request identifier from.
+	// RequestIDField 是引擎从请求体中读取请求标识符的字段名。
 	RequestIDField string
-	// IDPrefix is what the engine puts in front of the request identifier in its answer's id.
+	// IDPrefix 是引擎在响应的 id 字段中加在请求标识符前面的前缀。
 	IDPrefix string
-	// ChatFields are the fields beside the identifier and the messages that the engine's chat
-	// route reads.
+	// ChatFields 是除标识符与消息列表之外，引擎的 chat 路由还会读取的附加字段。
 	ChatFields map[string]any
-	// Mooncake says the engine's transfer connector exports the mooncake series the observation
-	// records beside the pair. An engine without them is not scraped for them, so its observation
-	// carries no line about a connector it does not run.
+	// Mooncake 表示该引擎的传输连接器是否会导出需在配对旁记录的 Mooncake 指标序列。
+	// 不提供此类指标的引擎不会被抓取，因此其观测记录中也不会包含未运行连接器的相关行。
 	Mooncake bool
-	// Heads renders the requests the two heads of one rank pair carry.
+	// Heads 生成单个 rank 配对的两个端头各自携带的请求。
 	Heads func(in modelDeploymentGroupForwardPairInput) ([]modelDeploymentGroupForwardPairLeg, error)
 }
 
-// modelDeploymentGroupForwardPairEngines is the per-engine matrix of the directed pair probe. An
-// engine absent from it has no verified observation, and the probe names it rather than guessing
-// at a reason.
+// modelDeploymentGroupForwardPairEngines 是有向配对探测的按引擎划分的配置矩阵。
+// 未包含在其中的引擎没有经过验证的观测方法，探测时将直接指明该引擎而非猜测原因。
 var modelDeploymentGroupForwardPairEngines = map[string]modelDeploymentGroupForwardPairEngine{
 	workercore.ModelDeploymentEngineSGLang: {
-		// The chat route is the one that takes a request identifier and answers with it, and it is
-		// the route the measured pair ran on.
+		// chat 路由会接收请求标识符并在响应中返回它，同时也是实测配对所运行的路由。
 		Path:           "/v1/chat/completions",
 		RequestIDField: "rid",
-		// The engine puts nothing in front of the identifier in its answer's id.
+		// 该引擎在响应的 id 字段中不会在请求标识符前添加任何前缀。
 		IDPrefix: "",
-		// The thinking switch is what keeps a model that reasons out loud from answering with the
-		// reasoning, which the copy would then not match.
+		// 思考开关用于防止输出推理过程的模型把推理内容放进回答，从而导致无法匹配预期的复述文本。
 		ChatFields: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}},
 		Heads: func(in modelDeploymentGroupForwardPairInput) ([]modelDeploymentGroupForwardPairLeg, error) {
 			prefill, err := modelDeploymentGroupForwardPairSGLangBody(in, in.PrefillRank)
@@ -825,13 +762,13 @@ var modelDeploymentGroupForwardPairEngines = map[string]modelDeploymentGroupForw
 	workercore.ModelDeploymentEngineVLLM: {
 		Path:           "/v1/chat/completions",
 		RequestIDField: "request_id",
-		// The engine prefixes the identifier with the kind of completion it answered.
+		// 该引擎会在标识符前加上所响应补全类型的前缀。
 		IDPrefix: "chatcmpl-",
 		Mooncake: true,
 		Heads: func(in modelDeploymentGroupForwardPairInput) ([]modelDeploymentGroupForwardPairLeg, error) {
-			// THE ENGINE ID OF THE PREFILLER'S RANK IS WHAT THE HANDSHAKE NAMES THE PREFILLER BY,
-			// and this operator does not read the prefiller's own registry to learn it. A pair that
-			// needs it and cannot have it holds closed rather than guess an identifier.
+			// prefiller rank 的引擎 ID 是握手阶段用于标识 prefiller 的名称，
+			// 且当前 operator 不会读取 prefiller 自身的注册表来获取该 ID。需要该 ID 却无法获取时，
+			// 配对会保持关闭，而不会猜测标识符。
 			if in.RemoteEngineID == "" {
 				return nil, fmt.Errorf(
 					"the probe cannot discover the prefiller engine id for rank %d, and the "+
@@ -879,25 +816,22 @@ var modelDeploymentGroupForwardPairEngines = map[string]modelDeploymentGroupForw
 	},
 }
 
-// observeModelDeploymentGroupForwardPair probes a prefill group and a decode group as one
-// directed pair, and answers for both roles.
+// observeModelDeploymentGroupForwardPair 将一个 prefill 组和一个 decode 组作为一个有向配对进行探测，
+// 并同时给出两个角色的判定结果。
 //
-// THE TWO GROUPS ARE PROBED AS ONE PAIR because neither of them serves on its own: the prefiller
-// computes the KV and the decoder consumes it, so a request that comes back with the copied answer
-// is evidence about both, and a request that does not come back is evidence about neither.
+// 两个组作为单个配对进行探测，因为双方均无法单独提供服务：prefiller 计算 KV 而 decoder 消费它，
+// 因此返回复制答案的请求能够同时证明双方正常，而未返回答案的请求则无法证明任何一方。
 //
-// EVERY FAILURE IS UNKNOWN FOR BOTH ROLES, never Failed. A pair that could not be observed says
-// nothing about which side is at fault, and blaming a healthy peer for a pair that could not be
-// read would withdraw a group that serves.
+// 所有失败对两个角色都判定为 Unknown，而不会判定为 Failed。无法完成观测的配对不能说明
+// 哪一方存在故障；因配对无法读取而将责任归咎于健康对端，会导致正常服务的组被下线。
 func observeModelDeploymentGroupForwardPair(
 	ctx context.Context, md *workercore.ModelDeployment,
 	prefill, decode modelDeploymentReplicaView,
 	fetch modelDeploymentGroupForwardPairFetch,
 ) modelDeploymentGroupForwardPairResult {
-	// THE SHAPE FOLLOWS THE DEPLOYMENT AND NOT THE ENGINE: a decode role that carries the routing
-	// proxy is reached through that proxy, and the proxy is what drives the transfer leg, so the
-	// operator names the prefiller to it and asks one question. A decode role with no proxy is
-	// reached directly, and then the operator drives both heads itself.
+	// 探测形态取决于部署方式而非引擎：带有路由代理的 decode 角色通过该代理访问，由代理负责驱动
+	// 传输阶段，因此 operator 只需向代理指定 prefiller 并发起一次请求。不带代理的 decode 角色
+	// 则直接访问，此时由 operator 自行驱动两个主节点。
 	decodeRole := modelDeploymentGroupForwardPairDecodeRole(md)
 	shape := modelDeploymentGroupForwardPairShapeHeadToHead
 	if decodeRole != nil && ModelDeploymentRoleFrontedByProxy(md, decodeRole) {
@@ -958,8 +892,8 @@ func observeModelDeploymentGroupForwardPair(
 		})
 	}
 
-	// THE RANKS COME FROM THE ROLES' OWN BOOKS, which are the only place the engine's data-parallel
-	// width is declared. A width nobody declared is the engine's own default of one.
+	// rank 数量来自各角色自身的声明配置，这是声明引擎数据并行宽度的唯一位置。
+	// 未声明宽度时，默认采用引擎自身的默认值 1。
 	pair, err := modelDeploymentDeclaredParallelismPair(md)
 	if err != nil {
 		return modelDeploymentGroupForwardPairHeld(attempt, modelDeploymentGroupForward{
@@ -994,9 +928,8 @@ func observeModelDeploymentGroupForwardPair(
 	for prefillRank := 0; prefillRank < prefillWidth; prefillRank++ {
 		for decodeRank := 0; decodeRank < decodeWidth; decodeRank++ {
 			if viaProxy && (prefillRank > 0 || decodeRank > 0) {
-				// The proxy picks the rank inside the engine it fronts, so there is one pair to
-				// ask about rather than one per rank. The declared widths do not change that:
-				// the shape is one question whatever they are.
+				// 代理会在其前端所服务的引擎内部自行选择 rank，因此只需探测一个配对，而无需为每个 rank
+				// 单独探测。声明的并行宽度不会改变这一点：无论宽度是多少，该形态都只发起一次请求。
 				continue
 			}
 			reply, room, reason := modelDeploymentGroupForwardPairProbe(
@@ -1010,17 +943,14 @@ func observeModelDeploymentGroupForwardPair(
 			}
 			attempt.RequestIDs = append(attempt.RequestIDs, reply)
 			if !viaProxy {
-				// THE ROOM IS RECORDED FOR EVERY HEAD-TO-HEAD PAIR, and a room of zero is a
-				// room like any other. The proxy shape records none, because the proxy picks
-				// the room it joins the pair on and this operator never builds one there.
+				// 每个直连配对都会记录 room，且 0 号 room 与其他 room 同等有效。代理形态不记录 room，
+				// 因为由代理自行选择用于关联配对的 room，当前 operator 在该场景下不会构建 room。
 				attempt.BootstrapRooms = append(attempt.BootstrapRooms, room)
 			}
 			if !mooncakeRead && engine.Mooncake {
-				// THE MOONCAKE SERIES ARE READ FROM BOTH HALVES ONCE, after the first pair and while
-				// its transfer is fresh: the prefill half's exposition carries the push evidence, and
-				// the decode half's carries whatever its connector did about it. The halves' addresses
-				// do not vary by rank and the exposition is cumulative, so a later pair would repeat
-				// the same lines.
+				// 在首个配对完成且传输结果尚新时，从两端各读取一次 Mooncake 指标序列：prefill 端的
+				// 指标导出包含发送端推送证据，而 decode 端包含其连接器对此的处理结果。两端的地址
+				// 不随 rank 变化，且指标导出值为累计值，因此后续配对只会重复相同的指标行。
 				mooncakeRead = true
 				attempt.Mooncake = append(attempt.Mooncake,
 					modelDeploymentGroupForwardPairMooncakeSeries(probeCtx, prefillURL, engine.Path, "prefill", fetch)...)
@@ -1033,7 +963,7 @@ func observeModelDeploymentGroupForwardPair(
 	return modelDeploymentGroupForwardPairVerified(attempt, len(attempt.RequestIDs))
 }
 
-// modelDeploymentGroupForwardPairProbe asks one pair's legs and reads their answers.
+// modelDeploymentGroupForwardPairProbe 向单个配对的各链路发起请求并读取其响应。
 func modelDeploymentGroupForwardPairProbe(
 	ctx context.Context, md *workercore.ModelDeployment, engine modelDeploymentGroupForwardPairEngine,
 	prefillHead *core.Pod, prefillURL, decodeURL string,
@@ -1114,17 +1044,14 @@ func modelDeploymentGroupForwardPairProbe(
 			return "", 0, "the " + legs[i].Name + " leg answered, but its finish reason reports " +
 				"the request did not complete, so the answer is not evidence that the pair carried one"
 		}
-		// THE COMPARE READS THE ANSWER'S VISIBLE TEXT. The chat template wraps its answer in a
-		// <think>…</think> block on this route whatever the thinking switch says -- case-9 run2's
-		// enriched reason caught the byte-perfect copy sitting behind an EMPTY wrapper -- and the
-		// wrapper is the template's noise, not the model's answer. The block is stripped before the
-		// compare; the rejected answer stays RAW in the reason, where the wrapper is still visible
-		// for the next classification.
+		// 比对时读取响应中的可见文本。无论思考开关如何设置，该路由上的聊天模板都会将回答包裹在
+		// <think>…</think> 块中（case-9 run2 的详细原因捕获到空包裹块之后存在逐字节一致的复制内容），
+		// 该包裹块属于模板噪声，而非模型回答。比对前会先剥离该块；被拒绝的回答则在原因中保留原始内容，
+		// 以便在后续分类中仍可看到该包裹块。
 		if visible := modelDeploymentGroupForwardPairVisibleCopy(reply.Content); visible != expected {
-			// THE ANSWER IS NAMED IN THE REASON, bounded and unstripped, so the run's evidence can
-			// tell a model that drifted from a context that was never whole. A reason that discarded
-			// the answer left the classification — answer drift, a broken read, a thinking leak — to
-			// a rerun this probe exists to avoid.
+			// 原因中会附上长度受限且未剥离包裹块的回答内容，以便根据本次运行证据区分模型输出偏移
+			// 与上下文不完整的情况。如果原因中丢弃了回答内容，就只能通过重跑来区分回答偏移、
+			// 读取异常或思考内容泄露等问题，而本探测正是为了避免此类重跑。
 			return "", 0, "the " + legs[i].Name + " leg answered, but it did not carry the text the " +
 				"request asked to be copied, so nothing shows the prefill's KV reached it (answer: \"" +
 				modelDeploymentGroupForwardPairBounded(reply.Content, modelDeploymentGroupForwardPairAnswerBound) + "\")"
@@ -1134,31 +1061,28 @@ func modelDeploymentGroupForwardPairProbe(
 	return requestID, input.BootstrapRoom, ""
 }
 
-// modelDeploymentGroupForwardPairThinkWrapper matches a leading <think>…</think> block, across
-// lines, at the head of an answer, with whitespace tolerated on either side of the block: chat
-// templates emit a leading newline or space before the wrapper on some variants, and an anchored
-// match that refused it would leave the wrapper in place and reject the copy behind it.
+// modelDeploymentGroupForwardPairThinkWrapper 跨行匹配回答开头的前导 <think>…</think> 块，
+// 并允许该块两侧存在空白字符：部分变体下聊天模板会在包裹块前输出前导换行或空格，
+// 若锚定匹配不允许空白字符，就会保留包裹块并误拒其后的复制文本。
 var modelDeploymentGroupForwardPairThinkWrapper = regexp.MustCompile(`(?s)^\s*<think>.*?</think>\s*`)
 
-// modelDeploymentGroupForwardPairVisibleCopy strips a leading <think>…</think> block from an
-// answer and trims what remains, leaving the copy the decode leg was asked for.
+// modelDeploymentGroupForwardPairVisibleCopy 从回答中剥离前导 <think>…</think> 块并修剪剩余内容，
+// 仅保留要求 decode 链路复制的文本。
 //
-// THE WRAPPER IS TEMPLATE NOISE, NOT CONTENT. The Qwen3 chat template emits the block on this
-// route whatever the thinking switch says -- case-9 run2's enriched reason caught the byte-perfect
-// copy sitting behind an EMPTY wrapper -- so the exact compare reads the answer with the block
-// removed. Rejected answers stay raw in their reasons, where the wrapper is still visible.
+// 该包裹块是模板噪声而非实际内容。无论思考开关如何设置，Qwen3 聊天模板都会在该路由上输出
+// 此包裹块（case-9 run2 的详细原因捕获到空包裹块之后存在逐字节一致的复制内容），因此精确比对
+// 会先移除该块再读取回答。被拒绝的回答在原因中保留原始内容，包裹块仍可见。
 func modelDeploymentGroupForwardPairVisibleCopy(answer string) string {
 	return strings.TrimSpace(modelDeploymentGroupForwardPairThinkWrapper.ReplaceAllString(answer, ""))
 }
 
-// modelDeploymentGroupForwardPairAnswerBound is how much of a rejected answer the failure reason
-// carries. Two hundred characters is enough to tell a drifted copy from an unrelated answer, and
-// small enough that a reason stays a line.
+// modelDeploymentGroupForwardPairAnswerBound 是失败原因中所携带的被拒回答的最大字符数。
+// 200 个字符足以区分复制偏移与无关回答，同时又足够简短，可使原因保持在单行内。
 const modelDeploymentGroupForwardPairAnswerBound = 200
 
-// modelDeploymentGroupForwardPairBounded cuts a text to at most limit characters on rune
-// boundaries and marks the cut with an ellipsis. The engines answer in more than one script, and
-// a bound that splits a character corrupts the very evidence it carries.
+// modelDeploymentGroupForwardPairBounded 按 rune 边界将文本截断至最多 limit 个字符，
+// 并在截断处附加省略号。引擎会使用多种文字回答，若截断位置拆分了单个字符，就会破坏
+// 所记录的证据内容。
 func modelDeploymentGroupForwardPairBounded(text string, limit int) string {
 	runes := []rune(text)
 	if len(runes) <= limit {
@@ -1167,13 +1091,12 @@ func modelDeploymentGroupForwardPairBounded(text string, limit int) string {
 	return string(runes[:limit]) + "…"
 }
 
-// modelDeploymentGroupForwardPairMooncakeSeries reads one half's metrics exposition and reduces it
-// to the mooncake series the observation records.
+// modelDeploymentGroupForwardPairMooncakeSeries 读取单端的指标导出内容，并将其归约为
+// 观测结果所记录的 Mooncake 指标序列。
 //
-// THE PUSH IS NOT THE PULL. vllm:mooncake_bytes_transferred is the sender's histogram, and its
-// _count is the number of transfers the prefill half completed; the connector exports no counter
-// for a successful read — vllm:mooncake_num_failed_recvs counts failed pulls only — so the series
-// are recorded as what they are, push evidence, and the copied answer stays the read-side proof.
+// 推送不等同于拉取。vllm:mooncake_bytes_transferred 是发送端的直方图，其 _count 表示
+// prefill 端已完成的传输次数；连接器未导出成功读取的计数器（vllm:mooncake_num_failed_recvs
+// 仅统计拉取失败次数），因此这些指标序列仅作为推送证据记录，而复制返回的回答仍作为读取端证明。
 func modelDeploymentGroupForwardPairMooncakeSeries(
 	ctx context.Context, chatURL, enginePath, half string, fetch modelDeploymentGroupForwardPairFetch,
 ) []string {
@@ -1198,11 +1121,10 @@ func modelDeploymentGroupForwardPairMooncakeSeries(
 	return series
 }
 
-// modelDeploymentGroupForwardPairSend asks every leg of a pair and reads the answers.
+// modelDeploymentGroupForwardPairSend 并发请求配对中的每一条链路并读取其响应。
 //
-// THE LEGS GO OUT TOGETHER, because a pair is a pair only while both halves are in flight: the
-// decode side waits for the prefiller, and a prefiller asked after its decoder gave up would be
-// asked about a transfer that can no longer happen.
+// 各链路必须同时发出，因为配对仅在两端请求同时在途时才成立：decode 端会等待 prefiller，
+// 若在 decoder 超时放弃后再请求 prefiller，所触发的将是一次已无法完成的传输。
 func modelDeploymentGroupForwardPairSend(
 	ctx context.Context, legs []modelDeploymentGroupForwardPairLeg,
 	fetch modelDeploymentGroupForwardPairFetch, requestID, idPrefix string,
@@ -1228,11 +1150,10 @@ func modelDeploymentGroupForwardPairSend(
 	return replies, failures
 }
 
-// modelDeploymentGroupForwardPairChatRead reads one leg's answer.
+// modelDeploymentGroupForwardPairChatRead 读取单条链路的响应。
 //
-// THE BINDING IS THE ENGINE'S OWN: the answer's id has to carry the identifier this operator sent,
-// with whatever the engine puts in front of it. An answer that carries an id is read as bound only
-// when the whole id is the one this operator asked for.
+// 绑定关系由引擎自身决定：响应中的 id 必须包含当前 operator 发送的标识符，引擎可在其前
+// 附加任意前缀。只有当完整 id 符合本 operator 所请求的标识时，携带 id 的响应才视为已绑定。
 func modelDeploymentGroupForwardPairChatRead(
 	body []byte, requestID, idPrefix string,
 ) modelDeploymentGroupForwardPairReply {
@@ -1259,9 +1180,8 @@ func modelDeploymentGroupForwardPairChatRead(
 	return reply
 }
 
-// modelDeploymentGroupForwardPairChatFields are the fields every leg of a directed pair carries
-// besides the engine's own handshake: the model, the identifier, the messages and the shape of the
-// answer.
+// modelDeploymentGroupForwardPairChatFields 返回有向配对中每条链路除引擎自身握手参数之外
+// 所携带的公共字段：模型名称、请求标识符、消息列表以及响应格式参数。
 func modelDeploymentGroupForwardPairChatFields(in modelDeploymentGroupForwardPairInput) map[string]any {
 	fields := map[string]any{
 		"model":       in.Model,
@@ -1280,8 +1200,8 @@ func modelDeploymentGroupForwardPairChatFields(in modelDeploymentGroupForwardPai
 	return fields
 }
 
-// modelDeploymentGroupForwardPairSGLangBody renders the request one leg of a directed pair
-// carries on the engine that names its rank in the body and its prefiller in the request.
+// modelDeploymentGroupForwardPairSGLangBody 构造有向配对中单条链路发送给在请求体中
+// 指定 rank 并在请求中指定 prefiller 的引擎的请求体。
 func modelDeploymentGroupForwardPairSGLangBody(
 	in modelDeploymentGroupForwardPairInput, rank int,
 ) ([]byte, error) {
@@ -1294,8 +1214,8 @@ func modelDeploymentGroupForwardPairSGLangBody(
 	return json.Marshal(fields)
 }
 
-// modelDeploymentGroupForwardPairVLLMBody renders the request one leg of a directed pair carries
-// on the engine whose handshake travels in the request's own transfer parameters.
+// modelDeploymentGroupForwardPairVLLMBody 构造有向配对中单条链路发送给在请求自身
+// transfer 参数中携带握手信息的引擎的请求体。
 func modelDeploymentGroupForwardPairVLLMBody(
 	in modelDeploymentGroupForwardPairInput, transfer map[string]any,
 ) ([]byte, error) {
@@ -1305,23 +1225,20 @@ func modelDeploymentGroupForwardPairVLLMBody(
 	return json.Marshal(fields)
 }
 
-// modelDeploymentGroupForwardPairProxyLeg renders the request a decoder's routing proxy carries.
+// modelDeploymentGroupForwardPairProxyLeg 构造发往 decoder 路由代理的请求。
 //
-// THE PROXY IS THE ONE THAT DRIVES THE TRANSFER LEG, so the operator does not build the
-// handshake: it names the prefiller in the header the router's picker writes, and the proxy asks
-// the prefiller's own registry for the transfer endpoints.
+// 传输阶段由代理负责驱动，因此 operator 不构建握手参数：它在路由器选择器使用的请求头中
+// 指定 prefiller，随后由代理向 prefiller 自身的注册表查询传输端点。
 //
-// THE LEG GOES TO THE PROXY'S OWN PORT, which is the front door the decode Service targets, and the
-// prefiller is named by its own engine address, because no proxy fronts it.
+// 该请求发往代理自身的端口（即 decode Service 所指向的前端入口端口），而 prefiller 使用其
+// 自身的引擎地址标识，因为其前方没有代理。
 //
-// THE RANK COVERAGE IS NOT ASSERTED HERE, and this shape cannot show it. The routing proxy drives
-// the pair, and the probe observes its response, this operator's own request identifier and the
-// copied text. It does not observe the prefiller's response, because the proxy runs the prefill
-// alongside the decode and streams back only the decode answer. It does not cover the individual
-// data-parallel ranks either: the proxy picks the room it joins the pair on and the rank inside the
-// engine it fronts, so this operator's room arithmetic steers nothing here. And with the prefiller
-// header absent the proxy skips disaggregation and forwards decode-only, so a bound answer
-// carrying the copied text is producible by the decode engine alone.
+// 此处不断言 rank 覆盖范围，该形态也无法证明这一点。配对由路由代理驱动，探测仅观测代理的
+// 响应、本 operator 自身的请求标识符以及复制的文本。它无法观测 prefiller 的响应，因为代理
+// 会协同执行 prefill 与 decode 并仅流式返回 decode 的回答；它也无法覆盖各个数据并行 rank：
+// 用于关联配对的 room 以及前端所服务引擎内部的 rank 均由代理自行选择，本 operator 的 room
+// 计算在此不起作用。此外，若缺少 prefiller 请求头，代理会跳过分离执行并仅转发至 decode，
+// 因此单独由 decode 引擎也能产生带有复制文本的绑定响应。
 func modelDeploymentGroupForwardPairProxyLeg(
 	in modelDeploymentGroupForwardPairInput, prefillHead *core.Pod,
 ) (modelDeploymentGroupForwardPairLeg, error) {
@@ -1349,12 +1266,11 @@ func modelDeploymentGroupForwardPairProxyLeg(
 	}, nil
 }
 
-// modelDeploymentGroupForwardPairDecodeRole returns the deployment's decode role, which is the role
-// the pair's decode leg is asked at.
+// modelDeploymentGroupForwardPairDecodeRole 返回部署的 decode 角色，即配对中 decode 链路
+// 所请求的目标角色。
 //
-// IT IS THE ROLE AND NOT A FLAG, because the port that role is reached on depends on what the
-// operator rendered for it: a decoder the routing proxy fronts is asked at its front door, and a
-// decoder with no proxy is asked at the engine's own address.
+// 返回角色对象而非布尔标志，因为访问该角色所使用的端口取决于 operator 为其渲染的配置：
+// 前置路由代理的 decoder 需访问其前端入口端口，而无代理的 decoder 则直接访问引擎自身地址。
 func modelDeploymentGroupForwardPairDecodeRole(
 	md *workercore.ModelDeployment,
 ) *workercore.ModelDeploymentRole {
@@ -1368,12 +1284,11 @@ func modelDeploymentGroupForwardPairDecodeRole(
 	return nil
 }
 
-// modelDeploymentGroupForwardPairDecodeURL builds the address the decode leg is asked at.
+// modelDeploymentGroupForwardPairDecodeURL 构建 decode 链路请求的目标地址。
 //
-// A FRONTED DECODER IS ASKED AT ITS FRONT DOOR, which is the port its Service targets and the
-// routing proxy opens. The annotation on such a member carries the engine's port behind that proxy,
-// and a client that read it would ask a port nothing outside the proxy answers. A decoder with no
-// proxy is asked at the engine's own address.
+// 前置代理的 decoder 需访问其前端入口端口，即其 Service 指向且由路由代理监听的端口。
+// 此类成员上的 annotation 记录的是代理背后引擎的端口，若客户端读取该端口，将会请求一个
+// 代理外部无法直接响应的端口。无代理的 decoder 则直接访问引擎自身的地址。
 func modelDeploymentGroupForwardPairDecodeURL(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 	decodeHead *core.Pod, path string, viaProxy bool,
@@ -1387,12 +1302,10 @@ func modelDeploymentGroupForwardPairDecodeURL(
 	)
 }
 
-// modelDeploymentGroupForwardPairHead returns the member of a group that serves the engine's
-// request route.
+// modelDeploymentGroupForwardPairHead 返回组内提供引擎请求路由的成员。
 //
-// IT IS THE LEADER BY CONSTRUCTION, because the other members of a disaggregated group run the
-// engine's workers and serve no request route of their own: the leader routes a request to the
-// rank the operator names, and every rank of the group is reached through that one address.
+// 按构造约定该成员即主节点，因为分离式部署组中的其他成员仅运行引擎工作进程，自身不提供
+// 请求路由：由主节点将请求路由至 operator 指定的 rank，组内所有 rank 均通过该单一地址访问。
 func modelDeploymentGroupForwardPairHead(view modelDeploymentReplicaView) (*core.Pod, string) {
 	if len(view.Members) == 1 {
 		return view.Members[0], ""
@@ -1406,12 +1319,11 @@ func modelDeploymentGroupForwardPairHead(view modelDeploymentReplicaView) (*core
 	return nil, "no member of the group carries the leader index"
 }
 
-// modelDeploymentGroupForwardPairBootstrapPort reads the port the prefiller's transfer endpoints
-// are served on.
+// modelDeploymentGroupForwardPairBootstrapPort 读取 prefiller 传输端点所监听的端口。
 //
-// IT IS READ OFF THE PREFILLER'S OWN ANNOTATION, which is the only place the port is published for
-// whoever has to fetch those endpoints. A prefiller that publishes no port cannot be paired with,
-// and saying so is better than dialing a number this operator guessed.
+// 该端口直接从 prefiller 自身的 annotation 中读取，这是向需要获取这些端点的调用方发布
+// 该端口的唯一位置。未发布端口的 prefiller 无法进行配对，明确报错优于使用 operator 猜测
+// 的端口号发起连接。
 func modelDeploymentGroupForwardPairBootstrapPort(prefillHead *core.Pod) (int, error) {
 	published := prefillHead.Annotations[modelDeploymentGroupForwardPairBootstrapPortAnnotation]
 	if published == "" {
@@ -1429,10 +1341,10 @@ func modelDeploymentGroupForwardPairBootstrapPort(prefillHead *core.Pod) (int, e
 	return port, nil
 }
 
-// modelDeploymentGroupForwardPairRoom allocates the bootstrap room one rank pair is joined on.
+// modelDeploymentGroupForwardPairRoom 为单个 rank 配对分配用于关联的 bootstrap room。
 //
-// THE ROOM'S LOW BITS CARRY THE PREFILL RANK: the room modulo the prefiller's data-parallel width
-// is the rank the request is routed to, so a room built for one rank does not answer for another.
+// room 的低位携带 prefill rank：room 对 prefiller 数据并行宽度取模的结果即为请求被路由到的
+// rank，因此为某一个 rank 构建的 room 不会响应另一个 rank。
 func modelDeploymentGroupForwardPairRoom(width, rank int) (int64, error) {
 	buffer := make([]byte, 8)
 	if _, err := rand.Read(buffer); err != nil {
@@ -1443,27 +1355,23 @@ func modelDeploymentGroupForwardPairRoom(width, rank int) (int64, error) {
 	return int64(bits*uint64(width) + uint64(rank)), nil
 }
 
-// modelDeploymentGroupForwardPairMaxWidth is the widest data-parallel group the pair probe
-// addresses.
+// modelDeploymentGroupForwardPairMaxWidth 是配对探测能够寻址的最大数据并行组宽度。
 //
-// IT IS THE ROOM ARITHMETIC'S OWN LIMIT and not a policy cap. The room is a random 52-bit value
-// scaled by the width and offset by the rank, and the rank a room names is the room modulo the
-// width, so the largest room is 2^52 * width - 1. That stays inside the positive range of an int64
-// while the width is 2048 and leaves it at 2049. A width above the bound is therefore not probed:
-// the room this operator would build for it no longer addresses the rank it names, and a request
-// that reached the wrong rank would prove nothing about the pair.
+// 这是 room 算术本身的限制，而非策略上限。room 由一个随机 52 位数值乘以宽度再加上 rank
+// 偏移生成，room 所指定的 rank 即 room 对宽度取模的值，因此最大的 room 为 2^52 * width - 1。
+// 当宽度为 2048 时该值仍在 int64 的正数范围内，到 2049 时则会溢出。因此超过该上限的宽度
+// 不予探测：此时 operator 构建的 room 将无法准确寻址其指定的 rank，而发往错误 rank 的请求
+// 也无法证明配对的有效性。
 const modelDeploymentGroupForwardPairMaxWidth = 2048
 
-// modelDeploymentGroupForwardPairWidthBound is the reason a declared data-parallel width above the
-// bound this operator probes is not probed, and an empty string when the width is inside it.
+// modelDeploymentGroupForwardPairWidthBound 返回当声明的数据并行宽度超过本 operator 探测上限时
+// 不予探测的原因；若宽度在上限以内，则返回空字符串。
 //
-// THE SIDE IS NAMED, because the two groups declare their widths separately and a reader has to be
-// able to tell which one this operator declined to probe.
+// 原因中会指明具体一侧，因为两个组分别声明各自的宽度，调用方需要能够分辨是哪一侧被拒绝探测。
 //
-// THE REASON FOLLOWS THE SHAPE, because the two shapes reach the bound differently. The head-to-head
-// shape builds its own room, and a width above the bound is what would carry that room outside the
-// range the rank arithmetic reads. The proxy shape never builds a room, because the proxy picks it,
-// so there the bound is the probe's own supported limit and nothing more is claimed about it.
+// 原因的表述随探测形态而异，因为两种形态受限于该上限的原因不同。直连形态会自行构建 room，
+// 超过上限会导致 room 超出 rank 算术所能表示的范围；而代理形态从不构建 room（由代理选择），
+// 因此在该形态下该上限仅代表探测自身支持的宽度限制，不再作其他隐含说明。
 func modelDeploymentGroupForwardPairWidthBound(
 	side string, width int, shape modelDeploymentGroupForwardPairShape,
 ) string {
@@ -1485,23 +1393,23 @@ func modelDeploymentGroupForwardPairWidthBound(
 		"rank arithmetic can address"
 }
 
-// modelDeploymentGroupForwardPairExpected is the text one pair's decoder must copy back.
+// modelDeploymentGroupForwardPairExpected 是单个配对的 decoder 必须原样复制返回的文本。
 //
-// IT NAMES THE PAIR, because an answer carrying another pair's text is not this pair's answer,
-// and the comparison is exact: anything else the decoder produced is not the copy.
+// 文本中包含配对标识，因为携带其他配对文本的回答不属于当前配对，且比对采用精确匹配：
+// decoder 输出的任何其他内容都不算作有效复制。
 func modelDeploymentGroupForwardPairExpected(prefillRank, decodeRank int) string {
 	return fmt.Sprintf("探测P%dD%d：星河春风。", prefillRank, decodeRank)
 }
 
-// modelDeploymentGroupForwardPairCopy is the instruction the decoder's answer is checked against.
-// It asks for the text inside the quotes and for nothing else, so the answer is a copy this
-// operator can compare exactly.
+// modelDeploymentGroupForwardPairCopy 生成用于校验 decoder 回答的提示词指令。
+// 该指令要求仅输出引号内的文字而不包含任何其他内容，从而确保返回的回答可供本 operator
+// 进行精确比对。
 func modelDeploymentGroupForwardPairCopy(expected string) string {
 	return "逐字复制引号内文字，只输出文字本身：『" + expected + "』 /no_think"
 }
 
-// modelDeploymentGroupForwardPairHeld answers both roles with the same verdict, which is what a
-// pair that could not be observed says: neither side is at fault, and neither side is proven.
+// modelDeploymentGroupForwardPairHeld 为两个角色返回相同的判定结果，用于表示无法完成观测的
+// 配对：既不能说明任何一方有故障，也不能证明任何一方正常。
 func modelDeploymentGroupForwardPairHeld(
 	attempt modelDeploymentGroupForwardPairAttempt, result modelDeploymentGroupForward,
 ) modelDeploymentGroupForwardPairResult {
@@ -1512,15 +1420,14 @@ func modelDeploymentGroupForwardPairHeld(
 	}
 }
 
-// modelDeploymentGroupForwardPairVerified answers both roles with the verdict a pair that carried
-// the request earns, each with the generation of its own group.
+// modelDeploymentGroupForwardPairVerified 为成功完成请求的配对向两个角色返回通过判定，
+// 并各自附带所属组的 generation。
 //
-// THE REASON FOLLOWS THE SHAPE, because the two shapes show different things. The head-to-head
-// shape drove both heads and can read the transfer in the decode answer. The proxy shape asked the
-// decode group's routing proxy one question, and that answer shows the proxy was alive, bound to
-// this operator's own identifier, and returned the text the request asked to be copied. It does not
-// show which rank pair served, because the proxy picked the rank, and it does not show the transfer
-// itself, because the proxy drove that leg.
+// 原因的表述随探测形态而异，因为两种形态所验证的内容不同。直连形态同时驱动了两个主节点，
+// 能够从 decode 回答中确认传输已完成；而代理形态仅向 decode 组的路由代理发起了一次请求，
+// 其回答只能说明代理存活、已绑定到本 operator 的请求标识符且返回了要求复制的文本。它无法
+// 证明具体由哪对 rank 提供服务（因为 rank 由代理选择），也无法直接证明传输本身（因为传输阶段
+// 由代理驱动）。
 func modelDeploymentGroupForwardPairVerified(
 	attempt modelDeploymentGroupForwardPairAttempt, pairs int,
 ) modelDeploymentGroupForwardPairResult {
@@ -1536,11 +1443,9 @@ func modelDeploymentGroupForwardPairVerified(
 	}
 	if len(attempt.Mooncake) > 0 {
 		observation += "; the mooncake exposition: " + strings.Join(attempt.Mooncake, "; ")
-		// THE READ SIDE HAS NO SUCCESS COUNTER. The connector's exported series count the sender's
-		// pushes and failed pulls only, so the observation says explicitly that the copied answer is
-		// the evidence a pull happened; a reader cannot take the counters for it. The sentence rides
-		// the exposition, so a shape that carries no mooncake series says nothing about a connector
-		// it does not run.
+		// 读取端没有成功计数器。连接器导出的指标序列仅统计发送端推送次数和拉取失败次数，因此
+		// 观测说明会明确指出复制返回的回答才是拉取实际发生的证据，不能仅凭计数器判断。该说明
+		// 仅随指标导出附带输出，因此不携带 Mooncake 指标序列的形态不会对未运行的连接器作任何说明。
 		observation += "; the mooncake connector exports no read-side success counter " +
 			"(vllm:mooncake_num_failed_recvs counts failed pulls only), so the copied answer is the read-side evidence"
 	}

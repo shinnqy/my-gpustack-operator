@@ -11,24 +11,19 @@ import (
 	"gpustack.ai/gpustack/gen/api/generator/utils"
 )
 
-// NameSystems returns the name system used by the generators in this package.
+// NameSystems 返回此包中生成器使用的命名系统。
 func NameSystems() namer.NameSystems {
 	return namer.NameSystems{
 		"public": namer.NewPublicNamer(0),
 	}
 }
 
-// DefaultNameSystem returns the default name system for ordering the types to be
-// processed by the generators in this package.
+// DefaultNameSystem 返回此包中生成器用于排序待处理类型的\n// 默认命名系统。
 func DefaultNameSystem() string {
 	return "public"
 }
 
-// GetTargets returns the targets the crd generator writes to.
-//
-// There is one target per input package. A target writes into the directory of
-// the package it describes, so the generated file lands next to the types it
-// was generated from.
+// GetTargets 返回 CRD 生成器写入的目标。\n//\n// 每个输入包对应一个目标。目标会写入其所描述的包所在目录，\n// 因此生成的文件会与其来源类型位于同一目录下。
 func GetTargets(context *generator.Context, arguments *args.Args) []generator.Target {
 	header, err := utils.Header(gengov2.StdBuildTag, arguments.GoHeaderFile)
 	if err != nil {
@@ -40,7 +35,7 @@ func GetTargets(context *generator.Context, arguments *args.Args) []generator.Ta
 		klog.V(5).Infof("considering pkg %q", context.Inputs[i])
 		pkg := context.Universe[context.Inputs[i]]
 		if pkg == nil {
-			// If the input had no Go files, for example.
+			// 例如输入中没有 Go 文件的情况。
 			continue
 		}
 

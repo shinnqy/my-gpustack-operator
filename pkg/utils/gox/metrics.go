@@ -2,7 +2,7 @@ package gox
 
 import "github.com/prometheus/client_golang/prometheus"
 
-// NewStatsCollector returns a new prometheus.Collector for global gorountine pool.
+// NewStatsCollector 返回用于全局 goroutine 池的新 prometheus.Collector。
 func NewStatsCollector() prometheus.Collector {
 	fqName := func(name string) string {
 		return "gopool_" + name

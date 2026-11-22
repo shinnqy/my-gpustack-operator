@@ -15,9 +15,9 @@ import (
 
 const _DevicesResource = "devices"
 
-// DevicesHandler handles v1.Devices objects.
+// DevicesHandler 处理 v1.Devices 对象。
 //
-// DevicesHandler proxies the server v1alpha1.Devices objects.
+// DevicesHandler 代理服务端的 v1alpha1.Devices 对象。
 type DevicesHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -27,7 +27,7 @@ func (h *DevicesHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &workercore.Devices{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -40,16 +40,16 @@ func (h *DevicesHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_DevicesResource)
 
-	// Create table convertor to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 的输出。
 	tc, err := extensionapi.NewJSONPathTableConvertor()
 	if err != nil {
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储后端。
 	h.ObjectInfo = &worker.Devices{}
 	h.CurdOperations = extensionapi.WithCurdProxy[
 		*worker.Devices, *worker.DevicesList, *workercore.Devices, *workercore.DevicesList,

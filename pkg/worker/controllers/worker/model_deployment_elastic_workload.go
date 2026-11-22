@@ -21,19 +21,19 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/elasticprofile"
 )
 
-// ModelDeploymentElasticBootWidthAnnotation records the bootstrap width on the master Pod.
+// ModelDeploymentElasticBootWidthAnnotation 在 master Pod 上记录引导宽度。
 const ModelDeploymentElasticBootWidthAnnotation = "worker.gpustack.ai/elastic-boot-width"
 
-// ModelDeploymentElasticMasterBootWidthAnnotation is the master Pod's bootstrap record.
+// ModelDeploymentElasticMasterBootWidthAnnotation 是 master Pod 的引导记录注解。
 const ModelDeploymentElasticMasterBootWidthAnnotation = ModelDeploymentElasticBootWidthAnnotation
 
-// ModelDeploymentElasticRayNodeIdentityLabel binds Ray membership to the owning Pod UID.
+// ModelDeploymentElasticRayNodeIdentityLabel 将 Ray 节点成员身份绑定到所属 Pod UID。
 const ModelDeploymentElasticRayNodeIdentityLabel = "gpustack-pod-uid"
 
-// ModelDeploymentElasticHeadCommand enables the state service required by native vLLM.
+// ModelDeploymentElasticHeadCommand 启用原生 vLLM 所需的状态服务。
 const ModelDeploymentElasticHeadCommand = "ray start --head --include-dashboard=true"
 
-// ModelDeploymentElasticRole returns the role that requests the managed elastic profile.
+// ModelDeploymentElasticRole 返回请求托管弹性配置的角色。
 func ModelDeploymentElasticRole(md *workercore.ModelDeployment) *workercore.ModelDeploymentRole {
 	for i := range md.Spec.Roles {
 		if md.Spec.Roles[i].ElasticEP != nil {
@@ -43,12 +43,11 @@ func ModelDeploymentElasticRole(md *workercore.ModelDeployment) *workercore.Mode
 	return nil
 }
 
-// ModelDeploymentElasticBootstrapFromMaster retains a live master's captured bootstrap width.
-// Missing or invalid live records hold reconciliation. A new master uses the current request.
+// ModelDeploymentElasticBootstrapFromMaster 保留存活 master 已捕获的引导宽度。
+// 若实时记录缺失或无效，则阻塞调谐；新创建的 master 使用当前请求宽度。
 //
-// The width is held against the shared elastic profile bounds rather than numbers of its own,
-// so a rendered bootstrap can never sit outside the range admission accepts or native
-// observation can measure.
+// 该宽度受共享弹性配置边界约束而非使用独立数值，
+// 从而确保渲染出的引导配置绝不会超出准入校验允许或原生观测可度量的范围。
 func ModelDeploymentElasticBootstrapFromMaster(masterUID, raw string, md *workercore.ModelDeployment) (int32, bool) {
 	width := int64(0)
 	if masterUID != "" {

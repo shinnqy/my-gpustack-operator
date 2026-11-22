@@ -1,55 +1,54 @@
-// Package modelartifact holds what a ModelArtifact's identity is made of: the canonical manifest
-// format, and the client that resolves a Hugging Face source into one.
+// Package modelartifact 包含构成 ModelArtifact 标识的核心内容：规范化清单（manifest）格式，
+// 以及将 Hugging Face 源解析为该清单的客户端。
 //
-// It imports nothing from the controllers, so node-side code that verifies downloads against a
-// manifest digest can use the same definition the controller published.
+// 该包不导入控制器中的任何内容，因此节点侧用于按清单摘要校验下载内容的组件
+// 可以使用与控制器发布时完全相同的定义。
 package modelartifact
 
 import (
 	"fmt"
 )
 
-// The per-file digest algorithms the format admits, as they are spelled before the colon.
+// 该格式支持的文件级摘要算法，即冒号前的拼写形式。
 const (
-	// DigestSHA256 is the SHA-256 of the file's content: an LFS file's oid on Hugging Face.
+	// DigestSHA256 是文件内容的 SHA-256 摘要，对应 Hugging Face 上 LFS 文件的 oid。
 	DigestSHA256 = "sha256"
-	// DigestGitSHA1 is the git blob id of the file: a non-LFS file's oid on Hugging Face.
+	// DigestGitSHA1 是文件的 git blob id，对应 Hugging Face 上非 LFS 文件的 oid。
 	DigestGitSHA1 = "gitsha1"
 )
 
-// ManifestEntry is one file of a manifest.
+// ManifestEntry 是清单中的单个文件。
 type ManifestEntry struct {
-	// Path is the slash-separated path relative to the repository root, in the bytes the source
-	// returned. It is never normalized: the files on disk must carry the names the source serves.
+	// Path 是相对于仓库根目录、以斜杠分隔的路径，保持源端返回的原始字节。
+	// 该路径永不规范化：磁盘上的文件必须保留源端提供的原始名称。
 	Path string
-	// Size is the file size in bytes.
+	// Size 是以字节为单位的文件大小。
 	Size int64
-	// Digest is "<algorithm>:<lowercase hexadecimal>", the algorithm one of DigestSHA256 and
-	// DigestGitSHA1.
+	// Digest 的格式为 "<algorithm>:<lowercase hexadecimal>"，其中算法为 DigestSHA256 或
+	// DigestGitSHA1。
 	Digest string
 }
 
-// Manifest is a canonical manifest and the figures a ModelArtifact publishes from it.
+// Manifest 是规范化清单以及 ModelArtifact 据此发布的统计数值。
 type Manifest struct {
-	// Encoded is the canonical encoding: the header line, then one "<digest> <size> <path>" line
-	// per file in ascending byte order of the path, every line terminated by LF.
+	// Encoded 为规范化编码结果：首行为头信息，随后按路径字节升序每文件占一行
+	// "<digest> <size> <path>"，每行均以 LF 结尾。
 	Encoded []byte
-	// Digest is "sha256:" followed by the SHA-256 of Encoded, which is the manifest digest.
+	// Digest 为 "sha256:" 后接 Encoded 的 SHA-256 摘要，即清单摘要。
 	Digest string
-	// FileCount is the number of files.
+	// FileCount 为文件数量。
 	FileCount int64
-	// SizeBytes is the sum of the files' sizes.
+	// SizeBytes 为所有文件大小的总和。
 	SizeBytes int64
-	// Entries are the files, in the encoding's order: what a node downloads and verifies.
+	// Entries 为按编码顺序排列的文件列表，即节点下载并校验的对象。
 	Entries []ManifestEntry
 }
 
-// NewManifest encodes entries into the canonical manifest and computes its digest.
+// NewManifest 将 entries 编码为规范化清单并计算其摘要。
 //
-// The input order never matters. An invalid entry, or two entries with one path, refuses the whole
-// manifest rather than dropping the entry: a manifest silently missing a file would publish a
-// digest for content that is not the commit's.
+// 输入顺序不影响结果。遇到无效条目或同一路径对应两个条目时，将拒绝整个清单
+// 而非丢弃条目：静默遗漏文件的清单会为并非该 commit 实际内容的产物发布摘要。
 func NewManifest(entries []ManifestEntry) (Manifest, error) {
-	// Implement this function in chapter 16.
+	// 在第 16 章实现此函数。
 	return Manifest{}, fmt.Errorf("manifest construction is pending")
 }

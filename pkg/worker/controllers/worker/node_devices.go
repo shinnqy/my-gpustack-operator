@@ -23,16 +23,15 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/mapx"
 )
 
-// NodeDevicesReconciler keeps the control-plane labels the worker owns — gpustack.ai/managed, the
-// node's real general(CPU) feature key, and its topology profile — in sync on each Devices object. A Devices object is
-// cluster-scoped and named after the node, so the two share a key. The DeviceManager stamps a Devices
-// object's os/arch/accelerator-key selector labels but deliberately leaves these to the worker: node
-// management is a control-plane decision the per-node device-manager must not assert, and the CPU key
-// (ExtractGeneralNodeKey) needs the node's CPU labels the device-manager's NodeFeature does not carry
-// (so it can only ever guess the "generic" sentinel). Mirroring both lets a queue's Devices be
-// selected by the same labels as its ResourceFlavor. The CPU key distinguishes hardware pools; the
-// topology profile keeps device admission inside the exact TAS capacity partition Kueue assigned.
-// It also deletes the Devices of a node that is gone (see deleteDevicesOfAbsentNode).
+// NodeDevicesReconciler 将 worker 归属的控制面标签——gpustack.ai/managed、Node 真实的
+// general(CPU) 特征键及其拓扑 profile——同步到每个 Devices 对象上。Devices 对象为集群作用域
+// 且以 Node 命名，因此两者共享同一键。DeviceManager 会写入 Devices 对象的 os/arch/accelerator-key
+// 选择器标签，但刻意将这些控制面标签留给 worker 处理：Node 纳管属于控制面决策，每节点运行的
+// DeviceManager 不应越权断言；而 CPU 键（ExtractGeneralNodeKey）依赖 Node 上的 CPU 标签，
+// DeviceManager 所属的 NodeFeature 并未携带这些标签（因此它只能猜测 "generic" 哨兵值）。
+// 同步这两类标签使队列的 Devices 能够使用与 ResourceFlavor 相同的标签进行筛选。CPU 键用于区分硬件池；
+// 拓扑 profile 则将设备准入约束在 Kueue 分配的精确 TAS 容量分区内。
+// 此外，该控制器还负责删除已不存在的 Node 所对应的 Devices（见 deleteDevicesOfAbsentNode）。
 type NodeDevicesReconciler struct {
 	Client    ctrlcli.Client
 	APIReader ctrlcli.Reader
@@ -43,7 +42,7 @@ var _ ctrlreconcile.Reconciler = (*NodeDevicesReconciler)(nil)
 func (r *NodeDevicesReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := ctrllog.FromContext(ctx)
 
-	// Fetch the Devices (named after the node). Gone → nothing to sync.
+	// 获取 Devices（以 Node 命名）。若已不存在则无需同步。
 	devs := new(workercore.Devices)
 	err := r.Client.Get(ctx, req.NamespacedName, devs)
 	if err != nil {
@@ -59,8 +58,7 @@ func (r *NodeDevicesReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Read the node. A missing node means the Devices describes accelerators that are gone, so it is
-	// deleted here rather than left to the garbage collector.
+	// 读取 Node。若 Node 缺失，说明该 Devices 描述的加速器已不存在，因此在此直接删除而非交由垃圾回收器处理。
 	nd := new(core.Node)
 	err = r.Client.Get(ctx, ctrlcli.ObjectKey{Name: req.Name}, nd)
 	if err != nil {
@@ -71,16 +69,16 @@ func (r *NodeDevicesReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Already in sync — same managed value and same general(CPU) key(s), with no stale one of
-	// either kind — leaves the Devices untouched (the DeviceManager owns the rest of the labels).
+	// 若已同步——managed 值与 general(CPU) 键均一致，且两者皆无陈旧标签——则保持 Devices 不变
+	// （其余标签归 DeviceManager 所有）。
 	want := nodeDevicesControlLabels(nd)
 	if nodeDevicesControlInSync(devs.Labels, want) {
 		logger.V(3).Info("control labels already synced, skip")
 		return ctrl.Result{}, nil
 	}
 
-	// Converge: keep the DeviceManager's labels, replacing the worker-owned ones with what the node
-	// dictates (a node change may have retired a stale managed mark or a stale CPU key).
+	// 收敛状态：保留 DeviceManager 的标签，用 Node 决定的标签替换 worker 归属的标签
+	// （Node 变更可能已淘汰了陈旧的 managed 标记或陈旧的 CPU 键）。
 	devs.Labels = mapx.Merge(mapx.Filter(devs.Labels, func(k, _ string) bool {
 		return !nodeDevicesControlLabelKey(k)
 	}), want)
@@ -93,18 +91,16 @@ func (r *NodeDevicesReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// deleteDevicesOfAbsentNode deletes a Devices whose Node is gone.
+// deleteDevicesOfAbsentNode 删除其所属 Node 已不存在的 Devices。
 //
-// The Node owns the Devices, but the garbage collector reaches Devices through the worker's
-// aggregated API, which is the preferred version of the group. While the worker is down, as it is
-// when it ran on the departed node, the collector cannot delete the object, and once the worker is
-// back it retries only when its backoff expires, which grows to many minutes. Every consumer of the
-// ledger keeps counting the departed node's accelerators until then.
+// Node 拥有 Devices，但垃圾回收器需要通过 worker 的聚合 API 访问 Devices（该 API 是此资源组的首选版本）。
+// 当 worker 处于停机状态时（例如 worker 本身就运行在已离线的 Node 上），垃圾回收器无法删除该对象；
+// 而当 worker 恢复后，垃圾回收器仅在退避时间到期时才会重试，该退避时间可能增长至数十分钟。
+// 在此期间，所有账本消费者都会继续统计已离开 Node 的加速器。
 //
-// The absence is confirmed by an uncached read first: a node that has just joined may not be in the
-// cache yet, and deleting its fresh Devices would hide its accelerators until the DeviceManager's
-// next pass. Such a node's own add event enqueues the Devices again. The UID precondition keeps a
-// Devices written for a new node of the same name from being deleted in its place.
+// 删除前会先通过非缓存读取确认 Node 确实不存在：刚加入集群的 Node 可能尚未进入缓存，
+// 若误删其新建的 Devices，会导致其加速器在 DeviceManager 下一次上报前不可见。
+// 此类 Node 自身的添加事件会再次将 Devices 入队。UID 前置条件则可防止为同名新 Node 写入的 Devices 被误删。
 func (r *NodeDevicesReconciler) deleteDevicesOfAbsentNode(ctx context.Context, devs *workercore.Devices) error {
 	logger := ctrllog.FromContext(ctx)
 
@@ -128,15 +124,15 @@ func (r *NodeDevicesReconciler) deleteDevicesOfAbsentNode(ctx context.Context, d
 	return nil
 }
 
-// nodeDevicesControlLabelKey reports whether a label key is one the worker owns on a Devices object:
-// the managed mark, topology profile, or a general(CPU) feature key (bare or a .count/.capacity sibling).
+// nodeDevicesControlLabelKey 判断某个标签键是否属于 worker 在 Devices 对象上管理的控制标签：
+// 包括 managed 标记、拓扑 profile 以及 general(CPU) 特征键（裸键或其 .count/.capacity 伴随键）。
 func nodeDevicesControlLabelKey(k string) bool {
 	return k == systemname.ManagedLabelKey || k == TopologyProfileLabel ||
 		strings.HasPrefix(k, nodefeature.GeneralFeatureLabelPrefix)
 }
 
-// nodeDevicesControlLabels are the labels the worker mirrors from a Node onto its Devices: the managed
-// mark (only when the node carries one), topology profile, and the node's real general(CPU) feature key.
+// nodeDevicesControlLabels 生成 worker 从 Node 镜像到其 Devices 的标签：
+// managed 标记（仅当 Node 携带时）、拓扑 profile 以及 Node 真实的 general(CPU) 特征键。
 func nodeDevicesControlLabels(nd *core.Node) map[string]string {
 	out := make(map[string]string, 3)
 	if v := nd.Labels[systemname.ManagedLabelKey]; v != "" {
@@ -151,12 +147,11 @@ func nodeDevicesControlLabels(nd *core.Node) map[string]string {
 	return out
 }
 
-// nodeDevicesControlInSync reports whether two label sets agree on the worker-owned control labels:
-// the managed mark, topology profile, and every general(CPU) key. It drives both the skip check (Devices vs desired) and
-// the watch predicates (old vs new). The DeviceManager-owned labels — notably the accelerator
-// (acceleratable.) selector keys the detector stamps — are deliberately ignored, so an
-// accelerator-only change never triggers a control re-sync. This is the mirror of the detector's
-// acceleratableDevicesSelectorLabels, which keeps those accelerator keys and drops the general key.
+// nodeDevicesControlInSync 判断两组标签在 worker 归属的控制标签上是否一致：
+// 包括 managed 标记、拓扑 profile 以及所有 general(CPU) 键。它同时驱动跳过检查（Devices 与期望值对比）
+// 和 watch predicate（旧对象与新对象对比）。由 DeviceManager 管理的标签——尤其是探测器写入的加速器
+// （acceleratable.）选择器键——会被刻意忽略，因此仅涉及加速器的变更绝不会触发控制标签重同步。
+// 该函数与探测器的 acceleratableDevicesSelectorLabels 互为镜像，后者保留加速器键而丢弃通用键。
 func nodeDevicesControlInSync(a, b map[string]string) bool {
 	return mapx.EqualWithKey(a, b, systemname.ManagedLabelKey) &&
 		mapx.EqualWithKey(a, b, TopologyProfileLabel) &&
@@ -170,9 +165,9 @@ func (r *NodeDevicesReconciler) SetupController(_ context.Context, opts controll
 	return ctrl.NewControllerManagedBy(opts.Manager).
 		Named("nodedevices").
 		For(
-			// Reconcile each Devices object by its own name (= the node name). A
-			// start-up resync stamps every Devices, and an update is observed only when
-			// a worker-owned control label drifts (the DeviceManager rewrites other labels often).
+			// 按自身名称（即 Node 名称）协调每个 Devices 对象。启动时的全量重同步会为每个 Devices
+			// 写入标签，而在运行期间仅当 worker 归属的控制标签发生漂移时才响应更新事件
+			// （DeviceManager 会频繁重写其他标签）。
 			&workercore.Devices{},
 			ctrlbuilder.WithPredicates(
 				ctrlpredicate.Funcs{
@@ -190,8 +185,7 @@ func (r *NodeDevicesReconciler) SetupController(_ context.Context, opts controll
 			),
 		).
 		Watches(
-			// Watch Nodes and enqueue the same-named Devices when a control label changes or the
-			// node is deleted.
+			// 监听 Node，并在控制标签发生变化或 Node 被删除时将同名的 Devices 加入队列。
 			&core.Node{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFunc(
 				5*time.Second,

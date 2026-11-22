@@ -14,32 +14,30 @@ var (
 	gp   = NewPool(100)
 )
 
-// NewPool creates a new goroutine pool with the given factor.
+// NewPool 使用给定的 factor 创建一个新的 goroutine 池。
 //
-// The factor is used to calculate the maximum number of workers in the pool,
-// which is based on the number of available CPU cores.
+// factor 用于基于可用 CPU 核心数计算池中的最大 worker 数量。
 //
-// The factor should be a positive integer, and if it is less than 10, it will be set to 10 by default.
+// factor 应为正整数；如果小于 10，将默认设置为 10。
 func NewPool(factor int) pond.Pool {
-	// NB(thxCode): Go allows us to create goroutines at will, but if we create too many goroutines,
-	// it will cause the program to crash due to insufficient memory,
-	// so we need to limit the number of goroutines with pooling.
+	// NB(thxCode): Go 允许我们随意创建 goroutine，但如果创建过多 goroutine，
+	// 会导致程序因内存不足而崩溃，因此我们需要通过池化来限制 goroutine 的数量。
 	//
-	// The advantage of pooling is that space is exchanged for time and the reuse rate is improved.
+	// 池化的优势在于以空间换时间，并提高复用率。
 	//
-	// - MaxWorkers is the total goroutine number should the pool creates,
-	//   we take the number of available CPU cores as the basic value at present,
-	//   then times the given factor to get it.
-	// - MaxQueueSize is the max value of submitting goroutine number should be accepted at the same time,
-	//   we take 150% of the MaxWorkers as the result.
+	// - MaxWorkers 是池应创建的 goroutine 总数，
+	//   目前我们以可用 CPU 核心数作为基准值，
+	//   然后乘以给定的 factor 得到该值。
+	// - MaxQueueSize 是同时可接收的提交 goroutine 数量上限，
+	//   我们取 MaxWorkers 的 150% 作为结果。
 	factor = max(factor, 10)
 	maxWorkers := runtime.GOMAXPROCS(0) * factor
 	maxQueueSize := maxWorkers / 10 * 15
 	return pond.NewPool(maxWorkers, pond.WithQueueSize(maxQueueSize))
 }
 
-// Configure sets the goroutine pool with a new factor once,
-// multiple calls will be ignored.
+// Configure 使用新的 factor 仅配置一次 goroutine 池，
+// 多次调用将被忽略。
 func Configure(factor int) {
 	once.Do(func() {
 		gp.Stop()
@@ -47,7 +45,7 @@ func Configure(factor int) {
 	})
 }
 
-// Go submits a task as goroutine.
+// Go 将任务作为 goroutine 提交。
 func Go(f func()) {
 	if _, ok := gp.TrySubmit(f); !ok {
 		klog.Background().WithName("gopool").
@@ -57,7 +55,7 @@ func Go(f func()) {
 	}
 }
 
-// IsHealthy returns nil if the pool has plenty workers.
+// IsHealthy 在池中拥有充足的 worker 时返回 nil。
 func IsHealthy(atLeast ...int) error {
 	watermark := 0
 	if len(atLeast) > 0 {

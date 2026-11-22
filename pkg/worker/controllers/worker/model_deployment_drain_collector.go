@@ -22,80 +22,75 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// THE TRANSPORT IS AN EXEC, NOT A SCRAPE, because the question is per member and only the member
-// can answer it. A scrape would arrive through the same Service the router uses, and a Service
-// load balances across the members, so it cannot say which one is idle. An exec runs inside the
-// exact container, on that container's loopback, and the answer is that member's and no other's.
+// 此处采用 exec 而非 scrape 作为传输方式，因为这是针对单个成员的查询，只有该成员自身能够回答。
+// scrape 会经由路由器使用的同一 Service 抵达，而 Service 会在各成员间做负载均衡，因此无法判断
+// 究竟哪一个成员处于空闲。exec 则直接运行在目标容器内部，访问该容器自身的回环地址，其响应明确
+// 来自该成员本身而非其他成员。
 //
-// It is the read-only twin of the preStop hook, and it is deliberately a second READING of the same
-// gauges rather than a reuse of the hook: the hook runs on the kubelet's grace clock after the
-// delete, which is too late to decide anything, and its answer is deliberately unreportable because
-// it always exits zero. This read's answer is acted on, so it carries its own envelope and its own
-// completeness, and a parse failure has to be visible rather than absorbed.
+// 它是 preStop hook 的只读孪生实现，且有意对同一组 gauge 做第二次独立读取，而非复用 hook：
+// hook 在删除触发后按 kubelet 的宽限期时钟运行，此时再做决策已为时过晚；且 hook 始终以零状态退出，
+// 其结果刻意设计为不可上报。而本次读取的结果会直接用于决策，因此它自带响应封装与完整性校验，
+// 解析失败也必须显式暴露而非被静默吞掉。
 const (
-	// modelDeploymentDrainHTTPTimeoutSeconds bounds the engine's own answer. The hook allows one
-	// second on the kubelet's clock; a controller-side read is not on that clock, so it can afford
-	// one more and still return inside a reconcile pass.
+	// modelDeploymentDrainHTTPTimeoutSeconds 限制引擎自身响应的超时时间。preStop hook 在 kubelet 的
+	// 时钟下只允许 1 秒；控制器侧的读取不受该时钟限制，因此可以多留出 1 秒，同时仍能在单次 reconcile
+	// 周期内返回。
 	modelDeploymentDrainHTTPTimeoutSeconds = 2
 
-	// modelDeploymentDrainExecTimeoutSeconds bounds the whole read, dial included. Two reads of one
-	// member cost at most this twice, and both are holds, so the pass returns rather than blocks.
+	// modelDeploymentDrainExecTimeoutSeconds 限制包含建立连接在内的整次读取的超时时间。对单个成员执行
+	// 两次读取最多耗时该值的两倍，且两次失败均视为保持等待（hold），因此该轮检查会及时返回而不会阻塞。
 	modelDeploymentDrainExecTimeoutSeconds = 5
 
-	// modelDeploymentDrainMaxBodyBytes caps what one read may pull. An engine whose endpoint
-	// misbehaves is bounded here rather than by the size of whatever it chooses to serve.
+	// modelDeploymentDrainMaxBodyBytes 限制单次读取可拉取的最大响应体字节数。即使引擎的指标端点行为异常，
+	// 其影响也会被约束在此上限内，而不取决于它返回多大的内容。
 	modelDeploymentDrainMaxBodyBytes = 1 << 20
 )
 
-// modelDeploymentDrainIndexPodUID indexes a Pod by its own UID.
+// modelDeploymentDrainIndexPodUID 按 Pod 自身的 UID 建立索引。
 //
-// THE TARGET IS A UID AND NOT A NAME because a name is not an identity here. A replica is created
-// with GenerateName and nothing else (model_deployment_render.go), so its name is whatever the API
-// server chose, and a Pod deleted and recreated under the same name would answer for a member the
-// reservation never held. The UID is the one handle that cannot be reused.
+// 查找目标是 UID 而非名称，因为在此场景下名称不能作为唯一身份标识。副本创建时仅设置了
+// GenerateName（见 model_deployment_render.go），其名称由 API server 自动生成；若一个 Pod 被删除并
+// 以相同名称重建，按名称查询就会命中一个从未受当前预留约束的新成员。UID 是唯一不可复用的句柄。
 const modelDeploymentDrainIndexPodUID = "gpustack.ai/model-deployment-drain-pod-uid"
 
-// modelDeploymentDrainExec runs one command inside one container and returns its standard output.
+// modelDeploymentDrainExec 在指定容器内执行一条命令并返回其标准输出。
 //
-// It is a function rather than a dials this reader makes, for the reason the seam is an interface:
-// the answers this has to get right are failures, and a real SPDY stream cannot be made to produce
-// a refused exec, a truncated body or a container that changed identity mid-read on demand.
+// 将其定义为函数而非由该读取器直接发起网络连接，其原因与通过接口隔离（seam）相同：需要确保
+// 正确处理的结果都是各种故障情形，而真实的 SPDY 流无法按需模拟出 exec 被拒绝、响应体被截断或
+// 容器在读取中途变更身份等情况。
 type modelDeploymentDrainExec func(
 	ctx context.Context, pod *corev1.Pod, container string, argv []string,
 ) (string, error)
 
-// modelDeploymentDrainCollector is the production reader: it resolves one member's Pod, checks
-// that the member is one this protocol is allowed to measure, and reads its engine's own gauges.
+// modelDeploymentDrainCollector 是生产环境使用的读取器：它定位目标成员的 Pod，校验该成员是否
+// 允许被当前协议度量，并读取其所在引擎自身的 gauge 指标。
 //
-// IT HOLDS NO STATE BETWEEN READS. Continuity is proven from the live Pod rather than from a
-// remembered sample, so a controller restart cannot lose it and there is no mutex to get wrong.
-// The cost of that choice is stated where it is paid, at the restart check below.
+// 它在两次读取之间不保留任何状态。身份连续性直接通过实时查询 Pod 来证明，而非依赖缓存的采样值，
+// 因此控制器重启不会丢失状态，也不存在可能出错的互斥锁。这一选择的代价会在下方的重启检查处说明。
 type modelDeploymentDrainCollector struct {
-	// client locates the target Pod. Its field index is a LOCATOR and not an authority: it answers
-	// which namespace and name carry a member UID, and the object it returns is the one the
-	// controller's cache last saw, which may predate a restart, a replacement or a relabel.
+	// client 用于定位目标 Pod。其字段索引仅作为定位器而非权威数据源：它只回答哪个命名空间和名称
+	// 对应目标成员的 UID，而其返回的对象是控制器缓存最后一次看到的快照，该快照可能早于一次重启、
+	// 替换或重新打标。
 	client ctrlcli.Client
 
-	// fresh is the authority the locator's answer is checked against. Every fact this read acts on
-	// is taken from a live read rather than from the cache, and it is taken twice, once before the
-	// exec and once after, because a container can be replaced under a stable Pod while the stream
-	// is open. A nil fresh reader is a hold rather than a fallback to the cache: a read that cannot
-	// prove what it is measuring has not measured it.
+	// fresh 是用于校验定位器结果的权威数据源。此次读取所依赖的每一项事实都取自实时查询而非缓存，
+	// 且会查询两次——exec 前一次、exec 后一次——因为即使 Pod 本身未变，容器也可能在流打开期间
+	// 被替换。若 fresh reader 为 nil，则直接保持等待（hold）而非回退到缓存：无法证明自身正在度量谁的
+	// 读取等同于尚未完成度量。
 	fresh ctrlcli.Reader
 
-	// restConfig and clientset carry the exec. They are separate because the REST client is what
-	// builds the subresource URL and the executor is what upgrades it to a stream.
-	// core is the typed core client rather than the whole clientset, because the only subresource
-	// this reader touches is pods/exec. Pulling the full clientset for one verb would add a
-	// dependency surface the operator has no other reason to carry.
+	// restConfig 与 core 用于承载 exec 执行。二者分开传入，因为 REST client 负责构造子资源 URL，
+	// 而 executor 负责将其升级为流。
+	// core 使用类型化的核心客户端而非完整的 clientset，因为该读取器唯一访问的子资源是 pods/exec。
+	// 仅为一个动词引入完整的 clientset 会增加本无需由 operator 承担的依赖面。
 	core       corev1client.CoreV1Interface
 	restConfig *rest.Config
 
 	exec modelDeploymentDrainExec
 }
 
-// newModelDeploymentDrainCollector builds the production reader. A nil exec installs the real one,
-// so a test can supply its own and a production caller cannot accidentally get a nil.
+// newModelDeploymentDrainCollector 构造生产环境读取器。当 exec 为 nil 时会安装真实的实现，
+// 从而使测试可以注入自己的模拟实现，同时生产调用方也不会意外得到 nil。
 func newModelDeploymentDrainCollector(
 	client ctrlcli.Client, fresh ctrlcli.Reader, restConfig *rest.Config,
 	core corev1client.CoreV1Interface,
@@ -112,23 +107,21 @@ func newModelDeploymentDrainCollector(
 	return collector
 }
 
-// Drain reports what one member still holds in flight.
+// Drain 报告单个成员当前仍有在途的工作量。
 //
-// THE ORDER OF THE CHECKS IS THE ORDER OF WHAT MUST BE PROVEN, and each one that fails is a hold
-// rather than an answer: the target is this member, the member is measurable at all, the member is
-// one this protocol may act on, the engine it runs is one with a gauge list, the container is the
-// same instance before and after, and only then is a number read and believed.
+// 检查的顺序就是各项条件必须得到证明的顺序，且任一检查失败都会返回 hold 而非直接给出结论：
+// 目标确实是该成员、该成员总体上可被度量、该成员属于本协议可操作的对象、其运行的引擎拥有 gauge 列表、
+// exec 前后为同一容器实例——只有全部满足，才会读取并采信返回的数值。
 //
-// NOT EVERY FAILURE IS AN ERROR. A transport that cannot answer returns an answer carrying the
-// shape of what went wrong, because the protocol's reason string is what tells an operator why a
-// replica is being held. Returning an error instead would collapse all of them into one line and
-// leave the hold unexplained.
+// 并非所有失败都是 error。无法给出结果的传输层异常会返回一个携带故障形态的响应，因为协议的
+// reason 字符串是告知运维人员副本为何被挂起保留的依据。若改为直接返回 error，所有情况都会坍缩为
+// 一行错误信息，导致无法解释为何继续保留。
 func (c *modelDeploymentDrainCollector) Drain(
 	ctx context.Context, target modelDeploymentDrainTarget,
 ) (modelDeploymentDrainAnswer, error) {
 	if target.PodUID == "" {
-		// An empty UID matches no member and, worse, could match every one of them if the lookup
-		// were written as a filter rather than an equality. It fails closed.
+		// 空 UID 不会匹配任何成员；更糟的是，如果查询被写成过滤而非精确相等，它甚至可能匹配所有成员。
+		// 因此此处采用 fail-closed 策略直接拒绝。
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown,
 			"the drain target names no member"), nil
 	}
@@ -140,9 +133,8 @@ func (c *modelDeploymentDrainCollector) Drain(
 
 	expected, known := modelDeploymentInFlightMetrics[target.Engine]
 	if !known {
-		// Same refusal the protocol itself makes, and for the same reason: an engine with no gauge
-		// list has no measurement, and inventing one here would be the assumption Unsupported
-		// exists to refuse.
+		// 与协议自身做出的拒绝保持一致，原因也相同：没有 gauge 列表的引擎就无法进行度量，
+		// 若在此处自行编造列表，就违背了设置 Unsupported 状态来拒绝未知引擎的初衷。
 		return modelDeploymentDrainHold(modelDeploymentDrainUnsupported,
 			"engine "+target.Engine+" has no in-flight gauge list"), nil
 	}
@@ -154,9 +146,8 @@ func (c *modelDeploymentDrainCollector) Drain(
 
 	container, found := modelDeploymentDrainContainerOf(pod, target.Container)
 	if !found {
-		// The seam carries the container rather than looking it up, and the carried name is still
-		// only a claim: the Pod is the authority on which containers it has. A claim the Pod
-		// contradicts is not a container this read may enter.
+		// 该扩展点直接携带了容器名而非现场查找，但携带的名称本身仍只是一份声明：Pod 才是其拥有哪些
+		// 容器的权威依据。与 Pod 实际记录相矛盾的容器名不允许进入读取。
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown,
 			fmt.Sprintf("member %s has no container %q", pod.Name, target.Container)), nil
 	}
@@ -171,18 +162,17 @@ func (c *modelDeploymentDrainCollector) Drain(
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown, drift), nil
 	}
 
-	// The owning deployment is re-read LIVE rather than trusted from the Pod's owner reference.
-	// A reference is a claim written when the Pod was created, and an object deleted and recreated
-	// under the same name leaves every reference pointing at the name while the UID behind it is
-	// gone; a cached identity would confirm a member the operation no longer holds. It runs after
-	// the captured identity above, so a target that names no deployment at all is refused for that
-	// rather than for a read it never asked for.
+	// 所属的部署对象必须实时重新读取，而不能轻信 Pod 的 owner reference。
+	// owner reference 是创建 Pod 时写入的声明；若对象被删除后以相同名称重建，所有引用仍会指向该名称，
+	// 而其背后的 UID 已经改变——缓存的身份信息就会误认为当前操作仍持有该成员。该检查位于前述
+	// 捕获身份检查之后，从而使根本未指定部署对象的目标直接因该原因被拒绝，而非因一次它从未请求的
+	// 读取而报错。
 	if drift := c.verifyModelDeploymentIdentity(ctx, pod, target); drift != "" {
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown, drift), nil
 	}
 
-	// The first live read is kept whole rather than reduced to a container status, because the
-	// comparison after the exec is against the member as it was and not against one field of it.
+	// 第一次实时读取保留完整 Pod 对象，而非仅提取容器状态，因为 exec 后的比对针对的是成员当时的
+	// 整体状态，而非其中某一个字段。
 	beforePod := pod
 	before, ok := modelDeploymentDrainContainerStatus(beforePod, target.Container)
 	if !ok {
@@ -190,11 +180,10 @@ func (c *modelDeploymentDrainCollector) Drain(
 			fmt.Sprintf("member %s reports no status for container %q", pod.Name, target.Container)), nil
 	}
 
-	// A RESTART IS NOT INDEFINITE AND IT IS NOT FREE. The gauges now served come from an engine
-	// that did not exist when the protocol began watching, so they cannot speak for the work the
-	// protocol set out to account for. The hold is bounded by the drain budget, which ends the
-	// retirement as Aborted with the member retained rather than deleted, so a member that keeps
-	// crashing is never deleted and never blocks the queue forever.
+	// 容器重启并不意味着无限等待，也并非没有代价。当前提供指标的引擎在协议开始观察时还不存在，
+	// 因此它的数据无法代表协议原本要核算的在途工作。挂起保留受排空（drain）预算限制，超时后会将
+	// 此次下线标记为 Aborted 并保留该成员而非删除，从而使持续崩溃的成员既不会被误删，也不会永久
+	// 阻塞队列。
 	if before.RestartCount > 0 {
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown,
 			fmt.Sprintf("member %s container %q has restarted %d time(s) since it was created",
@@ -212,15 +201,12 @@ func (c *modelDeploymentDrainCollector) Drain(
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown, err.Error()), nil
 	}
 
-	// THE POST-CHECK IS WHAT MAKES THE READ ABOUT THIS MEMBER. A container can be replaced under a
-	// stable Pod between the resolve and the exec, so its identity is re-read and compared rather
-	// than assumed to have held.
+	// 后置检查才是让这次读取真正对应当前成员的关键。在定位与 exec 之间，容器可能在稳定不变的 Pod
+	// 内部被替换，因此必须重新读取并比对身份，而不能假设其一直未变。
 	//
-	// THE MEMBER'S OWN IDENTITY IS NOT COMPARED HERE, because the re-resolve is a lookup BY that
-	// UID through an index built from each Pod's own UID: a member that was deleted and replaced
-	// carries a new one, so the lookup finds nothing and the read is already unobserved. A
-	// comparison here could not fail, and a check that cannot fail reads like a protection that
-	// does not exist.
+	// 此处不再比对成员自身的 UID，因为重新定位本来就是通过基于各 Pod 自身 UID 构建的索引来查找的：
+	// 若成员已被删除并重建，新成员会带有新的 UID，查找结果将为空，从而读取早已被判定为未观测到。
+	// 在此处再做一次不可能失败的比对，只会营造出一种并不存在的保护假象。
 	after, hold := c.resolveMember(ctx, target, "re-resolved after the read")
 	if hold != nil {
 		return *hold, nil
@@ -236,31 +222,26 @@ func (c *modelDeploymentDrainCollector) Drain(
 			fmt.Sprintf("container %q was replaced while it was being read", target.Container)), nil
 	}
 
-	// A CONTAINER THAT STOPPED DURING THE READ ANSWERED A DIFFERENT QUESTION. The gauges came from
-	// a process the kubelet has since seen exit, so whether the body is a complete envelope is
-	// beside the point: there is no longer an engine of this member running for the answer to be
-	// about. The same requirement is applied before the exec, so the pair brackets the read.
+	// 在读取期间停止运行的容器回答的是另一个问题。指标来自一个随后已被 kubelet 观察到退出的进程，
+	// 因此响应体是否格式完整已无关紧要：该成员已不再有正在运行的引擎可供度量。exec 前也施加了
+	// 同样要求，从而在读取前后形成闭环校验。
 	if running, why := modelDeploymentDrainContainerRunning(after, target.Container); !running {
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown, why), nil
 	}
 
-	// THE TWO BOOKENDS MUST BE ABOUT THE SAME MEMBER, and a container ID is the smallest part of
-	// that. Everything else this read acted on is compared here as well, because each is a way the
-	// member under the read can stop being the member the reservation bound: an owner that changed
-	// is a Pod that has been adopted, a role that changed is a member re-seated or relabelled, an
-	// address that changed is a member that has moved, and a metrics endpoint that changed is a
-	// different process being read. A read whose subject moved cannot answer about the work the
-	// protocol is accounting for, whatever the numbers say.
+	// 前后两次读取必须指向同一个成员，而容器 ID 只是其中最小的一部分。此次读取所依赖的其他所有
+	// 状态也一并在此比对，因为其中任何一项变化都意味着被读取的成员已不再是预留所绑定的成员：
+	// 属主变更说明 Pod 已被重新接管，角色变更说明成员被重新安置或重新打标，地址变更说明成员已迁移，
+	// 指标端点变更则说明正在读取的是另一个进程。主语在读取期间发生变化的读数，无论数字是多少，
+	// 都不能用来证明协议所核算的工作量。
 	if drift := modelDeploymentDrainIdentityDrift(beforePod, after, target.Container); drift != "" {
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown, drift), nil
 	}
 
-	// THE IDENTITY IS READ AGAIN AFTER THE EXEC, not only before it. The drift check above names
-	// what moved and is the better answer when it fires, so this is the backstop behind it: a
-	// Pod whose controller was re-pointed, or whose owning deployment was deleted and recreated
-	// under the same name while the stream was open, keeps every container identity compared above
-	// and is a different member underneath. The gauges would then answer about a member the
-	// operation no longer holds, so the captured identity is checked again on the live object.
+	// 身份信息不仅在 exec 前校验，在 exec 后也会再次读取。前文的漂移检查能指明具体哪一项发生了变化，
+	// 在触发时是更清晰的答案，而此处则是其兜底保障：若流打开期间 Pod 的控制器被重新指向，或所属部署
+	// 被删除并以同名重建，前文比对的所有容器级身份信息都可能保持不变，但其底层已变成另一个成员。
+	// 此时指标所反映的将是一个当前操作不再持有的成员，因此必须在实时对象上再次核验捕获的身份。
 	if drift := modelDeploymentDrainExpectedIdentity(after, target, target.Container); drift != "" {
 		return modelDeploymentDrainHold(modelDeploymentDrainUnknown, fmt.Sprintf(
 			"member is no longer the member this read began on: %s", drift,
@@ -275,13 +256,12 @@ func (c *modelDeploymentDrainCollector) Drain(
 	return modelDeploymentDrainAnswerFromBody(body, expected), nil
 }
 
-// modelDeploymentDrainIdentityDrift names what changed about the member between the two live reads,
-// or the empty string when nothing this read depends on did.
+// modelDeploymentDrainIdentityDrift 返回两次实时读取之间成员发生变化的项，若读取所依赖的一切
+// 均未改变，则返回空字符串。
 //
-// THE ROLE IS COMPARED AGAINST THE TARGET AND NOT ONLY AGAINST ITSELF, because a role that changed
-// from one value to another is still a change, and a role that is not the one the reservation names
-// is a member this operation never bound. The label is read through the tree's own accessor rather
-// than by a key written here, so there is one answer to "which role is this Pod" in the tree.
+// 角色不仅要与自身前后对比，还要与目标声明对比，因为从一个值变为另一个值固然是变化，
+// 而与预留所指定角色不符的成员根本就不是本次操作绑定的对象。角色标签通过代码库统一的访问器读取，
+// 而非在此硬编码键名，从而保证整个代码库对“该 Pod 属于哪个角色”只有唯一权威判断。
 func modelDeploymentDrainIdentityDrift(
 	before, after *corev1.Pod, container string,
 ) string {
@@ -315,8 +295,7 @@ func modelDeploymentDrainIdentityDrift(
 			after.Name, container)
 	}
 
-	// A restart count that moved is a restart that happened during the read, and the gauges now
-	// served come from a process that did not exist when the read began.
+	// 重启计数发生变化，说明读取期间发生过重启，此时提供指标的进程在读取开始时并不存在。
 	if beforeStatus.RestartCount != afterStatus.RestartCount {
 		return fmt.Sprintf("container %q restarted while it was being read", container)
 	}
@@ -324,14 +303,12 @@ func modelDeploymentDrainIdentityDrift(
 	return ""
 }
 
-// modelDeploymentDrainControllerOf is the Pod's controlling owner, which is what binds a replica to
-// the deployment that declared it.
-// modelDeploymentDrainControllerOf is the Pod's controlling owner as an identity.
+// modelDeploymentDrainControllerOf 返回 Pod 的控制属主，正是它将副本绑定到声明它的部署对象。
+// modelDeploymentDrainControllerOf 返回作为身份标识的 Pod 控制属主。
 //
-// THE UID IS PART OF IT, and leaving it out made the comparison vacuous in two ways at once: a Pod
-// whose owner was deleted and recreated under the same name compared equal to itself, and two Pods
-// with no owner at all compared equal to each other. A name is not an identity for the same reason
-// a member's name is not.
+// UID 是其中不可或缺的部分；若省略 UID，比对将在两个方面同时失效：属主被删除并以同名重建的
+// Pod 会与自身判等，而没有任何属主的两个 Pod 也会彼此判等。名称在这里不能充当身份标识，原因
+// 与成员名称不能充当身份标识完全相同。
 func modelDeploymentDrainControllerOf(pod *corev1.Pod) string {
 	owner := metav1.GetControllerOf(pod)
 	if owner == nil {
@@ -341,13 +318,11 @@ func modelDeploymentDrainControllerOf(pod *corev1.Pod) string {
 	return owner.Kind + "/" + owner.Name + "/" + string(owner.UID)
 }
 
-// modelDeploymentDrainExpectedIdentity is what the live Pod must still be for this read to be about
-// the member the reservation bound.
+// modelDeploymentDrainExpectedIdentity 校验实时 Pod 是否仍符合预留所绑定的成员身份。
 //
-// EVERY FIELD IS CHECKED BECAUSE EVERY ONE CAN BE ABSENT. An empty expected value and an empty
-// observed value are not agreement, so a target that names no deployment, or a live Pod with no
-// controller, is refused rather than passed. A read that cannot say which deployment it is measuring
-// is a read of nothing in particular.
+// 每一个字段都必须检查，因为每一项都可能缺失。预期值为空且观测值也为空并不算达成一致，因此
+// 未指定部署对象的目标，或没有控制器的实时 Pod，都会被直接拒绝而非放行。连自己正在度量哪个
+// 部署都说不清的读取，度量的是一个毫无确定指向的对象。
 func modelDeploymentDrainExpectedIdentity(
 	pod *corev1.Pod, target modelDeploymentDrainTarget, container string,
 ) string {
@@ -360,15 +335,13 @@ func modelDeploymentDrainExpectedIdentity(
 		return fmt.Sprintf("member %s has no controlling owner", pod.Name)
 	}
 
-	// THE OWNER IS THE MODELDEPLOYMENT ITSELF, because that is the shape the render writes: an
-	// ordinary engine member is controlled directly by its ModelDeployment
-	// (model_deployment_render.go), with no ReplicaSet and no workload Deployment between them.
-	// A check that walked a ReplicaSet and a Deployment would refuse every faithful member, and
-	// the cost of refusing them is that no member is ever drainable.
+	// 属主必须是 ModelDeployment 本身，因为这正是渲染逻辑写入的结构：普通引擎成员直接由其
+	// ModelDeployment 控制（见 model_deployment_render.go），中间不存在 ReplicaSet 或工作负载 Deployment。
+	// 若检查逻辑沿着 ReplicaSet 和 Deployment 向上追溯，就会拒绝所有正常成员，而拒绝它们的代价是
+	// 没有任何成员能够被优雅排空。
 	//
-	// THE MATCH IS BY KIND, API VERSION AND UID, never by a suffix of a joined string. A suffix
-	// accepts any owner of any kind whose UID happens to match, so it would read a Pod adopted by
-	// an unrelated object of the same name as this operation's member.
+	// 匹配必须同时校验 Kind、API 版本和 UID，绝不能仅凭拼接字符串的后缀判断。后缀匹配会放行
+	// 任何 UID 恰好相同的任意类型属主，从而把被无关同名对象接管的 Pod 当作当前操作的成员来读取。
 	if controller.Kind != workercore.SchemeGroupVersionKind("ModelDeployment").Kind {
 		return fmt.Sprintf("member %s is controlled by %q rather than a ModelDeployment",
 			pod.Name, controller.Kind)
@@ -382,8 +355,8 @@ func modelDeploymentDrainExpectedIdentity(
 			pod.Name, controller.Kind, controller.Name, target.DeploymentUID)
 	}
 
-	// The role is read through the tree's own accessor, so there is one answer to which role a Pod
-	// is rather than two that can drift.
+	// 角色通过代码库统一的访问器读取，以确保对 Pod 属于哪个角色只有唯一判断口径，避免两处实现
+	// 之间产生漂移。
 	if role := modelDeploymentPodRole(pod); role != target.Role {
 		return fmt.Sprintf("member %s is role %q rather than %q", pod.Name, role, target.Role)
 	}
@@ -392,14 +365,13 @@ func modelDeploymentDrainExpectedIdentity(
 	if !found {
 		return fmt.Sprintf("member %s reports no status for container %q", pod.Name, container)
 	}
-	// AN EMPTY CONTAINER IDENTITY IS NOT A MATCHING ONE. The kubelet has not yet reported which
-	// container this is, and two empty identities agree with each other while saying nothing.
+	// 空的容器身份并不构成有效匹配。这说明 kubelet 尚未上报该容器的标识，而两个空标识彼此相等
+	// 却没有任何实质意义。
 	if status.ContainerID == "" {
 		return fmt.Sprintf("member %s reports no container identity for %q", pod.Name, container)
 	}
-	// THE CONTAINER MUST BE RUNNING, not merely present. A terminated or waiting container has no
-	// engine serving its metrics endpoint, so a body read from it answers about a process that is
-	// not this member's, or answers about a stale socket that some earlier process left behind.
+	// 容器必须处于运行中（running），而不仅仅是存在。已终止或等待中的容器没有引擎在提供指标端点，
+	// 从中读取到的响应要么来自不属于该成员的进程，要么来自某个先前进程遗留的陈旧套接字。
 	if running, why := modelDeploymentDrainContainerRunning(pod, container); !running {
 		return why
 	}
@@ -407,12 +379,11 @@ func modelDeploymentDrainExpectedIdentity(
 	return ""
 }
 
-// modelDeploymentDrainContainerRunning reports whether the named container is running, and why not
-// when it is not.
+// modelDeploymentDrainContainerRunning 报告指定容器是否正在运行；若未运行，则返回原因。
 //
-// THE STATE IS READ AND NOT INFERRED. A container status whose State is nil is a container the
-// kubelet has reported nothing about, which is neither running nor stopped, and reading it as
-// running would let a member that never started confirm a zero.
+// 运行状态必须直接读取而非推断。State 为 nil 的容器状态表示 kubelet 尚未上报任何相关信息，
+// 它既不处于运行中也不处于停止状态；若将其视作正在运行，就会让从未启动过的成员错误地确认
+// 读数为零。
 func modelDeploymentDrainContainerRunning(pod *corev1.Pod, name string) (bool, string) {
 	status, found := modelDeploymentDrainContainerStatus(pod, name)
 	if !found {
@@ -428,13 +399,9 @@ func modelDeploymentDrainContainerRunning(pod *corev1.Pod, name string) (bool, s
 	return true, ""
 }
 
-// verifyModelDeploymentIdentity re-reads the deployment the member names through the live reader and
-// refuses anything but the object the reservation captured.
+// verifyModelDeploymentIdentity 通过实时读取器重新读取成员所指明的部署，并拒绝除预留阶段所捕获对象以外的任何对象。
 //
-// THE POD'S OWNER REFERENCE IS NOT PROOF. It is a claim written when the Pod was created, and a
-// deployment deleted and recreated under the same name leaves every reference resolving while the
-// UID behind the name is a different object's. Only a live read of the object itself, compared by
-// UID, says whether the operation still holds the deployment its members belong to.
+// Pod 的 OwnerReference 并非凭证。它只是创建 Pod 时写入的声明；如果某部署被删除并以相同名称重建，所有引用仍会解析到该名称，但其背后的 UID 已属于另一个对象。只有对对象本身执行实时读取并按 UID 比对，才能确定当前操作是否仍持有其成员所属的那个部署。
 func (c *modelDeploymentDrainCollector) verifyModelDeploymentIdentity(
 	ctx context.Context, pod *corev1.Pod, target modelDeploymentDrainTarget,
 ) string {
@@ -462,11 +429,9 @@ func (c *modelDeploymentDrainCollector) verifyModelDeploymentIdentity(
 	return ""
 }
 
-// read runs the collector script and returns whatever envelope it managed to produce.
+// read 运行采集器脚本并返回它实际生成的信封数据。
 //
-// A TRUNCATED BODY IS NOT AN ERROR, because the script is allowed to have found nothing and still
-// exit zero. An incomplete envelope is what an absent or half-read answer looks like, and the
-// caller turns it into a hold; treating it as a transport error here would say less about it.
+// 响应体被截断并非错误，因为脚本在未发现任何内容时也允许以零状态码退出。不完整的信封正对应着缺失或读取了一半的结果，调用方会将其转为挂起（hold）状态；在此处将其视为传输错误反而会丢失具体语义。
 func (c *modelDeploymentDrainCollector) read(
 	ctx context.Context, pod *corev1.Pod, container, url string, expected []string,
 ) (string, error) {
@@ -476,24 +441,12 @@ func (c *modelDeploymentDrainCollector) read(
 	return c.exec(readCtx, pod, container, modelDeploymentDrainArgv(url, expected))
 }
 
-// resolveMember is the one lookup, and it returns a Pod or the hold that explains its absence rather
-// than an error, because a member that cannot be found is not a failure of the transport: it is one
-// of the answers this read is built to give, and it has to reach the operator's status with the reason
-// intact.
+// resolveMember 是唯一的查找入口，它返回 Pod 或解释其缺失原因的挂起（hold）信息，而不是直接返回 error。因为找不到成员并非传输失败：这是本次读取预期给出的结果之一，必须保留原因并传递到 operator 的状态中。
 //
-// The lookup is by UID through a field index rather than a list, so a read costs one cache lookup
-// instead of a sweep of every Pod in the cluster. It refuses when more than one Pod carries the UID,
-// which cannot happen and is refused rather than resolved to the first of them.
-// THE CACHE LOCATES, THE SERVER AUTHORIZES. The index is how this reader learns which namespace
-// and name carry a member UID, because a UID is an identity and a name is not; it is not how the
-// read is answered, because the cached object is whatever the watch last delivered and a member that
-// has restarted, been replaced or been relabelled since then is still in it. The name the locator
-// found is therefore used to read the object live, and the live object's own UID is matched against
-// the frozen target, because a Pod deleted and recreated under the same name answers with a new UID
-// and is a different member.
+// 查找通过字段索引按 UID 进行，而非 list 全量扫描，因此一次读取只需一次缓存查找，而不必遍历集群中的所有 Pod。如果同一个 UID 对应多个 Pod，则会拒绝处理（这种情况本不应发生，拒绝而非取其中第一个）。
+// 缓存负责定位，API server 负责鉴权确认。索引用于让本读取器获知哪个 Namespace 和名称承载了成员 UID——因为 UID 才是身份标识而名称不是；但它不直接用于回答读取结果，因为缓存对象只是 watch 上次推送的快照，自那时起成员可能已重启、被替换或被重新打标。因此需要用定位到的名称去实时读取对象，再将实时对象的 UID 与冻结的目标进行比对：以相同名称删除并重建的 Pod 会返回新的 UID，属于不同的成员。
 //
-// A Pod UID field selector would read more cheaply and would be refused: the API server does not
-// index that field, so a reader that used one would depend on a scan it cannot ask for.
+// 使用 Pod UID 字段选择器虽然读取成本更低，但会被拒绝：API server 并未对该字段建立索引，依赖它的读取器将无法请求所需的扫描。
 func (c *modelDeploymentDrainCollector) resolveMember(
 	ctx context.Context, target modelDeploymentDrainTarget, phase string,
 ) (*corev1.Pod, *modelDeploymentDrainAnswer) {
@@ -539,8 +492,7 @@ func (c *modelDeploymentDrainCollector) resolveMember(
 		return nil, &hold
 	}
 
-	// The name the locator reported may now belong to another member entirely. A live read that
-	// does not carry the frozen UID is a different Pod, whatever its name.
+	// 定位器上报的名称如今可能已完全属于另一个成员。未携带冻结 UID 的实时读取结果无论名称如何，都是另一个 Pod。
 	if pod.UID != target.PodUID {
 		hold := modelDeploymentDrainHold(modelDeploymentDrainUnknown,
 			fmt.Sprintf("member could not be %s: %s/%s now carries uid %s rather than %s",
@@ -552,12 +504,9 @@ func (c *modelDeploymentDrainCollector) resolveMember(
 	return pod, nil
 }
 
-// execInto is the real transport: an SPDY stream into the container, bounded on both time and size.
+// execInto 是实际的传输通道：进入容器的 SPDY 流，同时受时间和大小限制。
 //
-// The command is the image's own python3, for the reason the preStop hook uses it: both engines are
-// Python programs, so the interpreter is there, and inventing a second binary dependency for a
-// read would be a new thing to trust. Standard error is declared and discarded, so an engine
-// that talks is read rather than blocked, and it still cannot grow the bounded response.
+// 命令使用的是镜像自带的 python3，理由与 preStop hook 相同：两种引擎都是 Python 程序，因此解释器必然存在，而为一次读取引入第二个二进制依赖会带来新的信任成本。标准错误输出已声明并丢弃，这样即使引擎输出日志也会被读取而不会阻塞，同时仍不会使受限响应体积膨胀。
 func (c *modelDeploymentDrainCollector) execInto(
 	ctx context.Context, pod *corev1.Pod, container string, argv []string,
 ) (string, error) {
@@ -574,9 +523,9 @@ func (c *modelDeploymentDrainCollector) execInto(
 		VersionedParams(&corev1.PodExecOptions{
 			Container: container,
 			Command:   argv,
-			// Declare stdout so the exec stream can deliver the bounded response below.
+			// 声明 stdout，以便 exec 流在下方传递受限响应。
 			Stdout: true,
-			// Declare stderr because the client drains that stream below.
+			// 声明 stderr，因为客户端在下方会排空该流。
 			Stderr: true,
 			TTY:    false,
 		}, scheme.ParameterCodec)
@@ -586,11 +535,9 @@ func (c *modelDeploymentDrainCollector) execInto(
 		return "", fmt.Errorf("prepare exec into %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 
-	// The bound is enforced while the stream is running rather than after it, so an endpoint that
-	// keeps writing is cut off at the cap instead of being allowed to grow the response and then
-	// measured.
+	// 大小限制在流运行期间而非结束后强制执行，因此持续写入的端点会在达到上限时被截断，而不会先放任响应增长再做计量。
 	//
-	// Drain stderr without adding it to the bounded stdout response.
+	// 排空 stderr，但不将其计入受限的 stdout 响应。
 	stdout := &modelDeploymentDrainBounded{limit: modelDeploymentDrainMaxBodyBytes}
 	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdout: stdout,
@@ -607,16 +554,14 @@ func (c *modelDeploymentDrainCollector) execInto(
 	return stdout.body.String(), nil
 }
 
-// modelDeploymentDrainBounded accumulates a stream up to a fixed size and remembers that it did not
-// fit. It stops accepting bytes rather than truncating, because a truncated Prometheus body can end
-// mid-line and parse as a shorter but well-formed answer.
+// modelDeploymentDrainBounded 在固定大小内累积流数据，并记录是否发生溢出。它在达到上限后停止接收字节而非直接截断，因为被截断的 Prometheus 响应体可能在行中结束，从而被解析成一个更短但格式看似正常的错误结果。
 type modelDeploymentDrainBounded struct {
 	body     bytes.Buffer
 	limit    int
 	exceeded bool
 }
 
-// Write accumulates until the limit and refuses everything after it.
+// Write 持续累积数据直至达到上限，并拒绝超出上限后的所有数据。
 func (b *modelDeploymentDrainBounded) Write(p []byte) (int, error) {
 	if b.body.Len()+len(p) > b.limit {
 		b.exceeded = true
@@ -626,29 +571,17 @@ func (b *modelDeploymentDrainBounded) Write(p []byte) (int, error) {
 	return b.body.Write(p)
 }
 
-// modelDeploymentDrainArgv is the one command this transport ever runs: the image's python3 with
-// a generated program. There is no second form of it and no argument a user can reach, which is
-// what makes the read-only claim checkable by reading this function.
+// modelDeploymentDrainArgv 是本传输通道唯一会执行的命令：使用镜像自带的 python3 运行一段生成的程序。不存在第二种命令形式，也没有用户可触及的参数，这使得只读保证只需阅读本函数即可验证。
 func modelDeploymentDrainArgv(url string, expected []string) []string {
 	names := make([]string, 0, len(expected))
 	for _, name := range expected {
 		names = append(names, strconv.Quote(name))
 	}
 
-	// THE SCRIPT SUMS ACROSS LABEL SETS AND NEVER ACROSS BODIES. A series the engine splits by
-	// label, which both engines do, is one member's work reported in several rows, and the rows
-	// that belong to it are the ones in this one body. Reading more than one body is how a
-	// per-member zero turns into a group one, and there is no second read here to do it with.
+	// 该脚本仅跨标签集求和，绝不跨响应体求和。引擎按标签拆分的指标序列（两种引擎均会这样做）代表同一个成员的工作在多行中的汇报，属于它的行都在这单个响应体中。读取多个响应体正是将单成员零值误算为组零值的根源，而这里没有第二次读取可供混用。
 	//
-	// A sample it cannot parse is reported as unreadable rather than dropped, so a name this read
-	// asked for and could not understand reaches the caller as a broken envelope instead of as an
-	// absent one. Dropping it would leave a partial sum looking like a complete zero.
-	// A REQUIRED SAMPLE IS NEVER DROPPED AND NEVER CANCELED. A gauge the engine splits by label
-	// is several rows, and a row this script cannot read is still that gauge being reported and
-	// missed; summing the sibling it did read would report a number the engine never wrote, and
-	// letting the sibling stand would report a total the engine never meant. A value that is not a
-	// count, or is not finite, or is below zero, refuses the gauge the same way an unreadable row
-	// does, so there is no path by which bad evidence becomes a zero.
+	// 无法解析的样本会被报告为不可读而非直接丢弃，这样本次读取请求了但无法理解的指标名称会作为损坏的信封到达调用方，而不是表现为缺失指标。直接丢弃会导致部分求和结果看起来像是一个完整的零。
+	// 必需样本绝不会被丢弃，也绝不会被抵消。引擎按标签拆分的 gauge 指标包含多行，脚本无法读取的某一行依然代表该 gauge 正在汇报且被遗漏；仅对其可读的兄弟行求和会得出一个引擎从未写出的数字，而放任兄弟行保留则会报出一个引擎本意之外的总数。非计数、非有限值或小于零的值会以与不可读行相同的方式拒绝该 gauge，从而杜绝任何将无效证据转化为零的路径。
 	script := fmt.Sprintf(`import math, sys, urllib.request
 names = [%s]
 try:
@@ -700,15 +633,11 @@ sys.exit(0)
 	return []string{"python3", "-c", script}
 }
 
-// modelDeploymentDrainAnswerFromBody turns the envelope into the four states.
+// modelDeploymentDrainAnswerFromBody 将信封数据转换为四种状态之一。
 //
-// COMPLETENESS IS DECIDED BEFORE THE NUMBERS ARE SUMMED, and a missing gauge is a hold rather than
-// a zero. That ordering is the whole point: a reader that scraped two of the four SGLang gauges
-// would otherwise sum what it found and report the emptiness of a series it never read, and the
-// protocol would act on it.
+// 完整性必须在数值求和之前判定，缺失的 gauge 应导致挂起（hold）而非零。这一顺序正是核心所在：如果读取器只抓取了四个 SGLang gauge 中的两个，否则就会直接对已找到的值求和，从而将未读到的序列报告为空，进而触发协议误操作。
 //
-// The protocol re-checks the same list independently against the one map in the tree, so this
-// function is the first gate and not the only one.
+// 协议层还会对照树中唯一映射表独立复核同一份清单，因此本函数是第一道闸门而非唯一一道。
 func modelDeploymentDrainAnswerFromBody(
 	body string, expected []string,
 ) modelDeploymentDrainAnswer {
@@ -726,10 +655,8 @@ func modelDeploymentDrainAnswerFromBody(
 		}
 		value, err := strconv.ParseFloat(strings.TrimSpace(sample), 64)
 		if err != nil || !modelDeploymentDrainActivityValue(value) {
-			// A name this transport asked for, carrying something that is not a usable count, is a
-			// broken envelope rather than an absent one. It is recorded so the reason says which.
-			// Parsing into a float succeeds for NaN and the infinities, so the value is judged as
-			// well as parsed, and a negative count is refused for the same reason.
+			// 传输层请求了某个名称，但其携带的不是可用计数值，这属于损坏的信封而非缺失的指标。将其记录下来，以便原因中能指出具体是哪一个。
+			// 解析为浮点数时 NaN 和无穷大也会解析成功，因此解析后还需校验数值本身；负计数值也因同样理由被拒绝。
 			if modelDeploymentDrainExpected(name, expected) {
 				unparsable = append(unparsable, name)
 			}
@@ -738,9 +665,7 @@ func modelDeploymentDrainAnswerFromBody(
 		series[name] = value
 	}
 
-	// A name that came back with something other than a number is reported before a name that did
-	// not come back at all. Both hold, but they are different faults, and the engine that served an
-	// unreadable value has answered while the engine that served nothing has not.
+	// 返回了非数字内容的指标名称会在完全未返回的指标名称之前报告。两者都会触发挂起，但属于不同故障：返回了不可读值的引擎至少给出了响应，而什么都没返回的引擎则没有。
 	if len(unparsable) > 0 {
 		sort.Strings(unparsable)
 		return modelDeploymentDrainAnswer{
@@ -760,9 +685,7 @@ func modelDeploymentDrainAnswerFromBody(
 	for _, value := range series {
 		total += value
 	}
-	// The values are each finite and nonnegative, so the only way the sum stops being a count is an
-	// overflow. It is refused rather than reported, because an engine serving counts this large is
-	// not describing a queue this protocol can reason about.
+	// 每个值都是有限且非负的，因此总和不再是有效计数的唯一可能是发生溢出。此时应拒绝而非上报，因为给出如此巨大计数的引擎所描述的队列已超出本协议的推理范围。
 	if math.IsInf(total, 0) || math.IsNaN(total) {
 		return modelDeploymentDrainAnswer{
 			State:  modelDeploymentDrainUnknown,
@@ -786,7 +709,7 @@ func modelDeploymentDrainAnswerFromBody(
 	}
 }
 
-// modelDeploymentDrainAbsentSeries names the gauges the envelope did not carry.
+// modelDeploymentDrainAbsentSeries 列出信封中未携带的 gauge 名称。
 func modelDeploymentDrainAbsentSeries(expected []string, series map[string]float64) []string {
 	missing := make([]string, 0, len(expected))
 	for _, name := range expected {
@@ -798,7 +721,7 @@ func modelDeploymentDrainAbsentSeries(expected []string, series map[string]float
 	return missing
 }
 
-// modelDeploymentDrainExpected reports whether a name is one this read was asked about.
+// modelDeploymentDrainExpected 报告某个名称是否属于本次读取请求关注的指标之一。
 func modelDeploymentDrainExpected(name string, expected []string) bool {
 	for _, candidate := range expected {
 		if candidate == name {
@@ -809,18 +732,16 @@ func modelDeploymentDrainExpected(name string, expected []string) bool {
 	return false
 }
 
-// modelDeploymentDrainHold is a hold carrying why, with completeness false so the protocol cannot
-// read a number out of it whatever state it is given.
+// modelDeploymentDrainHold 表示携带原因的挂起（hold）结果，其 completeness 设为 false，使协议无论收到何种状态都无法从中读取数值。
 func modelDeploymentDrainHold(
 	state modelDeploymentDrainState, reason string,
 ) modelDeploymentDrainAnswer {
 	return modelDeploymentDrainAnswer{State: state, Reason: reason}
 }
 
-// modelDeploymentDrainContainerOf finds the container a read is about.
+// modelDeploymentDrainContainerOf 查找本次读取对应的容器。
 //
-// The name is carried by the target rather than looked up, but a carried name is a claim and the
-// Pod is the authority, so the claim is checked here rather than at the call site.
+// 虽然容器名由 target 携带而非重新查询，但携带的名称只是声明，Pod 才是权威依据，因此在此处而非调用点校验该声明。
 func modelDeploymentDrainContainerOf(
 	pod *corev1.Pod, name string,
 ) (*corev1.Container, bool) {
@@ -833,7 +754,7 @@ func modelDeploymentDrainContainerOf(
 	return nil, false
 }
 
-// modelDeploymentDrainContainerStatus is the container's identity as the kubelet last saw it.
+// modelDeploymentDrainContainerStatus 返回 kubelet 最近一次观测到的容器状态身份信息。
 func modelDeploymentDrainContainerStatus(
 	pod *corev1.Pod, name string,
 ) (*corev1.ContainerStatus, bool) {
@@ -846,12 +767,9 @@ func modelDeploymentDrainContainerStatus(
 	return nil, false
 }
 
-// modelDeploymentDrainURL is the engine's own metrics endpoint as the Pod records it.
+// modelDeploymentDrainURL 返回 Pod 中记录的引擎自身指标端点。
 //
-// IT IS READ FROM THE POD RATHER THAN DERIVED, for the reason the engine is read from the
-// deployment rather than the role: a replica whose role the spec has already dropped is still
-// drainable, and the role is exactly what may be gone. The annotations are written at render and
-// carry the port the engine actually bound, which a role's own port declaration can disagree with.
+// 该地址从 Pod 读取而非从规格推导，原因与从部署而非 role 读取引擎一致：即便 spec 已移除某个副本的 role，该副本仍可排空，而 role 恰恰可能已经不存在。注解在渲染时写入，记录了引擎实际绑定的端口，而 role 自身的端口声明可能与之不一致。
 func modelDeploymentDrainURL(pod *corev1.Pod) (string, bool) {
 	port, err := strconv.Atoi(pod.Annotations["prometheus.io/port"])
 	if err != nil || port <= 0 || port > 65535 {
@@ -874,7 +792,7 @@ func modelDeploymentDrainURL(pod *corev1.Pod) (string, bool) {
 	return fmt.Sprintf("%s://127.0.0.1:%d%s", schemeName, port, path), true
 }
 
-// modelDeploymentDrainParallelismUnreadable refuses parallelism declarations the controller cannot read.
+// modelDeploymentDrainParallelismUnreadable 拒绝控制器无法读取的并行度声明。
 func modelDeploymentDrainParallelismUnreadable(
 	engine string, kind workercore.ModelDeploymentRoleKind, container *corev1.Container,
 ) (string, bool) {

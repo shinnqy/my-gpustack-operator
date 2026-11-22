@@ -8,7 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 )
 
-// Null creates a Server that does nothing.
+// Null 创建一个空操作的 Server。
 func Null() Server {
 	return &null{}
 }

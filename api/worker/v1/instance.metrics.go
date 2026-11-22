@@ -8,158 +8,138 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstanceMetrics is the subresource of Instance for reading the current utilization,
-// which provides one up-to-date sample of the underlying Kubernetes Pod's
-// CPU/memory/storage usage and the allocated accelerators' metrics.
+// InstanceMetrics 是 Instance 用于读取当前资源利用率的子资源，
+// 提供底层 Kubernetes Pod 的 CPU、内存、存储使用量以及所分配加速器指标的实时采样。
 //
-// The CPU/memory/storage figures are read in real time from the node kubelet at request
-// time; the accelerator figures come from the device manager's latest snapshot and are
-// dropped when older than a few monitor periods.
+// CPU、内存和存储数据在请求时从节点 kubelet 实时读取；
+// 加速器数据来自 device manager 的最新快照，若超过若干个监控周期未更新则会被丢弃。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceMetrics struct {
 	meta.TypeMeta   `json:",inline"`
 	meta.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
-	// Sample is the current utilization sample of the Instance.
-	// Its optional fields are absent when the corresponding source is unavailable.
+	// Sample 是该 Instance 当前的资源利用率采样。
+	// 当对应的数据源不可用时，其中的可选字段将缺省。
 	Sample InstanceMetricsSample `json:"sample" protobuf:"bytes,2,opt,name=sample"`
 }
 
 var _ runtime.Object = (*InstanceMetrics)(nil)
 
-// InstanceMetricsSample is a single utilization sampling point of an Instance.
+// InstanceMetricsSample 是 Instance 的单次资源利用率采样点。
 //
-// Every figure is one half of a Total/Used pair reported in one unit, so that a consumer
-// computes a utilization percentage from one sample without reading the Instance's spec:
-// CPU in milli-cores, memory and storage in MiB. The sources measure in finer units — the
-// kubelet in nanocores and bytes, the manufacturer's device libraries in MiB — and the
-// coarser unit wins, because a percentage needs no more precision than that.
+// 每个数值都是按同一单位上报的 Total/Used 配对之一，以便调用方无需读取 Instance 的 spec
+// 即可通过单次采样直接计算出利用率百分比：CPU 单位为毫核（milli-cores），内存和存储单位为 MiB。
+// 数据源本身以更精细的单位计量——kubelet 使用纳核（nanocores）和字节，厂商设备库使用 MiB——
+// 最终以较粗的单位为准，因为计算百分比无需更高的精度。
 //
-// A Total comes from the Instance's own declaration and is therefore always populated; a Used
-// figure is a measurement, and is absent when its source is unavailable. Every conversion
-// rounds up, so a measured usage below one unit reads as 1 and 0 means no usage at all.
+// Total 来自 Instance 自身的声明，因此始终有值；Used 则是实测值，
+// 在其数据源不可用时会缺省。每次单位换算均向上取整，
+// 因此低于一个单位的实测用量会记为 1，而 0 表示完全没有使用。
 type InstanceMetricsSample struct {
-	// Timestamp indicates when the CPU/memory/storage figures were measured by the kubelet.
+	// Timestamp 表示 kubelet 测量 CPU、内存和存储数据的时间点。
 	Timestamp meta.Time `json:"timestamp" protobuf:"bytes,1,opt,name=timestamp"`
 
-	// CPUTotalMilliCores is the CPU limit of the Instance's Pod in milli-cores.
+	// CPUTotalMilliCores 是 Instance 对应 Pod 的 CPU 上限（单位为毫核）。
 	CPUTotalMilliCores uint64 `json:"cpuTotalMilliCores" protobuf:"varint,2,opt,name=cpuTotalMilliCores"`
 
-	// CPUUsedMilliCores is the CPU usage of the Instance's Pod in milli-cores,
-	// averaged over the kubelet's sample window.
+	// CPUUsedMilliCores 是 Instance 对应 Pod 在 kubelet 采样窗口内的平均 CPU 使用量（单位为毫核）。
 	CPUUsedMilliCores *uint64 `json:"cpuUsedMilliCores,omitempty" protobuf:"varint,3,opt,name=cpuUsedMilliCores"`
 
-	// MemoryTotalMiB is the memory limit of the Instance's Pod in MiB.
+	// MemoryTotalMiB 是 Instance 对应 Pod 的内存上限（单位为 MiB）。
 	MemoryTotalMiB uint64 `json:"memoryTotalMiB" protobuf:"varint,4,opt,name=memoryTotalMiB"`
 
-	// MemoryUsedMiB is the working set memory usage of the Instance's Pod in MiB.
+	// MemoryUsedMiB 是 Instance 对应 Pod 的工作集（working set）内存使用量（单位为 MiB）。
 	MemoryUsedMiB *uint64 `json:"memoryUsedMiB,omitempty" protobuf:"varint,5,opt,name=memoryUsedMiB"`
 
-	// StorageTotalMiB is the ephemeral storage limit of the Instance's Pod in MiB.
+	// StorageTotalMiB 是 Instance 对应 Pod 的临时存储上限（单位为 MiB）。
 	StorageTotalMiB uint64 `json:"storageTotalMiB" protobuf:"varint,6,opt,name=storageTotalMiB"`
 
-	// StorageUsedMiB is the ephemeral storage usage of the Instance's Pod in MiB.
+	// StorageUsedMiB 是 Instance 对应 Pod 的临时存储使用量（单位为 MiB）。
 	//
-	// This is the pod-level aggregate the kubelet evicts on — the containers' writable
-	// layers, their logs, and the local emptyDir volumes — so it is measured against the
-	// same ceiling StorageTotalMiB reports. Absent when the figures came from the
-	// metrics.k8s.io fallback, which carries no storage metrics.
+	// 这是 kubelet 执行驱逐时所依据的 Pod 级汇总用量——包括容器的可写层、日志以及本地 emptyDir 卷——
+	// 因此它与 StorageTotalMiB 所报告的上限采用同一口径。当数据来自不提供存储指标的
+	// metrics.k8s.io 回退路径时，该字段缺省。
 	StorageUsedMiB *uint64 `json:"storageUsedMiB,omitempty" protobuf:"varint,7,opt,name=storageUsedMiB"`
 
-	// Accelerators holds the metrics of the accelerators allocated to the Instance, keyed by the
-	// identifier of what it was granted — a device, or a hardware partition of one; absent when the
-	// Instance has no allocated accelerator or the device manager is unreachable.
+	// Accelerators 保存分配给该 Instance 的加速器指标，以其获授资源的标识符为键——
+	// 可以是整张设备或其中的硬件分区；当 Instance 未分配加速器或 device manager 不可达时，该字段缺省。
 	//
 	// +listType=map
 	// +listMapKey=id
 	Accelerators []InstanceAcceleratorMetrics `json:"accelerators,omitempty" protobuf:"bytes,8,rep,name=accelerators"`
 }
 
-// InstanceAcceleratorMetrics is one accelerator an Instance holds, reported in the Instance's OWN
-// terms: what it was granted on that accelerator, and what it was measured using of the grant.
+// InstanceAcceleratorMetrics 表示 Instance 持有的单个加速器，按 Instance 自身的口径上报：
+// 它在该加速器上获授的配额，以及实测使用了多少获授资源。
 //
-// EVERY MODE REPORTS THE SAME FIELDS WITH THE SAME MEANING. An Instance holding a whole device reads
-// the device's figures because the device is the grant; one holding a carved share — a logical slice
-// or a hardware partition — reads that share's quota and that share's usage. So a consumer asking
-// "how much memory is this Instance using, and how close is it to its ceiling" reads the same two
-// fields whatever the allocation did, and never has to know. Mode says how the grant was made, for a
-// consumer that wants to group by it; nothing else changes shape with it.
+// 所有模式都上报相同的字段且具有相同的语义。持有整张设备的 Instance 直接读取该设备的指标，
+// 因为整张设备即为其获授资源；持有切分份额（逻辑切片或硬件分区）的 Instance 则读取该份额的配额与用量。
+// 因此，无论底层采用何种分配方式，调用方在查询“该 Instance 使用了多少显存、距离上限还有多少”时
+// 只需读取相同的两个字段，完全无需感知分配细节。Mode 仅用于向需要按模式分组的调用方说明分配方式，
+// 除此之外不会改变任何字段结构。
 //
-// A Total comes from the allocation and is present whenever the allocation can state it. A Used
-// figure is a measurement, and is absent — never zero — when nothing on this node could measure it:
-// a manufacturer serving no per-process device query, a driver answering NOT_SUPPORTED, a process on
-// the device that could not be attributed to its container. Absence means "not measurable here", and
-// the Device Manager's capability gauge names which of those it was; zero means measured and idle.
-// A carved share whose usage could not be measured therefore reports NO usage rather than the
-// device's, whose figure counts every other tenant on the card.
+// Total 来自资源分配结果，只要分配过程能确定该值就会存在。Used 则是实测数值，
+// 当当前节点无法测量时该字段将缺省（绝不返回 0）：例如厂商未提供按进程的设备查询接口、
+// 驱动返回 NOT_SUPPORTED，或设备上的进程无法归因到对应容器。字段缺省表示“此处无法测量”，
+// 具体原因由 Device Manager 的能力指标（capability gauge）指明；而 0 表示已测量且处于空闲状态。
+// 因此，若切分份额的用量无法测量，将不上报任何用量，而不会回退上报整卡用量（因整卡数据包含了卡上其他租户的用量）。
 type InstanceAcceleratorMetrics struct {
-	// ID is the universally unique identifier of the accelerator the Instance holds.
+	// ID 是该 Instance 所持有加速器的全局唯一标识符。
 	//
-	// Under Partitioned this is the PARTITION's own identifier — a MIG UUID rather than the parent
-	// card's — because the partition is what the Instance was granted and what every figure below
-	// describes. It is also what keeps two partitions of one card, held by one Instance, from
-	// collapsing into a single entry under the card's shared identifier.
+	// 在 Partitioned 模式下，该值是分区自身的标识符（例如 MIG UUID，而非父卡的 UUID），
+	// 因为分区才是 Instance 实际获授的资源，下方所有指标也均针对该分区。
+	// 这也避免了同一 Instance 持有同一张卡上的两个分区时，因共用卡级标识符而合并为一条记录。
 	ID string `json:"id" protobuf:"bytes,1,opt,name=id"`
 
-	// Mode is how this accelerator was granted to the Instance: the whole device, a logical slice of
-	// it, or a hardware partition of it. It does not change what the figures below mean — it names
-	// the mechanism behind them, so that a consumer can group or filter by it.
+	// Mode 表示该加速器分配给 Instance 的方式：整卡独占、逻辑切片或硬件分区。
+	// 它不会改变下方指标的含义，仅标识其背后的分配机制，以便调用方按此分组或过滤。
 	//
-	// It carries the mode's NAME — "Exclusive", "Sliced", "Partitioned" — rather than the enum's wire
-	// value, because a name is the only form that says anything to the reader of a metric, and because
-	// it is what this same field already reads as on the Device Manager's Prometheus surface. A
-	// consumer must never have to translate between the two.
+	// 该字段携带的是模式的名称——"Exclusive"、"Sliced"、"Partitioned"——而非枚举的传输值，
+	// 因为名称是对指标读取方唯一直观的形式，且该字段在 Device Manager 的 Prometheus 指标中
+	// 也采用同样的名称。调用方绝无需在两者之间进行转换。
 	Mode string `json:"mode" protobuf:"bytes,9,opt,name=mode"`
 
-	// MemoryTotalMiB is the memory the Instance was granted on this accelerator, in MiB: the device's
-	// own memory when it holds the device, the quota the allocation charged when it holds a logical
-	// slice, and the partition's own memory when it holds a partition.
+	// MemoryTotalMiB 是 Instance 在该加速器上获授的内存（单位为 MiB）：
+	// 持有整张设备时为设备自身内存，持有逻辑切片时为分配时计入的配额，
+	// 持有硬件分区时为该分区自身的内存。
 	//
-	// A slice's quota is folded back from the units the allocation charged — the same memory-anchored
-	// basis admission counted credits on — so this denominator can never disagree with what was
-	// granted. Absent when nothing could state the grant: a partition whose geometry the driver would
-	// not disclose, or a device whose capacity did not reach this sample.
+	// 逻辑切片的配额由分配所计费的单位折算回 MiB——与准入阶段计算额度时采用相同的内存基准——
+	// 因此该分母绝不会与实际获授量不一致。当无法确定获授大小时该字段缺省：
+	// 例如驱动未公开分区几何规格，或设备的容量信息尚未同步到当前采样中。
 	MemoryTotalMiB *uint64 `json:"memoryTotalMiB,omitempty" protobuf:"varint,2,opt,name=memoryTotalMiB"`
 
-	// MemoryUsedMiB is the memory the Instance was measured holding of that grant, in MiB.
+	// MemoryUsedMiB 是实测该 Instance 在其获授资源中所占用的内存（单位为 MiB）。
 	//
-	// It measures the hardware rather than any bookkeeping, so it MAY EXCEED MemoryTotalMiB and is not
-	// clamped: clamping would present a leaking quota as a perfectly enforced one. Read an overshoot
-	// as an anomaly to investigate rather than as proof — the quota's unit conversion floors, and
-	// driver accounting overhead can produce one too.
+	// 该值直接测量自硬件而非账面记录，因此可能会超出 MemoryTotalMiB 且不会被截断：
+	// 截断会把存在泄漏的配额伪装成严格受控的状态。遇到超额时应将其视为需要排查的异常现象，
+	// 而非违规铁证——配额单位换算的向下取整以及驱动层的记账开销也可能导致数值略微超出。
 	MemoryUsedMiB *uint64 `json:"memoryUsedMiB,omitempty" protobuf:"varint,3,opt,name=memoryUsedMiB"`
 
-	// MemoryUtilizationPercent is MemoryUsedMiB over MemoryTotalMiB, in percent. It is stated rather
-	// than left to the consumer so that the percentage and the pair it comes from can never disagree,
-	// and it is absent whenever either of them is.
+	// MemoryUtilizationPercent 是 MemoryUsedMiB 占 MemoryTotalMiB 的百分比。显式提供该字段而非交由调用方计算，
+	// 是为了确保百分比与其来源字段始终一致；当其中任一字段缺失时，该字段也不存在。
 	MemoryUtilizationPercent *uint32 `json:"memoryUtilizationPercent,omitempty" protobuf:"varint,4,opt,name=memoryUtilizationPercent"`
 
-	// CoresUtilizationPercent is how much of the Instance's OWN compute allowance it was measured
-	// using, in percent — the device's utilization when it holds the device, and the measured share of
-	// the card over the enforced cap when it holds a logical slice. A slice capped at a fifth of a
-	// card and saturating that fifth reads 100, not 20.
+	// CoresUtilizationPercent 是测得的 Instance 实际使用的自身算力配额百分比：独占整张设备时为设备利用率，
+	// 持有逻辑切片时为测得的卡占用比例除以强制上限。例如，上限为整卡五分之一的切片跑满该五分之一配额时，读数为 100 而非 20。
 	//
-	// TWO CONSEQUENCES OF THAT DENOMINATOR, both deliberate. It MAY EXCEED 100, for the same reason
-	// the memory pair may: a shim that lets a slice burst past its cap while the card is idle is
-	// reporting a cap that is not being enforced, and clamping would hide exactly that. And it is
-	// COARSE under a small cap — the manufacturers measure the card in whole percent, so a cap of 5%
-	// can only ever yield multiples of 20 here.
+	// 该分母定义会带来两个有意保留的后果。首先，其值可能超过 100，原因与显存指标对相同：如果 shim 层允许切片在卡空闲时
+	// 突发超出上限，则说明该上限并未被强制执行，而截断处理恰好会掩盖这一情况。其次，在上限较小时粒度较粗——厂商对整卡的
+	// 度量精度为整数百分比，因此 5% 的上限在此处只能产生 20 的倍数。
 	//
-	// Absent for a hardware partition: no manufacturer serves a per-partition compute figure today.
+	// 硬件分区下该字段缺失：目前尚无厂商提供按分区统计的算力数据。
 	CoresUtilizationPercent *uint32 `json:"coresUtilizationPercent,omitempty" protobuf:"varint,5,opt,name=coresUtilizationPercent"` // nolint: lll
 
-	// TemperatureCelsius is the temperature of the accelerator in Celsius.
+	// TemperatureCelsius 是加速器的温度（单位：摄氏度）。
 	//
-	// WHOLE-DEVICE, in every mode: a carved share has no temperature of its own, and the device's is
-	// the only honest answer to what the Instance's hardware is doing thermally.
+	// 在所有模式下均为整卡维度：切分出的份额没有独立温度，整张设备的温度是唯一能真实反映 Instance 硬件热状态的指标。
 	TemperatureCelsius *uint32 `json:"temperatureCelsius,omitempty" protobuf:"varint,6,opt,name=temperatureCelsius"`
 
-	// PowerUsageWatts is the power usage of the accelerator in Watts.
-	// Whole-device in every mode, for the reason TemperatureCelsius is.
+	// PowerUsageWatts 是加速器的功耗（单位：瓦特）。
+	// 在所有模式下均为整卡维度，原因与 TemperatureCelsius 相同。
 	PowerUsageWatts *uint32 `json:"powerUsageWatts,omitempty" protobuf:"varint,7,opt,name=powerUsageWatts"`
 
-	// Unhealthy indicates whether the accelerator is unhealthy.
-	// Whole-device in every mode: an unhealthy card carries every share of it down.
+	// Unhealthy 表示加速器是否处于不健康状态。
+	// 在所有模式下均为整卡维度：一旦整卡异常，其上的所有份额都会受到影响。
 	Unhealthy *bool `json:"unhealthy,omitempty" protobuf:"varint,8,opt,name=unhealthy"`
 }

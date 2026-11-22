@@ -9,20 +9,20 @@ import (
 )
 
 type (
-	// SetupOptions is the options for setting up a controller.
+	// SetupOptions 是用于初始化控制器的选项。
 	SetupOptions struct {
-		// Manager is the controller-runtime manager.
+		// Manager 是 controller-runtime 管理器。
 		Manager manager.CtrlManager
 	}
 
-	// Setup is the interface for the controller setup.
+	// Setup 是控制器初始化的接口。
 	Setup interface {
 		ctrlreconcile.Reconciler
-		// SetupController sets up the controller.
+		// SetupController 初始化控制器。
 		//
-		// SetupController is called before the Cache is started,
-		// you should not do anything that requires the Cache to be started.
-		// Instead, you can configure the Cache, like IndexField or something else.
+		// SetupController 在 Cache 启动之前调用，
+		// 因此不应执行任何需要 Cache 已启动才能进行的操作。
+		// 相反，可以在此配置 Cache，例如调用 IndexField 等。
 		SetupController(ctx context.Context, opts SetupOptions) error
 	}
 )

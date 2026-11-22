@@ -21,7 +21,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/ctrlhandlerx"
 )
 
-// TopologySourceReconciler observes inventories and publishes writable labels through NodeFeatures.
+// TopologySourceReconciler 观测设备清单并通过 NodeFeatures 发布可写标签。
 type TopologySourceReconciler struct {
 	Client    ctrlcli.Client
 	APIReader ctrlcli.Reader
@@ -31,7 +31,7 @@ type TopologySourceReconciler struct {
 var _ ctrlreconcile.Reconciler = (*TopologySourceReconciler)(nil)
 
 func (r *TopologySourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Implement this function in chapter 13.
+	// 在第 13 章中实现此函数。
 	var result0 ctrl.Result
 	var result1 error
 	return result0, result1

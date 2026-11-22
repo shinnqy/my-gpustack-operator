@@ -18,31 +18,31 @@ import (
 )
 
 var (
-	// LoopbackKubeInside is a flag that indicates whether the system runs inside the loopback Kubernetes cluster.
+	// LoopbackKubeInside 是指示系统是否运行在环回 Kubernetes 集群内部的标志。
 	LoopbackKubeInside varx.Once[bool]
 
-	// LoopbackKubeNearby is a flag that indicates whether the system runs nearby the loopback Kubernetes cluster.
-	// If the system runs nearby, it can connect to the loopback Kubernetes cluster even if it is not inside the cluster.
+	// LoopbackKubeNearby 是指示系统是否运行在环回 Kubernetes 集群附近的标志。
+	// 如果系统运行在集群附近，即使不在集群内部，也可以连接到该环回 Kubernetes 集群。
 	LoopbackKubeNearby varx.Once[bool]
 
-	// LoopbackKubeClientConfigPath is the path to the loopback Kubernetes client configuration file.
+	// LoopbackKubeClientConfigPath 是环回 Kubernetes 客户端配置文件的路径。
 	LoopbackKubeClientConfigPath varx.Once[string]
 
-	// LoopbackKubeRestConfig is the loopback Kubernetes rest configuration.
+	// LoopbackKubeRestConfig 是环回 Kubernetes 的 rest 配置。
 	LoopbackKubeRestConfig varx.Once[rest.Config]
 
-	// LoopbackKubeHTTPClient is the loopback Kubernetes HTTP client.
+	// LoopbackKubeHTTPClient 是环回 Kubernetes 的 HTTP 客户端。
 	LoopbackKubeHTTPClient varx.Once[*http.Client]
 
-	// LoopbackKubeClient is the loopback Kubernetes client.
+	// LoopbackKubeClient 是环回 Kubernetes 客户端。
 	LoopbackKubeClient varx.Once[kubernetes.Interface]
 
-	// LoopbackKubeVersion is the loopback Kubernetes cluster version,
-	// read once at startup after the cluster is connected.
+	// LoopbackKubeVersion 是环回 Kubernetes 集群版本，
+	// 在连接集群后于启动时读取一次。
 	LoopbackKubeVersion varx.Once[kubediscovery.Version]
 )
 
-// ConfigureLoopbackKube configures the loopback Kubernetes.
+// ConfigureLoopbackKube 配置环回 Kubernetes。
 func ConfigureLoopbackKube(inside bool, configPath string, config rest.Config,
 	httpClient *http.Client, client kubernetes.Interface, version kubediscovery.Version,
 ) {
@@ -56,28 +56,28 @@ func ConfigureLoopbackKube(inside bool, configPath string, config rest.Config,
 }
 
 var (
-	// LoopbackCtrlClient is the controller client for the loopback Kubernetes cluster.
+	// LoopbackCtrlClient 是环回 Kubernetes 集群的控制器客户端。
 	//
-	// LoopbackCtrlClient is similar to LoopbackKubeClient,
-	// but it has a self-manager cache for tuning read-only accessing,
-	// which means we don't need to handle list/watch manually.
+	// LoopbackCtrlClient 与 LoopbackKubeClient 类似，
+	// 但它拥有自管理的缓存以优化只读访问，
+	// 这意味着我们无需手动处理 list/watch。
 	LoopbackCtrlClient varx.Once[ctrlcli.Client]
 
-	// LoopbackCtrlAPIReader is the controller API reader for the loopback Kubernetes cluster.
+	// LoopbackCtrlAPIReader 是环回 Kubernetes 集群的控制器 API 读取器。
 	//
-	// LoopbackCtrlAPIReader is similar to LoopbackCtrlClient,
-	// but it only has the read-only access to the API server.
+	// LoopbackCtrlAPIReader 与 LoopbackCtrlClient 类似，
+	// 但它对 API server 仅具有只读访问权限。
 	LoopbackCtrlAPIReader varx.Once[ctrlcli.Reader]
 )
 
-// ConfigureLoopbackCtrlRuntime configures the loopback Kubernetes controller runtime.
+// ConfigureLoopbackCtrlRuntime 配置环回 Kubernetes 控制器运行时。
 func ConfigureLoopbackCtrlRuntime(client ctrlcli.Client, apiReader ctrlcli.Reader) {
 	LoopbackCtrlClient.Configure(client)
 	LoopbackCtrlAPIReader.Configure(apiReader)
 }
 
 func isLoopbackClusterNearby(restCfg *rest.Config) bool {
-	// Extract host from rest config.
+	// 从 rest 配置中提取主机地址。
 	var host string
 	if strings.Contains(restCfg.Host, "://") {
 		u, _ := url.Parse(restCfg.Host)
@@ -91,7 +91,7 @@ func isLoopbackClusterNearby(restCfg *rest.Config) bool {
 		host = strings.Split(host, ":")[0]
 	}
 
-	// Detect host in a fast pass way.
+	// 通过快速路径检测主机。
 	knownLoopbackHosts := []string{
 		"kubernetes.docker.internal",
 		"host.docker.internal",
@@ -104,14 +104,14 @@ func isLoopbackClusterNearby(restCfg *rest.Config) bool {
 		return true
 	}
 
-	// Detect host in a slow pass way.
+	// 通过慢速路径检测主机。
 	subnets := make([]netx.IPv4, 0, Subnets.Get().Len())
 	for _, v := range sets.List(Subnets.Get()) {
 		sn := netx.MustIPv4FromCIDR(v)
 		subnets = append(subnets, sn)
 	}
 
-	// IP detect.
+	// IP 检测。
 	if ip := net.ParseIP(host); ip != nil {
 		for j := range subnets {
 			if subnets[j].Contains(ip) {
@@ -122,7 +122,7 @@ func isLoopbackClusterNearby(restCfg *rest.Config) bool {
 		return false
 	}
 
-	// Or DNS lookup.
+	// 或 DNS 查询。
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return false

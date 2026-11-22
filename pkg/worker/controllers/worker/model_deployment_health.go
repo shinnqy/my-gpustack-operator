@@ -1,24 +1,20 @@
-// Whole-group health qualification: the predicate that decides whether a replica's endpoints may
-// be selected, at instance granularity rather than per member.
+// 整组健康资格判定：以 instance 粒度而非单个成员粒度决定副本端点是否可被选中的谓词。
 //
-// A replica is admitted to selection only when the WHOLE group qualifies. A single member's
-// readiness is not a statement about the group: a member that is up while a peer is down serves
-// nothing, because the group is one forward path. This file evaluates that path as five named
-// legs and keeps three-valued answers, because the two non-passing answers have to behave
-// differently and a boolean would merge them into one.
+// 仅当整组都满足条件时，副本才会被准入选路。单个成员就绪并不代表整组可用：
+// 某个成员正常而对等成员宕机时仍无法提供服务，因为整组构成同一条前向路径。
+// 本文件将该路径拆分为五个具名检查项（leg）并保留三值判定结果，因为两种未通过状态
+// 的行为必须不同，而布尔值会将它们混为一谈。
 //
-// THE THREE VERDICTS ARE THREE DIFFERENT INSTRUCTIONS. A FAILED leg is a definite health fault
-// and may revoke immediately. An UNKNOWN leg is an observation this operator cannot make, and it
-// HOLDS: it never revokes on its own and it never restores. A VERIFIED leg has been evaluated
-// and passed. Collapsing FAILED and UNKNOWN would either blackhole a healthy deployment on a
-// missing observation or grant eligibility the spec forbids granting on a weaker signal.
+// 三种判定结果对应三种不同的处置语义。FAILED 表示明确的健康故障，可立即撤销资格。
+// UNKNOWN 表示本 operator 无法完成的观测，其行为为保持现状（hold）：既不会单独触发撤销，
+// 也不会恢复资格。VERIFIED 表示已评估且通过。若将 FAILED 与 UNKNOWN 合并，
+// 要么会因缺失观测而将健康的部署黑洞化，要么会在规范禁止的弱信号下授予资格。
 //
-// THE GROUP-FORWARD LEG IS NOW OBSERVABLE FOR SOME SHAPES, and where it is not, the file says
-// which obstacle is in the way rather than that observation is impossible. A non-disaggregated
-// multi-rank replica is verified by a one-token request bound to this operator's own identifier,
-// which is described in the probe file. A single-member replica has no cross-member path to verify
-// and is not applicable. A disaggregated replica stays unsupported, on each engine for its own
-// measured reason, because on both of them one request cannot reach across the roles.
+// group-forward 检查项目前对部分形态已可观测；对于不可观测的形态，本文件会说明
+// 具体受阻原因，而非笼统认定无法观测。非分离式多 rank 副本通过绑定本 operator 自有
+// 标识符的单 token 请求进行验证，具体见 probe 文件。单成员副本没有跨成员路径需要验证，
+// 因此不适用。分离式副本在各引擎上均因各自实测原因保持不支持状态，因为在这类引擎上
+// 单次请求都无法跨越不同 role。
 package worker
 
 import (
@@ -33,25 +29,23 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
-// modelDeploymentLegVerdict is one leg's answer.
+// modelDeploymentLegVerdict 表示单个检查项的判定结果。
 type modelDeploymentLegVerdict int
 
 const (
-	// modelDeploymentLegVerified is a leg that was evaluated and passed.
+	// modelDeploymentLegVerified 表示已完成评估且通过的检查项。
 	modelDeploymentLegVerified modelDeploymentLegVerdict = iota
 
-	// modelDeploymentLegFailed is a definite health fault. It revokes, and it revokes whether or
-	// not the group predicate is otherwise verifiable, because a group known to be broken needs
-	// no further evidence.
+	// modelDeploymentLegFailed 表示明确的健康故障。它会触发资格撤销，且无论组谓词的
+	// 其他部分是否可验证都会撤销，因为已知损坏的组无需更多证据。
 	modelDeploymentLegFailed
 
-	// modelDeploymentLegUnknown is a leg this operator could not evaluate. It holds.
+	// modelDeploymentLegUnknown 表示本 operator 无法评估的检查项，其行为为保持现状。
 	modelDeploymentLegUnknown
 )
 
-// modelDeploymentQualificationLegName is one condition of the whole-group predicate. It is
-// carried by name so a held instance can report WHICH leg is unverified, rather than that
-// something is.
+// modelDeploymentQualificationLegName 表示整组谓词中的某一项条件。它按名称传递，
+// 以便处于保持状态的 instance 能准确报告是哪一项未通过验证，而非笼统提示存在未验证项。
 type modelDeploymentQualificationLegName string
 
 const (
@@ -62,28 +56,26 @@ const (
 	modelDeploymentLegNoPendingReplacement modelDeploymentQualificationLegName = "NoPendingReplacement"
 )
 
-// modelDeploymentQualificationLeg is one named condition and its answer.
+// modelDeploymentQualificationLeg 表示一个具名条件及其判定结果。
 type modelDeploymentQualificationLeg struct {
 	Name    modelDeploymentQualificationLegName
 	Verdict modelDeploymentLegVerdict
 	Reason  string
 }
 
-// modelDeploymentMembershipGeneration names exactly which Pods a verification was taken against.
+// modelDeploymentMembershipGeneration 精确标识某次验证所针对的一组 Pod。
 //
-// IT IS DERIVED AND NEVER STORED. A generation that had to be persisted would need a writer, a
-// place to keep it, and an ordering rule, and every one of those is a way for a restart or a
-// missed write to leave a verification standing against a group that no longer exists. Deriving
-// it from the member UID set makes that impossible: a replaced member is a different set, so the
-// prior verification simply does not apply to the new one.
+// 它是实时推导的，从不持久化存储。若需要持久化 generation，就必须引入写入方、
+// 存储位置和排序规则，而其中任何一环都可能在重启或漏写时导致旧验证继续作用于
+// 已不存在的组。直接从成员 UID 集合推导可彻底避免这一问题：成员一旦替换，
+// UID 集合即发生变化，先前的验证自然不再适用于新集合。
 //
-// IT IS ORDER-INDEPENDENT, which a raw concatenation would not be. The member list comes from a
-// Pod listing, and a listing that returns the same Pods in a different order describes the same
-// group; an order-sensitive generation would read that as a new membership and hold a healthy
-// deployment with nothing to explain why.
+// 它是顺序无关的，而直接拼接字符串做不到这一点。成员列表来自 Pod 列表查询，
+// 以不同顺序返回相同 Pod 的查询结果描述的仍是同一个组；若 generation 对顺序敏感，
+// 就会将其误判为新成员集合，从而无故将健康的部署置于保持状态。
 type modelDeploymentMembershipGeneration string
 
-// modelDeploymentGenerationOf derives the generation of a replica's current membership.
+// modelDeploymentGenerationOf 推导副本当前成员集合的 generation。
 func modelDeploymentGenerationOf(view modelDeploymentReplicaView) modelDeploymentMembershipGeneration {
 	uids := make([]string, 0, len(view.Members))
 	for _, member := range view.Members {
@@ -94,16 +86,15 @@ func modelDeploymentGenerationOf(view modelDeploymentReplicaView) modelDeploymen
 	return modelDeploymentMembershipGeneration(strings.Join(uids, "/"))
 }
 
-// modelDeploymentPendingReplacement records which ordinals of which roles this pass has already
-// condemned as outdated, so the qualification can refuse to restore a replica that is on its way
-// out. It is read from the rollout the same pass already computed, never recomputed from the
-// render, because the two answers to "is this replica being replaced" have to be one answer.
+// modelDeploymentPendingReplacement 记录本轮协调已判定为过时的 role 与 ordinal，
+// 从而让资格判定拒绝恢复正在淘汰中的副本。它直接读取同一轮中已计算好的 rollout 结果，
+// 从不根据渲染结果重新计算，因为关于“该副本是否正在被替换”的判断必须保持唯一一致。
 type modelDeploymentPendingReplacement struct {
-	// ordinals is keyed by role name and then by replica ordinal.
+	// ordinals 按 role 名称为第一层键、副本 ordinal 为第二层键进行索引。
 	ordinals map[string]map[int]bool
 }
 
-// modelDeploymentPending reports whether the named replica is condemned for replacement.
+// modelDeploymentPending 报告指定的副本是否已被标记为待替换。
 func (p modelDeploymentPendingReplacement) modelDeploymentPending(role string, ordinal int) bool {
 	if p.ordinals == nil {
 		return false
@@ -112,31 +103,28 @@ func (p modelDeploymentPendingReplacement) modelDeploymentPending(role string, o
 	return p.ordinals[role][ordinal]
 }
 
-// modelDeploymentGroupForwardState is what an engine-level group-forward observation can say.
-// The two states this operator produces today are NotApplicable and Unsupported; the middle ones
-// exist so a future observation has somewhere honest to land.
+// modelDeploymentGroupForwardState 表示引擎级 group-forward 观测可能给出的结论。
+// 本 operator 目前产生其中 NotApplicable 和 Unsupported 两种状态，其余中间状态
+// 用于为后续接入实际观测预留准确的语义位置。
 type modelDeploymentGroupForwardState string
 
 const (
-	// modelDeploymentGroupForwardNotApplicable is a replica with no cross-member path at all, so
-	// there is nothing to observe. It is a different answer from Unsupported, and conflating
-	// them would hold every ordinary single-member deployment forever.
+	// modelDeploymentGroupForwardNotApplicable 表示完全没有跨成员路径的副本，
+	// 因此无需观测。它不同于 Unsupported，若将两者混淆会导致所有普通单成员部署永久处于保持状态。
 	modelDeploymentGroupForwardNotApplicable modelDeploymentGroupForwardState = "NotApplicable"
 
 	modelDeploymentGroupForwardVerified modelDeploymentGroupForwardState = "Verified"
 
 	modelDeploymentGroupForwardFailed modelDeploymentGroupForwardState = "Failed"
 
-	// modelDeploymentGroupForwardUnknown is an observation that could not be made or was not
-	// fresh enough to inform the answer.
+	// modelDeploymentGroupForwardUnknown 表示无法完成观测或观测结果不够新鲜、不足以支撑判定的状态。
 	modelDeploymentGroupForwardUnknown modelDeploymentGroupForwardState = "Unknown"
 
-	// modelDeploymentGroupForwardUnsupported is a shape no engine-level group-forward
-	// observation exists for.
+	// modelDeploymentGroupForwardUnsupported 表示不存在引擎级 group-forward 观测手段的部署形态。
 	modelDeploymentGroupForwardUnsupported modelDeploymentGroupForwardState = "Unsupported"
 )
 
-// modelDeploymentGroupForward is one replica's group-forward evidence.
+// modelDeploymentGroupForward 表示单个副本的 group-forward 观测证据。
 type modelDeploymentGroupForward struct {
 	State       modelDeploymentGroupForwardState
 	Reason      string
@@ -144,28 +132,27 @@ type modelDeploymentGroupForward struct {
 	Observation string
 }
 
-// modelDeploymentInstanceQualification is one replica's whole-group answer.
+// modelDeploymentInstanceQualification 表示单个副本的整组健康资格判定结果。
 type modelDeploymentInstanceQualification struct {
-	// View is the replica this qualifies, so the caller can reach the members it covers.
+	// View 是当前进行资格判定的副本视图，调用方可通过它访问其涵盖的成员。
 	View modelDeploymentReplicaView
-	// Generation is the membership the legs below were evaluated against.
+	// Generation 是评估下列检查项时所针对的成员集合标识。
 	Generation modelDeploymentMembershipGeneration
-	// GroupForward is kept whole rather than flattened into a leg, because activation is
-	// decided from it and the status reports which state produced the hold.
+	// GroupForward 保留完整结构而不展平为普通检查项，因为激活资格由它决定，
+	// 且 status 需要报告具体是哪种状态导致了保持。
 	GroupForward modelDeploymentGroupForward
-	// PairAttempt is the directed pair attempt that verified this replica, when one did. It is
-	// retained so a reader can tell a proxy-shape answer from a rank-covering one without
-	// re-deriving it, and so the requests the answer was bound to can be read.
+	// PairAttempt 是在通过有向配对探测验证该副本时记录的探测尝试信息。
+	// 保留该字段以便读取方无需重新推导即可区分代理形态与覆盖 rank 形态的结论，
+	// 并能读取该结论所绑定的请求信息。
 	PairAttempt *modelDeploymentGroupForwardPairAttempt
-	// Observed is whether any member's readiness has actually been reported. A replica this
-	// pass just created has not, and a deployment made entirely of those has made no eligibility
-	// observation at all -- which is what the status already calls NotObserved, and which must not
-	// be restated as a hold.
+	// Observed 表示是否已有任意成员实际报告了就绪状态。本轮刚创建的副本尚未报告，
+	// 完全由这类副本组成的部署尚未产生任何资格观测结果——即 status 中所称的 NotObserved，
+	// 不应将其重述为保持状态。
 	Observed bool
 	Legs     []modelDeploymentQualificationLeg
 }
 
-// Leg reads one named leg.
+// Leg 读取指定名称的检查项。
 func (q modelDeploymentInstanceQualification) Leg(
 	name modelDeploymentQualificationLegName,
 ) modelDeploymentQualificationLeg {
@@ -182,34 +169,34 @@ func (q modelDeploymentInstanceQualification) Leg(
 	}
 }
 
-// modelDeploymentGroupState is the state a group's qualification stands in.
+// modelDeploymentGroupState 表示组健康资格所处的状态。
 //
-// THE NAMES ARE THE ONES THE STATUS PUBLISHES, because this operator reports one state per group
-// and a reader learns nothing from two vocabularies for one thing.
+// 这里的命名与 status 对外发布的名称保持一致，因为本 operator 对每个组只报告一种状态，
+// 为同一概念维护两套词汇没有任何益处。
 type modelDeploymentGroupState string
 
 const (
-	// modelDeploymentGroupStateEligible is a group every leg verified.
+	// modelDeploymentGroupStateEligible 表示所有检查项均已通过验证的组状态。
 	modelDeploymentGroupStateEligible modelDeploymentGroupState = "Eligible"
-	// modelDeploymentGroupStateWithdrawn is a group a definite fault withdrew.
+	// modelDeploymentGroupStateWithdrawn 表示因明确故障而被撤销资格的组状态。
 	modelDeploymentGroupStateWithdrawn modelDeploymentGroupState = "Withdrawn"
-	// modelDeploymentGroupStateAwaitingMembers is a group whose member set is not established.
+	// modelDeploymentGroupStateAwaitingMembers 表示成员集合尚未建立完整的组状态。
 	modelDeploymentGroupStateAwaitingMembers modelDeploymentGroupState = "AwaitingMembers"
-	// modelDeploymentGroupStateAwaitingReady is a group whose members are not all Ready=True.
+	// modelDeploymentGroupStateAwaitingReady 表示成员尚未全部达到 Ready=True 的组状态。
 	modelDeploymentGroupStateAwaitingReady modelDeploymentGroupState = "AwaitingReady"
-	// modelDeploymentGroupStateAwaitingProbe is a group whose forward path could not be observed.
+	// modelDeploymentGroupStateAwaitingProbe 表示前向路径尚未完成观测的组状态。
 	modelDeploymentGroupStateAwaitingProbe modelDeploymentGroupState = "AwaitingProbe"
-	// modelDeploymentGroupStateUnsupported is a shape no observation exists for.
+	// modelDeploymentGroupStateUnsupported 表示不存在可用观测手段的部署形态状态。
 	modelDeploymentGroupStateUnsupported modelDeploymentGroupState = "Unsupported"
-	// modelDeploymentGroupStateUnknown is a group held on a fact this operator cannot name.
+	// modelDeploymentGroupStateUnknown 表示因本 operator 无法归类原因而处于保持状态的组状态。
 	modelDeploymentGroupStateUnknown modelDeploymentGroupState = "Unknown"
 )
 
-// modelDeploymentQualificationLegOrder is the order the legs are evaluated in, and the order a held
-// group reports its blocking leg in.
+// modelDeploymentQualificationLegOrder 是检查项的评估顺序，也是处于保持状态的组报告
+// 阻塞检查项时的顺序。
 //
-// THE ORDER IS THE EVALUATION ORDER, so the first leg that is not verified is the one that would
-// have to change before the group could qualify.
+// 该顺序即实际评估顺序，因此第一个未通过验证的检查项正是该组获得资格前
+// 必须先发生改变的条件。
 var modelDeploymentQualificationLegOrder = []modelDeploymentQualificationLegName{
 	modelDeploymentLegMemberSetComplete,
 	modelDeploymentLegMembersReady,
@@ -218,22 +205,21 @@ var modelDeploymentQualificationLegOrder = []modelDeploymentQualificationLegName
 	modelDeploymentLegNoPendingReplacement,
 }
 
-// MembersReady reports whether every member of the group reports Ready=True.
+// MembersReady 报告组内所有成员是否均报告为 Ready=True。
 //
-// IT IS THE FAIL-CLOSED ANSWER TO THE MEMBER QUESTION. Ready=True is the only positive answer, so
-// a member that has not reported its readiness, or has reported it as anything but True, makes the
-// group unsafe. The leg itself stays three-valued, because a group that is still starting is HELD
-// and not REVOKED, but the group is withdrawn either way.
+// 这是针对成员就绪问题的故障关闭（fail-closed）回答。只有 Ready=True 才是肯定答案，
+// 因此只要有成员尚未报告就绪状态，或报告结果不是 True，整组就不安全。
+// 该检查项本身仍保持三值语义，因为仍在启动中的组应处于保持而非撤销状态，
+// 但无论哪种情况，该组当前都不予选路。
 func (q modelDeploymentInstanceQualification) MembersReady() bool {
 	return q.Leg(modelDeploymentLegMembersReady).Verdict == modelDeploymentLegVerified
 }
 
-// GroupState classifies the group.
+// GroupState 对组进行状态分类。
 //
-// THE BLOCKING LEG IS SELECTED ONCE, so the state and the reason can never disagree about what
-// holds the group. The precedence reads a revocation above an unsupported shape above a hold, which
-// is the precedence the status already publishes, so the classification here and the status there
-// cannot disagree about which of two facts came first.
+// 阻塞检查项只选择一次，因此状态与原因绝不会在“是什么阻塞了该组”上产生分歧。
+// 优先级顺序为：撤销高于不支持形态，不支持形态高于保持；这与 status 中已发布的
+// 优先级一致，确保此处的分类与 status 中的展示不会对两个事实的先后关系产生冲突。
 func (q modelDeploymentInstanceQualification) GroupState() modelDeploymentGroupState {
 	if q.Eligible() {
 		return modelDeploymentGroupStateEligible
@@ -257,21 +243,21 @@ func (q modelDeploymentInstanceQualification) GroupState() modelDeploymentGroupS
 			return modelDeploymentGroupStateAwaitingProbe
 		}
 
-		// THE FIRST LEG THAT IS NOT VERIFIED NAMES THE STATE, so a group held on the retirement or
-		// the replacement leg reports the state this operator has no finer name for.
+		// 由第一个未通过验证的检查项决定状态名称，因此因淘汰或替换检查项而被保持的组，
+		// 会报告本 operator 尚未进一步细分的通用状态。
 		return modelDeploymentGroupStateUnknown
 	}
 
 	return modelDeploymentGroupStateUnknown
 }
 
-// Reason names the fact that holds the group, or says that it qualifies.
+// Reason 说明阻塞该组的具体事实，或声明该组已具备资格。
 //
-// IT NAMES THE SAME LEG THE STATE NAMES, so a reader is never told that a group is awaiting one
-// thing and given the reason for another.
+// 它对应的检查项与 GroupState 一致，避免出现状态提示等待某项条件而原因却指向
+// 另一项条件的不一致情况。
 func (q modelDeploymentInstanceQualification) Reason() string {
 	if q.Eligible() {
-		// Proxy responses do not prove individual rank coverage or KV transfer.
+		// 代理返回的响应并不能证明各个 rank 均已覆盖或 KV 传输正常。
 		if q.PairAttempt != nil && q.PairAttempt.Shape == modelDeploymentGroupForwardPairShapeViaRoutingProxy {
 			return "routing proxy returned the expected content with the probe request ID while naming " +
 				"the prefiller; individual rank coverage and KV transfer remain unproven"
@@ -298,9 +284,8 @@ func (q modelDeploymentInstanceQualification) Reason() string {
 	return q.GroupForward.Reason
 }
 
-// HasFailure reports a definite health fault. It is the signal that revokes unconditionally and
-// is deliberately NOT a question about whether the group predicate is available: a group known
-// to be broken does not also need to be verifiable.
+// HasFailure 报告是否存在明确的健康故障。该信号会无条件触发资格撤销，
+// 且刻意不依赖组谓词本身是否可验证：已知损坏的组无需再要求其具备可验证性。
 func (q modelDeploymentInstanceQualification) HasFailure() bool {
 	for _, leg := range q.Legs {
 		if leg.Verdict == modelDeploymentLegFailed {
@@ -311,8 +296,8 @@ func (q modelDeploymentInstanceQualification) HasFailure() bool {
 	return false
 }
 
-// Eligible is the one question the eligibility write asks. Any UNKNOWN leg holds, so a held
-// instance can never be restored by a leg that was merely skipped.
+// Eligible 是写入资格状态时唯一询问的条件。只要存在任意 UNKNOWN 检查项即保持现状，
+// 因此处于保持状态的 instance 绝不会因为某个检查项被跳过而恢复资格。
 func (q modelDeploymentInstanceQualification) Eligible() bool {
 	for _, leg := range q.Legs {
 		if leg.Verdict != modelDeploymentLegVerified {
@@ -323,14 +308,13 @@ func (q modelDeploymentInstanceQualification) Eligible() bool {
 	return true
 }
 
-// Conclusive reports whether the predicate reached a DEFINITE answer for this replica, as opposed
-// to leaving a question open. It is what separates a revoked replica from a held one: a revoked
-// replica is conclusively not eligible and stays that way, while a held one may still qualify once
-// the missing observation lands.
+// Conclusive 报告谓词是否已对该副本得出明确结论，而非留下悬而未决的问题。
+// 它用于区分被撤销的副本与被保持的副本：被撤销的副本已明确不具备资格且将保持该状态，
+// 而被保持的副本在缺失的观测到位后仍可能获得资格。
 //
-// Only a conclusive replica may contribute to a published qualified count. Counting a held
-// replica's current false as if it were final would publish a number the next pass has to take
-// back, and would report a group as fully disqualified when it is really unobserved.
+// 只有结论明确的副本才能计入对外发布的合格计数。若把被保持副本当前的 false 当作最终结果
+// 计入统计，会导致上一轮发布的数字在下一轮被迫收回，也会将实际处于未观测状态的组误报为
+// 完全不合格。
 func (q modelDeploymentInstanceQualification) Conclusive() bool {
 	for _, leg := range q.Legs {
 		if leg.Verdict == modelDeploymentLegUnknown {
@@ -341,8 +325,8 @@ func (q modelDeploymentInstanceQualification) Conclusive() bool {
 	return true
 }
 
-// HeldLegs names the legs that are not Verified, in a stable order, so the reported reason does
-// not change between two passes over an unchanged group.
+// HeldLegs 按稳定顺序列出未达到 Verified 的检查项名称，从而确保在组状态未变时，
+// 连续两轮协调报告的原因不会来回变化。
 func (q modelDeploymentInstanceQualification) HeldLegs() []modelDeploymentQualificationLegName {
 	held := make([]modelDeploymentQualificationLegName, 0, len(q.Legs))
 	for _, leg := range q.Legs {
@@ -355,38 +339,32 @@ func (q modelDeploymentInstanceQualification) HeldLegs() []modelDeploymentQualif
 	return held
 }
 
-// Activated reports whether this replica may have its eligibility RESTORED. Withdrawal is not
-// gated on it and never is.
+// Activated 报告是否允许恢复该副本的资格。资格撤回从来不受此条件限制。
 //
-// THE GATE IS A POSITIVE ANSWER, NOT THE ABSENCE OF ONE. Restore runs when the group-forward leg is
-// Verified, or when the replica is NotApplicable and so has no group to verify. An Unknown leg
-// holds: the probe was made and could not be understood, or the member was never asked, and
-// treating that as permission would restore an endpoint on no evidence at all — which is the whole
-// failure this leg exists to prevent. Reading it as "not Unsupported" would have done exactly that
-// the moment an observation became possible to fail.
+// 该准入门槛要求的是明确的肯定结论，而非否定结论的缺失。仅当 group-forward 检查项为
+// Verified，或副本为 NotApplicable（即不存在需要验证的组）时才允许恢复。Unknown 状态
+// 会阻止恢复：这意味着探测无法解析或根本未能询问成员，若将其视为放行许可，就会在毫无
+// 依据的情况下恢复端点——而这正是该检查项要防止的失效模式。若把条件写成“非 Unsupported”，
+// 一旦观测可能失败就会落入同样的问题。
 //
-// The gate exists because the group-forward leg is Unsupported for a shape no probe can reach. With
-// the capability unavailable, the reconciler may not put an endpoint back into selection, because
-// doing so would grant eligibility on a weaker signal than the spec requires. It may still take an
-// endpoint out, because that is the direction the health faults all point.
+// 设置该门槛是因为对于探针无法触达的部署形态，group-forward 检查项会返回 Unsupported。
+// 在缺乏该观测能力时，reconciler 不得将端点重新放回选路集合，否则就相当于在低于规范要求的
+// 弱信号下授予了资格；但它仍可以移除端点，因为所有健康故障信号都指向同一撤回方向。
 func (q modelDeploymentInstanceQualification) Activated() bool {
 	return q.GroupForward.State == modelDeploymentGroupForwardVerified ||
 		q.GroupForward.State == modelDeploymentGroupForwardNotApplicable
 }
 
-// qualifyModelDeploymentInstances evaluates the whole-group predicate once per replica.
+// qualifyModelDeploymentInstances 为每个副本评估一次整组健康谓词。
 //
-// THE CHEAP LEGS ARE EVALUATED FIRST AND THE OBSERVATION LAST, which is an ordering with a
-// consequence rather than a preference. A replica that is short a member or holds an unready one
-// is already condemned by facts the informer cache carries, so it never pays for a live
-// observation, and more importantly its definite fault is never softened into a hold by an
-// observation that happens to be missing.
+// 先评估低开销检查项、最后执行实时观测，这一顺序具有实质意义而非单纯偏好。
+// 缺少成员或存在未就绪成员的副本已由 informer 缓存中的事实判定失效，因此既无需付出
+// 实时观测开销，更重要的是其明确故障绝不会因恰巧缺少观测而被弱化为保持状态。
 //
-// THE DIRECTED PAIR TRANSPORT IS OPTIONAL. A Prefill or a Decode group is served by a pair, and
-// without that transport this operator has no observation of a pair at all, so such a group
-// answers Unsupported rather than being asked a question it cannot answer. A caller that must see
-// the pair answered has to wire the transport, and a caller that does not gets the answer the
-// ordinary group's shape implies.
+// 有向配对传输通道是可选的。Prefill 或 Decode 组以配对形式提供服务，若未提供该传输通道，
+// 本 operator 就完全无法观测配对状态，因此这类组会直接返回 Unsupported，而不是被问及
+// 无法回答的问题。需要获得配对判定结果的调用方必须接入该传输通道，未接入的调用方则会
+// 按普通组形态得到相应的默认判定结果。
 func qualifyModelDeploymentInstances(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
 	pending modelDeploymentPendingReplacement, fetch modelDeploymentGroupForwardFetch,
@@ -402,8 +380,8 @@ func qualifyModelDeploymentInstances(
 	for _, view := range views {
 		role := roles[view.Role]
 		if role == nil {
-			// A replica of a role the spec no longer names is leaving; it qualifies for nothing
-			// and reporting a held leg for it would be a reason nobody can act on.
+			// 属于 spec 中已不再提及的 role 的副本正在退出；它不具备任何资格，
+			// 为其报告阻塞检查项只会给出无人可采取行动的无效原因。
 			continue
 		}
 
@@ -424,10 +402,10 @@ func qualifyModelDeploymentInstances(
 	return qualifications
 }
 
-// modelDeploymentPairTransport reads the directed pair transport out of the optional argument.
+// modelDeploymentPairTransport 从可选参数中读取有向配对传输通道。
 //
-// AN ABSENT TRANSPORT IS AN UNWIRED CAPABILITY and not a license to ask the pair anyway: the
-// caller that does not wire one has told this operator it has no way to observe a pair.
+// 缺少传输通道代表未接入该观测能力，而不是允许绕过它继续询问配对：
+// 调用方未传入该参数，即表明本 operator 没有观测配对的途径。
 func modelDeploymentPairTransport(
 	pairFetch []modelDeploymentGroupForwardPairFetch,
 ) modelDeploymentGroupForwardPairFetch {
@@ -438,26 +416,24 @@ func modelDeploymentPairTransport(
 	return pairFetch[0]
 }
 
-// modelDeploymentReplicaLocal is the part of one replica's answer that needs no observation.
+// modelDeploymentReplicaLocal 保存单个副本判定结果中无需实时观测的部分。
 //
-// THE LOCAL LEGS ARE HERE AND NOT IN THE QUALIFICATION because the observation needs to know them
-// before it asks anything: a pair can only be asked about two replicas that are both ready and
-// complete, and a replica that is neither is never asked about at all.
+// 本地检查项放在此处而非直接放进最终资格结果中，是因为在发起任何观测前必须先了解
+// 这些状态：只有成员完整且均已就绪的两个副本才能参与配对探测，不满足的副本根本不会被探测。
 type modelDeploymentReplicaLocal struct {
-	// view is the replica these legs belong to.
+	// view 是这些检查项所属的副本视图。
 	view modelDeploymentReplicaView
-	// role is the role the replica belongs to.
+	// role 是该副本所属的角色。
 	role *workercore.ModelDeploymentRole
-	// membersComplete and membersReady are the two member legs.
+	// membersComplete 和 membersReady 是两个成员判定项。
 	membersComplete modelDeploymentQualificationLeg
 	membersReady    modelDeploymentQualificationLeg
 }
 
-// newModelDeploymentReplicaLocal decides the two member legs of one replica.
+// newModelDeploymentReplicaLocal 确定单个副本的两个成员判定项。
 //
-// COMPLETENESS IS MEASURED AGAINST THE GROUP TOTAL THE MEMBERS DECLARE, never the role's declared
-// size, so a replica the role has been edited away from stays whole. A shape the members cannot
-// establish holds; a replica short of its total still fails.
+// 完整性依据成员自身声明的组总数来衡量，而非角色声明的大小，从而使因角色被修改而脱离当前配置的副本仍保持完整。
+// 成员无法确立形态时保持待定；数量低于其声明总数的副本仍判定为失败。
 func newModelDeploymentReplicaLocal(
 	view modelDeploymentReplicaView, role *workercore.ModelDeploymentRole,
 ) modelDeploymentReplicaLocal {
@@ -484,17 +460,15 @@ func newModelDeploymentReplicaLocal(
 	}
 	switch {
 	case unobserved == len(view.Members) && len(view.Members) > 0:
-		// NOTHING HAS BEEN OBSERVED YET, which is not a fault. A replica this pass just created has
-		// no PodReady condition at all, and reading that as "not ready" would condemn a healthy
-		// deployment the instant it was born -- and would move the reported answer on the first pass
-		// after the create, which is a write an unchanged spec should not issue.
+		// 尚未观测到任何状态，这并非故障。本轮刚创建的副本完全没有 PodReady 条件，
+		// 若将其解读为“未就绪”，会在健康部署刚创建时就误判其异常——并且会在创建后的下一轮
+		// 导致上报结果发生变化，而未变更的 spec 不应触发这种状态写入。
 		membersReady.Verdict = modelDeploymentLegUnknown
 		membersReady.Reason = "no member's readiness has been observed yet"
 	case unready == 0 && unobserved > 0:
-		// ONE MEMBER'S READINESS IS NOT THE WHOLE GROUP'S. A replica with a ready member and a
-		// sibling still inside its startup window has not made the observation this leg names,
-		// so it holds: reading it as "every member reports ready" would grant eligibility on a
-		// partial answer.
+		// 单个成员就绪不代表整个组就绪。当副本中一个成员已就绪而另一个同级成员仍处于启动窗口期内时，
+		// 尚未完成该判定项所要求的观测，因此保持待定：若将其解读为“所有成员均报告就绪”，
+		// 就会基于不完整的结果授予资格。
 		membersReady.Verdict = modelDeploymentLegUnknown
 		membersReady.Reason = strconvx.Itoa(unobserved) + " of " +
 			strconvx.Itoa(len(view.Members)) + " members are still starting"
@@ -514,16 +488,16 @@ func newModelDeploymentReplicaLocal(
 	}
 }
 
-// localReady reports whether the replica is complete and every member of it reports Ready=True.
+// localReady 报告副本是否完整且其所有成员均报告 Ready=True。
 //
-// IT IS THE CONDITION A PAIR IS ASKED UNDER, and it is stricter than the ordinary group's: a pair
-// speaks for two replicas at once, so a replica that is not serving must not be one half of it.
+// 这是进行配对探测的前提条件，比普通组的条件更严格：一个配对同时代表两个副本，
+// 因此未处于服务状态的副本绝不能成为配对的一方。
 func (l modelDeploymentReplicaLocal) localReady() bool {
 	return l.membersComplete.Verdict == modelDeploymentLegVerified &&
 		l.membersReady.Verdict == modelDeploymentLegVerified
 }
 
-// localFault names the member leg that stopped the replica from being asked about.
+// localFault 返回阻止对该副本进行探测的成员判定项名称。
 func (l modelDeploymentReplicaLocal) localFault() string {
 	if l.membersComplete.Verdict != modelDeploymentLegVerified {
 		return l.membersComplete.Reason
@@ -532,11 +506,9 @@ func (l modelDeploymentReplicaLocal) localFault() string {
 	return l.membersReady.Reason
 }
 
-// modelDeploymentQualification assembles one replica's whole-group answer from its local legs and
-// its observation.
+// modelDeploymentQualification 根据副本的本地判定项及其观测结果组装整个组的判定结论。
 //
-// THE LEG ORDER IS UNCHANGED, because the order the legs are read in is the order a reader of the
-// status reads them in.
+// 判定项的顺序保持不变，因为读取判定项的顺序就是状态读取方看到它们的顺序。
 func (l modelDeploymentReplicaLocal) modelDeploymentQualification(
 	md *workercore.ModelDeployment, pending modelDeploymentPendingReplacement,
 	answer modelDeploymentGroupForwardAnswer,
@@ -555,10 +527,9 @@ func (l modelDeploymentReplicaLocal) modelDeploymentQualification(
 		}
 	}
 
-	// COMPLETENESS IS NOT REDUNDANT WITH READINESS. A replica short of a declared member can
-	// have every member it does hold reporting ready, while Kueue has composed no Workload for
-	// it and it is admitted by nothing. It is absent with some Pods lying around, not partly
-	// working.
+	// 完整性检查与就绪性检查并不冗余。缺少已声明成员的副本可能其现有成员全部报告就绪，
+	// 但 Kueue 并未为其组装 Workload，也未准入任何资源。这种情况属于成员缺失（仅残留部分 Pod），
+	// 而非部分正常工作。
 	qualification.Legs = append(qualification.Legs, l.membersComplete)
 	qualification.Legs = append(qualification.Legs, l.membersReady)
 
@@ -588,19 +559,18 @@ func (l modelDeploymentReplicaLocal) modelDeploymentQualification(
 	return qualification
 }
 
-// modelDeploymentGroupForwardAnswer is one replica's observation and the evidence behind it.
+// modelDeploymentGroupForwardAnswer 表示单个副本的观测结果及其背后依据。
 type modelDeploymentGroupForwardAnswer struct {
-	// forward is the observation itself.
+	// forward 为观测结果本身。
 	forward modelDeploymentGroupForward
-	// attempt is the directed pair attempt that verified this replica, when a verified pair did.
+	// attempt 为验证该副本的有向配对尝试记录（当通过已验证的配对完成验证时存在）。
 	attempt *modelDeploymentGroupForwardPairAttempt
 }
 
-// modelDeploymentGroupForwardAnswers asks the observation for every replica.
+// modelDeploymentGroupForwardAnswers 获取每个副本的观测结果。
 //
-// THE ORDINARY ROLES ARE ASKED ONE BY ONE, and the Prefill and the Decode roles are asked AS PAIRS,
-// because neither half of a pair serves on its own: the prefiller computes the KV and the decoder
-// consumes it, so one request that comes back with the copied answer is evidence about both.
+// 普通角色逐一探测，而 Prefill 和 Decode 角色则成对探测，因为配对中的任何一方都无法单独提供服务：
+// prefiller 计算 KV 而 decoder 消费 KV，因此一个返回预期响应的请求即可同时作为双方的有效证据。
 func modelDeploymentGroupForwardAnswers(
 	ctx context.Context, md *workercore.ModelDeployment,
 	locals []modelDeploymentReplicaLocal,
@@ -622,11 +592,9 @@ func modelDeploymentGroupForwardAnswers(
 			continue
 		}
 
-		// A REPLICA CONDEMNED BY A DEFINITE MEMBER LEG OWES NOTHING TO A LIVE PROBE: the request
-		// would spend engine tokens on an answer that cannot soften the fault. The observation is
-		// still ASKED, with no transport: answers that never needed the network (a one-member
-		// replica is NotApplicable, an unverified shape is Unsupported) are unchanged, and only the
-		// probe leg comes back as an absence of evidence.
+		// 已被明确判定为失败的成员判定项所否决的副本无需进行实时探测：发送请求只会消耗推理引擎的 token，
+		// 却无法改变故障结论。此时仍会以无传输方式调用观测逻辑：不依赖网络的结论（单成员副本为
+		// NotApplicable，未验证的形态为 Unsupported）保持不变，仅探测项返回缺少证据。
 		transport := fetch
 		if local.membersComplete.Verdict == modelDeploymentLegFailed ||
 			local.membersReady.Verdict == modelDeploymentLegFailed {
@@ -644,11 +612,10 @@ func modelDeploymentGroupForwardAnswers(
 	return answers
 }
 
-// modelDeploymentPairAnswers answers the Prefill and the Decode replicas of one deployment.
+// modelDeploymentPairAnswers 获取同一部署中 Prefill 与 Decode 副本的探测结果。
 //
-// THE CONFIGURATION IS DECIDED ONCE FOR BOTH ROLES, because a pair is a fact about the two roles
-// together: a role whose route this operator does not know cannot be paired with anything, and
-// neither can its opposite.
+// 两个角色的配置会一次性联合判定，因为配对涉及双方角色：若其中某个角色的路由本 operator 无法识别，
+// 则该角色无法与任何对端配对，其对端角色亦然。
 func modelDeploymentPairAnswers(
 	ctx context.Context, md *workercore.ModelDeployment,
 	locals []modelDeploymentReplicaLocal,
@@ -662,9 +629,8 @@ func modelDeploymentPairAnswers(
 
 	unsupported, unsupportedReason := modelDeploymentGroupForwardPairSupport(md)
 
-	// THE CANDIDATES ARE THE ONES THAT MAY BE ASKED ABOUT. Every replica that is not a candidate
-	// already has its answer: the shape has no observation of it, or the replica is not ready
-	// enough to be asked about, or the transport is unwired.
+	// 候选列表包含可以进行探测的副本。所有非候选副本均已有确定结果：要么该形态无需观测，
+	// 要么副本尚未达到可探测的就绪状态，要么传输通道未连接。
 	candidates := func(group []int) []int {
 		ready := make([]int, 0, len(group))
 		for _, i := range group {
@@ -698,8 +664,7 @@ func modelDeploymentPairAnswers(
 	readyPrefills := candidates(prefills)
 	readyDecodes := candidates(decodes)
 
-	// A PAIR WITH NO PARTNER IS NOT A PAIR, so a replica with no ready counterpart holds with the
-	// reason that names what is missing.
+	// 缺少对端成员的配对无法成对，因此没有就绪对端副本的实例将保持待定，并注明所缺失的对象。
 	if len(readyPrefills) == 0 || len(readyDecodes) == 0 {
 		for _, i := range append(append([]int{}, readyPrefills...), readyDecodes...) {
 			answers[i] = modelDeploymentGroupForwardAnswer{
@@ -712,8 +677,7 @@ func modelDeploymentPairAnswers(
 		return answers
 	}
 
-	// THE RECIPES ARE ASKED IN A FIXED ORDER, so one pass asks the same pairs in the same order
-	// every time.
+	// 按固定顺序发起探测，以确保每一轮都以相同顺序探测相同的配对。
 	slices.SortStableFunc(readyPrefills, func(a, b int) int {
 		return locals[a].view.Ordinal - locals[b].view.Ordinal
 	})
@@ -725,8 +689,7 @@ func modelDeploymentPairAnswers(
 	for _, prefill := range readyPrefills {
 		for _, decode := range readyDecodes {
 			if verified[prefill] && verified[decode] {
-				// NEITHER SIDE STILL NEEDS THIS PAIR, so asking it again could not change either
-				// answer and would spend engine tokens to learn nothing.
+				// 双方均已不再需要此次配对探测，因此再次探测既不会改变任何一方的结果，还会白白消耗推理引擎的 token。
 				continue
 			}
 
@@ -734,9 +697,8 @@ func modelDeploymentPairAnswers(
 				ctx, md, locals[prefill].view, locals[decode].view, fetch,
 			)
 
-			// THE TWO SIDES ARE FOLDED INDEPENDENTLY, because the driver answers each side on its
-			// own account. A VERIFIED ANSWER IS NEVER DISPLACED by a later unsuccessful partner,
-			// and the attempt that verified a replica is the evidence kept beside it.
+			// 配对双方独立汇总结果，因为驱动会分别给出各自的结果。已验证的结果绝不会被后续失败的配对伙伴覆盖，
+			// 且验证该副本的那次尝试记录会作为依据保留在旁。
 			if !verified[prefill] {
 				answers[prefill] = modelDeploymentGroupForwardAnswer{forward: result.Prefill}
 			}
@@ -761,25 +723,24 @@ func modelDeploymentPairAnswers(
 	return answers
 }
 
-// modelDeploymentGroupForwardPairSupport reports whether this operator has NO verified observation for
-// the directed pair this deployment's shape implies, and why it has none.
+// modelDeploymentGroupForwardPairSupport 报告本 operator 是否无法对该部署形态对应的有向配对
+// 提供已验证的观测支持，以及不支持的原因。
 //
-// THE CHECKS ARE NARROW AND NAMED, because a general engine-support table would be a second place
-// where engine differences are decided, and the pair driver already decides most of them.
+// 这些检查精确且具名，因为维护一份通用的引擎支持表会导致引擎差异在两处重复判定，
+// 而配对驱动本身已经决定了其中大部分差异。
 //
-// THE FIRST ANSWER MEANS UNSUPPORTED, so that the call site reads as the question it is.
+// 第一个返回值表示不支持，以便调用处代码更符合其语义。
 func modelDeploymentGroupForwardPairSupport(
 	md *workercore.ModelDeployment,
 ) (bool, string) {
-	// THE ENGINE IS THE PAIR DRIVER'S OWN FACT, and the driver states it the same way.
+	// 引擎支持情况由配对驱动自身决定，驱动也会以相同方式说明。
 	if _, known := modelDeploymentGroupForwardPairEngines[md.Spec.Engine.Name]; !known {
 		return true, "engine " + md.Spec.Engine.Name +
 			" has no group-forward observation this operator has verified"
 	}
 
-	// A ROLE THAT TOOK OVER ITS COMMAND LINE SERVES A ROUTE THIS OPERATOR DOES NOT KNOW, and a
-	// pair cannot be asked at a route nobody knows. The check covers BOTH halves of the pair,
-	// because a half that cannot be paired with is not made pairable by a partner that can.
+	// 接管了自身命令行的角色所提供的路由本 operator 无法获知，而配对无法向未知路由发起探测。
+	// 此检查覆盖配对的双方，因为无法配对的一方不会因为对端可配对而变得可配对。
 	for i := range md.Spec.Roles {
 		role := &md.Spec.Roles[i]
 		switch ModelDeploymentEffectiveRoleKind(role) {
@@ -794,9 +755,8 @@ func modelDeploymentGroupForwardPairSupport(
 		}
 	}
 
-	// THE VLLM PAIR IS OBSERVABLE ONLY THROUGH THE ROUTING PROXY, because the connector's
-	// handshake names the prefiller by an engine id that comes out of the prefiller's own transfer
-	// registry, and this operator does not read that registry.
+	// vLLM 配对仅能通过路由代理进行观测，因为 connector 握手时通过来自 prefiller 自身传输注册表的
+	// engine id 来指定 prefiller，而本 operator 并不读取该注册表。
 	if md.Spec.Engine.Name == workercore.ModelDeploymentEngineVLLM {
 		if decodeRole := modelDeploymentGroupForwardPairDecodeRole(md); decodeRole != nil &&
 			!ModelDeploymentRoleFrontedByProxy(md, decodeRole) {
@@ -809,28 +769,22 @@ func modelDeploymentGroupForwardPairSupport(
 	return false, ""
 }
 
-// modelDeploymentMemberReadiness reads one member's own readiness as three answers rather than
-// the two podIsReady returns.
+// modelDeploymentMemberReadiness 将单个成员的就绪状态读取为三种结论，而非 podIsReady 返回的两种。
 //
-// THE ABSENCE OF A CONDITION IS NOT A NEGATIVE ANSWER. A Pod that has just been created carries no
-// PodReady condition at all, and podIsReady calls that not-ready. For a question about whether a
-// group is healthy that is the wrong reading twice over: it condemns a deployment for existing,
-// and it makes the answer move on the pass after the create, which is a status write an unchanged
-// spec has no reason to issue. A condition that is present and False is a real observation and is
-// reported as one.
+// 条件缺失并不等同于否定结论。刚创建的 Pod 完全没有 PodReady 条件，而 podIsReady 会将其判为未就绪。
+// 若用于判断组是否健康，这种解读存在双重错误：它会仅仅因为部署刚创建就判定其异常，
+// 并且会在创建后的下一轮导致结果变动，而未变更的 spec 不应触发此类状态写入。
+// 只有存在且为 False 的条件才是真实的观测结果，应如实上报。
 //
-// AN UNKNOWN CONDITION IS ABSENCE OF EVIDENCE TOO. Kubernetes legitimately writes PodReady=Unknown
-// (a kubelet that is restarting, a node gone quiet, an eviction in progress), and at that moment
-// nothing is known about the member's health; reading it as Failed would report a definite fault
-// the cluster never observed. Only False is the definite answer.
+// Unknown 条件同样属于缺少证据。Kubernetes 会在合理场景下写入 PodReady=Unknown
+// （如 kubelet 正在重启、Node 失联、驱逐正在进行），此时成员的健康状况未知；
+// 将其视为 Failed 会报告集群从未观测到的确定性故障。只有 False 才是确定性结论。
 //
-// A CONTAINER STILL IN ITS STARTUP WINDOW IS NOT A FAULT EITHER. A running container kubelet has
-// not marked Started is one whose startupProbe has not yet succeeded, which is the state a large
-// model can sit in for a long time while it compiles graphs; reading it as Failed would revoke a
-// replica for starting slowly and restart the very compilation the startup budget exists to
-// protect. A container stuck in a terminal waiting reason is the opposite: a definite fault
-// reported as one even before any readiness answer exists, because a group known to be broken
-// needs no further evidence.
+// 仍处于启动窗口期内的容器也不属于故障。kubelet 尚未标记为 Started 的运行中容器，
+// 意味着其 startupProbe 尚未成功——大模型在编译计算图时可能会长期处于此状态；
+// 若将其判为 Failed，就会因为启动较慢而撤销副本资格，进而打断启动时间预算本应保护的编译过程。
+// 处于终态等待原因的容器则恰恰相反：即便尚未产生任何就绪结果，也应直接作为确定性故障上报，
+// 因为已明确损坏的组无需更多证据。
 func modelDeploymentMemberReadiness(pod *core.Pod) modelDeploymentLegVerdict {
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == core.PodReady && condition.Status == core.ConditionTrue {
@@ -870,9 +824,8 @@ func modelDeploymentMemberReadiness(pod *core.Pod) modelDeploymentLegVerdict {
 	return modelDeploymentLegUnknown
 }
 
-// groupForwardVerdict maps the observation's own state onto the leg's verdict. An Unsupported
-// observation is UNKNOWN rather than FAILED: nothing is known to be wrong with the group, and
-// reporting Failed would claim a health fault this operator cannot see.
+// groupForwardVerdict 将观测自身的状态映射为判定项的结论。Unsupported 的观测结果映射为
+// UNKNOWN 而非 FAILED：此时并未发现组存在任何异常，若报告 Failed 则相当于宣称了本 operator 无法确认的健康故障。
 func groupForwardVerdict(state modelDeploymentGroupForwardState) modelDeploymentLegVerdict {
 	switch state {
 	case modelDeploymentGroupForwardNotApplicable, modelDeploymentGroupForwardVerified:
@@ -884,10 +837,9 @@ func groupForwardVerdict(state modelDeploymentGroupForwardState) modelDeployment
 	}
 }
 
-// retirementVerdict reports whether a retirement is planned for this replica. A reservation is
-// read here and NEVER written, and only to say that a planned departure is not a group fault:
-// health revocation and member replacement revoke independently of any reservation, so nothing
-// downstream of a reservation can keep an unhealthy group eligible.
+// retirementVerdict 报告该副本是否已有计划中的退服安排。此处仅读取预留信息而绝不写入，
+// 且仅用于说明计划中的退出不属于组故障：健康状态撤销与成员替换会独立于任何预留执行，
+// 因此预留后续的任何逻辑都无法让不健康的组继续保持合格资格。
 func retirementVerdict(
 	md *workercore.ModelDeployment, view modelDeploymentReplicaView,
 ) modelDeploymentLegVerdict {
@@ -898,7 +850,7 @@ func retirementVerdict(
 	return modelDeploymentLegVerified
 }
 
-// retirementReason names the reservation that claims this replica, or says there is none.
+// retirementReason 说明占用该副本的预留名称，或指出不存在此类预留。
 func retirementReason(
 	md *workercore.ModelDeployment, view modelDeploymentReplicaView,
 ) string {
@@ -909,9 +861,8 @@ func retirementReason(
 	return "a retirement reservation names this replica"
 }
 
-// retirementTargets reports whether the deployment's single reservation names this replica. A
-// reservation in any state claims it, because a held or completed operation is still a decision
-// about this replica rather than an absence of one.
+// retirementTargets 报告部署的单个预留是否指定了该副本。处于任何状态的预留都会认定其占用该副本，
+// 因为挂起或已完成的操作仍然是对该副本做出的决定，而非没有决定。
 func retirementTargets(
 	md *workercore.ModelDeployment, view modelDeploymentReplicaView,
 ) bool {
@@ -926,9 +877,8 @@ func retirementTargets(
 	return view.Seated && int(reservation.ReplicaOrdinal) == view.Ordinal
 }
 
-// modelDeploymentQualificationsByMember indexes the qualifications by the UID of every member
-// they cover, so the eligibility write, which runs per Pod, can reach its replica's answer
-// without regrouping anything a second time.
+// modelDeploymentQualificationsByMember 按所覆盖每个成员的 UID 建立资格判定结果索引，
+// 从而使按 Pod 执行的资格写入逻辑能够直接获取对应副本的结果，无需再次分组。
 func modelDeploymentQualificationsByMember(
 	qualifications []modelDeploymentInstanceQualification,
 ) map[types.UID]modelDeploymentInstanceQualification {
@@ -942,20 +892,16 @@ func modelDeploymentQualificationsByMember(
 	return byMember
 }
 
-// modelDeploymentRoleQualified counts the replicas of each role whose whole group qualified.
+// modelDeploymentRoleQualified 统计每个角色中整组通过资格判定的副本数量。
 //
-// THE COUNT IS NIL WHENEVER ANY REPLICA OF THE ROLE IS INCONCLUSIVE, which is the distinction
-// the wire makes between an unobserved list and an observed empty one. A role with three
-// qualified replicas and one held does not report three eligible endpoints: it reports nothing it
-// can stand behind, because a reader seeing three would conclude the role is qualified while a
-// fourth replica is not known.
+// 只要该角色存在任意尚未定论的副本，计数即为 nil，这是传输格式用来区分“未观测到的列表”与“已观测到的空列表”的方式。
+// 拥有三个合格副本和一个待定副本的角色不会上报三个合格端点：它不会上报无法担保的数值，
+// 因为看到数字 3 的读取方会误以为该角色状态明确，而实际上第四个副本尚不明确。
 //
-// A REPLICAS THAT IS CONCLUSIVELY NOT QUALIFIED STILL COUNTS. It is a definite answer to the
-// question, so a role of two replicas with one qualified and one revoked reports one, and a role
-// whose every replica is known and none qualifies reports an EXPLICIT ZERO -- the list is
-// complete and it is empty, which is what a revoked replica looks like. A count is published for
-// every role the predicate looked at, so a role that qualifies nothing reports zero rather than
-// vanishing from the status.
+// 明确不合格的副本仍计入已定论范围。它代表对问题的确定回答，因此一个包含两个副本（一个合格、一个被撤销资格）
+// 的角色会上报 1；而一个所有副本均已明确且无一合格的角色会上报显式的 0——列表完整且为空，
+// 这正是副本资格被撤销后的表现。每个经由该谓词评估的角色都会发布计数，因此没有合格副本的角色会报告 0，
+// 而非从状态中消失。
 func modelDeploymentRoleQualified(
 	qualifications []modelDeploymentInstanceQualification,
 ) map[string]*int32 {
@@ -968,12 +914,10 @@ func modelDeploymentRoleQualified(
 			seen[role] = true
 			conclusive[role] = true
 		}
-		// The flag is INTERSECTED ACROSS EVERY REPLICA, so one inconclusive replica demotes the
-		// role however many of its siblings qualified. Setting it on the first conclusive replica
-		// instead would publish a partial count and hide the open question behind it.
+		// 该标志会对所有副本取交集，因此无论有多少同级副本合格，只要有一个未定论的副本就会使整个角色降级为未定论。
+		// 若改为在第一个已定论副本上设置该标志，则会发布不完整的计数并掩盖尚未解决的悬而未决状态。
 		conclusive[role] = conclusive[role] && qualification.Conclusive()
-		// A replica can only be eligible if every leg verified, which already makes it
-		// conclusive, so no separate guard is needed here.
+		// 副本只有在每个判定项都通过验证时才具备资格，这本身就意味着结论已定，因此此处无需额外检查。
 		if qualification.Eligible() {
 			qualified[role]++
 		}

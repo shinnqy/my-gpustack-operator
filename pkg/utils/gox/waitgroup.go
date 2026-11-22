@@ -21,8 +21,8 @@ type IContextWaitGroup interface {
 	Go(func(context.Context) error)
 }
 
-// Group returns a waiting group,
-// which closes at all tasks finishing and aggregates errors from tasks.
+// Group 返回一个等待组，
+// 该等待组在所有任务完成时关闭并聚合来自任务的 error。
 func Group() IWaitGroup {
 	lg := klog.Background().WithName("gopool")
 	return &waitGroup{lg: lg}
@@ -35,13 +35,13 @@ type waitGroup struct {
 	err error
 }
 
-// Wait blocks until all tasks completed and aggregates errors from tasks.
+// Wait 阻塞直到所有任务完成，并聚合来自任务的 error。
 func (g *waitGroup) Wait() error {
 	g.g.Wait()
 	return g.err
 }
 
-// Go submits a task as goroutine.
+// Go 将任务作为 goroutine 提交。
 func (g *waitGroup) Go(f func() error) {
 	if f == nil {
 		return
@@ -72,8 +72,8 @@ func (g *waitGroup) Go(f func() error) {
 	})
 }
 
-// newContextWaitGroup returns the group concretely, so a caller inside this package can reach the
-// derived context that the IWaitGroup interface does not carry.
+// newContextWaitGroup 返回具体的等待组类型，以便包内调用方能够访问
+// IWaitGroup 接口未携带的派生 context。
 func newContextWaitGroup(ctx context.Context) contextWaitGroup {
 	return contextWaitGroup{
 		lg: klog.Background().WithName("gopool"),
@@ -86,19 +86,18 @@ type contextWaitGroup struct {
 	g  pond.TaskGroup
 }
 
-// Wait blocks until either all tasks completed or
-// one of them returned a non-nil error or the context associated to this group
-// was canceled.
+// Wait 阻塞直到所有任务完成、
+// 其中任一任务返回非 nil error，或与该等待组关联的 context 被取消。
 func (g contextWaitGroup) Wait() error {
 	return g.g.Wait()
 }
 
-// context returns the context this group's tasks are meant to run under.
+// context 返回该等待组中的任务应运行的 context。
 func (g contextWaitGroup) context() context.Context {
 	return g.g.Context()
 }
 
-// Go submits a task as goroutine.
+// Go 将任务作为 goroutine 提交。
 func (g contextWaitGroup) Go(f func() error) {
 	if f == nil {
 		return
@@ -119,15 +118,15 @@ func (g contextWaitGroup) Go(f func() error) {
 	g.g.SubmitErr(wf)
 }
 
-// GroupWithContextIn is similar as GroupWithContext but hands each task the group's own derived
-// context at submitting, a kind of more compact usage.
+// GroupWithContextIn 与 GroupWithContext 类似，但在提交时向每个任务传入等待组自身的派生
+// context，是一种更紧凑的用法。
 //
-// That context is deliberately not the caller's. It ends when the caller's does, and also as soon as
-// any task in the group returns an error — so a task watching nothing but its context still returns
-// when a sibling fails. Which is what lets the group report that failure at all: Wait does not return
-// until every task has, so one task waiting on a context nobody cancels holds a sibling's error back
-// for as long as the caller lives. A task that simply returns nil cancels nothing, so a group of
-// tasks that hand off to each other still runs to completion.
+// 该 context 刻意不是调用方的 context。它会在调用方的 context 结束时终止，也会在
+// 组内任一任务返回 error 时立即终止——因此仅监听自身 context 的任务在兄弟任务失败时
+// 仍能返回。这正是让等待组能够上报该失败的原因：Wait 必须等所有任务都返回后才会返回，
+// 因此如果一个任务一直在等待没人取消的 context，就会导致兄弟任务的 error 在调用方
+// 存活期间一直无法返回。仅返回 nil 的任务不会触发取消，因此相互协作接力的任务组
+// 仍会运行直至全部完成。
 func GroupWithContextIn(ctx context.Context) IContextWaitGroup {
 	g := newContextWaitGroup(ctx)
 
@@ -139,14 +138,13 @@ type embeddedContextWaitGroup struct {
 	c context.Context
 }
 
-// Wait blocks until either all tasks completed or
-// one of them returned a non-nil error or the context associated to this group
-// was canceled.
+// Wait 阻塞直到所有任务完成、
+// 其中任一任务返回非 nil error，或与该等待组关联的 context 被取消。
 func (g embeddedContextWaitGroup) Wait() error {
 	return g.g.Wait()
 }
 
-// Go submits a task as goroutine.
+// Go 将任务作为 goroutine 提交。
 func (g embeddedContextWaitGroup) Go(f func(context.Context) error) {
 	if f == nil {
 		return

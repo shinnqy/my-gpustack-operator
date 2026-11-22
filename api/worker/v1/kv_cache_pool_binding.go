@@ -7,11 +7,10 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// KVCachePoolBinding grants a namespace a cache quota and reuse domain within a pool.
+// KVCachePoolBinding 在一个池内为命名空间授予缓存配额和复用域。
 //
-// Configuration changes proxy to the v1alpha1 resource. Controller-owned status is read-only
-// through the main object; the public API serves no status subresource. Main-resource writes
-// preserve the backing resource's status.
+// 配置变更会代理到 v1alpha1 资源。由控制器管理的 status 通过主对象只读访问；
+// 公共 API 不提供 status 子资源。对主资源的写入会保留底层资源的 status。
 //
 // +genclient
 // +genclient:noStatus
@@ -21,7 +20,7 @@ type KVCachePoolBinding workercore.KVCachePoolBinding
 
 var _ runtime.Object = (*KVCachePoolBinding)(nil)
 
-// KVCachePoolBindingList holds the list of KVCachePoolBindings.
+// KVCachePoolBindingList 保存 KVCachePoolBinding 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type KVCachePoolBindingList struct {

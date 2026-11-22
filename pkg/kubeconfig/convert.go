@@ -10,14 +10,13 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// ConvertRestConfigToRestClientGetter converts a rest config to a RESTClientGetter,
+// ConvertRestConfigToRestClientGetter 将 rest.Config 转换为 RESTClientGetter。
 func ConvertRestConfigToRestClientGetter(cfg *rest.Config) genericclioptions.RESTClientGetter {
 	rcg := restClientGetter(*cfg)
 	return &rcg
 }
 
-// restClientGetter is a RESTClientGetter interface implementation for the
-// Helm Go packages.
+// restClientGetter 是供 Helm Go 包使用的 RESTClientGetter 接口实现。
 type restClientGetter rest.Config
 
 func (g restClientGetter) ToRESTConfig() (*rest.Config, error) {
@@ -46,7 +45,7 @@ func (g restClientGetter) ToRESTMapper() (kmeta.RESTMapper, error) {
 }
 
 func (g restClientGetter) ToRawKubeConfigLoader() clientcmd.ClientConfig {
-	// Build our config and client.
+	// 构建配置和客户端。
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},

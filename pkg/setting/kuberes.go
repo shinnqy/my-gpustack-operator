@@ -18,24 +18,23 @@ import (
 )
 
 var (
-	// DelegatedSecretNamespace is the delegated Kubernetes Secret namespace for the settings.
+	// DelegatedSecretNamespace 是用于托管配置项的 Kubernetes Secret 所在 Namespace。
 	DelegatedSecretNamespace = systemname.NamespaceName
 
-	// DelegatedSecretName is the delegated Kubernetes Secret name for the settings.
+	// DelegatedSecretName 是用于托管配置项的 Kubernetes Secret 名称。
 	DelegatedSecretName = "gpustack-settings"
 )
 
-// DefaultTrackingName is the name of the Setting whose comma-separated value lists the Settings
-// that follow the operator's built-in default instead of an administrator's stored value.
+// DefaultTrackingName 是一个 Setting 的名称，其逗号分隔的值列出了遵循 operator 内置默认值
+// 而非使用管理员存储值的各项 Setting。
 //
-// The align pass resolves it by name in the settings registry, and the registry registers it
-// under this same name. The two must agree: a Setting registered under any other name would be
-// matched by neither the read nor the list, and no Setting would be tracked at all.
+// 对齐过程会按该名称在配置注册表中解析它，而注册表也以同一名称注册该项。两者必须保持一致：
+// 若以其他名称注册，读取逻辑与追踪列表均无法匹配到它，从而导致没有任何 Setting 被追踪。
 const DefaultTrackingName = "settings-default-tracking"
 
-// Initialize initializes Kubernetes resources for settings.
+// Initialize 初始化配置项所需的 Kubernetes 资源。
 //
-// Initialize creates the delegated Kubernetes Secret for settings.
+// Initialize 会创建用于托管配置项的 Kubernetes Secret。
 func (h Settings) Initialize(ctx context.Context, cli kubernetes.Interface) error {
 	err := review.CanDoUpdate(ctx,
 		cli.AuthorizationV1().SelfSubjectAccessReviews(),
@@ -69,14 +68,13 @@ func (h Settings) Initialize(ctx context.Context, cli kubernetes.Interface) erro
 	systemmeta.NoteResource(eSec, eResType, eNotes)
 	alignFn := func(aSec *core.Secret) (_ *core.Secret, skip bool, err error) {
 		skip = true
-		// Align delegated info.
+		// 对齐托管元信息。
 		if !systemmeta.EqualResourceTypeAndNotes(eSec, aSec) {
 			systemmeta.NoteResource(aSec, eResType, eNotes)
 			skip = false
 		}
-		// Align data. An absent key is backfilled first, before any rule is evaluated, so a
-		// newly registered setting with a blank default still appears and a Secret predating
-		// the tracking setting gets its key on this same pass.
+		// 对齐数据。在评估任何规则之前，先回填缺失的键，以便默认值为空的新注册配置项仍能写入，
+		// 且早于追踪配置项创建的 Secret 也能在同一轮对齐中补齐该键。
 		for k := range eSec.Data {
 			if _, ok := aSec.Data[k]; !ok {
 				aSec.Data[k] = eSec.Data[k]
@@ -88,8 +86,8 @@ func (h Settings) Initialize(ctx context.Context, cli kubernetes.Interface) erro
 			stored := string(aSec.Data[name])
 			desired, rule := s.desiredValue(tracking)
 			if desired == "" || desired == stored {
-				// These rules never write a blank value, and an equal value is not an
-				// override, so a pass that changes nothing logs nothing.
+				// 这些规则绝不会写入空值，且相等的值不构成覆盖，
+				// 因此未发生任何变更的对齐过程不会产生日志。
 				continue
 			}
 			aSec.Data[name] = []byte(desired)
@@ -109,23 +107,20 @@ func (h Settings) Initialize(ctx context.Context, cli kubernetes.Interface) erro
 	return nil
 }
 
-// sensitiveValuesWithheld stands in for both values of a sensitive Setting on the override log
-// line. It is a literal no value can equal, so a reader can tell it from an empty value, which
-// reads as a Setting that holds nothing, and from an absent pair, which reads as one the operator
-// never wrote.
+// sensitiveValuesWithheld 在覆盖日志行中同时替代敏感 Setting 的新旧两个值。它是一个任何实际值
+// 都不会与之相等的字面量，使阅读者能够将其与空值（表示 Setting 未保存内容）以及缺失的键值对
+// （表示 operator 从未写入）区分开来。
 const sensitiveValuesWithheld = "[withheld: sensitive setting]"
 
-// overrideLogPairs returns the key-value pairs the override log line carries for this Setting,
-// given the stored value it replaces, the new value it writes and the rule that claimed it.
+// overrideLogPairs 根据被替换的存储值、新写入的值以及触发覆盖的规则，返回该 Setting 在
+// 覆盖日志行中携带的键值对。
 //
-// A sensitive Setting's line carries neither value in any form. The log is a wider audience than
-// the delegated Secret: it is usually readable more broadly and it is shipped to aggregators, CI
-// output and backups, so a value the operator took care to keep out of the Secret must not appear
-// there. The name, the rule and the variable stay, because together they are what tells an
-// operator which Setting changed and why, and none of the three is the value.
+// 敏感 Setting 的日志行不会以任何形式包含这两个值。日志的可见范围比托管 Secret 更广：
+// 通常具有更高的读取权限覆盖面，且会被收集至日志聚合器、CI 输出和备份中，因此 operator 刻意
+// 避免泄露的内容绝不能出现在日志里。配置名称、规则与环境变量名仍会保留，因为这三者足以向
+// 运维人员说明哪个 Setting 发生了变更及其原因，且都不包含配置值本身。
 //
-// A Setting that is not sensitive keeps the line it carried before the marker was honored here,
-// pair for pair and in the same order.
+// 非敏感 Setting 则按原有的键值对及顺序保留与此前一致的日志内容。
 func (s Setting) overrideLogPairs(stored, desired, rule string) []any {
 	pairs := []any{"setting", s.name}
 	if s.Sensitive() {
@@ -140,18 +135,16 @@ func (s Setting) overrideLogPairs(stored, desired, rule string) []any {
 	return pairs
 }
 
-// trackingValue returns the raw tracking list from the live Secret, or an empty string when the
-// Secret carries no such key. The Secret is the only source the align pass consults, because its
-// backfill has already written the built-in default into a Secret that predates the setting, so
-// what the Secret holds here is the administrator's list or that default.
+// trackingValue 从当前 Secret 中返回原始追踪列表，若 Secret 中无此键则返回空字符串。
+// Secret 是对齐过程唯一查询的来源，因为此前的回填步骤已经将内置默认值写入早于该配置项
+// 创建的 Secret 中，所以此时 Secret 中保存的要么是管理员配置的列表，要么就是该默认值。
 func trackingValue(aSec *core.Secret) string {
 	return string(aSec.Data[DefaultTrackingName])
 }
 
-// parseTrackedSettings returns the registered settings the raw tracking list names. It splits on a
-// comma, trims each segment, drops a segment left empty, a duplicate, the tracking setting's own
-// name, and any name the registry does not carry, so a stored value cannot track a setting that
-// does not exist. Every dropped segment is logged once at the fourth verbosity with its reason.
+// parseTrackedSettings 返回原始追踪列表中所指明的已注册配置项集合。它会按逗号分割、去除各段
+// 首尾空白，并丢弃空段、重复项、追踪配置项自身名称以及注册表中不存在的名称，从而防止存储值
+// 追踪不存在的配置项。每个被丢弃的片段都会以 verbosity 4 级别记录一次日志并附带原因。
 func parseTrackedSettings(h Settings, raw string) sets.Set[string] {
 	tracked := sets.New[string]()
 	for _, segment := range strings.Split(raw, ",") {
@@ -179,13 +172,12 @@ func parseTrackedSettings(h Settings, raw string) sets.Set[string] {
 	return tracked
 }
 
-// desiredValue returns the value the operator owns for this Setting and the rule that claimed it.
-// An empty rule means the operator owns nothing here and the stored value is the administrator's.
+// desiredValue 返回 operator 对该 Setting 持有的期望值及主张该值的规则名称。
+// 若规则为空，表示 operator 对此不作管控，沿用管理员存储的值。
 //
-// The operator writes a Setting when its seed is non-blank and the environment declares it or the
-// tracking list names it. A variable present with an empty value yields a blank seed, because a
-// built-in default is substituted only for an absent variable, so a blank declaration claims
-// nothing even for a Setting that has a default.
+// 当某项 Setting 的种子值非空，且环境变量显式声明了该项或追踪列表包含该项时，operator 会写入该值。
+// 若环境变量存在但其值为空，则会得到空种子值——因为内置默认值仅在环境变量缺失时才进行替换，
+// 所以即使该 Setting 拥有默认值，空值声明也不会触发任何写入。
 func (s Setting) desiredValue(tracked sets.Set[string]) (value, rule string) {
 	if isBlank(s.defVal) {
 		return "", ""

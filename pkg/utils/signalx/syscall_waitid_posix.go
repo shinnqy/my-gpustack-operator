@@ -25,13 +25,13 @@ const (
 )
 
 type Siginfo struct {
-	Signo  int32 /* Signal number. */
-	Errno  int32 /* An errno value. */
-	Code   int32 /* Signal code. */
+	Signo  int32 /* 信号编号。 */
+	Errno  int32 /* errno 值。 */
+	Code   int32 /* 信号代码。 */
 	Trapno int32
 	Pid    int32
 	Uid    int32
-	Status int32 /* Exit value or signal. */
+	Status int32 /* 退出值或信号。 */
 	_      [100]byte
 }
 

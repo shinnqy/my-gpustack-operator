@@ -68,7 +68,7 @@ func (g *apiRegGen) Filter(c *generator.Context, t *types.Type) bool {
 
 func (g *apiRegGen) Namers(c *generator.Context) namer.NameSystems {
 	return namer.NameSystems{
-		// Have the raw namer for this file track what it imports.
+		// 让此文件的 raw namer 追踪其导入的包。
 		"raw": namer.NewRawNamer(g.outputPackage, g.imports),
 		"private": &namer.NameStrategy{
 			Join: func(pre string, in []string, post string) string {
@@ -103,7 +103,7 @@ func (g *apiRegGen) Init(c *generator.Context, w io.Writer) error {
 	args := getAPIServiceTypedArgs()
 	sw := generator.NewSnippetWriter(w, c, "$", "$")
 
-	// START: Interfaces
+	// 开始: Interfaces
 	sw.Do("type (\n", nil)
 	{
 		sw.Do("WithStatusSubResource interface {\n", nil)
@@ -121,26 +121,25 @@ func (g *apiRegGen) Init(c *generator.Context, w io.Writer) error {
 		sw.Do("}\n\n", nil)
 	}
 	sw.Do(")\n\n", nil)
-	// END: Interfaces
+	// 结束: Interfaces
 
-	// START: GetAPIService
+	// 开始: GetAPIService
 	sw.Do("func GetAPIService(svc $.ServiceReference|raw$, ca []byte) *$.APIService|raw$ {\n", args)
 	sw.Do("return &$.APIService|raw${\n", args)
 	args = args.With("APISERVICE", g.pkgDef)
-	// START: TypeMeta.
+	// 开始: TypeMeta。
 	sw.Do("TypeMeta: $.TypeMeta|raw${\n", args)
 	sw.Do("APIVersion: \"$.APISERVICE.TypeMeta.APIVersion$\",\n", args)
 	sw.Do("Kind: \"$.APISERVICE.TypeMeta.Kind$\",\n", args)
 	sw.Do("},\n", nil)
-	// END: TypeMeta.
-	// START: ObjectMeta.
+	// 结束: TypeMeta。\n// 开始: ObjectMeta。
 	sw.Do("ObjectMeta: $.ObjectMeta|raw${\n", args)
 	sw.Do("Name: \"$.APISERVICE.ObjectMeta.Name$\",\n", args)
 	sw.Do("},\n", nil)
-	// END: ObjectMeta.
+	// 结束: ObjectMeta。
 	spec := g.pkgDef.Spec
 	args = args.With("SPEC", spec)
-	// START: Spec.
+	// 开始: Spec。
 	sw.Do("Spec: $.APIServiceSpec|raw${\n", args)
 	sw.Do("Service: svc.DeepCopy(),\n", args)
 	sw.Do("Group: \"$.SPEC.Group$\",\n", args)
@@ -150,10 +149,10 @@ func (g *apiRegGen) Init(c *generator.Context, w io.Writer) error {
 	sw.Do("GroupPriorityMinimum: $.SPEC.GroupPriorityMinimum$,\n", args)
 	sw.Do("VersionPriority: $.SPEC.VersionPriority$,\n", args)
 	sw.Do("},\n", nil)
-	// END: Spec.
+	// 结束: Spec。
 	sw.Do("}\n", nil)
 	sw.Do("}\n\n", nil)
-	// END: GetAPIService
+	// 结束: GetAPIService
 
 	return sw.Error()
 }
@@ -167,28 +166,28 @@ func (g *apiRegGen) GenerateType(c *generator.Context, t *types.Type, w io.Write
 	args := getAPIResourceTypedArgs().With("TYPE", t)
 	sw := generator.NewSnippetWriter(w, c, "$", "$")
 
-	// START: rest.Scoper
+	// 开始: rest.Scoper
 	sw.Do("var _ $.Scoper|raw$ = (*$.TYPE|raw$)(nil)\n", args)
 	sw.Do("func (*$.TYPE|raw$) NamespaceScoped() bool{\n", args)
 	sw.Do("return $.$\n", res.Scope == string(apiext.NamespaceScoped))
 	sw.Do("}\n\n", nil)
-	// END: rest.Scoper
+	// 结束: rest.Scoper
 
-	// START: rest.KindProvider
+	// 开始: rest.KindProvider
 	sw.Do("var _ $.KindProvider|raw$ = (*$.TYPE|raw$)(nil)\n", args)
 	sw.Do("func (*$.TYPE|raw$) Kind() string{\n", args)
 	sw.Do("return \"$.$\"", res.Kind)
 	sw.Do("}\n\n", nil)
-	// END: rest.KindProvider
+	// 结束: rest.KindProvider
 
-	// START: rest.SingularNameProvider
+	// 开始: rest.SingularNameProvider
 	sw.Do("var _ $.SingularNameProvider|raw$ = (*$.TYPE|raw$)(nil)\n", args)
 	sw.Do("func (*$.TYPE|raw$) GetSingularName() string{\n", args)
 	sw.Do("return \"$.$\"\n", res.Singular)
 	sw.Do("}\n\n", nil)
-	// END: rest.SingularNameProvider
+	// 结束: rest.SingularNameProvider
 
-	// START: rest.ShortNamesProvider
+	// 开始: rest.ShortNamesProvider
 	sw.Do("var _ $.ShortNamesProvider|raw$ = (*$.TYPE|raw$)(nil)\n", args)
 	sw.Do("func (*$.TYPE|raw$) ShortNames() []string{\n", args)
 	if len(res.ShortNames) != 0 {
@@ -197,9 +196,9 @@ func (g *apiRegGen) GenerateType(c *generator.Context, t *types.Type, w io.Write
 		sw.Do("return []string{}\n", nil)
 	}
 	sw.Do("}\n\n", nil)
-	// END: rest.ShortNamesProvider
+	// 结束: rest.ShortNamesProvider
 
-	// START: rest.CategoriesProvider
+	// 开始: rest.CategoriesProvider
 	sw.Do("var _ $.CategoriesProvider|raw$ = (*$.TYPE|raw$)(nil)\n", args)
 	sw.Do("func (*$.TYPE|raw$) Categories() []string{\n", args)
 	if len(res.Categories) != 0 {
@@ -208,9 +207,9 @@ func (g *apiRegGen) GenerateType(c *generator.Context, t *types.Type, w io.Write
 		sw.Do("return []string{}\n", nil)
 	}
 	sw.Do("}\n\n", nil)
-	// END: rest.CategoriesProvider
+	// 结束: rest.CategoriesProvider
 
-	// START: subresources
+	// 开始: subresources
 	for _, v := range slices.Compact(res.SubResources) {
 		switch v {
 		case "status":
@@ -235,7 +234,7 @@ func (g *apiRegGen) GenerateType(c *generator.Context, t *types.Type, w io.Write
 			}
 		}
 	}
-	// END: subresources
+	// 结束: subresources
 
 	return sw.Error()
 }

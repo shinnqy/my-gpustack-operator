@@ -8,7 +8,7 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/controllers/worker"
 )
 
-// setups is the list of controller setup functions.
+// setups 是控制器初始化函数列表。
 var setups = []controller.Setup{
 	new(worker.InstanceReconciler),
 	new(worker.InstanceIsolationReconciler),
@@ -38,7 +38,7 @@ var setups = []controller.Setup{
 }
 
 // IMPORTANT: 控制面 Deployment 入口
-// Setup sets up all controllers.
+// Setup 初始化所有控制器。
 func Setup(ctx context.Context, mgr manager.CtrlManager) error {
 	return controller.ExecuteSetup(ctx, mgr, setups)
 }

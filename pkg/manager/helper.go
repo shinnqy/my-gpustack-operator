@@ -17,7 +17,7 @@ import (
 )
 
 type (
-	// CtrlManager is a wrapper around ctrl.Manager.
+	// CtrlManager 是对 ctrl.Manager 的封装。
 	// CtrlManager 保留 controller-runtime 的客户端和缓存，并为索引注册去重。
 	CtrlManager struct {
 		ctrl.Manager
@@ -27,14 +27,14 @@ type (
 		indexedFields     sets.Set[string]
 	}
 
-	// RepeatableCtrlFieldIndexer is a wrapper around ctrlcli.FieldIndexer.
+	// RepeatableCtrlFieldIndexer 是对 ctrlcli.FieldIndexer 的封装。
 	RepeatableCtrlFieldIndexer struct {
 		ctrl.Manager
 		indexedFields sets.Set[string]
 	}
 )
 
-// GetHTTPClient implements the controller manager interface to returns the singleton HTTP client of the system.
+// GetHTTPClient 实现 controller manager 接口，返回系统的单例 HTTP 客户端。
 func (m CtrlManager) GetHTTPClient() *http.Client {
 	if m.httpClient != nil {
 		return m.httpClient
@@ -42,17 +42,17 @@ func (m CtrlManager) GetHTTPClient() *http.Client {
 	return m.Manager.GetHTTPClient()
 }
 
-// Start implements the controller manager interface to avoid function ambiguity.
+// Start 实现 controller manager 接口，以避免函数二义性。
 func (m CtrlManager) Start(ctx context.Context) error {
 	return m.Manager.Start(ctx)
 }
 
-// Add implements the controller manager interface to add a controller to the manager.
+// Add 实现 controller manager 接口，用于向管理器添加控制器。
 //
-// Add skips controllers who need leader election, when specifies with disableController.
+// 当指定 disableController 时，Add 会跳过需要 leader election 的控制器。
 func (m CtrlManager) Add(r ctrlmgr.Runnable) error {
 	if m.disableController {
-		// If cache is disabled, skip controllers who need leader election.
+		// 如果缓存已禁用，跳过需要 leader election 的控制器。
 		l, ok := r.(ctrlmgr.LeaderElectionRunnable)
 		if ok && l.NeedLeaderElection() {
 			if _, ok := r.(ctrlctrl.Controller); ok {
@@ -63,9 +63,9 @@ func (m CtrlManager) Add(r ctrlmgr.Runnable) error {
 	return m.Manager.Add(r)
 }
 
-// GetFieldIndexer implements the controller manager interface to returns the repeatable field indexer.
+// GetFieldIndexer 实现 controller manager 接口，返回可重复的字段索引器。
 //
-// GetFieldIndexer warns up if the same field is indexed multiple times.
+// 如果同一字段被多次索引，GetFieldIndexer 会发出警告。
 func (m CtrlManager) GetFieldIndexer() ctrlcli.FieldIndexer {
 	return RepeatableCtrlFieldIndexer{
 		Manager:       m.Manager,
@@ -81,7 +81,7 @@ func (i RepeatableCtrlFieldIndexer) IndexField(ctx context.Context, obj ctrlcli.
 	}
 	key := gvk.String() + "/" + field
 	if i.indexedFields.Has(key) {
-		// If the field is already indexed, skip.
+		// 如果字段已被索引，则跳过。
 		logger.InfoDepth(1, "field is already indexed, skipping", "field", field, "gvk", gvk)
 		return nil
 	}
@@ -89,7 +89,7 @@ func (i RepeatableCtrlFieldIndexer) IndexField(ctx context.Context, obj ctrlcli.
 	return i.Manager.GetFieldIndexer().IndexField(ctx, obj, field, extractValue)
 }
 
-// HostPort returns the host and port of the manager's server listener.
+// HostPort 返回管理器服务器监听器的主机和端口。
 func (m CtrlManager) HostPort() (string, int, error) {
 	ms := m.GetWebhookServer()
 	if ms == nil {
@@ -102,8 +102,7 @@ func (m CtrlManager) HostPort() (string, int, error) {
 	return s.HostPort()
 }
 
-// _CtrlManagerSentinel is a ctrlmgr.Runnable implementation for observing
-// whether the ctrl.Manager is started.
+// _CtrlManagerSentinel 是一个 ctrlmgr.Runnable 实现，用于观察 ctrl.Manager 是否已启动。
 // _CtrlManagerSentinel 在管理器启动时关闭信号通道。
 type _CtrlManagerSentinel struct {
 	done chan struct{}

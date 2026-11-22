@@ -23,52 +23,40 @@ import (
 	_ "embed"
 )
 
-// The identity seam this observer reads is frozen: the Ray node label that carries the
-// owning Pod's UID. The workload render passes it to `ray start --labels`, Ray persists
-// it in GcsNodeInfo.labels, and every join this file performs goes through it. A Pod-IP
-// or Pod-name join would survive a same-name replacement and is deliberately not used.
+// 本观测器读取的身份接缝已冻结：即承载所属 Pod UID 的 Ray 节点标签。工作负载渲染时通过 `ray start --labels` 传入该标签，Ray 将其持久化在 GcsNodeInfo.labels 中，本文件执行的每一次关联（join）都经由此标签完成。基于 Pod IP 或 Pod 名称的关联在同名重建后会误连，因此刻意不予使用。
 const modelDeploymentElasticPodUIDLabelKey = "gpustack-pod-uid"
 
 //go:embed model_deployment_elastic_observer.py
 var modelDeploymentElasticObserverScript string
 
-// Bounds on what one observation may claim. They are parser bounds, not transport
-// bounds: the exec transport enforces its own byte cap, and these keep a malformed but
-// well-formed-looking document from being walked unboundedly.
+// 单次观测可声称的规模上限。它们是解析器上限，而非传输上限：exec 传输层有自身的字节上限，而这些上限用于防止格式畸形但看似合法的文档被无界遍历。
 const (
 	modelDeploymentElasticMaxNodes  = 4096
 	modelDeploymentElasticMaxActors = 4096
 	modelDeploymentElasticMaxPGs    = 4096
 
-	// Total bound for one Observe call. An earlier caller deadline still wins: the
-	// budget is installed with context.WithTimeout, so whichever expires first fires.
+	// 单次 Observe 调用的总时间预算。调用方更早的截止时间仍优先生效：该预算通过 context.WithTimeout 叠加，因此先到期者触发。
 	modelDeploymentElasticObservationBudget = 45 * time.Second
 
-	// Per-exec bound handed to the script so its own writer stops before the transport's
-	// cap and the refusal (exit 4) is what arrives instead of a truncated stream.
+	// 传递给脚本的单次 exec 执行上限，使其自身的写入器在触及传输层上限之前主动停止，从而返回明确拒绝（退出码 4）而非被截断的流。
 	modelDeploymentElasticScriptMaxOutputBytes = 6 << 20
 
 	modelDeploymentElasticScriptDeadlineSeconds = 20.0
 
-	// The GCS address the head's own control plane listens on by default. The caller
-	// supplies the address from the rendered head spec; an empty capture is refused.
+	// head 自身控制面默认监听的 GCS 地址。调用方从渲染后的 head spec 中提供该地址；捕获为空时直接拒绝。
 	modelDeploymentElasticDefaultGCSAddress = "127.0.0.1:6379"
 )
 
-// Native DP actor classes. A rank proof requires an actor of exactly one of these
-// classes; every other alive actor on a member still counts against that member's
-// actor-free fact.
+// 原生 DP actor 类。rank 证明必须由其中精确一类的 actor 满足；成员上所有其他存活的 actor 仍会否决该成员的 actor-free 事实。
 const (
 	modelDeploymentElasticActorClassEngineCore  = "EngineCoreActor"
 	modelDeploymentElasticActorClassDPMoEEngine = "DPMoEEngineCoreActor"
 )
 
-// Native placement-group names are dp_rank_N, produced by the pinned vLLM engine at
-// v1/engine/utils.py:739 (initial) and :843 (scale-up).
+// 原生 placement-group 名称格式为 dp_rank_N，由固定版本的 vLLM 引擎在 v1/engine/utils.py:739（初始化）和 :843（扩容）处生成。
 const modelDeploymentElasticRankPGPrefix = "dp_rank_"
 
-// Raw GCS enum values the parser accepts. Anything outside them is Unknown, never a
-// default: an unrecognized state is a schema drift this file refuses to interpret.
+// 解析器接受的原始 GCS 枚举值。除此之外的任何值均视为 Unknown，绝不回退为默认值：未识别的状态属于本文件拒绝解释的 schema 漂移。
 const (
 	elasticRayActorDependenciesUnready = 0
 	elasticRayActorPendingCreation     = 1
@@ -83,7 +71,7 @@ const (
 	elasticRayPGRescheduling = 4
 )
 
-// modelDeploymentElasticMemberRole is the captured role of one owned Pod.
+// modelDeploymentElasticMemberRole 是捕获到的单个受管 Pod 的角色。
 type modelDeploymentElasticMemberRole string
 
 const (
@@ -92,9 +80,7 @@ const (
 	modelDeploymentElasticRoleWorker modelDeploymentElasticMemberRole = "worker"
 )
 
-// modelDeploymentElasticCapturedMember is one captured owned Pod: name, UID, container and
-// role as the controller recorded them before observing. Every runtime fact this file
-// produces is bound back to these captures by uncached reads.
+// modelDeploymentElasticCapturedMember 表示一个已捕获的受管 Pod：控制器在观测前记录的名称、UID、容器和角色。本文件产出的每一项运行时事实都会通过非缓存读取绑定回这些捕获记录。
 type modelDeploymentElasticCapturedMember struct {
 	PodUID    types.UID
 	PodName   string
@@ -102,9 +88,7 @@ type modelDeploymentElasticCapturedMember struct {
 	Role      modelDeploymentElasticMemberRole
 }
 
-// Wire shapes. Required fields are pointers so an absent or null field is refused
-// instead of read as a zero: a zero here is a claim that nothing exists, and the
-// protocol acts on zeros.
+// 传输线格式（wire shape）。必需字段均使用指针，以便缺失或 null 字段被拒绝而不是被当作零值读取：在这里零值意味着声明什么都不存在，而协议会对零值采取行动。
 type elasticRayNodeWire struct {
 	NodeIDHex           *string           `json:"node_id_hex"`
 	Alive               *bool             `json:"alive"`
@@ -157,10 +141,7 @@ type elasticRayDocumentWire struct {
 	Errors          []elasticRayErrorWire  `json:"errors"`
 }
 
-// rejectDuplicateJSONKeys walks the token stream of one JSON document and refuses the
-// first object that states one key twice. encoding/json itself silently keeps the last
-// duplicate, so a payload that carries `{"state":2,"state":4}` would otherwise parse as
-// whichever value the decoder saw last.
+// rejectDuplicateJSONKeys 遍历单个 JSON 文档的 token 流，并在遇到第一个重复声明同一键的对象时拒绝该文档。encoding/json 本身会静默保留最后一个重复键，否则类似 `{"state":2,"state":4}` 的载荷就会按解码器最后看到的值解析。
 func rejectDuplicateJSONKeys(dec *json.Decoder) error {
 	return walkDuplicateJSONKeys(dec, 0)
 }
@@ -212,10 +193,7 @@ func walkDuplicateJSONKeys(dec *json.Decoder, depth int) error {
 	}
 }
 
-// parseElasticRayDocument decodes one collector document strictly: no unknown fields,
-// no duplicate keys, no trailing value, every required table and field present, and
-// table sizes inside the parser bounds. A document that fails any of these is an error,
-// which the caller turns into Unknown rather than into an empty cluster.
+// parseElasticRayDocument 严格解码单个采集器文档：不允许未知字段、不允许重复键、不允许尾随多余值，所有必需的表与字段必须存在，且表大小在解析器上限之内。任一检查失败都会返回 error，调用方会将其转为 Unknown 而非视为空集群。
 func parseElasticRayDocument(data []byte) (*elasticRayDocumentWire, error) {
 	scanner := json.NewDecoder(strings.NewReader(string(data)))
 	if err := rejectDuplicateJSONKeys(scanner); err != nil {
@@ -326,16 +304,13 @@ func elasticRayPGRequired(pg *elasticRayPGWire) error {
 	return nil
 }
 
-// modelDeploymentElasticActorFreeFact is the per-captured-UID actor-free answer: the
-// bool is only meaningful with its reason, and a false never deletes anything.
+// modelDeploymentElasticActorFreeFact 是按已捕获 UID 记录的 actor-free 结论：布尔值必须结合其 reason 才有意义，且为 false 时绝不删除任何对象。
 type modelDeploymentElasticActorFreeFact struct {
 	ActorFree bool
 	Reason    string
 }
 
-// modelDeploymentElasticObservation feeds the resize controller: separately known width, the
-// rank to Pod UID map, complete actor identities, and per-captured-UID actor-free facts
-// with explicit reasons. It never authorizes a resize, a deletion, or a completion.
+// modelDeploymentElasticObservation 为扩缩容控制器提供观测输入：独立判明的宽度、rank 到 Pod UID 的映射、完整的 actor 身份信息，以及按已捕获 UID 记录且带明确原因的 actor-free 事实。它本身绝不直接授权扩缩容、删除或完成操作。
 type modelDeploymentElasticObservation struct {
 	SchemaVersion int
 	RayVersion    string
@@ -347,10 +322,7 @@ type modelDeploymentElasticObservation struct {
 	WidthUnknownReason string
 	RankToPodUID       map[int]types.UID
 
-	// RegisteredGPU is the NODE side of the four-layer join: how many captured GPU
-	// members currently sit, one whole GPU each, on unique ALIVE Ray nodes. It is
-	// deliberately independent of RayWidth — a scale-up registers capacity before the
-	// native ranks exist — and a known zero means genuinely no GPU members are captured.
+	// RegisteredGPU 是四层关联中的节点侧指标：当前有多少个已捕获的 GPU 成员正各自占用整张 GPU 落在唯一的 ALIVE Ray 节点上。它刻意独立于 RayWidth——扩容时容量会先于原生 rank 注册完成——且已知的零表示确实没有捕获到 GPU 成员。
 	RegisteredGPUKnown         bool
 	RegisteredGPU              int
 	RegisteredGPUUnknownReason string
@@ -362,15 +334,13 @@ type modelDeploymentElasticObservation struct {
 	UnknownReasons []string
 }
 
-// isNativeElasticActorClass reports whether a GCS actor class is one of the native DP
-// engine actor classes a rank proof may be satisfied by.
+// isNativeElasticActorClass 报告某个 GCS actor 类是否属于可满足 rank 证明的原生 DP 引擎 actor 类之一。
 func isNativeElasticActorClass(class string) bool {
 	return class == modelDeploymentElasticActorClassEngineCore ||
 		class == modelDeploymentElasticActorClassDPMoEEngine
 }
 
-// elasticRayRankOfName parses dp_rank_N strictly: the exact prefix and nothing after
-// the integer. A name that only prefixes the token, or carries a suffix, is not a rank.
+// elasticRayRankOfName 严格解析 dp_rank_N：必须具备精确前缀且整数之后没有任何字符。仅匹配前缀或带有后缀的名称均不算作 rank。
 func elasticRayRankOfName(name string) (int, bool) {
 	rest, ok := strings.CutPrefix(name, modelDeploymentElasticRankPGPrefix)
 	if !ok || rest == "" {
@@ -389,10 +359,7 @@ func elasticRayRankOfName(name string) (int, bool) {
 	return rank, true
 }
 
-// joinModelDeploymentElasticRayIdentity binds one collector document to the captured
-// members. Every rule below is a hold, not a zero: anything the document does not prove
-// is carried as an explicit Unknown reason, because a missing proof is what retirement
-// safety is made of.
+// joinModelDeploymentElasticRayIdentity 将单个采集器文档与已捕获的成员关联起来。下方的每条规则都导向挂起而非零值：文档未能证明的任何事实都会带有明确的 Unknown 原因，因为缺失证明正是下线安全性的基石。
 func joinModelDeploymentElasticRayIdentity(
 	doc *elasticRayDocumentWire,
 	members []modelDeploymentElasticCapturedMember,
@@ -420,10 +387,7 @@ func joinModelDeploymentElasticRayIdentity(
 		memberByUID[member.PodUID] = member
 	}
 
-	// Node joins. Only ALIVE nodes make claims: a DEAD row is history — a restarted
-	// Pod's old node, a retired foreign box — and must neither count toward registered
-	// membership nor duplicate the ALIVE node that now carries the same Pod UID. DEAD
-	// rows stay in the raw lookup so actors sitting on them are still resolved.
+	// 节点关联。只有 ALIVE 节点才会纳入声明：DEAD 行只是历史记录——例如重启后 Pod 的旧节点或已下线的外部机器——既不得计入已注册成员数，也不得与当前携带相同 Pod UID 的 ALIVE 节点重复。DEAD 行仍保留在原始查找表中，以便解析仍驻留在其上的 actor。
 	nodeByHex := map[string]*elasticRayNodeWire{}
 	nodeHexByUID := map[types.UID]string{}
 	headHexByUID := map[types.UID]string{}
@@ -474,12 +438,7 @@ func joinModelDeploymentElasticRayIdentity(
 		}
 	}
 
-	// Registered GPU capacity is the NODE side of the four-layer join, independent of the
-	// native rank side: how many captured GPU members an ALIVE Ray node currently carries
-	// one whole GPU for. A scale-up registers capacity before the engine creates the new
-	// ranks, so this must be known on its own or the kernel deadlocks waiting for ranks
-	// that the command has not created yet. Zero captured GPU members is a known zero;
-	// a captured GPU member with no current ALIVE node is Unknown, never a short count.
+	// 已注册 GPU 容量是四层关联中的节点侧指标，独立于原生 rank 侧：即 ALIVE Ray 节点当前为多少个已捕获的 GPU 成员各持有一整张 GPU。扩容时容量会在引擎创建新 rank 之前完成注册，因此该值必须能够独立判明，否则内核会因等待命令尚未创建的 rank 而死锁。没有已捕获 GPU 成员是已知的零；若某个已捕获 GPU 成员当前没有对应的 ALIVE 节点，则结果为 Unknown，绝不能按缺额计数。
 	obs.RegisteredGPUKnown = true
 	gpuMembers := 0
 	for _, member := range members {
@@ -527,8 +486,7 @@ func joinModelDeploymentElasticRayIdentity(
 		obs.RegisteredGPU = 0
 	}
 
-	// Actor inventory. Duplicates are schema drift; unknown-state rows were refused at
-	// parse. Every actor's node must resolve, or complete actor identities is false.
+	// Actor 清单。重复条目属于 schema 漂移；未知状态行已在解析阶段被拒绝。每个 actor 的节点都必须能够解析，否则完整 actor 身份标记将为 false。
 	actorByID := map[string]*elasticRayActorWire{}
 	actorsByNode := map[string][]*elasticRayActorWire{}
 	actorsByPG := map[string][]*elasticRayActorWire{}
@@ -551,8 +509,7 @@ func joinModelDeploymentElasticRayIdentity(
 			actorsComplete = false
 			continue
 		}
-		// A nonterminal actor parked on a DEAD node is an unresolved live worker the
-		// cluster has not accounted for; DEAD actors on DEAD nodes are history.
+		// 停留在 DEAD 节点上的非终态 actor 属于集群尚未清理妥当的未决存活工作进程；DEAD 节点上的 DEAD actor 只是历史记录。
 		if node := nodeByHex[actor.NodeIDHex]; !*node.Alive && *actor.State != elasticRayActorDead {
 			obs.addUnknown(fmt.Sprintf(
 				"nonterminal actor %s (%s) in state %s sits on DEAD node %s",
@@ -563,9 +520,9 @@ func joinModelDeploymentElasticRayIdentity(
 	}
 	obs.ActorsComplete = actorsComplete
 
-	// Rank proofs. Each expected rank needs its dp_rank_N placement group CREATED, one
-	// ALIVE native actor scheduled on it, and that actor's node alive and joined to the
-	// captured GPU member. Pending, restarting, removed and rescheduled states hold.
+	// Rank 证明。每个预期 rank 都需要其 dp_rank_N placement group 处于 CREATED 状态，
+	// 其上调度有一个 ALIVE 状态的原生 actor，且该 actor 所在节点存活并已加入捕获的 GPU 成员。
+	// pending、restarting、removed 和 rescheduled 状态均会阻塞。
 	pgByRank := map[int]*elasticRayPGWire{}
 	for i := range *doc.PlacementGroups {
 		pg := &(*doc.PlacementGroups)[i]
@@ -589,8 +546,8 @@ func joinModelDeploymentElasticRayIdentity(
 		pgByRank[rank] = pg
 	}
 
-	// addWidthReason is addUnknown: a rank proof that does not close is an unknown the
-	// reason string names, not a smaller width.
+	// addWidthReason 即 addUnknown：未能闭环的 rank 证明属于由原因字符串指明的未知状态，
+	// 而非更小的宽度。
 	addWidthReason := obs.addUnknown
 
 	for rank := 0; rank < int(expectedWidth); rank++ {
@@ -609,7 +566,7 @@ func joinModelDeploymentElasticRayIdentity(
 		proofUID := types.UID("")
 		for _, actor := range actorsByPG[*pg.PlacementGroupIDHex] {
 			if *actor.State == elasticRayActorDead {
-				// A DEAD actor on the rank group is restart history, not a rank claim.
+				// rank 组上的 DEAD 状态 actor 属于重启历史，而非有效的 rank 声明。
 				continue
 			}
 			if *actor.State != elasticRayActorAlive {
@@ -653,9 +610,9 @@ func joinModelDeploymentElasticRayIdentity(
 		obs.RankToPodUID[rank] = proofUID
 	}
 	for rank, pg := range pgByRank {
-		// A REMOVED rank beyond the expected width is drain residue from the resize this
-		// observation follows; it is history, not an emerging width. Any other state
-		// beyond the expected width is a native rank the engine still holds and holds.
+		// 超出预期宽度的 REMOVED 状态 rank 是本次观测所跟踪扩缩容的排空残留；
+		// 它属于历史记录，而非正在形成的新宽度。超出预期宽度的任何其他状态
+		// 都是引擎仍在持有的原生 rank，会阻塞流程。
 		if rank >= int(expectedWidth) && *pg.State != elasticRayPGRemoved {
 			addWidthReason(fmt.Sprintf(
 				"unexpected native rank %d placement group is %s", rank, pg.StateName,
@@ -665,11 +622,9 @@ func joinModelDeploymentElasticRayIdentity(
 
 	obs.RayWidth = len(obs.RankToPodUID)
 
-	// Actor-free facts, per captured GPU member. ALL actors on the member's node count,
-	// of every class: a non-native leftover is exactly what a drain must not leave
-	// behind. DEAD actors are history; every nonterminal state blocks. The fact requires
-	// the captured UID's UNIQUE current ALIVE node — a duplicated claim is not a node
-	// this fact may be read from.
+	// 按捕获的 GPU 成员记录无 actor 事实。成员节点上的所有 actor（无论何种类型）均计入：
+	// 非原生残留正是排空绝不能遗留的对象。DEAD actor 属于历史记录；所有非终态都会阻塞。
+	// 该事实要求捕获 UID 对应唯一的当前 ALIVE 节点——存在重复声明的节点不能用于读取该事实。
 	for _, member := range members {
 		if member.Role == modelDeploymentElasticRoleHead {
 			continue
@@ -712,9 +667,8 @@ func joinModelDeploymentElasticRayIdentity(
 }
 
 func (o *modelDeploymentElasticObservation) addUnknown(reason string) {
-	// Every unknown is also a width hold: an observation that cannot prove a structural
-	// fact cannot prove a width either, and a width proven beside a structural unknown
-	// would be the false zero this file exists to refuse.
+	// 每个未知状态同时也是宽度阻塞：无法证明结构事实的观测同样无法证明宽度，
+	// 而在存在结构未知状态的情况下判定出的宽度正是本文件所要杜绝的虚假零值。
 	o.UnknownReasons = append(o.UnknownReasons, reason)
 	o.WidthKnown = false
 	if o.WidthUnknownReason != "" {
@@ -723,8 +677,8 @@ func (o *modelDeploymentElasticObservation) addUnknown(reason string) {
 	o.WidthUnknownReason += reason
 }
 
-// unknownElasticObservation is the shape every Observe hold returns: nothing proven,
-// every seam's Unknown reason carrying the same cause.
+// unknownElasticObservation 是所有 Observe 阻塞情况返回的形态：未证明任何结论，
+// 每个接入点的 Unknown 原因都携带相同的根本原因。
 func unknownElasticObservation(reason string) modelDeploymentElasticObservation {
 	return modelDeploymentElasticObservation{
 		UnknownReasons:             []string{reason},
@@ -735,10 +689,9 @@ func unknownElasticObservation(reason string) modelDeploymentElasticObservation 
 	}
 }
 
-// modelDeploymentElasticObserver reads one elastic deployment's Ray identity through
-// the existing exec transport. It adds no second exec implementation: the drain
-// collector's bounded SPDY stream is the transport, and this observer owns only the
-// script, the K8s identity checks around it, and the strict parse and join.
+// modelDeploymentElasticObserver 通过现有 exec 传输通道读取单个弹性部署的 Ray 身份信息。
+// 它不新增第二套 exec 实现：排空收集器的有界 SPDY 流即为其传输通道，
+// 本 observer 仅负责执行脚本、围绕它的 K8s 身份校验以及严格的解析与关联。
 type modelDeploymentElasticObserver struct {
 	client ctrlcli.Client
 	fresh  ctrlcli.Reader
@@ -746,9 +699,8 @@ type modelDeploymentElasticObserver struct {
 	budget time.Duration
 }
 
-// newModelDeploymentElasticObserver builds the production observer on the same
-// transport the drain collector uses. A nil exec installs the drain collector's real
-// one; a test may replace it through the same field.
+// newModelDeploymentElasticObserver 基于排空收集器使用的同一传输通道构建生产环境 observer。
+// exec 为 nil 时会安装排空收集器的真实实现；测试可通过同一字段进行替换。
 func newModelDeploymentElasticObserver(
 	client ctrlcli.Client, fresh ctrlcli.Reader, restConfig *rest.Config,
 	core corev1client.CoreV1Interface,
@@ -762,17 +714,16 @@ func newModelDeploymentElasticObserver(
 	}
 }
 
-// modelDeploymentElasticIdentity is the before/after identity a read is bound to: the
-// live deployment's UID and generation must not move between the two uncached reads.
+// modelDeploymentElasticIdentity 是读取操作所绑定的前后身份标识：
+// 实时部署的 UID 和 generation 在两次非缓存读取之间不得发生变化。
 type modelDeploymentElasticIdentity struct {
 	UID        types.UID
 	Generation int64
 }
 
-// Observe collects and joins one elastic observation. It fails closed: a member that
-// moved, a container that is not running, a document that does not parse, or a
-// deployment whose identity drifted between the bounding reads is Unknown with the
-// reason named, never an empty cluster.
+// Observe 采集并关联一次弹性观测。它采用故障关闭（fail-closed）策略：若成员发生变更、
+// 容器未处于运行状态、文档无法解析，或部署身份在首尾两次边界读取之间发生漂移，
+// 则返回带有明确原因的 Unknown 状态，绝不将其视为空集群。
 func (o *modelDeploymentElasticObserver) Observe(
 	ctx context.Context,
 	md *workercore.ModelDeployment,
@@ -795,10 +746,9 @@ func (o *modelDeploymentElasticObserver) Observe(
 		return unknownElasticObservation(drift), nil
 	}
 
-	// Every captured member is bound to a live Pod before the exec: same name, same
-	// UID, owned by this deployment, engine container running. The read then runs in
-	// the captured CPU head's container — the head proves its own captured identity
-	// the same way, but is never a GPU width member.
+	// 在执行 exec 之前，每个捕获的成员都会与实时 Pod 绑定：名称相同、UID 相同、归属当前部署、
+	// 且引擎容器正在运行。随后在捕获的 CPU head 容器中执行读取——head 以同样方式
+	// 证明其自身捕获的身份，但它绝不计入 GPU 宽度成员。
 	var head *corev1.Pod
 	for _, member := range members {
 		pod, drift := o.liveMember(ctx, md, &before, member)
@@ -849,8 +799,7 @@ func (o *modelDeploymentElasticObserver) Observe(
 	return joinModelDeploymentElasticRayIdentity(doc, members, expectedWidth, tp), nil
 }
 
-// liveIdentity reads the deployment uncached and, when expected is non-nil, refuses a
-// UID or generation that moved under it.
+// liveIdentity 以非缓存方式读取部署；当 expected 非 nil 时，若 UID 或 generation 发生变更则拒绝继续。
 func (o *modelDeploymentElasticObserver) liveIdentity(
 	ctx context.Context, md *workercore.ModelDeployment, expected *modelDeploymentElasticIdentity,
 ) (modelDeploymentElasticIdentity, string) {
@@ -868,8 +817,8 @@ func (o *modelDeploymentElasticObserver) liveIdentity(
 	return current, ""
 }
 
-// liveMember binds one captured member to its live Pod: same name, same UID, owned by
-// the deployment captured above, container present and running.
+// liveMember 将单个捕获成员绑定到其实时 Pod：名称相同、UID 相同、归属上述捕获的部署，
+// 且容器存在并正在运行。
 func (o *modelDeploymentElasticObserver) liveMember(
 	ctx context.Context, md *workercore.ModelDeployment,
 	deployment *modelDeploymentElasticIdentity, member modelDeploymentElasticCapturedMember,
@@ -910,8 +859,8 @@ func (o *modelDeploymentElasticObserver) liveMember(
 	return pod, ""
 }
 
-// headContainerOf picks the container the exec runs in: the captured CPU head's own
-// container. The head is where the Ray control plane and its GCS listen.
+// headContainerOf 选择运行 exec 的容器：即捕获的 CPU head 自身容器。
+// head 是 Ray 控制面及其 GCS 监听所在的位置。
 func headContainerOf(members []modelDeploymentElasticCapturedMember) string {
 	for _, member := range members {
 		if member.Role == modelDeploymentElasticRoleHead {
@@ -921,7 +870,7 @@ func headContainerOf(members []modelDeploymentElasticCapturedMember) string {
 	return ""
 }
 
-// elasticTPBundlesAgree requires the complete TP group on the engine actor's node.
+// elasticTPBundlesAgree 要求引擎 actor 所在节点上存在完整的 TP 组。
 func elasticTPBundlesAgree(pg *elasticRayPGWire, nodeID string, expected int) string {
 	seen := map[int]bool{}
 	gpus := 0

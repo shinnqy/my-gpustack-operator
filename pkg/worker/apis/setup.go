@@ -22,34 +22,32 @@ var (
 	}
 )
 
-// InstallCRDs installs the custom resource definitions.
+// InstallCRDs 安装 CRD。
 func InstallCRDs(ctx context.Context, cli kubernetes.Interface) error {
 	return api.InstallCRDs(ctx, cli, apiCrdGetters)
 }
 
-// EnsureCRDs keeps the custom resource definitions installed until the given context is done.
+// EnsureCRDs 保持 CRD 处于已安装状态，直到给定的 context 结束。
 func EnsureCRDs(ctx context.Context, cli kubernetes.Interface) error {
 	return api.EnsureCRDs(ctx, cli, apiCrdGetters)
 }
 
-// InstallServices installs the api services.
+// InstallServices 安装 API 服务。
 func InstallServices(ctx context.Context, cli kubernetes.Interface, svc apireg.ServiceReference, ca []byte) error {
 	return api.InstallServices(ctx, cli, svc, ca, apiSvcGetters)
 }
 
-// EnsureServices keeps the api services installed until the given context is done.
+// EnsureServices 保持 API 服务处于已安装状态，直到给定的 context 结束。
 func EnsureServices(ctx context.Context, cli kubernetes.Interface, svc apireg.ServiceReference, ca []byte) error {
 	return api.EnsureServices(ctx, cli, svc, ca, apiSvcGetters)
 }
 
-// DeleteServicesBackedBy deletes the api services backed by a service in the given namespace —
-// the ones this worker registered and the ones its sub-releases did (Kueue's visibility
-// pair), which outlive the namespace alike when the deletion skips the chart's uninstall.
+// DeleteServicesBackedBy 删除由指定 Namespace 中的 Service 支撑的 API 服务——\n// 包括当前 worker 注册的以及其子 release 注册的（即 Kueue 的 visibility 服务对），\n// 当删除流程跳过 chart 卸载时，这些资源同样会比 Namespace 存活更久。
 func DeleteServicesBackedBy(ctx context.Context, cli kubernetes.Interface, namespace string) error {
 	return api.DeleteServicesBackedBy(ctx, cli, namespace)
 }
 
-// WaitForServicesReady waits for the api services to be ready.
+// WaitForServicesReady 等待 API 服务就绪。
 func WaitForServicesReady(ctx context.Context, cli kubernetes.Interface) error {
 	return api.WaitForServicesReady(ctx, cli, apiSvcGetters)
 }

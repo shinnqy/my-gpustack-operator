@@ -15,20 +15,19 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kvcache/mooncake"
 )
 
-// ModelDeploymentKind is how a ModelDeployment names itself in a KVCachePoolBinding's usedBy.
+// ModelDeploymentKind 是 ModelDeployment 在 KVCachePoolBinding 的 usedBy 中标识自身的类型名称。
 //
-// The Binding's API declares this kind as the ONLY writer of that list, and its finalizer refuses to
-// release a Binding the list is not empty on. So the constant is not a label: it is the token the
-// refusal keys on, and misspelling it would leave the refusal enforcing over an empty list forever.
+// Binding 的 API 将该 kind 声明为该列表的唯一写入者，且其 finalizer 在列表非空时会拒绝释放
+// Binding。因此该常量并非普通标签，而是触发拒绝保护的关键令牌；若拼写错误，将导致拒绝保护
+// 机制永远作用于空列表而失效。
 const ModelDeploymentKind = "ModelDeployment"
 
-// ModelDeploymentConditionDomainRegistered reports whether the referenced KVCachePoolBinding
-// resolved and its reuse domain was read.
+// ModelDeploymentConditionDomainRegistered 表示所引用的 KVCachePoolBinding 是否已解析并
+// 成功读取其复用域。
 const ModelDeploymentConditionDomainRegistered kubeapistatus.ConditionType = "DomainRegistered"
 
-// The reasons DomainRegistered carries. Four rather than two, because the four send a reader to
-// four different places: nowhere, create the Binding, wait for it (or look at the pool), find who
-// deleted it.
+// DomainRegistered 所携带的 reason 枚举。采用四个而非两个，是因为这四个 reason 分别对应
+// 四种排查方向：无需处理、创建 Binding、等待其就绪（或检查池状态）、排查是谁将其删除。
 const (
 	modelDeploymentReasonRegistered      = "Registered"
 	modelDeploymentReasonNotApplicable   = "NotApplicable"
@@ -37,37 +36,34 @@ const (
 	modelDeploymentReasonBindingDeleting = "BindingDeleting"
 )
 
-// modelDeploymentDomain is what one pass observed about the referenced Binding.
+// modelDeploymentDomain 表示单轮调谐中对所引用 Binding 的观测结果。
 //
-// KVCache is nil when the Binding could not be read at all. That is NOT the same as an empty
-// projection: a deployment that resolved once and has since lost its Binding keeps the domain it
-// attached to, and the condition is what says the reading is stale. Emptying it would delete the one
-// record of which cache the replicas are still writing into.
+// 当完全无法读取 Binding 时，KVCache 为 nil。这不同于空投影：曾经解析成功但随后丢失了
+// Binding 的部署会保留其已挂载的域信息，而由 condition 标明该读数已过期。若将其清空，
+// 将抹除副本仍在向哪个缓存写入的唯一记录。
 type modelDeploymentDomain struct {
 	KVCache *workercore.ModelDeploymentKVCacheStatus
 	Ready   bool
 	Reason  string
 	Message string
 
-	// Blocks and Usage are the master's own account of what this reuse domain holds, carried
-	// straight off the Binding and NOT flattened to zero. Both are pointers there with omitempty,
-	// and absent means the scrape did not carry this domain — a different fact from a domain holding
-	// nothing, and the only reader that needs the difference is the cache-attachment reading.
+	// Blocks 和 Usage 是主节点对该复用域实际占用情况的统计，直接取自 Binding 而不会归零处理。
+	// 两者在原结构中均为带 omitempty 的指针：缺失表示本次采集未包含该域——这与域中数据为空
+	// 是截然不同的事实，且只有缓存挂载状态读取逻辑需要区分这两者。
 	Blocks *int64
 	Usage  *resource.Quantity
 }
 
-// resolveModelDeploymentDomain reads the KVCachePoolBinding this deployment references and projects
-// its immutable domain block.
+// resolveModelDeploymentDomain 读取当前部署所引用的 KVCachePoolBinding，并投影其不可变的
+// 域配置块。
 //
-// The read is scoped to the deployment's OWN namespace and there is no other lookup: poolRef is a
-// LocalObjectReference, so the name it carries can only ever mean an object here. The pool is named
-// from the Binding rather than read, because the projection wants its name and nothing else.
+// 读取范围仅限部署所在的 Namespace，不存在其他查找路径：poolRef 为 LocalObjectReference，
+// 其名称只能指向当前 Namespace 下的对象。池名称直接取自 Binding 而非再去读取池对象，因为
+// 投影结果仅需要其名称。
 //
-// A deployment declaring no cache gets an explicit not-applicable reading rather than nil, because
-// nil is reserved for a pass that did not look and a cache-less deployment is an ANSWER, not a gap:
-// without it the object would carry no DomainRegistered condition at all, and an absent condition
-// and an inapplicable one are different states.
+// 未声明缓存的部署会获得显式的“不适用”结果而非 nil，因为 nil 专用于表示未执行检查的轮次，
+// 而无缓存部署是一个明确的结论而非缺失：若不返回该结果，对象上将完全没有 DomainRegistered
+// condition，而缺少 condition 与不适用的 condition 属于不同的状态。
 func (r *ModelDeploymentReconciler) resolveModelDeploymentDomain(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (*modelDeploymentDomain, error) {
@@ -100,10 +96,9 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentDomain(
 		KVCache: &workercore.ModelDeploymentKVCacheStatus{
 			Binding: kvcpb.Name,
 			Pool:    kvcpb.Spec.PoolRef.Name,
-			// Echoed from the Binding's spec, which requires and freezes all three, rather than from
-			// its status: the domain is what an admin declared, and a projection that waited for the
-			// Binding's own controller would report no domain during exactly the window the deployment
-			// is asking which cache it is on.
+			// 直接取自 Binding 的 spec（该处要求并冻结了全部三个字段），而非取自其 status：域是管理员
+			// 声明的配置，若投影等待 Binding 自身控制器写入 status，恰好会在部署查询自身归属哪个缓存的
+			// 时间窗口内报告空域。
 			Domain: workercore.ModelDeploymentKVCacheDomain{
 				Name:      kvcpb.Spec.Domain.Name,
 				BlockSize: kvcpb.Spec.Domain.BlockSize,
@@ -117,22 +112,20 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentDomain(
 	return observed, nil
 }
 
-// modelDeploymentBindingUsable reports whether a Binding can actually take a byte.
+// modelDeploymentBindingUsable 返回 Binding 当前是否真正具备写入能力。
 //
-// It reads TWO independent facts, and the redundancy is the point — each covers the other's failure
-// mode:
+// 该判断读取两项相互独立的事实，其冗余设计正是为了互相兜底各自可能失效的场景：
 //
-//   - The Binding's own phase, which its controller derives from every axis it has. Reading the
-//     summary rather than a copy of the axis list means an axis added later is honored here without
-//     this file changing; a copied list would go stale silently and report usable.
-//   - The QuotaGranted axis directly. That axis exists because readiness once reported True both
-//     when the master granted an effective quota of zero and when it carried no ledger entry at all,
-//     so a Binding could read Ready while no write could succeed. This spec is what made that
-//     reachable, so the one regression it was burned by is checked rather than delegated.
+//   - Binding 自身的 phase，由其控制器综合所有维度推导得出。读取汇总状态而非复制维度列表，
+//     意味着后续新增的维度无需修改本文件即可在此生效；若复制列表，则会在静默过期后仍误报
+//     为可用。
+//   - 直接检查 QuotaGranted 维度。设置该维度是因为就绪状态曾出现过在主节点授予有效配额为
+//     零或完全没有账本条目时仍报告 True 的情况，导致 Binding 显示 Ready 却无法成功写入。
+//     本规格正是为暴露此类状态而引入，因此对这一曾经触发过回归的维度直接检查，而不委托给
+//     汇总状态。
 //
-// A Binding on its way out is its own answer. It is not released here and must not be: the claim in
-// usedBy is what holds the deletion, and dropping it would let the authorization vanish from under
-// replicas that are still writing.
+// 正在删除中的 Binding 本身即视为不可用。此处不会且绝不能释放它：usedBy 中的占用声明正是
+// 阻塞删除流程的关键，若丢弃该声明，仍在写入数据的副本将失去授权支撑。
 func modelDeploymentBindingUsable(kvcpb *workercore.KVCachePoolBinding) (bool, string, string) {
 	if kvcpb.DeletionTimestamp != nil {
 		return false, modelDeploymentReasonBindingDeleting, fmt.Sprintf(
@@ -162,9 +155,9 @@ func modelDeploymentBindingUsable(kvcpb *workercore.KVCachePoolBinding) (bool, s
 	)
 }
 
-// modelDeploymentBindingPhase spells the phase for a message, including the one case where there is
-// none: a Binding whose own controller has not reached it yet has an empty phase, and "is : " reads
-// like a bug in this operator rather than as a Binding nobody has looked at.
+// modelDeploymentBindingPhase 将 phase 拼写为消息文本，包括没有 phase 的情况：尚未被其自身
+// controller 处理的 Binding 的 phase 为空，而 "is : " 读起来更像是本 operator 的 bug，
+// 而不是一个尚未被检查的 Binding。
 func modelDeploymentBindingPhase(kvcpb *workercore.KVCachePoolBinding) string {
 	if kvcpb.Status.Phase == "" {
 		return "not observed yet"
@@ -173,11 +166,10 @@ func modelDeploymentBindingPhase(kvcpb *workercore.KVCachePoolBinding) string {
 	return kvcpb.Status.Phase
 }
 
-// observeModelDeploymentDomain folds one pass's reading of the Binding into the status.
+// observeModelDeploymentDomain 将单轮对 Binding 的读取结果合入 status。
 //
-// A nil reading means this pass did not look — a teardown pass does not — and then the condition and
-// the projection are both left exactly as they were. Overwriting them with "not observed" would turn
-// every teardown into a report that the domain had gone away.
+// 读取结果为 nil 表示本轮未进行检查（清理阶段的轮次不会检查），此时 condition 和
+// projection 均保持原样。若将其覆盖为 "not observed"，会导致每次清理都报告 domain 已消失。
 func observeModelDeploymentDomain(holder *workercore.ModelDeployment, observed *modelDeploymentDomain) {
 	if observed == nil {
 		return
@@ -196,23 +188,21 @@ func observeModelDeploymentDomain(holder *workercore.ModelDeployment, observed *
 	ModelDeploymentConditionDomainRegistered.False(holder, observed.Reason, observed.Message)
 }
 
-// claimModelDeploymentBinding records this deployment in the Binding's usedBy.
+// claimModelDeploymentBinding 将当前 deployment 记录到 Binding 的 usedBy 中。
 //
-// The claim is what makes the Binding's deletion refusal real: that list is declared to have exactly
-// one writer, this kind, and until something writes it the refusal enforces over a list that is
-// always empty. It is written on every pass that can read the Binding, INCLUDING one where the
-// Binding is not usable — a store leader restart makes every Binding briefly not-Ready, and a claim
-// that came and went with readiness would open a window in which an admin's delete went through
-// under replicas that are still writing.
+// 该声明是 Binding 拒绝删除机制得以生效的关键：该列表约定只有一个写入方（即本类型），
+// 在有写入之前，拒绝删除只会面对一个始终为空的列表。每次能够读取 Binding 的轮次都会写入该声明，
+// 包括 Binding 尚不可用的情况——store leader 重启会使每个 Binding 短暂处于非 Ready 状态，
+// 若声明随就绪状态反复增删，就会在 replica 仍在写入时敞开窗口，导致管理员的删除操作意外通过。
 func (r *ModelDeploymentReconciler) claimModelDeploymentBinding(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) error {
 	return r.syncModelDeploymentBindingClaim(ctx, md, true)
 }
 
-// releaseModelDeploymentBinding drops the claim, so a Binding deleted after its deployments can
-// finish. It is called only once the replicas are gone: released while one is still up, the
-// authorization could vanish under a process that is still writing through it.
+// releaseModelDeploymentBinding 移除该声明，使在 deployment 之后被删除的 Binding 能够完成删除。
+// 仅当 replica 全部消失后才调用该函数：若在仍有 replica 运行时提前释放，授权可能会在进程
+// 仍在通过它写入时失效。
 func (r *ModelDeploymentReconciler) releaseModelDeploymentBinding(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) error {
@@ -231,16 +221,15 @@ func (r *ModelDeploymentReconciler) syncModelDeploymentBindingClaim(
 		return err
 	}
 	if kvcpb == nil {
-		// Nothing to claim, and nothing to release either: a Binding that is gone took its list with
-		// it. Reported through DomainRegistered rather than as an error, because a deployment whose
-		// Binding was deleted keeps serving.
+		// 无需声明，也无需释放：已不存在的 Binding 连同其列表一并消失了。这种情况通过
+		// DomainRegistered 上报，而不作为 error 返回，因为其 Binding 被删除的 deployment 仍会继续提供服务。
 		return nil
 	}
 
 	ref := workercore.KVCacheObjectReference{
 		Kind: ModelDeploymentKind,
-		// Left empty by the field's own rule: everything that can appear here is in the Binding's
-		// namespace, so naming it would restate the Binding's metadata on every entry.
+		// 按该字段自身规则留空：此处可能出现的所有对象都位于 Binding 所在的 namespace 中，
+		// 因此显式命名只会在每个条目上重复 Binding 的元数据。
 		Namespace: "",
 		Name:      md.Name,
 	}
@@ -248,32 +237,29 @@ func (r *ModelDeploymentReconciler) syncModelDeploymentBindingClaim(
 	at := slices.IndexFunc(kvcpb.Status.UsedBy,
 		func(e workercore.KVCacheObjectReference) bool { return e == ref })
 	if claim == (at >= 0) {
-		// Already says what it should. This guard is what keeps a settled deployment from rewriting
-		// another controller's object on every pass, which with the Binding's own reconciler writing
-		// the same status would make every pass a conflict.
+		// 已与预期一致。该保护可防止已稳定的 deployment 在每一轮都重写另一个 controller 的对象，
+		// 否则由于 Binding 自身的 reconciler 也在写入同一 status，会导致每一轮都发生冲突。
 		return nil
 	}
 
 	if claim {
 		kvcpb.Status.UsedBy = append(kvcpb.Status.UsedBy, ref)
-		// One order for one state, so a Binding held by two deployments is not rewritten because they
-		// claimed it in a different order than last time.
+		// 同一状态对应同一顺序，避免因两个 deployment 声明顺序与上次不同而反复重写 Binding。
 		slices.SortFunc(kvcpb.Status.UsedBy, compareKVCacheObjectReferences)
 	} else {
 		kvcpb.Status.UsedBy = slices.Delete(kvcpb.Status.UsedBy, at, at+1)
 	}
 
-	// A conflict goes back on the queue rather than being retried in place: the Binding's own
-	// reconciler writes this status too, so the losing side's whole view of the object is stale by
-	// then and retrying just the list would write a claim derived from something that has moved.
+	// 发生冲突时重新入队，而不是原地重试：Binding 自身的 reconciler 也会写入该 status，
+	// 此时落败方对整个对象的视图已过期，仅重试列表会写入基于已变更状态的声明。
 	return r.Client.Status().Update(ctx, kvcpb)
 }
 
-// getModelDeploymentBinding reads the referenced Binding, returning nil for one that does not exist.
+// getModelDeploymentBinding 读取引用的 Binding，若不存在则返回 nil。
 //
-// Absence is a value rather than an error because it is an ordinary, reportable state: admission
-// refuses a poolRef naming no Binding, so the way to reach it is to delete the Binding under a
-// running deployment, and that case keeps the replicas serving.
+// 将不存在作为返回值而非 error，是因为这属于一种正常且可上报的状态：准入控制会拒绝
+// 指向不存在 Binding 的 poolRef，因此进入该状态的唯一途径是在运行中的 deployment 下删除
+// 该 Binding，而此时 replica 仍继续提供服务。
 func (r *ModelDeploymentReconciler) getModelDeploymentBinding(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (*workercore.KVCachePoolBinding, error) {
@@ -297,8 +283,8 @@ func (r *ModelDeploymentReconciler) getModelDeploymentBinding(
 	return kvcpb, nil
 }
 
-// resolveModelDeploymentInterfaceProtocols reads the backend declaration independently of its
-// published endpoint. Device allocation must be stable while the cache domain is still starting.
+// resolveModelDeploymentInterfaceProtocols 独立于已发布的 endpoint 读取 backend 声明。
+// 当 cache domain 仍在启动时，设备分配必须保持稳定。
 func (r *ModelDeploymentReconciler) resolveModelDeploymentInterfaceProtocols(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) ([]string, error) {
@@ -323,24 +309,22 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentInterfaceProtocols(
 	return mooncake.MemberProtocols(backend), nil
 }
 
-// resolveModelDeploymentConnection reads what the pool and its backend published: the half of the
-// synthesis input that is the same for every role of one deployment.
+// resolveModelDeploymentConnection 读取 pool 及其 backend 发布的信息：即同一 deployment
+// 下所有角色共享的那一半合成输入。
 //
-// It returns nil when there is nothing to connect to, and the caller then renders replicas with NO
-// connector at all rather than a partial one. That is the spec's rule and it is not caution: a
-// client configured to reach an address that does not answer looks like a cache MISS from outside
-// the Pod, while a replica that was never configured says so in its own spec.
+// 当没有可连接目标时返回 nil，调用方随后会渲染完全不带 connector 的 replica，而不是部分配置
+// 的 connector。这是规范的要求，并非出于保守：配置了无响应地址的客户端从 Pod 外部看像是
+// 缓存 MISS，而从未配置过的 replica 会在其自身的 spec 中明确体现这一点。
 //
-// EVERY MISSING PIECE TAKES THAT SAME EXIT, deliberately. An absent pool, an unpublished endpoint,
-// an absent backend -- each is a state the cluster converges out of on its own, and each is already
-// reported by DomainRegistered or by the pool's own conditions. A second opinion here would add a
-// message without adding an observation.
+// 任何缺失环节都特意走同一退出路径。缺失的 pool、未发布的 endpoint、缺失的 backend——
+// 每种情况集群都能自行收敛恢复，且均已通过 DomainRegistered 或 pool 自身的 conditions 上报。
+// 在此处另行判断只会增加冗余消息，而不会提供新的观测信息。
 //
-// The other half of the input, the engine and the accelerator, is per role: the accelerator comes
-// from the role's InstanceType, so the synthesis itself cannot be hoisted out of that loop.
+// 另一半输入（引擎和加速器）按角色区分：加速器来自角色的 InstanceType，因此合成过程
+// 本身无法提取到该循环之外。
 func (r *ModelDeploymentReconciler) resolveModelDeploymentConnection(
 	ctx context.Context, domain *modelDeploymentDomain,
 ) (*ModelDeploymentConnectorInput, error) {
-	// Implement this function in chapter 22.
+	// 在第 22 章实现此函数。
 	return nil, nil
 }

@@ -31,10 +31,10 @@ type Manager struct {
 	stopped  atomic.Bool
 }
 
-// Prepare prepares the runtime for the manager,
-// including installing CRDs and registering metric collectors.
+// Prepare 准备管理器的运行时环境，
+// 包括安装 CRD 和注册指标采集器。
 func (m *Manager) Prepare(_ context.Context) error {
-	// Register metric collectors.
+	// 注册指标采集器。
 	{
 		reg := ctrlmetrics.Registry
 		cs := []prometheus.Collector{
@@ -52,18 +52,17 @@ func (m *Manager) Prepare(_ context.Context) error {
 	return nil
 }
 
-// Start starts the manager.
+// Start 启动管理器。
 //
-// Start sets up controllers and registers assistant routes,
-// before starting the controller manager.
+// Start 在启动 controller manager 之前设置控制器并注册辅助路由。
 func (m *Manager) Start(ctx context.Context) error {
 	cm := m.CtrlManager
 	ms := cm.GetWebhookServer()
 
-	// Register /metrics.
+	// 注册 /metrics。
 	ms.Register("/metrics", newMetricsHandler(ctrlmetrics.Registry))
 
-	// Register /readyz.
+	// 注册 /readyz。
 	{
 		p := "/readyz"
 		h := &ctrlhealthz.Handler{
@@ -75,7 +74,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		ms.Register(p, http.StripPrefix(p, h))
 	}
 
-	// Register /livez.
+	// 注册 /livez。
 	{
 		p := "/livez"
 		h := &ctrlhealthz.Handler{
@@ -99,7 +98,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		ms.Register(p, http.StripPrefix(p, h))
 	}
 
-	// Register /debug.
+	// 注册 /debug。
 	{
 		runtime.SetBlockProfileRate(1)
 		ms.Register("/debug/pprof/", httpx.LoopbackAccessHandlerFunc(pprof.Index))
@@ -110,15 +109,14 @@ func (m *Manager) Start(ctx context.Context) error {
 		ms.Register("/debug/flags/v", httpx.LoopbackAccessHandlerFunc(routes.StringFlagPutHandler(logs.GlogSetter)))
 	}
 
-	// Start.
+	// Start。
 	//
-	// The controller manager returning is terminal, and not only when it returns an error:
-	// controller-runtime stops every controller and returns as soon as the leader lease is lost,
-	// which a single slow apiserver round trip is enough to cause. Record that it happened,
-	// because the process does not necessarily exit when it does — a sibling task that fails to
-	// return on cancellation keeps the process, and its HTTP handlers, alive — and a process that
-	// keeps answering its liveness probe while reconciling nothing is the worst of both outcomes:
-	// Kubernetes sees a healthy Pod and the whole chain silently stops converging.
+	// controller manager 返回即为终止状态，不仅限于返回 error 时：
+	// 一旦失去 leader 租约，controller-runtime 就会立即停止所有控制器并返回，
+	// 而单次缓慢的 apiserver 往返就足以触发这种情况。需要记录该事件的发生，
+	// 因为此时进程未必会退出——如果有同级任务在收到取消信号后未能返回，
+	// 进程及其 HTTP 处理程序就会继续存活——而一个只回应存活探针却不再执行任何调谐的进程
+	// 会导致最坏的双重后果：Kubernetes 看到健康的 Pod，而整条调度链却悄无声息地停止收敛。
 	defer m.stopped.Store(true)
 	return cm.Start(ctx)
 }

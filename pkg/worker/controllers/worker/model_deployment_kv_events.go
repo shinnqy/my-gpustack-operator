@@ -7,11 +7,10 @@ import (
 	"gpustack.ai/gpustack/pkg/kubeapistatus"
 )
 
-// ModelDeploymentConditionKVEventsPublishing reports whether every role that produces cache blocks
-// was configured to publish events.
+// ModelDeploymentConditionKVEventsPublishing 报告所有产生缓存块的角色是否均已配置为发布事件。
 //
-// It reports configuration, not traffic. A publisher that was configured and then crashed remains
-// True here because observing the event stream requires a live consumer and is a separate check.
+// 它反映的是配置状态，而非实际流量。已配置但随后崩溃的发布者在此处仍保持 True，
+// 因为观测事件流需要活跃的消费者，属于另一项独立检查。
 const ModelDeploymentConditionKVEventsPublishing kubeapistatus.ConditionType = "KVEventsPublishing"
 
 const (
@@ -27,9 +26,8 @@ func observeModelDeploymentKVEvents(
 ) {
 	if md.Spec.Router == nil {
 		for i := range md.Spec.Roles {
-			// AN ENCODER IS NOT ONE OF THE ROLES THE MESSAGE NAMES. It reads media and hands
-			// embeddings to a prefiller, so it neither produces nor consumes cache blocks; counting
-			// it would report a deployment as needing a router for a role no router could serve.
+			// 编码器（Encode）并非该消息所指的角色之一。它读取媒体数据并将 embedding 传递给 prefiller，
+			// 因此既不产生也不消费缓存块；若将其计入，就会错误地报告部署需要为任何 router 都无法服务的角色配置 router。
 			switch ModelDeploymentEffectiveRoleKind(&md.Spec.Roles[i]) {
 			case workercore.ModelDeploymentRoleKindPrefill, workercore.ModelDeploymentRoleKindDecode:
 				ModelDeploymentConditionKVEventsPublishing.False(holder,
@@ -39,9 +37,8 @@ func observeModelDeploymentKVEvents(
 			}
 		}
 
-		// SO THE MESSAGE MAY NAME THE ROLE KIND, because the encoder is not reachable here: the
-		// loop above returned on a prefiller or a decoder, and admission refuses an Encode role
-		// with no router. The kind is new enough that no stored object predates that rule.
+		// 因此该消息可以直接指明角色类型，因为此处不可能出现编码器：上方的循环会在遇到 prefiller 或 decoder 时返回，
+		// 且准入控制会拒绝没有 router 的 Encode 角色。该角色类型足够新，不存在早于该规则的历史持久化对象。
 		ModelDeploymentConditionKVEventsPublishing.True(holder,
 			modelDeploymentReasonKVEventsNotApplicable,
 			"the unrouted deployment has only server roles, so nothing consumes cache events")
@@ -51,10 +48,9 @@ func observeModelDeploymentKVEvents(
 	configured := 0
 	for i := range md.Spec.Roles {
 		role := &md.Spec.Roles[i]
-		// A CONSUMER PUBLISHES NOTHING, AND NEITHER DOES AN ENCODER. An encoder was handed media
-		// and produces embeddings for the prefiller, so it is not a producer whose configuration
-		// this operator failed to find -- counting it reported a healthy encoder deployment as
-		// unconfigured, and named a role that publishes no events at all.
+		// 消费者不会发布事件，编码器也是如此。编码器接收媒体数据并为 prefiller 生成 embedding，
+		// 因此它并非本 operator 未能找到配置的生产者——若将其计入，会将健康的编码器部署误判为未配置，
+		// 并指向一个根本不发布任何事件的角色。
 		if kind := ModelDeploymentEffectiveRoleKind(role); kind == workercore.ModelDeploymentRoleKindDecode ||
 			kind == workercore.ModelDeploymentRoleKindEncode {
 			continue

@@ -9,197 +9,188 @@ import (
 )
 
 const (
-	// ModelDeploymentScalerBindingAnnotationKey names the annotation that carries the binding
-	// between a scaler and the ModelDeployment it drives.
+	// ModelDeploymentScalerBindingAnnotationKey 指定用于承载扩缩器与其所驱动
+	// ModelDeployment 之间绑定关系的注解键。
 	//
-	// The payload names the scaler and the term the scaler wrote under. A ModelDeployment that
-	// carries this annotation belongs to that scaler alone, so a second scaler refuses to bind to
-	// it and the worker reconciler refuses to write a replica count on behalf of anyone else.
+	// 该负载包含扩缩器名称及其写入时所依据的任期。带有此注解的 ModelDeployment 仅属于
+	// 该扩缩器，因此第二个扩缩器会拒绝与其绑定，worker 协调器也会拒绝代表其他任何方写入
+	// 副本数。
 	ModelDeploymentScalerBindingAnnotationKey = "modeldeployment.gpustack.ai/scaler-binding"
 
-	// ModelDeploymentScalerDecisionAnnotationKey names the annotation that carries the last
-	// committed decision of a scaler.
+	// ModelDeploymentScalerDecisionAnnotationKey 指定用于承载扩缩器最近一次已提交
+	// 决策的注解键。
 	//
-	// The payload names the decision, the term it was written under and the replica vector it
-	// committed. The planner reads it after a restart so that it rebuilds its state from what the
-	// target actually carries instead of re-committing a vector it merely remembers.
+	// 该负载包含决策标识、写入时所依据的任期以及其提交的副本向量。规划器在重启后会读取
+	// 该注解，以便根据目标实际承载的内容重建状态，而不是重新提交其仅在内存中记录的向量。
 	ModelDeploymentScalerDecisionAnnotationKey = "modeldeployment.gpustack.ai/scaler-decision"
 
-	// ModelDeploymentScalerFinalizerKey names the finalizer a scaler holds on itself while bound
-	// to a target.
+	// ModelDeploymentScalerFinalizerKey 指定扩缩器在绑定到目标期间于自身保留的
+	// finalizer 键。
 	//
-	// The finalizer is what lets a deleted scaler remove its binding annotation before the scaler
-	// object disappears, so that the target keeps serving and becomes bindable again.
+	// 该 finalizer 使被删除的扩缩器能够在扩缩器对象消失前移除其绑定注解，从而确保目标
+	// 保持服务状态并重新变为可绑定状态。
 	ModelDeploymentScalerFinalizerKey = "modeldeployment.gpustack.ai/scaler-binding"
 
-	// ModelDeploymentScalerModelIDAnnotationKey declares the exact catalog model identity on a
-	// target ModelDeployment when the deployment spec does not establish it.
+	// ModelDeploymentScalerModelIDAnnotationKey 在部署 spec 未明确指定时，于目标
+	// ModelDeployment 上声明确切的目录模型标识。
 	ModelDeploymentScalerModelIDAnnotationKey = "worker.gpustack.ai/model-id"
 
-	// ModelDeploymentScalerHardwareIDAnnotationKey declares the exact catalog hardware identity on
-	// a target ModelDeployment when the deployment spec does not establish it.
+	// ModelDeploymentScalerHardwareIDAnnotationKey 在部署 spec 未明确指定时，于目标
+	// ModelDeployment 上声明确切的目录硬件标识。
 	ModelDeploymentScalerHardwareIDAnnotationKey = "worker.gpustack.ai/hardware-id"
 
-	// ModelDeploymentScalerPrecisionAnnotationKey declares the exact catalog precision or
-	// quantization identity on a target ModelDeployment when the deployment spec does not establish
-	// it.
+	// ModelDeploymentScalerPrecisionAnnotationKey 在部署 spec 未明确指定时，于目标
+	// ModelDeployment 上声明确切的目录精度或量化标识。
 	ModelDeploymentScalerPrecisionAnnotationKey = "worker.gpustack.ai/precision"
 
-	// ModelDeploymentScalerPrefillHardwareIDAnnotationKey overrides the catalog hardware identity
-	// declaration for Prefill roles on a target ModelDeployment.
+	// ModelDeploymentScalerPrefillHardwareIDAnnotationKey 覆盖目标 ModelDeployment 上
+	// Prefill 角色的目录硬件标识声明。
 	ModelDeploymentScalerPrefillHardwareIDAnnotationKey = "worker.gpustack.ai/prefill-hardware-id"
 
-	// ModelDeploymentScalerDecodeHardwareIDAnnotationKey overrides the catalog hardware identity
-	// declaration for Decode roles on a target ModelDeployment.
+	// ModelDeploymentScalerDecodeHardwareIDAnnotationKey 覆盖目标 ModelDeployment 上
+	// Decode 角色的目录硬件标识声明。
 	ModelDeploymentScalerDecodeHardwareIDAnnotationKey = "worker.gpustack.ai/decode-hardware-id"
 )
 
-// The conditions a scaler reports.
+// 扩缩器上报的状态条件。
 //
-// Bound says whether the scaler owns its target, Active says whether it is allowed to change it,
-// MetricsReady says whether it has what it needs to plan, CapacityPriorsReady says whether
-// configured catalog priors resolved, and Blocked says what stops it.
+// Bound 表示扩缩器是否拥有其目标，Active 表示其是否被允许更改目标，MetricsReady
+// 表示其是否具备规划所需的指标，CapacityPriorsReady 表示配置的目录先验是否已解析，
+// Blocked 表示是什么阻止了它。
 const (
-	// ModelDeploymentScalerConditionTypeBound says whether the scaler holds the binding on its
-	// target.
+	// ModelDeploymentScalerConditionTypeBound 表示扩缩器是否持有对其目标的绑定。
 	ModelDeploymentScalerConditionTypeBound = "Bound"
 
-	// ModelDeploymentScalerConditionTypeActive says whether the scaler acts on what it observes.
+	// ModelDeploymentScalerConditionTypeActive 表示扩缩器是否根据观测结果执行操作。
 	ModelDeploymentScalerConditionTypeActive = "Active"
 
-	// ModelDeploymentScalerConditionTypeMetricsReady says whether the scaler has the signals its
-	// algorithm needs.
+	// ModelDeploymentScalerConditionTypeMetricsReady 表示扩缩器是否具备其算法所需的信号。
 	ModelDeploymentScalerConditionTypeMetricsReady = "MetricsReady"
 
-	// ModelDeploymentScalerConditionTypeCapacityPriorsReady says whether the scaler resolved the
-	// capacity priors its algorithm needs.
+	// ModelDeploymentScalerConditionTypeCapacityPriorsReady 表示扩缩器是否已解析其算法
+	// 所需的容量先验。
 	ModelDeploymentScalerConditionTypeCapacityPriorsReady = "CapacityPriorsReady"
 
-	// ModelDeploymentScalerConditionTypeBlocked says whether something stops the scaler.
+	// ModelDeploymentScalerConditionTypeBlocked 表示是否有因素阻止了扩缩器。
 	ModelDeploymentScalerConditionTypeBlocked = "Blocked"
 )
 
-// The reasons a scaler condition carries.
+// 扩缩器状态条件携带的原因。
 //
-// They name the situation rather than the mechanism, so a reader learns what is true of the
-// scaler without reading the code that found it out.
+// 这些原因描述的是当前处境而非底层机制，因此读者无需阅读判定该状态的代码即可了解
+// 扩缩器的真实情况。
 const (
-	// ModelDeploymentScalerReasonTargetNotFound says the target does not exist.
+	// ModelDeploymentScalerReasonTargetNotFound 表示目标不存在。
 	ModelDeploymentScalerReasonTargetNotFound = "TargetNotFound"
 
-	// ModelDeploymentScalerReasonAlreadyBound says another scaler owns the target.
+	// ModelDeploymentScalerReasonAlreadyBound 表示另一个扩缩器已拥有该目标。
 	ModelDeploymentScalerReasonAlreadyBound = "AlreadyBound"
 
-	// ModelDeploymentScalerReasonTargetReplaced says the target was deleted and recreated, so
-	// the binding points at an object that no longer exists.
+	// ModelDeploymentScalerReasonTargetReplaced 表示目标已被删除并重新创建，因此
+	// 当前绑定指向一个已不存在的对象。
 	ModelDeploymentScalerReasonTargetReplaced = "TargetReplaced"
 
-	// ModelDeploymentScalerReasonInvalidBinding says the target's binding annotation cannot be read,
-	// so no scaler may claim the target.
+	// ModelDeploymentScalerReasonInvalidBinding 表示无法读取目标的绑定注解，因此
+	// 任何扩缩器均不得声明拥有该目标。
 	ModelDeploymentScalerReasonInvalidBinding = "InvalidBinding"
 
-	// ModelDeploymentScalerReasonBoundsConflict says the bounds of the roles contradict each
-	// other.
+	// ModelDeploymentScalerReasonBoundsConflict 表示各角色的边界相互冲突。
 	ModelDeploymentScalerReasonBoundsConflict = "BoundsConflict"
 
-	// ModelDeploymentScalerReasonRatioConflict says the ratios contradict each other or the
-	// bounds.
+	// ModelDeploymentScalerReasonRatioConflict 表示比例配置之间或比例与边界之间存在冲突。
 	ModelDeploymentScalerReasonRatioConflict = "RatioConflict"
 
-	// ModelDeploymentScalerReasonPacingBounded says a step cap or a pending guard holds the
-	// vector where it is.
+	// ModelDeploymentScalerReasonPacingBounded 表示步长上限或待处理保护机制将向量
+	// 保持在当前值。
 	ModelDeploymentScalerReasonPacingBounded = "PacingBounded"
 
-	// ModelDeploymentScalerReasonWaitingForMetrics says the scaler has not yet read the signals
-	// its algorithm needs.
+	// ModelDeploymentScalerReasonWaitingForMetrics 表示扩缩器尚未读取到其算法所需的
+	// 信号。
 	ModelDeploymentScalerReasonWaitingForMetrics = "WaitingForMetrics"
 
-	// ModelDeploymentScalerReasonPredictorWarmingUp says the predictor has not seen enough
-	// points to forecast.
+	// ModelDeploymentScalerReasonPredictorWarmingUp 表示预测器尚未收集到足够的数据点
+	// 来进行预测。
 	ModelDeploymentScalerReasonPredictorWarmingUp = "PredictorWarmingUp"
 
-	// ModelDeploymentScalerReasonSuspended says the scaler is suspended.
+	// ModelDeploymentScalerReasonSuspended 表示扩缩器已暂停。
 	ModelDeploymentScalerReasonSuspended = "Suspended"
 
-	// ModelDeploymentScalerReasonShadowMode says the scaler only observes.
+	// ModelDeploymentScalerReasonShadowMode 表示扩缩器仅进行观测。
 	ModelDeploymentScalerReasonShadowMode = "ShadowMode"
 
-	// ModelDeploymentScalerReasonResourceExhausted says the cluster cannot give the role the
-	// replicas it asked for.
+	// ModelDeploymentScalerReasonResourceExhausted 表示集群无法为该角色提供其请求的
+	// 副本数。
 	ModelDeploymentScalerReasonResourceExhausted = "ResourceExhausted"
 
-	// ModelDeploymentScalerReasonScaleDownAborted says a retirement the scaler asked for failed
-	// and the vector was restored.
+	// ModelDeploymentScalerReasonScaleDownAborted 表示扩缩器请求的缩容下线失败，
+	// 向量已恢复。
 	ModelDeploymentScalerReasonScaleDownAborted = "ScaleDownAborted"
 
-	// ModelDeploymentScalerReasonRebalanceNotApplicable says the roles cannot give resources to
-	// each other.
+	// ModelDeploymentScalerReasonRebalanceNotApplicable 表示各角色之间无法互相转移
+	// 资源。
 	ModelDeploymentScalerReasonRebalanceNotApplicable = "RebalanceNotApplicable"
 
-	// ModelDeploymentScalerReasonRebalanceBlocked says a rebalance step cannot be taken.
+	// ModelDeploymentScalerReasonRebalanceBlocked 表示当前无法执行再均衡步骤。
 	ModelDeploymentScalerReasonRebalanceBlocked = "RebalanceBlocked"
 
-	// ModelDeploymentScalerReasonCapacityPriorUnresolved says a required capacity prior could not
-	// be resolved from the catalog.
+	// ModelDeploymentScalerReasonCapacityPriorUnresolved 表示无法从目录中解析所需的
+	// 容量先验。
 	ModelDeploymentScalerReasonCapacityPriorUnresolved = "CapacityPriorUnresolved"
 
-	// ModelDeploymentScalerReasonInsufficientLoadCoverage says the matched profile does not carry
-	// enough load points or boundary evidence to establish capacity.
+	// ModelDeploymentScalerReasonInsufficientLoadCoverage 表示匹配到的画像未包含足够的
+	// 负载数据点或边界证据以确定容量。
 	ModelDeploymentScalerReasonInsufficientLoadCoverage = "InsufficientLoadCoverage"
 
-	// ModelDeploymentScalerReasonIncompatibleMetric says the matched profile does not measure the
-	// throughput numerator, latency quantile, or cache convention the role requires.
+	// ModelDeploymentScalerReasonIncompatibleMetric 表示匹配到的画像未度量该角色所需的
+	// 吞吐量分子、延迟分位数或缓存约定。
 	ModelDeploymentScalerReasonIncompatibleMetric = "IncompatibleMetric"
 )
 
 const (
-	// ModelDeploymentScalerScaleDownOutcomeCommitted says the scale-down is in progress under retirement.
+	// ModelDeploymentScalerScaleDownOutcomeCommitted 表示缩容正在下线流程中推进。
 	ModelDeploymentScalerScaleDownOutcomeCommitted = "Committed"
 
-	// ModelDeploymentScalerScaleDownOutcomeAborted says the retirement failed and the vector was restored.
+	// ModelDeploymentScalerScaleDownOutcomeAborted 表示下线失败，向量已恢复。
 	ModelDeploymentScalerScaleDownOutcomeAborted = "Aborted"
 )
 
-// ModelDeploymentScalerBinding is the payload of the binding annotation.
+// ModelDeploymentScalerBinding 是绑定注解的负载结构。
 //
-// It is the whole of the single-writer contract: the target names the scaler that owns it and the
-// term that owner writes under, so a later scaler either takes over explicitly or stands down.
+// 它完整承载了单写者契约：目标通过它指定拥有自己的扩缩器以及该所有者写入时使用的任期，
+// 从而使后续扩缩器要么显式接管，要么主动退出。
 type ModelDeploymentScalerBinding struct {
-	// ScalerName is the name of the scaler that owns the target.
+	// ScalerName 是拥有该目标的扩缩器名称。
 	ScalerName string `json:"scalerName" protobuf:"bytes,1,opt,name=scalerName"`
 
-	// ScalerUID is the UID of the scaler that owns the target.
+	// ScalerUID 是拥有该目标的扩缩器 UID。
 	//
-	// A scaler that was deleted and recreated with the same name carries a different UID, so the
-	// target can tell the two apart.
+	// 被删除后以相同名称重新创建的扩缩器会携带不同的 UID，因此目标能够区分这两者。
 	ScalerUID string `json:"scalerUID" protobuf:"bytes,2,opt,name=scalerUID"`
 
-	// Term is the binding term the owner writes under.
+	// Term 是所有者写入时所依据的绑定任期。
 	Term int64 `json:"term" protobuf:"varint,3,opt,name=term"`
 }
 
-// ModelDeploymentScalerDecision is the payload of the decision annotation.
+// ModelDeploymentScalerDecision 是决策注解的负载结构。
 //
-// It records what the scaler last committed, so that a planner which lost its in-memory state
-// rebuilds from the target instead of committing a vector twice.
+// 它记录了扩缩器最近一次提交的内容，从而使丢失内存状态的规划器能够从目标重建状态，
+// 避免重复提交同一个向量。
 type ModelDeploymentScalerDecision struct {
-	// DecisionID identifies the decision that produced the vector.
+	// DecisionID 标识产生该向量的决策。
 	DecisionID string `json:"decisionID" protobuf:"bytes,1,opt,name=decisionID"`
 
-	// Term is the binding term the decision was written under.
+	// Term 是写入该决策时所依据的绑定任期。
 	Term int64 `json:"term" protobuf:"varint,2,opt,name=term"`
 
-	// Vector is the replica count per role the decision committed.
+	// Vector 是该决策提交的各角色副本数。
 	Vector map[string]int32 `json:"vector" protobuf:"bytes,3,rep,name=vector"`
 }
 
-// ModelDeploymentScaler is the schema for a metric-driven replica planner over one
-// ModelDeployment.
+// ModelDeploymentScaler 是针对单个 ModelDeployment 的指标驱动副本规划器模式定义。
 //
-// In Shadow mode it observes and records recommendations in status without modifying the target.
-// In Active mode its reconciler commits the planned replica vector and decision annotation onto
-// the target under the single-writer admission fence, and the ModelDeployment reconciler converges
-// the serving replicas to that count.
+// 在 Shadow 模式下，它仅观测并将建议记录在 status 中，不修改目标。在 Active 模式下，
+// 其协调器会在单写者准入栅栏下将规划好的副本向量和决策注解提交到目标上，随后
+// ModelDeployment 协调器会将服务副本收敛到该数量。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -220,7 +211,7 @@ type ModelDeploymentScaler struct {
 
 var _ runtime.Object = (*ModelDeploymentScaler)(nil)
 
-// ModelDeploymentScalerList holds the list of ModelDeploymentScalers.
+// ModelDeploymentScalerList 包含 ModelDeploymentScaler 列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelDeploymentScalerList struct {
@@ -232,46 +223,44 @@ type ModelDeploymentScalerList struct {
 
 var _ runtime.Object = (*ModelDeploymentScalerList)(nil)
 
-// ModelDeploymentScalerSpec defines the desired state of ModelDeploymentScaler.
+// ModelDeploymentScalerSpec 定义 ModelDeploymentScaler 的期望状态。
 type ModelDeploymentScalerSpec struct {
-	// TargetRef names the ModelDeployment this scaler plans for.
+	// TargetRef 指定此扩缩器为其进行规划的 ModelDeployment。
 	//
-	// The target is in this namespace. A scaler without a target has nothing to plan for, so the
-	// field is required and a name that matches nothing leaves the scaler unbound.
+	// 目标位于当前 Namespace 中。没有目标的扩缩器无法进行规划，因此该字段为必填项，且
+	// 名称不匹配任何对象时会使扩缩器保持未绑定状态。
 	//
 	// +required
 	TargetRef ModelDeploymentScalerTargetReference `json:"targetRef" protobuf:"bytes,1,name=targetRef"`
 
-	// Mode decides whether the scaler only observes or also acts.
+	// Mode 决定扩缩器是仅进行观测还是同时执行操作。
 	//
-	// Shadow observes and publishes what it would have done, and changes nothing. Active publishes
-	// and the worker reconciler applies the committed vector. Shadow is the default, so a scaler
-	// that was just created never moves a target before its owner asked for it.
+	// Shadow 模式仅观测并发布其本应执行的操作，不做任何更改。Active 模式则会发布决策，
+	// 并由 worker 协调器应用已提交的向量。Shadow 为默认值，因此刚创建的扩缩器在所有者
+	// 明确要求之前绝不会改动目标。
 	//
 	// +optional
 	// +k8s:validation:enum=["Shadow","Active"]
 	// +k8s:validation:default="Shadow"
 	Mode ModelDeploymentScalerMode `json:"mode,omitempty" protobuf:"bytes,2,opt,name=mode"`
 
-	// Suspend stops the scaler without deleting it.
+	// Suspend 在不删除扩缩器的情况下停止其运行。
 	//
-	// A suspended scaler releases its owned binding and stops planning without being deleted,
-	// reporting Suspended on its Bound and Active conditions until resumed.
+	// 处于暂停状态的扩缩器会释放其持有的绑定并停止规划，但不会被删除，并在其 Bound 和
+	// Active 条件上持续上报 Suspended，直到恢复运行。
 	//
 	// +optional
 	Suspend bool `json:"suspend,omitempty" protobuf:"varint,3,opt,name=suspend"`
 
-	// Sampling tunes how often the scaler looks at the target and how long it waits for a
-	// committed scale-up to become admitted.
+	// Sampling 调整扩缩器检查目标的频率，以及等待已提交扩容获得准入的时长。
 	//
 	// +optional
 	Sampling ModelDeploymentScalerSamplingSpec `json:"sampling,omitempty" protobuf:"bytes,4,opt,name=sampling"`
 
-	// Roles are the roles of the target this scaler plans for, with the bounds each one stays
-	// inside.
+	// Roles 是此扩缩器为其规划的目标角色列表，包含每个角色所应保持的边界范围。
 	//
-	// Every role of the target the scaler plans for needs a bound, and a role the target does not
-	// have is refused, so that the planner never reasons about a role that is not there.
+	// 扩缩器规划的每一个目标角色都需要配置边界，而目标中不存在的角色会被拒绝，从而确保
+	// 规划器绝不会针对不存在的角色进行推理。
 	//
 	// +required
 	// +k8s:validation:minItems=1
@@ -279,11 +268,10 @@ type ModelDeploymentScalerSpec struct {
 	// +listMapKey=name
 	Roles []ModelDeploymentScalerRoleBounds `json:"roles" protobuf:"bytes,5,rep,name=roles"`
 
-	// Ratios are the relationships between roles that a committed vector has to keep.
+	// Ratios 是已提交向量必须维持的角色间比例关系。
 	//
-	// A ratio bounds the replica count of a numerator role against the replica count of a
-	// denominator role, so that a coupled prefill and decode pair does not drift apart. A ratio
-	// names roles the scaler plans for, and a ratio that names an unknown role is refused.
+	// 比例将分子角色的副本数限制在分母角色副本数的一定范围内，防止耦合的 Prefill 与 Decode
+	// 角色对彼此偏离。比例引用缩放器所规划的角色，引用未知角色的比例将被拒绝。
 	//
 	// +optional
 	// +listType=map
@@ -291,29 +279,28 @@ type ModelDeploymentScalerSpec struct {
 	// +listMapKey=denominatorRole
 	Ratios []ModelDeploymentScalerRoleRatio `json:"ratios,omitempty" protobuf:"bytes,6,rep,name=ratios"`
 
-	// Algorithm says how the scaler turns what it observes into a replica count.
+	// Algorithm 指定缩放器如何将观测结果转换为副本数。
 	//
-	// The algorithm named here is the one that runs, and the parameters of the other algorithms
-	// are ignored, so a deployment states one algorithm and one set of parameters.
+	// 此处指定的算法将被实际执行，其他算法的参数则会被忽略，因此每个部署只需声明一种算法及其
+	// 对应的一组参数。
 	//
 	// +required
 	Algorithm ModelDeploymentScalerAlgorithmSpec `json:"algorithm" protobuf:"bytes,7,name=algorithm"`
 
-	// Behavior tunes how fast the scaler may move a role and how long it waits after a failure.
+	// Behavior 调节缩放器调整角色副本数的速率，以及在失败后的等待时长。
 	//
 	// +optional
 	Behavior ModelDeploymentScalerBehaviorSpec `json:"behavior,omitempty" protobuf:"bytes,8,opt,name=behavior"`
 
-	// Rebalance tunes what the scaler does when one role cannot grow because the cluster is
-	// exhausted and another role could give resources back.
+	// Rebalance 调节当集群资源耗尽导致某个角色无法扩容、而另一个角色可释放资源时缩放器的处理方式。
 	//
 	// +optional
 	Rebalance ModelDeploymentScalerRebalanceSpec `json:"rebalance,omitempty" protobuf:"bytes,9,opt,name=rebalance"`
 }
 
-// ModelDeploymentScalerTargetReference names the target of a scaler.
+// ModelDeploymentScalerTargetReference 指定缩放器的目标对象。
 type ModelDeploymentScalerTargetReference struct {
-	// Name is the name of the target ModelDeployment in this namespace.
+	// Name 是当前 Namespace 中目标 ModelDeployment 的名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
@@ -321,35 +308,32 @@ type ModelDeploymentScalerTargetReference struct {
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 }
 
-// ModelDeploymentScalerMode decides whether a scaler acts on what it observes.
+// ModelDeploymentScalerMode 决定缩放器是否根据观测结果执行操作。
 type ModelDeploymentScalerMode string
 
 const (
-	// ModelDeploymentScalerModeShadow observes and publishes without changing the target.
+	// ModelDeploymentScalerModeShadow 仅观测并发布结果，而不修改目标对象。
 	ModelDeploymentScalerModeShadow ModelDeploymentScalerMode = "Shadow"
 
-	// ModelDeploymentScalerModeActive observes, publishes and has the worker reconciler apply
-	// the committed vector.
+	// ModelDeploymentScalerModeActive 负责观测、发布结果，并由 worker 协调器应用已提交向量。
 	ModelDeploymentScalerModeActive ModelDeploymentScalerMode = "Active"
 )
 
-// ModelDeploymentScalerSamplingSpec tunes the observation interval and the pending timeout.
+// ModelDeploymentScalerSamplingSpec 调节观测间隔和挂起超时时间。
 type ModelDeploymentScalerSamplingSpec struct {
-	// IntervalSeconds is how often the scaler looks at the target.
+	// IntervalSeconds 是缩放器检查目标对象的频率。
 	//
-	// It is the floor on how fast the scaler reacts and the floor on how often it writes, so a
-	// short interval costs scrape load and a long one costs reaction time.
+	// 它既是缩放器响应速度的下限，也是写入频率的下限；间隔过短会增加采集负载，间隔过长则会降低
+	// 响应速度。
 	//
 	// +optional
 	// +k8s:validation:minimum=5
 	// +k8s:validation:maximum=300
 	IntervalSeconds int32 `json:"intervalSeconds,omitempty" protobuf:"varint,1,opt,name=intervalSeconds"`
 
-	// PendingTimeoutSeconds is how long a committed scale-up may stay unadmitted before it is
-	// retracted.
+	// PendingTimeoutSeconds 是已提交的扩容操作在未被准入前可维持的最长时间，超时后将被撤回。
 	//
-	// The retraction restores the vector the scale-up started from, so a timeout undoes a change
-	// rather than leaving a role waiting for resources that never arrive.
+	// 撤回操作会恢复至扩容开始前的向量，从而在超时后撤销变更，避免角色一直等待无法就绪的资源。
 	//
 	// +optional
 	// +k8s:validation:minimum=60
@@ -357,23 +341,23 @@ type ModelDeploymentScalerSamplingSpec struct {
 	PendingTimeoutSeconds int32 `json:"pendingTimeoutSeconds,omitempty" protobuf:"varint,2,opt,name=pendingTimeoutSeconds"`
 }
 
-// ModelDeploymentScalerRoleBounds are the bounds one role stays inside.
+// ModelDeploymentScalerRoleBounds 定义单个角色应保持的副本数边界。
 type ModelDeploymentScalerRoleBounds struct {
-	// Name is the name of the role on the target.
+	// Name 是目标对象上的角色名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// MinReplicas is the fewest replicas this role may have.
+	// MinReplicas 是该角色允许拥有的最少副本数。
 	//
 	// +optional
 	// +k8s:validation:minimum=1
 	// +k8s:validation:maximum=1024
 	MinReplicas int32 `json:"minReplicas,omitempty" protobuf:"varint,2,opt,name=minReplicas"`
 
-	// MaxReplicas is the most replicas this role may have.
+	// MaxReplicas 是该角色允许拥有的最多副本数。
 	//
 	// +required
 	// +k8s:validation:minimum=1
@@ -381,298 +365,279 @@ type ModelDeploymentScalerRoleBounds struct {
 	MaxReplicas int32 `json:"maxReplicas" protobuf:"varint,3,opt,name=maxReplicas"`
 }
 
-// ModelDeploymentScalerRoleRatio is a relationship two roles keep.
+// ModelDeploymentScalerRoleRatio 定义两个角色之间维持的比例关系。
 type ModelDeploymentScalerRoleRatio struct {
-	// NumeratorRole is the role whose replica count is the numerator.
+	// NumeratorRole 是副本数作为分子的角色。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	NumeratorRole string `json:"numeratorRole" protobuf:"bytes,1,name=numeratorRole"`
 
-	// DenominatorRole is the role whose replica count is the denominator.
+	// DenominatorRole 是副本数作为分母的角色。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	DenominatorRole string `json:"denominatorRole" protobuf:"bytes,2,name=denominatorRole"`
 
-	// Target is the ratio the projection aims at.
+	// Target 是规划投影所瞄准的目标比例。
 	//
-	// It is the ratio the planner looks for inside the bounds of every other rule, and it is
-	// what a coupled pair settles on when nothing else decides.
+	// 规划器会在所有其他规则的边界内尽量贴近该比例；在没有其他约束决定结果时，耦合角色对也会稳定
+	// 在该比例上。
 	//
 	// +optional
 	Target *resource.Quantity `json:"target,omitempty" protobuf:"bytes,3,opt,name=target"`
 
-	// Min is the smallest ratio the numerator may hold against the denominator.
+	// Min 是分子角色与分母角色之间允许的最小比例。
 	//
 	// +optional
 	Min *resource.Quantity `json:"min,omitempty" protobuf:"bytes,4,opt,name=min"`
 
-	// Max is the largest ratio the numerator may hold against the denominator.
+	// Max 是分子角色与分母角色之间允许的最大比例。
 	//
 	// +optional
 	Max *resource.Quantity `json:"max,omitempty" protobuf:"bytes,5,opt,name=max"`
 }
 
-// ModelDeploymentScalerAlgorithmSpec names the algorithm and holds its parameters.
+// ModelDeploymentScalerAlgorithmSpec 指定扩缩容算法并保存其参数。
 type ModelDeploymentScalerAlgorithmSpec struct {
-	// Type is the algorithm that runs.
+	// Type 是实际执行的算法类型。
 	//
 	// +required
 	// +k8s:validation:enum=["Proportional","TokenThroughput","Predictive"]
 	Type ModelDeploymentScalerAlgorithmType `json:"type" protobuf:"bytes,1,name=type"`
 
-	// Proportional holds the parameters of the Proportional algorithm.
+	// Proportional 保存 Proportional 算法的参数。
 	//
-	// It is required when Type is Proportional and ignored otherwise.
+	// 当 Type 为 Proportional 时必填，其他情况下将被忽略。
 	//
 	// +optional
 	Proportional *ModelDeploymentScalerProportionalSpec `json:"proportional,omitempty" protobuf:"bytes,2,opt,name=proportional"`
 
-	// TokenThroughput holds the parameters of the TokenThroughput algorithm.
+	// TokenThroughput 保存 TokenThroughput 算法的参数。
 	//
-	// It is required when Type is TokenThroughput and ignored otherwise.
+	// 当 Type 为 TokenThroughput 时必填，其他情况下将被忽略。
 	//
 	// +optional
 	TokenThroughput *ModelDeploymentScalerTokenThroughputSpec `json:"tokenThroughput,omitempty" protobuf:"bytes,3,opt,name=tokenThroughput"`
 
-	// Predictive holds the parameters of the Predictive algorithm.
+	// Predictive 保存 Predictive 算法的参数。
 	//
-	// It is required when Type is Predictive and ignored otherwise.
+	// 当 Type 为 Predictive 时必填，其他情况下将被忽略。
 	//
 	// +optional
 	Predictive *ModelDeploymentScalerPredictiveSpec `json:"predictive,omitempty" protobuf:"bytes,4,opt,name=predictive"`
 
-	// CapacityPrior permits resolving missing token capacities from a measured catalog for
-	// TokenThroughput and Predictive.
+	// CapacityPrior 允许为 TokenThroughput 和 Predictive 算法从实测容量目录中解析缺失的
+	// token 容量。
 	//
-	// An absent object means every capacity is stated by hand, and the scaler uses only those
-	// values. A present object permits resolving the capacities the scaler does not state, and
-	// only from the offline catalog it names. A capacity the scaler states is never replaced by a
-	// catalog value. When every serving capacity is stated, no catalog is read at all.
+	// 省略该对象表示所有容量均由人工显式指定，缩放器仅使用这些值。配置该对象则允许从其指定的离线
+	// 目录中解析缩放器未声明的容量，且缩放器已显式声明的容量绝不会被目录值覆盖。当所有服务容量均已
+	// 声明时，完全不会读取目录。
 	//
 	// +optional
 	CapacityPrior *ModelDeploymentScalerCapacityPriorSpec `json:"capacityPrior,omitempty" protobuf:"bytes,5,opt,name=capacityPrior"` // nolint: lll
 }
 
-// ModelDeploymentScalerAlgorithmType is the algorithm a scaler runs.
+// ModelDeploymentScalerAlgorithmType 表示缩放器运行的算法类型。
 type ModelDeploymentScalerAlgorithmType string
 
 const (
-	// ModelDeploymentScalerAlgorithmTypeProportional scales on how much work a replica already
-	// carries.
+	// ModelDeploymentScalerAlgorithmTypeProportional 根据单个副本当前承载的工作量进行扩缩容。
 	ModelDeploymentScalerAlgorithmTypeProportional ModelDeploymentScalerAlgorithmType = "Proportional"
 
-	// ModelDeploymentScalerAlgorithmTypeTokenThroughput scales on how many tokens a second the
-	// role has to serve.
+	// ModelDeploymentScalerAlgorithmTypeTokenThroughput 根据角色每秒需要处理的 token 数进行扩缩容。
 	ModelDeploymentScalerAlgorithmTypeTokenThroughput ModelDeploymentScalerAlgorithmType = "TokenThroughput"
 
-	// ModelDeploymentScalerAlgorithmTypePredictive forecasts the demand and scales on the
-	// forecast.
+	// ModelDeploymentScalerAlgorithmTypePredictive 预测负载需求并基于预测结果进行扩缩容。
 	ModelDeploymentScalerAlgorithmTypePredictive ModelDeploymentScalerAlgorithmType = "Predictive"
 )
 
-// ModelDeploymentScalerProportionalSpec holds the parameters of the Proportional algorithm.
+// ModelDeploymentScalerProportionalSpec 保存 Proportional 算法的参数。
 type ModelDeploymentScalerProportionalSpec struct {
-	// Metric is the signal the algorithm scales on.
+	// Metric 是该算法用于扩缩容的指标信号。
 	//
 	// +required
 	// +k8s:validation:enum=["QueueDepth","RunningRequests","WaitingRequests","PromptTokensPerSecond","GenerationTokensPerSecond","TotalTokensPerSecond"]
 	Metric ModelDeploymentScalerProportionalMetric `json:"metric" protobuf:"bytes,1,name=metric"`
 
-	// RoleTargets is the signal one replica of each role is expected to carry.
+	// RoleTargets 指定各角色单个副本预期承载的指标目标值。
 	//
-	// Every role the scaler plans for needs a target, because the algorithm divides what it
-	// observed by it to reach a replica count.
+	// 缩放器所规划的每个角色都需要一个目标值，因为算法会将观测值除以该目标值来计算所需副本数。
 	//
 	// +optional
 	// +listType=map
 	// +listMapKey=name
 	RoleTargets []ModelDeploymentScalerRoleTarget `json:"roleTargets,omitempty" protobuf:"bytes,2,rep,name=roleTargets"`
 
-	// Tolerance is the fraction around the target inside which nothing happens.
+	// Tolerance 是围绕目标值的容差比例，观测值落入该范围内时不触发扩缩容。
 	//
-	// A role whose observed load already sits inside the tolerance holds its replica count, so a
-	// steady deployment does not move for noise.
+	// 观测负载已处于容差范围内的角色会保持当前副本数，从而使稳定的部署不会因指标波动而频繁调整。
 	//
 	// +optional
 	Tolerance *resource.Quantity `json:"tolerance,omitempty" protobuf:"bytes,3,opt,name=tolerance"`
 }
 
-// ModelDeploymentScalerProportionalMetric is the signal the Proportional algorithm scales on.
+// ModelDeploymentScalerProportionalMetric 表示 Proportional 算法用于扩缩容的指标信号。
 type ModelDeploymentScalerProportionalMetric string
 
 const (
-	// ModelDeploymentScalerProportionalMetricQueueDepth counts the requests a role is running or
-	// waiting for.
+	// ModelDeploymentScalerProportionalMetricQueueDepth 统计角色正在运行及等待处理的请求数。
 	ModelDeploymentScalerProportionalMetricQueueDepth ModelDeploymentScalerProportionalMetric = "QueueDepth"
 
-	// ModelDeploymentScalerProportionalMetricRunningRequests counts the requests a role is
-	// running.
+	// ModelDeploymentScalerProportionalMetricRunningRequests 统计角色正在运行的请求数。
 	ModelDeploymentScalerProportionalMetricRunningRequests ModelDeploymentScalerProportionalMetric = "RunningRequests"
 
-	// ModelDeploymentScalerProportionalMetricWaitingRequests counts the requests a role is
-	// waiting for.
+	// ModelDeploymentScalerProportionalMetricWaitingRequests 统计角色正在等待处理的请求数。
 	ModelDeploymentScalerProportionalMetricWaitingRequests ModelDeploymentScalerProportionalMetric = "WaitingRequests"
 
-	// ModelDeploymentScalerProportionalMetricPromptTokensPerSecond counts the prompt tokens a
-	// role processes per second.
+	// ModelDeploymentScalerProportionalMetricPromptTokensPerSecond 统计角色每秒处理的 prompt
+	// token 数。
 	ModelDeploymentScalerProportionalMetricPromptTokensPerSecond ModelDeploymentScalerProportionalMetric = "PromptTokensPerSecond"
 
-	// ModelDeploymentScalerProportionalMetricGenerationTokensPerSecond counts the tokens a role
-	// generates per second.
+	// ModelDeploymentScalerProportionalMetricGenerationTokensPerSecond 统计角色每秒生成的 token 数。
 	ModelDeploymentScalerProportionalMetricGenerationTokensPerSecond ModelDeploymentScalerProportionalMetric = "GenerationTokensPerSecond"
 
-	// ModelDeploymentScalerProportionalMetricTotalTokensPerSecond counts every token a role
-	// processes per second.
+	// ModelDeploymentScalerProportionalMetricTotalTokensPerSecond 统计角色每秒处理的总 token 数。
 	ModelDeploymentScalerProportionalMetricTotalTokensPerSecond ModelDeploymentScalerProportionalMetric = "TotalTokensPerSecond"
 )
 
-// ModelDeploymentScalerRoleTarget is the signal one replica of a role is expected to carry.
+// ModelDeploymentScalerRoleTarget 定义单个角色副本预期承载的指标目标值。
 type ModelDeploymentScalerRoleTarget struct {
-	// Name is the role this target belongs to.
+	// Name 是该目标值所属的角色名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// Target is the signal one replica of this role is expected to carry.
+	// Target 是该角色单个副本预期承载的指标目标值。
 	//
-	// It is a quantity, so a rate is written as a quantity per second and a count as a plain
-	// number.
+	// 它使用 Quantity 类型表示，因此速率写为每秒数量，计数写为普通数值。
 	//
 	// +required
 	Target resource.Quantity `json:"target" protobuf:"bytes,2,name=target"`
 }
 
-// ModelDeploymentScalerTokenThroughputSpec holds the parameters of the TokenThroughput
-// algorithm.
+// ModelDeploymentScalerTokenThroughputSpec 保存 TokenThroughput 算法的参数。
 type ModelDeploymentScalerTokenThroughputSpec struct {
-	// PrefillTargetTokensPerSecond is the prompt-token rate one Prefill replica sustains.
+	// PrefillTargetTokensPerSecond 是单个 Prefill 副本可持续处理的 prompt token 速率。
 	//
-	// It is the capacity the demand is divided by, so the number of replicas follows from how
-	// many prompt tokens per second one replica is expected to serve.
+	// 算法会将需求除以该容量，因此副本数取决于单个副本预期每秒能处理的 prompt token 数。
 	//
 	// +optional
 	PrefillTargetTokensPerSecond *resource.Quantity `json:"prefillTargetTokensPerSecond,omitempty" protobuf:"bytes,1,opt,name=prefillTargetTokensPerSecond"` // nolint: lll
 
-	// DecodeTargetTokensPerSecond is the generation-token rate one Decode replica sustains.
+	// DecodeTargetTokensPerSecond 是单个 Decode 副本可持续处理的生成 token 速率。
 	//
 	// +optional
 	DecodeTargetTokensPerSecond *resource.Quantity `json:"decodeTargetTokensPerSecond,omitempty" protobuf:"bytes,2,opt,name=decodeTargetTokensPerSecond"`
 
-	// ServerTargetTokensPerSecond is the token rate one Server replica sustains, over prompt
-	// tokens and generation tokens together.
+	// ServerTargetTokensPerSecond 是单个 Server 副本可持续处理的总 token 速率（涵盖 prompt token
+	// 与生成 token）。
 	//
 	// +optional
 	ServerTargetTokensPerSecond *resource.Quantity `json:"serverTargetTokensPerSecond,omitempty" protobuf:"bytes,3,opt,name=serverTargetTokensPerSecond"`
 
-	// StableWindowSeconds is the window the stable recommendation is computed over.
+	// StableWindowSeconds 是计算稳定期推荐副本数所用的时间窗口。
 	//
-	// The stable window is long enough to smooth a burst, so a short spike does not move the
-	// replica count.
+	// 稳定窗口足够长，能够平滑突发流量，使短暂的峰值不会触发副本数变动。
 	//
 	// +optional
 	// +k8s:validation:minimum=30
 	// +k8s:validation:maximum=600
 	StableWindowSeconds int32 `json:"stableWindowSeconds,omitempty" protobuf:"varint,4,opt,name=stableWindowSeconds"`
 
-	// PanicWindowSeconds is the window the panic recommendation is computed over.
+	// PanicWindowSeconds 是计算紧急期推荐副本数所用的时间窗口。
 	//
-	// The panic window is short, so it reacts to a burst that the stable window smooths away.
+	// 紧急窗口较短，能够对稳定窗口会平滑掉的突发流量做出快速响应。
 	//
 	// +optional
 	// +k8s:validation:minimum=10
 	// +k8s:validation:maximum=300
 	PanicWindowSeconds int32 `json:"panicWindowSeconds,omitempty" protobuf:"varint,5,opt,name=panicWindowSeconds"`
 
-	// PanicThreshold is the growth rate over the ready replicas that starts a panic.
+	// PanicThreshold 是触发紧急模式的相对就绪副本数增长率阈值。
 	//
-	// A panic holds the replica count up and stops scale-downs until the load settles.
+	// 进入紧急模式后会保持副本数处于高位并暂停缩容，直到负载回落稳定。
 	//
 	// +optional
 	PanicThreshold *resource.Quantity `json:"panicThreshold,omitempty" protobuf:"bytes,6,opt,name=panicThreshold"`
 
-	// TTFTTargetMilliseconds is the time to first token the role is expected to keep under.
+	// TTFTTargetMilliseconds 是该角色预期保持的首 token 延迟（TTFT）上限。
 	//
-	// A role that is observed above this target is a role that needs more replicas, whatever the
-	// token counters say.
+	// 无论 token 计数指标如何，只要观测到角色的首 token 延迟高于该目标值，即表明需要增加副本。
 	//
 	// +optional
 	TTFTTargetMilliseconds *resource.Quantity `json:"ttftTargetMilliseconds,omitempty" protobuf:"bytes,7,opt,name=ttftTargetMilliseconds"`
 
-	// ITLTargetMilliseconds is the inter-token latency the role is expected to keep under.
+	// ITLTargetMilliseconds 是该角色预期保持的 token 间延迟（ITL）上限。
 	//
 	// +optional
 	ITLTargetMilliseconds *resource.Quantity `json:"itlTargetMilliseconds,omitempty" protobuf:"bytes,8,opt,name=itlTargetMilliseconds"`
 
-	// LatencyQuantile is the quantile of the latency distribution the role is held to.
+	// LatencyQuantile 是约束该角色延迟分布的分位数。
 	//
-	// IT IS THE QUANTILE THE ONLINE HISTOGRAMS ARE SAMPLED AT and the quantile the capacity
-	// prior is resolved against. An absent value means the ninety fifth percentile.
+	// 它是在线直方图的采样分位数，也是解析容量先验所依据的分位数。未设置时默认为第 95 百分位数。
 	//
-	// IT IS A NUMBER BETWEEN ZERO EXCLUSIVE AND ONE INCLUSIVE, and any percentile is allowed.
-	// THE VALUE IS READ AT THE PRECISION THE QUANTITY RESOLVES IT, so a quantile with more
-	// digits than that resolution keeps the rounded value and not the written one.
+	// 其取值为区间 (0, 1] 内的数值，支持任意百分位。
+	// 该值按 Quantity 解析的精度读取，因此如果写入的小数位数超过该精度，实际保留的是舍入后的值而非原始写入值。
 	//
 	// +optional
 	LatencyQuantile *resource.Quantity `json:"latencyQuantile,omitempty" protobuf:"bytes,9,opt,name=latencyQuantile"`
 }
 
-// ModelDeploymentScalerPredictiveSpec holds the parameters of the Predictive algorithm.
+// ModelDeploymentScalerPredictiveSpec 保存 Predictive 算法的参数。
 //
-// It carries the TokenThroughput parameters as well, because the predictor falls back to the
-// token throughput result while it has not seen enough points yet.
+// 它同时包含 TokenThroughput 参数，因为在尚未收集到足够数据点时，预测器会回退到
+// token 吞吐量算法的结果。
 type ModelDeploymentScalerPredictiveSpec struct {
-	// TokenThroughput holds the parameters the predictor falls back to.
+	// TokenThroughput 保存预测器回退时使用的参数。
 	//
 	// +optional
 	TokenThroughput ModelDeploymentScalerTokenThroughputSpec `json:"tokenThroughput,omitempty" protobuf:"bytes,1,opt,name=tokenThroughput"`
 
-	// HorizonSeconds is how far ahead the demand is forecast.
+	// HorizonSeconds 指定向前预测需求的时间跨度（单位：秒）。
 	//
 	// +optional
 	// +k8s:validation:minimum=30
 	// +k8s:validation:maximum=600
 	HorizonSeconds int32 `json:"horizonSeconds,omitempty" protobuf:"varint,2,opt,name=horizonSeconds"`
 
-	// PrefillTokenCapacityPerReplica is the prompt-token rate one Prefill replica sustains.
+	// PrefillTokenCapacityPerReplica 是单个 Prefill 副本可持续处理的提示词 token 速率。
 	//
 	// +optional
 	PrefillTokenCapacityPerReplica *resource.Quantity `json:"prefillTokenCapacityPerReplica,omitempty" protobuf:"bytes,3,opt,name=prefillTokenCapacityPerReplica"` // nolint: lll
 
-	// DecodeTokenCapacityPerReplica is the generation-token rate one Decode replica sustains.
+	// DecodeTokenCapacityPerReplica 是单个 Decode 副本可持续处理的生成 token 速率。
 	//
 	// +optional
 	DecodeTokenCapacityPerReplica *resource.Quantity `json:"decodeTokenCapacityPerReplica,omitempty" protobuf:"bytes,4,opt,name=decodeTokenCapacityPerReplica"` // nolint: lll
 
-	// ServerTokenCapacityPerReplica is the token rate one Server replica sustains.
+	// ServerTokenCapacityPerReplica 是单个 Server 副本可持续处理的 token 速率。
 	//
 	// +optional
 	ServerTokenCapacityPerReplica *resource.Quantity `json:"serverTokenCapacityPerReplica,omitempty" protobuf:"bytes,5,opt,name=serverTokenCapacityPerReplica"` // nolint: lll
 
-	// QLevel is how much the level of the forecast follows each new observation.
+	// QLevel 表示预测的水平分量跟随每次新观测值的程度。
 	//
 	// +optional
 	QLevel *resource.Quantity `json:"qLevel,omitempty" protobuf:"bytes,6,opt,name=qLevel"`
 
-	// QTrend is how much the trend of the forecast follows each new observation.
+	// QTrend 表示预测的趋势分量跟随每次新观测值的程度。
 	//
 	// +optional
 	QTrend *resource.Quantity `json:"qTrend,omitempty" protobuf:"bytes,7,opt,name=qTrend"`
 
-	// MeasurementNoise is how much the forecast trusts each new observation.
+	// MeasurementNoise 表示预测对每次新观测值的信任程度。
 	//
 	// +optional
 	MeasurementNoise *resource.Quantity `json:"measurementNoise,omitempty" protobuf:"bytes,8,opt,name=measurementNoise"`
 
-	// MinPoints is how many observations the predictor needs before it forecasts.
+	// MinPoints 是预测器开始预测前所需的观测点数量。
 	//
-	// Until it has them, the algorithm reports that it is warming up and returns the token
-	// throughput result.
+	// 在达到该数量之前，算法会报告处于预热状态，并返回 token 吞吐量的计算结果。
 	//
 	// +optional
 	// +k8s:validation:minimum=1
@@ -680,45 +645,42 @@ type ModelDeploymentScalerPredictiveSpec struct {
 	MinPoints int32 `json:"minPoints,omitempty" protobuf:"varint,9,opt,name=minPoints"`
 }
 
-// ModelDeploymentScalerCapacityPriorSpec permits resolving missing token capacities from an
-// offline catalog for TokenThroughput and Predictive.
+// ModelDeploymentScalerCapacityPriorSpec 允许为 TokenThroughput 和 Predictive 从离线目录中
+// 解析缺失的 token 容量。
 //
-// The presence of the spec is the request, because it holds no switch that turns the resolution
-// off. The resolution fills only the capacities the scaler does not state, and only from the
-// offline catalog, so there is no source outside it.
+// 该字段本身的存在即表示启用解析请求，因为它不包含关闭解析的开关。解析过程仅填充
+// 扩缩器未显式指定的容量字段，且仅从离线目录获取，不依赖外部来源。
 type ModelDeploymentScalerCapacityPriorSpec struct {
-	// CatalogRef names an optional ConfigMap and key in this namespace as the sole catalog source.
+	// CatalogRef 指定当前 Namespace 中一个可选的 ConfigMap 及其 key，作为唯一的目录来源。
 	//
-	// When omitted, the embedded catalog is used.
+	// 省略时使用内置目录。
 	//
 	// +optional
 	CatalogRef *ModelDeploymentScalerCatalogReference `json:"catalogRef,omitempty" protobuf:"bytes,2,opt,name=catalogRef"`
 
-	// Headroom is the margin in (0,1] applied to catalog-derived seed capacities.
+	// Headroom 是应用于从目录推导的初始容量的裕度系数，取值范围为 (0, 1]。
 	//
-	// It defaults to 0.75 when capacityPrior is present and does not apply to explicit capacity
-	// fields.
+	// 当存在 capacityPrior 时默认为 0.75，且不适用于显式指定的容量字段。
 	//
 	// +optional
 	Headroom *resource.Quantity `json:"headroom,omitempty" protobuf:"bytes,4,opt,name=headroom"`
 }
 
-// ModelDeploymentScalerCatalogReference selects a catalog key in a ConfigMap in the scaler's
-// namespace.
+// ModelDeploymentScalerCatalogReference 用于选择位于扩缩器所在 Namespace 的 ConfigMap 中的目录 key。
 type ModelDeploymentScalerCatalogReference struct {
-	// Name is the name of the ConfigMap in this namespace.
+	// Name 是当前 Namespace 中 ConfigMap 的名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// Key is the ConfigMap data key that holds the catalog document.
+	// Key 是 ConfigMap 中保存目录文档的数据键。
 	//
-	// The document is YAML or JSON, and the reader accepts the catalog under
-	// the priors.yaml key and under the priors.json key.
+	// 该文档采用 YAML 或 JSON 格式，读取器支持通过 priors.yaml 和 priors.json
+	// 两种键名读取目录。
 	//
-	// It defaults to priors.yaml when omitted.
+	// 省略时默认为 priors.yaml。
 	//
 	// +optional
 	// +k8s:validation:minLength=1
@@ -727,200 +689,196 @@ type ModelDeploymentScalerCatalogReference struct {
 	Key string `json:"key,omitempty" protobuf:"bytes,2,opt,name=key"`
 }
 
-// ModelDeploymentScalerBehaviorSpec tunes how fast a role may move and how long the scaler
-// waits after a failure.
+// ModelDeploymentScalerBehaviorSpec 用于调整角色扩缩容的速度以及失败后扩缩器的等待时间。
 type ModelDeploymentScalerBehaviorSpec struct {
-	// ScaleUp tunes how fast a role may grow.
+	// ScaleUp 用于调整角色扩容的速度。
 	//
 	// +optional
 	ScaleUp ModelDeploymentScalerScaleUpRules `json:"scaleUp,omitempty" protobuf:"bytes,1,opt,name=scaleUp"`
 
-	// ScaleDown tunes how fast a role may shrink and what happens after an aborted retirement.
+	// ScaleDown 用于调整角色缩容的速度以及副本下线被中止后的处理行为。
 	//
 	// +optional
 	ScaleDown ModelDeploymentScalerScaleDownRules `json:"scaleDown,omitempty" protobuf:"bytes,2,opt,name=scaleDown"`
 }
 
-// ModelDeploymentScalerScaleUpRules tune how fast a role may grow.
+// ModelDeploymentScalerScaleUpRules 用于调整角色扩容的速度。
 type ModelDeploymentScalerScaleUpRules struct {
-	// StabilizationWindowSeconds is how long a recommendation is held before it takes effect.
+	// StabilizationWindowSeconds 是建议在生效前保持稳定的时长（单位：秒）。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	// +k8s:validation:maximum=600
 	StabilizationWindowSeconds int32 `json:"stabilizationWindowSeconds,omitempty" protobuf:"varint,1,opt,name=stabilizationWindowSeconds"`
 
-	// MaxStepReplicas is the most replicas one pass may add to a role.
+	// MaxStepReplicas 是单轮操作中最多可为角色增加的副本数。
 	//
-	// Zero leaves the bound unset, so only the percentage bound applies.
+	// 设为 0 表示不限制副本数上限，此时仅百分比上限生效。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	MaxStepReplicas int32 `json:"maxStepReplicas,omitempty" protobuf:"varint,2,opt,name=maxStepReplicas"`
 
-	// MaxStepPercent is the most percent of the current replica count one pass may add to a role.
+	// MaxStepPercent 是单轮操作中最多可为角色增加的当前副本数百分比。
 	//
-	// Zero leaves the bound unset, so only the replica bound applies.
+	// 设为 0 表示不限制百分比上限，此时仅副本数上限生效。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	// +k8s:validation:maximum=1000
 	MaxStepPercent int32 `json:"maxStepPercent,omitempty" protobuf:"varint,3,opt,name=maxStepPercent"`
 
-	// StepPolicy is a step bound stated in one unit.
+	// StepPolicy 是以单一单位表示的步长上限。
 	//
-	// It replaces the two bounds above, so a deployment states its cap once instead of twice.
+	// 它取代了上述两个上限字段，使部署只需声明一次上限而非两次。
 	//
 	// +optional
 	StepPolicy *ModelDeploymentScalerStepPolicy `json:"stepPolicy,omitempty" protobuf:"bytes,4,opt,name=stepPolicy"`
 }
 
-// ModelDeploymentScalerScaleDownRules tune how fast a role may shrink.
+// ModelDeploymentScalerScaleDownRules 用于调整角色缩容的速度。
 type ModelDeploymentScalerScaleDownRules struct {
-	// StabilizationWindowSeconds is the window the recommendations are remembered over.
+	// StabilizationWindowSeconds 是记录历史建议的时间窗口（单位：秒）。
 	//
-	// The largest recommendation in that window is the floor a scale-down may go to, so a role
-	// that was asked to grow does not shrink again right away.
+	// 该窗口内的最大建议值将作为允许缩容的下限，从而避免刚被要求扩容的角色立即缩容。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	// +k8s:validation:maximum=1800
 	StabilizationWindowSeconds int32 `json:"stabilizationWindowSeconds,omitempty" protobuf:"varint,1,opt,name=stabilizationWindowSeconds"`
 
-	// CooldownAfterAbortSeconds is how long a role is held after an aborted retirement.
+	// CooldownAfterAbortSeconds 是在副本下线被中止后角色需要维持的冷却时长（单位：秒）。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	// +k8s:validation:maximum=3600
 	CooldownAfterAbortSeconds int32 `json:"cooldownAfterAbortSeconds,omitempty" protobuf:"varint,2,opt,name=cooldownAfterAbortSeconds"`
 
-	// DecodePostScaleUpGraceSeconds is how long a Decode role is held after it grew.
+	// DecodePostScaleUpGraceSeconds 是 Decode 角色在扩容后需要维持的保护时长（单位：秒）。
 	//
-	// A Decode role that just grew does not shrink again inside this window, because a pair that
-	// oscillates costs more than it saves.
+	// 刚扩容的 Decode 角色在此时间窗口内不会再次缩容，因为一对副本的频繁震荡
+	// 带来的开销大于其节省的资源。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	// +k8s:validation:maximum=3600
 	DecodePostScaleUpGraceSeconds int32 `json:"decodePostScaleUpGraceSeconds,omitempty" protobuf:"varint,3,opt,name=decodePostScaleUpGraceSeconds"`
 
-	// StepPolicy is a step bound stated in one unit.
+	// StepPolicy 是以单一单位表示的步长上限。
 	//
-	// It replaces the default of removing at most one replica per role per pass.
+	// 它取代了每轮每个角色最多移除一个副本的默认行为。
 	//
 	// +optional
 	StepPolicy *ModelDeploymentScalerStepPolicy `json:"stepPolicy,omitempty" protobuf:"bytes,4,opt,name=stepPolicy"`
 }
 
-// ModelDeploymentScalerStepPolicyType is the unit a step bound is expressed in.
+// ModelDeploymentScalerStepPolicyType 是步长上限所使用的计量单位。
 type ModelDeploymentScalerStepPolicyType string
 
 const (
-	// ModelDeploymentScalerStepPolicyTypePods counts replicas.
+	// ModelDeploymentScalerStepPolicyTypePods 按副本数计量。
 	ModelDeploymentScalerStepPolicyTypePods ModelDeploymentScalerStepPolicyType = "Pods"
 
-	// ModelDeploymentScalerStepPolicyTypePercent counts percent of the current replica count.
+	// ModelDeploymentScalerStepPolicyTypePercent 按当前副本数的百分比计量。
 	ModelDeploymentScalerStepPolicyTypePercent ModelDeploymentScalerStepPolicyType = "Percent"
 )
 
-// ModelDeploymentScalerStepPolicy is a bound on how far one role may move in one pass.
+// ModelDeploymentScalerStepPolicy 限制单个角色在单轮操作中可调整的幅度。
 type ModelDeploymentScalerStepPolicy struct {
-	// Type is the unit of Value.
+	// Type 是 Value 的计量单位。
 	//
 	// +required
 	// +k8s:validation:enum=["Pods","Percent"]
 	Type ModelDeploymentScalerStepPolicyType `json:"type" protobuf:"bytes,1,name=type"`
 
-	// Value is the bound expressed in the unit Type names.
+	// Value 是以 Type 所指定单位表示的步长上限。
 	//
 	// +required
 	// +k8s:validation:minimum=1
 	Value int32 `json:"value" protobuf:"varint,2,opt,name=value"`
 }
 
-// ModelDeploymentScalerRebalanceSpec tunes what the scaler does when one role cannot grow.
+// ModelDeploymentScalerRebalanceSpec 用于调整当某个角色无法继续扩容时扩缩器的处理策略。
 type ModelDeploymentScalerRebalanceSpec struct {
-	// Policy decides whether another role may give resources back to an exhausted one.
+	// Policy 决定其他角色是否可以向资源耗尽的角色归还资源。
 	//
 	// +optional
 	// +k8s:validation:enum=["Opposing","Priority","Disabled"]
 	Policy ModelDeploymentScalerRebalancePolicy `json:"policy,omitempty" protobuf:"bytes,1,opt,name=policy"`
 
-	// Priority orders the roles from the one that may give resources away to the one that may
-	// not.
+	// Priority 按顺序列出角色，从允许让出资源的角色到不允许让出资源的角色。
 	//
-	// It only means something under the Priority policy, where a role late in the order is the
-	// first one asked to shrink. A role that is not named keeps the place of its own
-	// recommendation.
+	// 该字段仅在 Priority 策略下生效，排在顺序末尾的角色会最先被要求缩容。
+	// 未在列表中指定的角色保留其自身扩缩建议所处的位置。
 	//
 	// +optional
 	// +listType=atomic
 	Priority []string `json:"priority,omitempty" protobuf:"bytes,2,rep,name=priority"`
 }
 
-// ModelDeploymentScalerRebalancePolicy decides whether another role may give resources back.
+// ModelDeploymentScalerRebalancePolicy 决定其他角色是否可以归还资源。
 type ModelDeploymentScalerRebalancePolicy string
 
 const (
-	// ModelDeploymentScalerRebalancePolicyOpposing lets a role whose own recommendation is to
-	// shrink give a replica to an exhausted role.
+	// ModelDeploymentScalerRebalancePolicyOpposing 允许自身建议为缩容的角色将副本
+	// 让渡给资源耗尽的角色。
 	ModelDeploymentScalerRebalancePolicyOpposing ModelDeploymentScalerRebalancePolicy = "Opposing"
 
-	// ModelDeploymentScalerRebalancePolicyPriority lets a role give a replica to an exhausted
-	// role even when its own recommendation is to hold, following the order in priority.
+	// ModelDeploymentScalerRebalancePolicyPriority 允许角色即使在自身建议为保持不变时，
+	// 也按照 priority 指定的顺序将副本让渡给资源耗尽的角色。
 	ModelDeploymentScalerRebalancePolicyPriority ModelDeploymentScalerRebalancePolicy = "Priority"
 
-	// ModelDeploymentScalerRebalancePolicyDisabled turns rebalancing off.
+	// ModelDeploymentScalerRebalancePolicyDisabled 禁用再均衡。
 	ModelDeploymentScalerRebalancePolicyDisabled ModelDeploymentScalerRebalancePolicy = "Disabled"
 )
 
-// ModelDeploymentScalerStatus is the observed state of ModelDeploymentScaler.
+// ModelDeploymentScalerStatus 是 ModelDeploymentScaler 的观测状态。
 type ModelDeploymentScalerStatus struct {
-	// ObservedGeneration is the generation this status was computed from.
+	// ObservedGeneration 是计算当前状态所依据的资源代数（generation）。
 	//
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty" protobuf:"varint,1,opt,name=observedGeneration"`
 
-	// Binding is the target this scaler is bound to.
+	// Binding 是当前扩缩器所绑定的目标对象。
 	//
 	// +optional
 	Binding *ModelDeploymentScalerBindingStatus `json:"binding,omitempty" protobuf:"bytes,2,opt,name=binding"`
 
-	// Roles is what the scaler saw and what it recommends for each role.
+	// Roles 记录扩缩器观测到的状态以及为每个角色给出的扩缩建议。
 	//
 	// +optional
 	// +listType=map
 	// +listMapKey=name
 	Roles []ModelDeploymentScalerRoleStatus `json:"roles,omitempty" protobuf:"bytes,3,rep,name=roles"`
 
-	// LastCommit is the decision the scaler last committed.
+	// LastCommit 是扩缩器最近一次提交的决策。
 	//
 	// +optional
 	LastCommit *ModelDeploymentScalerCommitStatus `json:"lastCommit,omitempty" protobuf:"bytes,4,opt,name=lastCommit"`
 
-	// PendingCohort is the scale-up the scaler committed and is waiting on.
+	// PendingCohort 是扩缩器已提交并正在等待完成的一组扩容操作。
 	//
 	// +optional
 	PendingCohort *ModelDeploymentScalerPendingCohortStatus `json:"pendingCohort,omitempty" protobuf:"bytes,5,opt,name=pendingCohort"`
 
-	// Rebalance is the transaction in which one role gives a replica to another.
+	// Rebalance 记录一个角色将副本让渡给另一个角色的事务状态。
 	//
 	// +optional
 	Rebalance *ModelDeploymentScalerRebalanceStatus `json:"rebalance,omitempty" protobuf:"bytes,6,opt,name=rebalance"`
 
-	// LastScaleDown is the outcome of the last scale-down the scaler committed.
+	// LastScaleDown 是扩缩器最近一次提交的缩容操作的结果。
 	//
 	// +optional
 	LastScaleDown *ModelDeploymentScalerScaleDownStatus `json:"lastScaleDown,omitempty" protobuf:"bytes,7,opt,name=lastScaleDown"`
 
-	// Predictors is the state of the predictor of each role.
+	// Predictors 是各角色预测器的当前状态。
 	//
 	// +optional
 	// +listType=map
 	// +listMapKey=name
 	Predictors []ModelDeploymentScalerPredictorStatus `json:"predictors,omitempty" protobuf:"bytes,8,rep,name=predictors"`
 
-	// Conditions holds the conditions of the scaler.
+	// Conditions 保存扩缩器的状态条件集合。
 	//
 	// +optional
 	// +patchMergeKey=type
@@ -929,137 +887,130 @@ type ModelDeploymentScalerStatus struct {
 	// +listMapKey=type
 	Conditions []gpustack.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,9,rep,name=conditions"`
 
-	// ResolvedCapacityPriors records the resolved capacity prior basis and per-field effective
-	// capacities for each role.
+	// ResolvedCapacityPriors 记录各角色已解析的容量先验基准以及各字段的有效容量。
 	//
 	// +optional
 	// +listType=map
 	// +listMapKey=name
 	ResolvedCapacityPriors []ModelDeploymentScalerResolvedCapacityPriorStatus `json:"resolvedCapacityPriors,omitempty" protobuf:"bytes,10,rep,name=resolvedCapacityPriors"` // nolint: lll
 
-	// LatencyQuantile is the quantile of the latency distribution the scaler is held to.
+	// LatencyQuantile 是约束扩缩器延迟分布的分位数。
 	//
-	// IT IS THE QUANTILE THE SCALER ASKED FOR, and the observed latencies of every role were
-	// sampled at it. It is absent only when the scaler names none, which means the ninety
-	// fifth percentile.
+	// 它是扩缩器所请求的分位数，所有角色的观测延迟均按该分位数采样。
+	// 仅当扩缩器未指定该值时才为空，此时表示默认采用第 95 百分位数。
 	//
-	// IT IS A STABLE VALUE, because it changes when the configuration changes and not when the
-	// sampler reads a new sample.
+	// 它是一个稳定值，仅在配置变更时改变，而不会随采样器读取新样本而变化。
 	//
 	// +optional
 	// +k8s:validation:maxLength=64
 	LatencyQuantile string `json:"latencyQuantile,omitempty" protobuf:"bytes,11,opt,name=latencyQuantile"`
 }
 
-// ModelDeploymentScalerBindingStatus is the binding a scaler holds.
+// ModelDeploymentScalerBindingStatus 表示扩缩器持有的绑定关系。
 type ModelDeploymentScalerBindingStatus struct {
-	// TargetUID is the UID of the bound target.
+	// TargetUID 是已绑定目标的 UID。
 	//
-	// A target that was deleted and recreated carries a different UID, so the binding tells the
-	// two apart.
+	// 目标被删除并重建后会带有不同的 UID，绑定关系借此区分两者。
 	//
 	// +optional
 	TargetUID string `json:"targetUID,omitempty" protobuf:"bytes,1,opt,name=targetUID"`
 
-	// TargetName is the name of the bound target.
+	// TargetName 是已绑定目标的名称。
 	//
 	// +optional
 	TargetName string `json:"targetName,omitempty" protobuf:"bytes,2,opt,name=targetName"`
 
-	// Term is the binding term the scaler writes under.
+	// Term 是扩缩器写入时所处的绑定任期。
 	//
 	// +optional
 	Term int64 `json:"term" protobuf:"varint,3,opt,name=term"`
 }
 
-// ModelDeploymentScalerRoleStatus is what the scaler saw and recommends for one role.
+// ModelDeploymentScalerRoleStatus 表示扩缩器针对单个角色观测到的状态与建议结果。
 type ModelDeploymentScalerRoleStatus struct {
-	// Name is the role this status belongs to.
+	// Name 是该状态所属的角色名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// CurrentReplicas is the replica count the target reports for this role.
+	// CurrentReplicas 是目标为该角色上报的当前副本数。
 	//
 	// +optional
 	CurrentReplicas int32 `json:"currentReplicas,omitempty" protobuf:"varint,2,opt,name=currentReplicas"`
 
-	// ReadyReplicas is the replica count of this role that is ready to serve.
+	// ReadyReplicas 是该角色中已就绪并可提供服务的副本数。
 	//
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty" protobuf:"varint,3,opt,name=readyReplicas"`
 
-	// SignalState is how much the scaler trusts what it observed for this role.
+	// SignalState 表示扩缩器对该角色观测结果的可信程度。
 	//
-	// It is Fresh when every required signal was read in the last window, Idle when the role was
-	// read and had nothing to do, Missing when a required signal was absent and Stale when the
-	// window it belongs to has passed.
+	// 当上一时间窗口内所有必需信号均已读取时为 Fresh；当已读取角色状态且当前无负载时为 Idle；
+	// 当缺少必需信号时为 Missing；当所属时间窗口已过期时为 Stale。
 	//
 	// +optional
 	SignalState string `json:"signalState,omitempty" protobuf:"bytes,4,opt,name=signalState"`
 
-	// PromptTokensPerSecond is the prompt-token rate the scaler observed.
+	// PromptTokensPerSecond 是扩缩器观测到的 prompt token 速率。
 	//
 	// +optional
 	PromptTokensPerSecond *resource.Quantity `json:"promptTokensPerSecond,omitempty" protobuf:"bytes,5,opt,name=promptTokensPerSecond"`
 
-	// GenerationTokensPerSecond is the generation-token rate the scaler observed.
+	// GenerationTokensPerSecond 是扩缩器观测到的生成 token 速率。
 	//
 	// +optional
 	GenerationTokensPerSecond *resource.Quantity `json:"generationTokensPerSecond,omitempty" protobuf:"bytes,6,opt,name=generationTokensPerSecond"`
 
-	// RunningRequests is the number of requests the role was running.
+	// RunningRequests 是该角色正在处理的请求数。
 	//
 	// +optional
 	RunningRequests int32 `json:"runningRequests,omitempty" protobuf:"varint,7,opt,name=runningRequests"`
 
-	// WaitingRequests is the number of requests the role was waiting for.
+	// WaitingRequests 是该角色正在等待处理的请求数。
 	//
 	// +optional
 	WaitingRequests int32 `json:"waitingRequests,omitempty" protobuf:"varint,8,opt,name=waitingRequests"`
 
-	// KVCacheUsage is how much of the key value cache the role was using.
+	// KVCacheUsage 是该角色当前的 KVCache 使用量。
 	//
 	// +optional
 	KVCacheUsage *resource.Quantity `json:"kvCacheUsage,omitempty" protobuf:"bytes,9,opt,name=kvCacheUsage"`
 
-	// TTFTMilliseconds is the time to first token the scaler observed.
+	// TTFTMilliseconds 是扩缩器观测到的首 token 延迟（TTFT）。
 	//
 	// +optional
 	TTFTMilliseconds *resource.Quantity `json:"ttftMilliseconds,omitempty" protobuf:"bytes,10,opt,name=ttftMilliseconds"`
 
-	// ITLMilliseconds is the inter-token latency the scaler observed.
+	// ITLMilliseconds 是扩缩器观测到的 token 间延迟（ITL）。
 	//
 	// +optional
 	ITLMilliseconds *resource.Quantity `json:"itlMilliseconds,omitempty" protobuf:"bytes,11,opt,name=itlMilliseconds"`
 
-	// RawRecommendedReplicas is the replica count the algorithm asked for, before the bounds and
-	// the ratios were applied.
+	// RawRecommendedReplicas 是算法在应用上下界与比例约束之前计算出的建议副本数。
 	//
 	// +optional
 	RawRecommendedReplicas int32 `json:"rawRecommendedReplicas,omitempty" protobuf:"varint,12,opt,name=rawRecommendedReplicas"`
 
-	// ConstrainedReplicas is the replica count the planner settled on after the bounds and the
-	// ratios were applied.
+	// ConstrainedReplicas 是规划器在应用上下界与比例约束之后最终确定的副本数。
 	//
 	// +optional
 	ConstrainedReplicas int32 `json:"constrainedReplicas,omitempty" protobuf:"varint,13,opt,name=constrainedReplicas"`
 
-	// Reason says why the recommendation is what it is.
+	// Reason 说明给出当前建议副本数的原因。
 	//
 	// +optional
 	Reason string `json:"reason,omitempty" protobuf:"bytes,14,opt,name=reason"`
 
-	// LastScaleUpTime is when this role last grew.
+	// LastScaleUpTime 是该角色上一次扩容的时间。
 	//
 	// +optional
 	LastScaleUpTime *meta.Time `json:"lastScaleUpTime,omitempty" protobuf:"bytes,15,opt,name=lastScaleUpTime"`
 
-	// StabilizationHistory is the recommendation this role received over the last window.
+	// StabilizationHistory 记录该角色在最近一个时间窗口内收到的建议副本数。
 	//
-	// It is bounded, and it is what lets the scale-down floor survive a restart.
+	// 该历史记录容量有上限，用于在重启后保留缩容下限状态。
 	//
 	// +optional
 	// +listType=atomic
@@ -1067,200 +1018,198 @@ type ModelDeploymentScalerRoleStatus struct {
 	StabilizationHistory []ModelDeploymentScalerStabilizationSample `json:"stabilizationHistory,omitempty" protobuf:"bytes,16,rep,name=stabilizationHistory"` // nolint: lll
 }
 
-// ModelDeploymentScalerStabilizationSample is one recommendation a role received.
+// ModelDeploymentScalerStabilizationSample 表示角色收到的一条副本数建议采样。
 type ModelDeploymentScalerStabilizationSample struct {
-	// Timestamp is when the recommendation was made.
+	// Timestamp 是生成该建议的时间。
 	//
 	// +required
 	Timestamp meta.Time `json:"timestamp" protobuf:"bytes,1,name=timestamp"`
 
-	// Replicas is the replica count the recommendation asked for.
+	// Replicas 是该建议请求的副本数。
 	//
 	// +required
 	Replicas int32 `json:"replicas" protobuf:"varint,2,opt,name=replicas"`
 }
 
-// ModelDeploymentScalerCommitStatus is the decision the scaler last committed.
+// ModelDeploymentScalerCommitStatus 表示扩缩器最近一次提交的决策。
 type ModelDeploymentScalerCommitStatus struct {
-	// DecisionID identifies the decision.
+	// DecisionID 用于唯一标识该决策。
 	//
 	// +optional
 	DecisionID string `json:"decisionID,omitempty" protobuf:"bytes,1,opt,name=decisionID"`
 
-	// Term is the binding term the decision was written under.
+	// Term 是写入该决策时所处的绑定任期。
 	//
 	// +optional
 	Term int64 `json:"term" protobuf:"varint,2,opt,name=term"`
 
-	// Vector is the replica count per role the decision committed.
+	// Vector 是该决策提交的各角色副本数向量。
 	//
 	// +optional
 	Vector map[string]int32 `json:"vector,omitempty" protobuf:"bytes,3,rep,name=vector"`
 
-	// BaselineVector is the replica count per role the decision started from.
+	// BaselineVector 是该决策开始执行前各角色的基准副本数。
 	//
-	// It is the vector the scaler restores when the decision has to be retracted.
+	// 当决策必须撤回时，扩缩器会恢复到该向量。
 	//
 	// +optional
 	BaselineVector map[string]int32 `json:"baselineVector,omitempty" protobuf:"bytes,4,rep,name=baselineVector"`
 
-	// Timestamp is when the decision was committed.
+	// Timestamp 是该决策提交的时间。
 	//
 	// +optional
 	Timestamp *meta.Time `json:"timestamp,omitempty" protobuf:"bytes,5,opt,name=timestamp"`
 
-	// TargetGeneration is the generation of the target the decision was computed from.
+	// TargetGeneration 是计算该决策所依据的目标资源 generation。
 	//
 	// +optional
 	TargetGeneration int64 `json:"targetGeneration,omitempty" protobuf:"varint,6,opt,name=targetGeneration"`
 }
 
-// ModelDeploymentScalerPendingCohortStatus is the scale-up the scaler is waiting on.
+// ModelDeploymentScalerPendingCohortStatus 表示扩缩器正在等待完成的扩容批次。
 type ModelDeploymentScalerPendingCohortStatus struct {
-	// DecisionID identifies the decision that added the cohort.
+	// DecisionID 用于标识添加该扩容批次的决策。
 	//
 	// +optional
 	DecisionID string `json:"decisionID,omitempty" protobuf:"bytes,1,opt,name=decisionID"`
 
-	// Term is the binding term the decision was written under.
+	// Term 是写入该决策时所处的绑定任期。
 	//
 	// +optional
 	Term int64 `json:"term" protobuf:"varint,2,opt,name=term"`
 
-	// BaselineVector is the replica count per role before the cohort was added.
+	// BaselineVector 是添加该扩容批次前各角色的基准副本数。
 	//
-	// It is the vector the scaler restores when the cohort is retracted.
+	// 当该批次被撤回时，扩缩器会恢复到该向量。
 	//
 	// +optional
 	BaselineVector map[string]int32 `json:"baselineVector,omitempty" protobuf:"bytes,3,rep,name=baselineVector"`
 
-	// TargetVector is the replica count per role the cohort asked for.
+	// TargetVector 是该扩容批次请求的各角色目标副本数。
 	//
 	// +optional
 	TargetVector map[string]int32 `json:"targetVector,omitempty" protobuf:"bytes,4,rep,name=targetVector"`
 
-	// StartedAt is when the cohort was committed.
+	// StartedAt 是该扩容批次提交的时间。
 	//
 	// +optional
 	StartedAt *meta.Time `json:"startedAt,omitempty" protobuf:"bytes,5,opt,name=startedAt"`
 }
 
-// ModelDeploymentScalerRebalanceStatus is the transaction in which one role gives a replica to
-// another.
+// ModelDeploymentScalerRebalanceStatus 表示一个角色向另一个角色让渡副本的再均衡事务。
 type ModelDeploymentScalerRebalanceStatus struct {
-	// ReceiverRole is the role that receives the replica.
+	// ReceiverRole 是接收副本的角色。
 	//
 	// +optional
 	ReceiverRole string `json:"receiverRole,omitempty" protobuf:"bytes,1,opt,name=receiverRole"`
 
-	// DonorRole is the role that gives the replica.
+	// DonorRole 是让渡副本的角色。
 	//
 	// +optional
 	DonorRole string `json:"donorRole,omitempty" protobuf:"bytes,2,opt,name=donorRole"`
 
-	// DonorTargetReplicas is the replica count the donor is heading for.
+	// DonorTargetReplicas 是让渡方角色正在调整的目标副本数。
 	//
 	// +optional
 	DonorTargetReplicas int32 `json:"donorTargetReplicas,omitempty" protobuf:"varint,3,opt,name=donorTargetReplicas"`
 
-	// ReceiverTargetReplicas is the replica count the receiver is heading for.
+	// ReceiverTargetReplicas 是接收方角色正在调整的目标副本数。
 	//
 	// +optional
 	ReceiverTargetReplicas int32 `json:"receiverTargetReplicas,omitempty" protobuf:"varint,4,opt,name=receiverTargetReplicas"`
 
-	// StartedAt is when the transaction began.
+	// StartedAt 是该事务开始的时间。
 	//
 	// +optional
 	StartedAt *meta.Time `json:"startedAt,omitempty" protobuf:"bytes,5,opt,name=startedAt"`
 
-	// ExhaustionEpisodeGeneration counts the exhaustion episodes the transaction belongs to.
+	// ExhaustionEpisodeGeneration 记录该事务所属的资源耗尽周期代数。
 	//
-	// It keeps one episode from draining more donors than it should.
+	// 它用于防止单个耗尽周期过度抽干让渡方角色的副本。
 	//
 	// +optional
 	ExhaustionEpisodeGeneration int64 `json:"exhaustionEpisodeGeneration,omitempty" protobuf:"varint,6,opt,name=exhaustionEpisodeGeneration"`
 
-	// DonationAttempted says whether the donor was already asked to give the replica.
+	// DonationAttempted 表示是否已向让渡方请求过让渡副本。
 	//
 	// +optional
 	DonationAttempted bool `json:"donationAttempted,omitempty" protobuf:"varint,7,opt,name=donationAttempted"`
 
-	// Reason says why the transaction is where it is.
+	// Reason 说明该事务处于当前状态的原因。
 	//
 	// +optional
 	Reason string `json:"reason,omitempty" protobuf:"bytes,8,opt,name=reason"`
 }
 
-// ModelDeploymentScalerScaleDownStatus is the outcome of the last scale-down.
+// ModelDeploymentScalerScaleDownStatus 表示最近一次缩容的结果。
 type ModelDeploymentScalerScaleDownStatus struct {
-	// Role is the role the scale-down removed a replica from.
+	// Role 是本次缩容从中移除副本的角色。
 	//
 	// +optional
 	Role string `json:"role,omitempty" protobuf:"bytes,1,opt,name=role"`
 
-	// Ordinal is the replica the scale-down removed.
+	// Ordinal 是本次缩容移除的副本序号。
 	//
 	// +optional
 	Ordinal int32 `json:"ordinal,omitempty" protobuf:"varint,2,opt,name=ordinal"`
 
-	// PreScaleDownVector is the replica count per role before the scale-down.
+	// PreScaleDownVector 是本次缩容前各角色的副本数。
 	//
-	// It is the vector the scaler restores when the retirement aborts.
+	// 当副本下线中止时，扩缩器会恢复到该向量。
 	//
 	// +optional
 	PreScaleDownVector map[string]int32 `json:"preScaleDownVector,omitempty" protobuf:"bytes,3,rep,name=preScaleDownVector"`
 
-	// Outcome is how the scale-down ended.
+	// Outcome 表示本次缩容的最终结果。
 	//
-	// It is Committed while the retirement runs and Aborted when the retirement failed and the
-	// scaler restored the vector.
+	// 副本下线进行中时为 Committed；下线失败且扩缩器恢复副本数向量后为 Aborted。
 	//
 	// +optional
 	Outcome string `json:"outcome,omitempty" protobuf:"bytes,4,opt,name=outcome"`
 
-	// AbortedAt is when the retirement aborted.
+	// AbortedAt 是副本下线中止的时间。
 	//
 	// +optional
 	AbortedAt *meta.Time `json:"abortedAt,omitempty" protobuf:"bytes,5,opt,name=abortedAt"`
 
-	// CooldownUntil is when the role may shrink again.
+	// CooldownUntil 是该角色允许再次缩容的冷却截止时间。
 	//
 	// +optional
 	CooldownUntil *meta.Time `json:"cooldownUntil,omitempty" protobuf:"bytes,6,opt,name=cooldownUntil"`
 }
 
-// ModelDeploymentScalerPredictorStatus is the state of the predictor of one role.
+// ModelDeploymentScalerPredictorStatus 表示单个角色预测器的状态。
 type ModelDeploymentScalerPredictorStatus struct {
-	// Name is the role this predictor belongs to.
+	// Name 是该预测器所属的角色名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// Level is the demand the predictor currently believes in.
+	// Level 是预测器当前估计的需求水平。
 	//
 	// +optional
 	Level *resource.Quantity `json:"level,omitempty" protobuf:"bytes,2,opt,name=level"`
 
-	// Trend is how fast the predictor believes the demand is moving.
+	// Trend 是预测器估计的需求变化速率。
 	//
 	// +optional
 	Trend *resource.Quantity `json:"trend,omitempty" protobuf:"bytes,3,opt,name=trend"`
 
-	// Covariance is how much the predictor trusts its own estimate.
+	// Covariance 表示预测器对其自身估计的置信程度。
 	//
 	// +optional
 	Covariance *ModelDeploymentScalerKalmanCovariance `json:"covariance,omitempty" protobuf:"bytes,4,opt,name=covariance"`
 
-	// SampleCount is how many observations the predictor has seen.
+	// SampleCount 是预测器已观测到的样本数量。
 	//
 	// +optional
 	SampleCount int32 `json:"sampleCount,omitempty" protobuf:"varint,5,opt,name=sampleCount"`
 
-	// History is the demand the predictor has seen.
+	// History 是预测器已观测到的历史需求。
 	//
-	// It is bounded, because the predictor only needs the recent past.
+	// 其长度是有界的，因为预测器只需保留近期数据。
 	//
 	// +optional
 	// +listType=atomic
@@ -1268,124 +1217,119 @@ type ModelDeploymentScalerPredictorStatus struct {
 	History []ModelDeploymentScalerDemandSample `json:"history,omitempty" protobuf:"bytes,6,rep,name=history"`
 }
 
-// ModelDeploymentScalerKalmanCovariance is the covariance matrix of a predictor.
+// ModelDeploymentScalerKalmanCovariance 是预测器的协方差矩阵。
 //
-// It is a two by two matrix in the order level, trend, so the four entries are the variance of
-// the level, the covariance of the level with the trend, the covariance of the trend with the
-// level, and the variance of the trend.
+// 它是一个按 level、trend 顺序排列的 2x2 矩阵，因此四个元素依次为：
+// level 的方差、level 与 trend 的协方差、trend 与 level 的协方差，以及 trend 的方差。
 type ModelDeploymentScalerKalmanCovariance struct {
-	// P00 is the variance of the level.
+	// P00 是 level 的方差。
 	//
 	// +optional
 	P00 *resource.Quantity `json:"p00,omitempty" protobuf:"bytes,1,opt,name=p00"`
 
-	// P01 is the covariance of the level with the trend.
+	// P01 是 level 与 trend 的协方差。
 	//
 	// +optional
 	P01 *resource.Quantity `json:"p01,omitempty" protobuf:"bytes,2,opt,name=p01"`
 
-	// P10 is the covariance of the trend with the level.
+	// P10 是 trend 与 level 的协方差。
 	//
 	// +optional
 	P10 *resource.Quantity `json:"p10,omitempty" protobuf:"bytes,3,opt,name=p10"`
 
-	// P11 is the variance of the trend.
+	// P11 是 trend 的方差。
 	//
 	// +optional
 	P11 *resource.Quantity `json:"p11,omitempty" protobuf:"bytes,4,opt,name=p11"`
 }
 
-// ModelDeploymentScalerDemandSample is one observation the predictor has seen.
+// ModelDeploymentScalerDemandSample 是预测器观测到的一条样本。
 type ModelDeploymentScalerDemandSample struct {
-	// Timestamp is when the observation was made.
+	// Timestamp 是观测发生的时间。
 	//
 	// +required
 	Timestamp meta.Time `json:"timestamp" protobuf:"bytes,1,name=timestamp"`
 
-	// TokensPerSecond is the demand that was observed.
+	// TokensPerSecond 是观测到的需求速率。
 	//
 	// +required
 	TokensPerSecond resource.Quantity `json:"tokensPerSecond" protobuf:"bytes,2,name=tokensPerSecond"`
 }
 
-// ModelDeploymentScalerCapacityFieldSource names where an effective capacity field value came
-// from.
+// ModelDeploymentScalerCapacityFieldSource 表示生效的容量字段值来源于何处。
 type ModelDeploymentScalerCapacityFieldSource string
 
 const (
-	// ModelDeploymentScalerCapacityFieldSourceExplicit says the capacity field was set explicitly
-	// in the scaler spec.
+	// ModelDeploymentScalerCapacityFieldSourceExplicit 表示该容量字段在 scaler spec 中显式设置。
 	ModelDeploymentScalerCapacityFieldSourceExplicit ModelDeploymentScalerCapacityFieldSource = "Explicit"
 
-	// ModelDeploymentScalerCapacityFieldSourceCatalog says the capacity field was derived from a
-	// catalog profile.
+	// ModelDeploymentScalerCapacityFieldSourceCatalog 表示该容量字段由 catalog profile 推导得出。
 	ModelDeploymentScalerCapacityFieldSourceCatalog ModelDeploymentScalerCapacityFieldSource = "Catalog"
 )
 
-// ModelDeploymentScalerResolvedCapacityPriorStatus records the resolved capacity prior basis and
-// effective field values for one role.
+// ModelDeploymentScalerResolvedCapacityPriorStatus 记录单个角色已解析的容量先验依据及各生效字段值。
 type ModelDeploymentScalerResolvedCapacityPriorStatus struct {
-	// Name is the role this status belongs to.
+	// Name 是此状态所属的角色。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// SourceID is the catalog source identifier the profile came from.
+	// SourceID 是该 profile 所属的 catalog 来源标识符。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	SourceID string `json:"sourceID,omitempty" protobuf:"bytes,3,opt,name=sourceID"`
 
-	// ProfileDigest is the content digest of the catalog profile.
+	// ProfileDigest 是 catalog profile 的内容摘要。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	ProfileDigest string `json:"profileDigest,omitempty" protobuf:"bytes,4,opt,name=profileDigest"`
 
-	// CompatibilityFingerprint covers the target, role, model, engine, hardware, quantization,
-	// topology, workload, catalog digest, and latency targets this resolution depends on.
+	// CompatibilityFingerprint 涵盖此解析所依赖的 target、role、model、engine、hardware、quantization、
+	// topology、workload、catalog digest 以及延迟目标。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	CompatibilityFingerprint string `json:"compatibilityFingerprint,omitempty" protobuf:"bytes,5,opt,name=compatibilityFingerprint"` // nolint: lll
 
-	// Metric is the throughput metric numerator the capacity was resolved from.
+	// Metric 是用于解析容量的吞吐量指标分子。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	Metric string `json:"metric,omitempty" protobuf:"bytes,6,opt,name=metric"`
 
-	// Quantile is the latency quantile statistic used to verify the role's latency constraints.
+	// Quantile 是用于校验该角色延迟约束的延迟分位数统计量。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	Quantile string `json:"quantile,omitempty" protobuf:"bytes,7,opt,name=quantile"`
 
-	// WorkloadID is the workload envelope identifier the profile was measured under.
+	// WorkloadID 是测量该 profile 时所处工作负载包络的标识符。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	WorkloadID string `json:"workloadID,omitempty" protobuf:"bytes,8,opt,name=workloadID"`
 
-	// Denominator is the measurement denominator reconstructed for one scaling replica.
+	// Denominator 是为单个扩缩容副本重建的测量分母。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	Denominator string `json:"denominator,omitempty" protobuf:"bytes,9,opt,name=denominator"`
 
-	// Headroom is the margin applied to the catalog seed capacity.
+	// Headroom 是应用于 catalog 种子容量的安全余量。
 	//
 	// +optional
 	Headroom *resource.Quantity `json:"headroom,omitempty" protobuf:"bytes,10,opt,name=headroom"`
 
-	// SeedTokensPerSecond is the per-replica catalog seed capacity before headroom is applied.
+	// SeedTokensPerSecond 是应用安全余量之前的单副本 catalog 种子容量。
 	//
 	// +optional
 	SeedTokensPerSecond *resource.Quantity `json:"seedTokensPerSecond,omitempty" protobuf:"bytes,11,opt,name=seedTokensPerSecond"` // nolint: lll
 
-	// Fields records the effective value and source of each required capacity field for this role.
+	// Fields 记录此角色每个必需容量字段的生效值及来源。
 	//
 	// +optional
 	// +listType=map
@@ -1393,40 +1337,37 @@ type ModelDeploymentScalerResolvedCapacityPriorStatus struct {
 	// +k8s:validation:maxItems=8
 	Fields []ModelDeploymentScalerResolvedCapacityFieldStatus `json:"fields,omitempty" protobuf:"bytes,12,rep,name=fields"` // nolint: lll
 
-	// CatalogDigest is the content digest of the catalog the profile was resolved from.
+	// CatalogDigest 是从中解析出该 profile 的 catalog 内容摘要。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	CatalogDigest string `json:"catalogDigest,omitempty" protobuf:"bytes,13,opt,name=catalogDigest"`
 
-	// SourceRevision pins the upstream source revision the catalog profile was imported from.
+	// SourceRevision 锁定导入该 catalog profile 的上游源修订版本。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	SourceRevision string `json:"sourceRevision,omitempty" protobuf:"bytes,14,opt,name=sourceRevision"`
 
-	// WorkloadRevision pins the workload definition the profile was measured under.
+	// WorkloadRevision 锁定测量该 profile 时所依据的工作负载定义版本。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	WorkloadRevision string `json:"workloadRevision,omitempty" protobuf:"bytes,15,opt,name=workloadRevision"`
 
-	// GPUsPerReplica is the number of accelerators in one scaling replica used to reconstruct a
-	// PerGPU measurement denominator.
+	// GPUsPerReplica 是单个扩缩容副本中的加速器数量，用于重建 PerGPU 测量分母。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	GPUsPerReplica int32 `json:"gpusPerReplica,omitempty" protobuf:"varint,16,opt,name=gpusPerReplica"`
 
-	// MeasuredReplicas is the number of scaling replicas in the measured system used to
-	// reconstruct a WholeSystem measurement denominator.
+	// MeasuredReplicas 是被测系统中的扩缩容副本数量，用于重建 WholeSystem 测量分母。
 	//
 	// +optional
 	// +k8s:validation:minimum=0
 	MeasuredReplicas int32 `json:"measuredReplicas,omitempty" protobuf:"varint,17,opt,name=measuredReplicas"`
 
-	// LatencyBounds records the quantile and conservative-bound basis for each required latency
-	// metric of the role.
+	// LatencyBounds 记录该角色每个必需延迟指标的分位数及保守上界依据。
 	//
 	// +optional
 	// +listType=map
@@ -1434,72 +1375,68 @@ type ModelDeploymentScalerResolvedCapacityPriorStatus struct {
 	// +k8s:validation:maxItems=8
 	LatencyBounds []ModelDeploymentScalerResolvedLatencyBoundStatus `json:"latencyBounds,omitempty" protobuf:"bytes,18,rep,name=latencyBounds"` // nolint: lll
 
-	// RequestedQuantile is the latency quantile the resolution was held to.
+	// RequestedQuantile 是解析时所遵循的延迟分位数。
 	//
-	// IT IS THE QUANTILE THE SCALER ASKED FOR and not the quantile the catalog measured, and
-	// the two differ when the catalog measured a higher quantile than the request needed.
+	// 它是扩缩容控制器所请求的分位数，而非 catalog 实际测量的分位数；
+	// 当 catalog 测量的分位数高于请求所需分位数时，两者会有所不同。
 	//
 	// +optional
 	// +k8s:validation:maxLength=253
 	RequestedQuantile string `json:"requestedQuantile,omitempty" protobuf:"bytes,19,opt,name=requestedQuantile"`
 }
 
-// ModelDeploymentScalerResolvedLatencyBoundStatus records the measured quantile basis for one
-// required latency metric.
+// ModelDeploymentScalerResolvedLatencyBoundStatus 记录单个必需延迟指标的实测分位数依据。
 type ModelDeploymentScalerResolvedLatencyBoundStatus struct {
-	// Metric is the required latency metric name, such as TTFT or ITL.
+	// Metric 是必需的延迟指标名称，例如 TTFT 或 ITL。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=64
 	Metric string `json:"metric" protobuf:"bytes,1,name=metric"`
 
-	// Quantile is the measured latency quantile statistic used to bound the metric.
+	// Quantile 是用于界定该指标上界的实测延迟分位数统计量。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=64
 	Quantile string `json:"quantile" protobuf:"bytes,2,name=quantile"`
 
-	// Conservative says whether a quantile higher than the required quantile was used as a
-	// conservative upper bound.
+	// Conservative 表示是否采用了高于所需分位数的分位数作为保守上界。
 	//
 	// +optional
 	Conservative bool `json:"conservative,omitempty" protobuf:"varint,3,opt,name=conservative"`
 }
 
-// ModelDeploymentScalerResolvedCapacityFieldStatus records the effective value and source of one
-// algorithm capacity field.
+// ModelDeploymentScalerResolvedCapacityFieldStatus 记录单个算法容量字段的生效值及来源。
 type ModelDeploymentScalerResolvedCapacityFieldStatus struct {
-	// Field is the name of the capacity field.
+	// Field 是容量字段的名称。
 	//
 	// +required
 	// +k8s:validation:minLength=1
 	// +k8s:validation:maxLength=253
 	Field string `json:"field" protobuf:"bytes,1,name=field"`
 
-	// Source says whether the effective value came from an explicit spec field or from the
-	// catalog.
+	// Source 表示生效值是来自显式 spec 字段还是来自 catalog。
 	//
 	// +required
 	// +k8s:validation:enum=["Explicit","Catalog"]
 	Source ModelDeploymentScalerCapacityFieldSource `json:"source" protobuf:"bytes,2,name=source"`
 
-	// EffectiveTokensPerSecond is the effective per-replica token capacity used for this field.
+	// EffectiveTokensPerSecond 是此字段使用的单副本有效 token 容量。
 	//
 	// +required
 	EffectiveTokensPerSecond resource.Quantity `json:"effectiveTokensPerSecond" protobuf:"bytes,3,name=effectiveTokensPerSecond"` // nolint: lll
 }
 
-// ModelDeploymentScalerCapacityPriorCatalog is an offline catalog of measured per-replica token
-// capacities and latency quantiles across load levels.
+// ModelDeploymentScalerCapacityPriorCatalog 是记录各负载水平下实测单副本 token 容量及
+// 延迟分位数的离线目录。
 //
 // +protobuf=false
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelDeploymentScalerCapacityPriorCatalog struct {
 	meta.TypeMeta `json:",inline"`
 
-	// Profiles holds the measured profiles in this catalog.
+	// Profiles 保存此 catalog 中的实测 profile 列表。
 	//
 	// +optional
 	// +listType=atomic
@@ -1508,121 +1445,119 @@ type ModelDeploymentScalerCapacityPriorCatalog struct {
 
 var _ runtime.Object = (*ModelDeploymentScalerCapacityPriorCatalog)(nil)
 
-// ModelDeploymentScalerCapacityPriorProfile is one measured serving profile in a capacity prior
-// catalog.
+// ModelDeploymentScalerCapacityPriorProfile 是容量先验 catalog 中的一条实测推理服务 profile。
 //
 // +protobuf=false
 type ModelDeploymentScalerCapacityPriorProfile struct {
-	// Role is the serving role the measurements describe.
+	// Role 是该测量数据所描述的服务角色。
 	//
 	// +required
 	Role string `json:"role" yaml:"role"`
 
-	// Model is the served model identifier.
+	// Model 是所提供服务的模型标识符。
 	//
 	// +required
 	Model string `json:"model" yaml:"model"`
 
-	// Quantization is the model quantization recipe.
+	// Quantization 是模型量化方案。
 	//
 	// +required
 	Quantization string `json:"quantization" yaml:"quantization"`
 
-	// Engine is the serving engine family.
+	// Engine 是推理引擎系列。
 	//
 	// +required
 	Engine string `json:"engine" yaml:"engine"`
 
-	// Hardware is the accelerator family.
+	// Hardware 是加速器硬件系列。
 	//
 	// +required
 	Hardware string `json:"hardware" yaml:"hardware"`
 
-	// Topology is the parallelism shape of one scaling replica.
+	// Topology 是单个扩缩容副本的并行拓扑形态。
 	//
 	// +required
 	Topology ModelDeploymentScalerCapacityPriorTopology `json:"topology" yaml:"topology"`
 
-	// Points are the load points measured for this profile.
+	// Points 是为此 profile 测得的负载数据点列表。
 	//
 	// +required
 	// +listType=atomic
 	Points []ModelDeploymentScalerCapacityPriorPoint `json:"points" yaml:"points"`
 }
 
-// ModelDeploymentScalerCapacityPriorTopology is the parallelism shape of one scaling replica in a
-// capacity prior profile.
+// ModelDeploymentScalerCapacityPriorTopology 是容量先验 profile 中单个扩缩容副本的并行拓扑形态。
 //
 // +protobuf=false
 type ModelDeploymentScalerCapacityPriorTopology struct {
-	// GPUsPerReplica is how many accelerators one scaling replica uses.
+	// GPUsPerReplica 是单个扩缩容副本所使用的加速器数量。
 	//
 	// +optional
 	GPUsPerReplica int `json:"gpusPerReplica,omitempty" yaml:"gpusPerReplica,omitempty"`
 
-	// TensorParallel is the tensor parallel width.
+	// TensorParallel 表示张量并行宽度。
 	//
 	// +optional
 	TensorParallel int `json:"tensorParallel,omitempty" yaml:"tensorParallel,omitempty"`
 
-	// PipelineParallel is the pipeline parallel width.
+	// PipelineParallel 表示流水线并行宽度。
 	//
 	// +optional
 	PipelineParallel int `json:"pipelineParallel,omitempty" yaml:"pipelineParallel,omitempty"`
 
-	// DataParallel is the data parallel width.
+	// DataParallel 表示数据并行宽度。
 	//
 	// +optional
 	DataParallel int `json:"dataParallel,omitempty" yaml:"dataParallel,omitempty"`
 
-	// LocalDataParallel is the local data parallel width.
+	// LocalDataParallel 表示本地数据并行宽度。
 	//
 	// +optional
 	LocalDataParallel int `json:"localDataParallel,omitempty" yaml:"localDataParallel,omitempty"`
 
-	// ContextParallel is the context parallel width.
+	// ContextParallel 表示上下文并行宽度。
 	//
 	// +optional
 	ContextParallel int `json:"contextParallel,omitempty" yaml:"contextParallel,omitempty"`
 
-	// ExpertParallel is the expert parallel width.
+	// ExpertParallel 表示专家并行宽度。
 	//
 	// +optional
 	ExpertParallel int `json:"expertParallel,omitempty" yaml:"expertParallel,omitempty"`
 }
 
-// ModelDeploymentScalerCapacityPriorPoint is one measured load point in a capacity prior profile.
+// ModelDeploymentScalerCapacityPriorPoint 表示容量先验配置中的一个实测负载点。
 //
 // +protobuf=false
 type ModelDeploymentScalerCapacityPriorPoint struct {
-	// Concurrency is how many requests ran at the same time.
+	// Concurrency 表示同时运行的请求数量。
 	//
 	// +required
 	Concurrency int `json:"concurrency" yaml:"concurrency"`
 
-	// TotalTokensPerSecond is the combined prompt and generated token rate of one replica.
+	// TotalTokensPerSecond 表示单个副本的提示词和生成 token 总速率。
 	//
 	// +required
 	TotalTokensPerSecond float64 `json:"totalTokensPerSecond" yaml:"totalTokensPerSecond"`
 
-	// InputTokensPerSecond is the prompt token rate of one replica.
+	// InputTokensPerSecond 表示单个副本的提示词 token 速率。
 	//
 	// +required
 	InputTokensPerSecond float64 `json:"inputTokensPerSecond" yaml:"inputTokensPerSecond"`
 
-	// OutputTokensPerSecond is the generated token rate of one replica.
+	// OutputTokensPerSecond 表示单个副本的生成 token 速率。
 	//
 	// +required
 	OutputTokensPerSecond float64 `json:"outputTokensPerSecond" yaml:"outputTokensPerSecond"`
 
-	// TTFTMilliseconds maps latency quantile keys such as p25, p50, p70, p90, p95, or p99 to
-	// measured time to first token in milliseconds.
+	// TTFTMilliseconds 将延迟分位键（如 p25、p50、p70、p90、p95 或 p99）映射到
+	// 实测首 token 延迟（单位：毫秒）。
 	//
 	// +optional
 	TTFTMilliseconds map[string]float64 `json:"ttftMilliseconds,omitempty" yaml:"ttftMilliseconds,omitempty"`
 
-	// ITLMilliseconds maps latency quantile keys such as p25, p50, p70, p90, p95, or p99 to
-	// measured inter-token latency in milliseconds.
+	// ITLMilliseconds 将延迟分位键（如 p25、p50、p70、p90、p95 或 p99）映射到
+	// 实测 token 间延迟（单位：毫秒）。
 	//
 	// +optional
 	ITLMilliseconds map[string]float64 `json:"itlMilliseconds,omitempty" yaml:"itlMilliseconds,omitempty"`

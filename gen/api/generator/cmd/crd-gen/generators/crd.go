@@ -52,7 +52,7 @@ func (g *crdGen) Filter(c *generator.Context, t *types.Type) bool {
 
 func (g *crdGen) Namers(c *generator.Context) namer.NameSystems {
 	return namer.NameSystems{
-		// Have the raw namer for this file track what it imports.
+		// 让该文件的 raw namer 跟踪其导入内容。
 		"raw": namer.NewRawNamer(g.outputPackage, g.imports),
 		"private": &namer.NameStrategy{
 			Join: func(pre string, in []string, post string) string {
@@ -87,7 +87,7 @@ func (g *crdGen) Init(c *generator.Context, w io.Writer) error {
 	args := getCustomResourceDefinitionTypedArgs()
 	sw := generator.NewSnippetWriter(w, c, "$", "$")
 
-	// START: GetCustomResourceDefinitions
+	// 开始: GetCustomResourceDefinitions
 	sw.Do("func GetCustomResourceDefinitions() map[string]*$.CustomResourceDefinition|raw$ {\n", args)
 	sw.Do("return map[string]*$.CustomResourceDefinition|raw$ {\n", args)
 
@@ -101,7 +101,7 @@ func (g *crdGen) Init(c *generator.Context, w io.Writer) error {
 
 	sw.Do("}\n", nil)
 	sw.Do("}\n\n", nil)
-	// END: GetCustomResourceDefinitions
+	// 结束: GetCustomResourceDefinitions
 
 	return sw.Error()
 }
@@ -118,21 +118,21 @@ func (g *crdGen) GenerateType(c *generator.Context, t *types.Type, w io.Writer) 
 	sw.Do("return &$.CustomResourceDefinition|raw$ {\n", args)
 
 	args = args.With("CRD", crd)
-	// START: TypeMeta.
+	// 开始: TypeMeta.
 	sw.Do("TypeMeta: $.TypeMeta|raw${\n", args)
 	sw.Do("APIVersion: \"apiextensions.k8s.io/v1\",\n", nil)
 	sw.Do("Kind: \"CustomResourceDefinition\",\n", nil)
 	sw.Do("},\n", nil)
-	// END: TypeMeta.
-	// START: ObjectMeta.
+	// 结束: TypeMeta.
+	// 开始: ObjectMeta.
 	sw.Do("ObjectMeta: $.ObjectMeta|raw${\n", args)
 	sw.Do("Name: \"$.$\",\n", crd.Name)
 	sw.Do("},\n", nil)
-	// END: ObjectMeta.
+	// 结束: ObjectMeta.
 
 	spec := crd.Spec
 	args = args.With("SPEC", spec)
-	// START: Spec.
+	// 开始: Spec.
 	sw.Do("Spec: $.CustomResourceDefinitionSpec|raw${\n", args)
 	sw.Do("Group: \"$.SPEC.Group$\",\n", args)
 	sw.Do("Names: $.CustomResourceDefinitionNames|raw${\n", args)
@@ -157,22 +157,22 @@ func (g *crdGen) GenerateType(c *generator.Context, t *types.Type, w io.Writer) 
 
 	ver := spec.Versions[0]
 	args = args.With("VERSION", ver)
-	// START: Spec/Versions/0.
+	// 开始: Spec/Versions/0.
 	sw.Do("Versions: []$.CustomResourceDefinitionVersion|raw${\n", args)
 	sw.Do("{\n", nil)
 	sw.Do("Name: \"$.VERSION.Name$\",\n", args)
 	sw.Do("Served: $.VERSION.Served$,\n", args)
 	sw.Do("Storage: $.VERSION.Storage$,\n", args)
 
-	// START: Spec/Versions/0/Schema.
+	// 开始: Spec/Versions/0/Schema.
 	sw.Do("Schema: &$.CustomResourceValidation|raw${\n", args)
 	sw.Do("OpenAPIV3Schema: &$.JSONSchemaProps|raw${\n", args)
 	writeSchema(sw, ver.Schema.OpenAPIV3Schema)
 	sw.Do("},\n", nil)
 	sw.Do("},\n", nil)
-	// END: Spec/Versions/0/Schema.
+	// 结束: Spec/Versions/0/Schema.
 
-	// START: Spec/Versions/0/SubResources.
+	// 开始: Spec/Versions/0/SubResources.
 	if subResources := ver.Subresources; subResources != nil {
 		sw.Do("Subresources: &$.CustomResourceSubresources|raw${\n", args)
 		if subResources.Status != nil {
@@ -183,9 +183,9 @@ func (g *crdGen) GenerateType(c *generator.Context, t *types.Type, w io.Writer) 
 		}
 		sw.Do("},\n", nil)
 	}
-	// END: Spec/Versions/0/SubResources.
+	// 结束: Spec/Versions/0/SubResources.
 
-	// START: Spec/Versions/0/AdditionalPrinterColumns.
+	// 开始: Spec/Versions/0/AdditionalPrinterColumns.
 	if printerColumns := ver.AdditionalPrinterColumns; len(printerColumns) > 0 {
 		sw.Do("AdditionalPrinterColumns: []$.CustomResourceColumnDefinition|raw${\n", args)
 		for _, printerColumn := range printerColumns {
@@ -195,22 +195,22 @@ func (g *crdGen) GenerateType(c *generator.Context, t *types.Type, w io.Writer) 
 			sw.Do("Type: \"$.COLUMN.Type$\",\n", colArgs)
 			sw.Do("Format: \"$.COLUMN.Format$\",\n", colArgs)
 			sw.Do("Description: $.$,\n", fmt.Sprintf("%#v", printerColumn.Description))
-			// Priority is an int32, so it is emitted bare. Quoting it produced a string constant
-			// in an int32 field, which is why no CustomResourceColumnDefinition had ever compiled.
+			// Priority 为 int32 类型，因此直接原样输出。加引号会在 int32 字段中生成字符串常量，
+			// 这也是之前所有 CustomResourceColumnDefinition 均无法通过编译的原因。
 			sw.Do("Priority: $.COLUMN.Priority$,\n", colArgs)
 			sw.Do("JSONPath: \"$.COLUMN.JSONPath$\",\n", colArgs)
 			sw.Do("},\n", nil)
 		}
 		sw.Do("},\n", nil)
 	}
-	// END: Spec/Versions/0/AdditionalPrinterColumns.
+	// 结束: Spec/Versions/0/AdditionalPrinterColumns.
 
 	sw.Do("},\n", nil)
 	sw.Do("},\n", nil)
-	// END: Spec/Versions/0.
+	// 结束: Spec/Versions/0.
 
 	sw.Do("},\n", nil)
-	// END: Spec.
+	// 结束: Spec.
 
 	sw.Do("}\n", nil)
 	sw.Do("}\n\n", nil)

@@ -7,40 +7,39 @@ import (
 	"gpustack.ai/gpustack/pkg/nodefeature"
 )
 
-// Shape is the six-tuple that identifies one deployment shape.
+// Shape 是唯一标识一种部署形态的六元组。
 //
-// IT IS WHAT A PROFILE IS KNOWN BY, because a catalog that names its profiles
-// by a name lets two profiles claim one name, and a deployment that selects a
-// profile by a name has to know that name before it knows anything else about
-// the catalog.
+// 它是 profile 的识别依据，因为按名称标识 profile 的 catalog 可能让
+// 两个 profile 声明同一名称，而且按名称选择 profile 的部署必须在了解
+// catalog 的其他任何信息之前就预先知道该名称。
 //
-// THE SIX ELEMENTS ARE THE ROLE, THE MODEL, THE QUANTIZATION, THE ENGINE, THE
-// HARDWARE AND THE TOPOLOGY, because a measurement of one model under one
-// recipe on one engine on one accelerator in one shape is one measurement.
+// 这六个要素分别是角色、模型、量化方式、引擎、硬件和拓扑，因为
+// 在一种引擎、一种加速卡和一种形态下对单个模型和单个配置所做的
+// 测量即构成一条独立的测量。
 type Shape struct {
-	// Role is the serving role the shape serves.
+	// Role 是该 shape 所承担的服务角色。
 	Role RoleKind `json:"role"`
 
-	// Model is the canonical model repository.
+	// Model 是规范化的模型仓库标识。
 	Model string `json:"model"`
 
-	// Quantization is the canonical quantization token.
+	// Quantization 是规范化的量化标识。
 	Quantization string `json:"quantization"`
 
-	// Engine is the engine family.
+	// Engine 是推理引擎系列。
 	Engine string `json:"engine"`
 
-	// Hardware is the canonical accelerator family.
+	// Hardware 是规范化的加速卡系列。
 	Hardware string `json:"hardware"`
 
-	// Topology is the normalized shape of one scaling replica.
+	// Topology 是单个扩缩容副本的标准化拓扑形态。
 	Topology Topology `json:"topology"`
 }
 
-// Shape returns the shape of a profile.
+// Shape 返回 profile 对应的形态。
 //
-// IT NORMALIZES EVERY ELEMENT, because a profile written under one spelling of
-// a model and a deployment written under another name one shape.
+// 它会对每个要素进行规范化，因为用不同拼写记录的模型 profile
+// 与部署实际上指向同一种形态。
 func (p Profile) Shape() Shape {
 	return Shape{
 		Role:         p.Role,
@@ -52,10 +51,10 @@ func (p Profile) Shape() Shape {
 	}
 }
 
-// DocumentShape returns the shape of a written profile.
+// DocumentShape 返回所编写 profile 的 shape。
 //
-// IT NORMALIZES EVERY ELEMENT, because the shape is what a profile is known by
-// and a reader has to reach the same shape from the file and from the runtime.
+// 该函数会对每个元素进行规范化，因为 shape 是识别 profile 的依据，
+// 读取方无论从文件还是从运行时获取，都必须得到相同的 shape。
 func DocumentShape(d ProfileDocument) Shape {
 	return Shape{
 		Role:         RoleKind(d.Role),
@@ -67,19 +66,19 @@ func DocumentShape(d ProfileDocument) Shape {
 	}
 }
 
-// NormalizeTopologyDocument returns a written topology in its canonical form.
+// NormalizeTopologyDocument 返回所编写拓扑的规范形式。
 //
-// IT REPLACES AN UNSTATED WIDTH WITH ONE, because a width a source did not
-// state is the width of one and a width of zero names no deployment.
+// 该函数会将未声明的宽度替换为 1，因为源中未声明的宽度即为 1，
+// 而宽度为 0 不对应任何部署。
 func NormalizeTopologyDocument(d TopologyDocument) Topology {
 	topology := Topology(d)
 	return topology.Normalized()
 }
 
-// Shape returns the shape a request names.
+// Shape 返回请求所指定的 shape。
 //
-// IT READS THE REQUEST AND NOT A PROFILE, because the request is what a
-// deployment states and the profile is what the catalog holds.
+// 该方法读取的是请求而非 profile，因为请求代表部署所声明的内容，
+// 而 profile 则是目录中保存的内容。
 func (r Request) Shape() Shape {
 	return Shape{
 		Role:         r.Role,
@@ -91,10 +90,10 @@ func (r Request) Shape() Shape {
 	}
 }
 
-// String renders the shape in a stable form.
+// String 以稳定格式呈现该 shape。
 //
-// IT NAMES THE SIX ELEMENTS, because a refusal that names the shape it could
-// not resolve tells the reader what to change.
+// 该方法会列出全部六个元素，因为当解析失败并被拒绝时，
+// 在拒绝信息中给出无法解析的 shape 可以提示读者需要修改哪些内容。
 func (s Shape) String() string {
 	return fmt.Sprintf(
 		"%s/%s/%s/%s/%s/gpus=%d,tp=%d,ep=%d,pp=%d,dp=%d,ldp=%d,cp=%d",
@@ -105,15 +104,14 @@ func (s Shape) String() string {
 	)
 }
 
-// shapeMatches says whether a profile's shape is the one a request names.
+// shapeMatches 判断 profile 的 shape 是否与请求指定的 shape 匹配。
 //
-// IT COMPARES THE MODEL BY NAME, because a deployment names a model without its
-// organization and the catalog records it with one.
+// 该函数按名称比较模型，因为部署指定的模型名称不含组织名，
+// 而目录中记录的模型名称包含组织名。
 //
-// IT ACCEPTS AN ELEMENT THE REQUEST DOES NOT STATE, because a deployment that
-// states no quantization has contradicted nothing and has chosen nothing
-// either. The selection refuses when several profiles match, so an unstated
-// element never picks a profile on its own.
+// 该函数允许请求未声明某些元素，因为未声明量化方式等参数的部署
+// 既没有产生冲突，也没有做出选择。当多个 profile 同时匹配时，选择逻辑会予以拒绝，
+// 因此未声明的元素绝不会擅自选中某个 profile。
 func shapeMatches(want, got Shape) bool {
 	if want.Role != got.Role {
 		return false
@@ -133,11 +131,11 @@ func shapeMatches(want, got Shape) bool {
 	return want.Topology == got.Topology
 }
 
-// CanonicalEngineFamily returns the engine family an engine name belongs to.
+// CanonicalEngineFamily 返回引擎名称所属的引擎系列。
 //
-// IT KEEPS AN ENGINE THIS OPERATOR DOES NOT KNOW AS IT IS, because an engine
-// this operator cannot place is still one engine and two of them are two
-// shapes.
+// 对于当前 operator 未知的引擎，该函数会原样保留其名称，
+// 因为即使 operator 无法调度该引擎，它仍然是一个独立的引擎，
+// 两个不同的未知引擎对应两个不同的 shape。
 func CanonicalEngineFamily(image string) string {
 	if family := EngineFamily(image); family != "" {
 		return family
@@ -145,10 +143,10 @@ func CanonicalEngineFamily(image string) string {
 	return strings.TrimSpace(image)
 }
 
-// CanonicalAcceleratorFamily returns the accelerator family a name belongs to.
+// CanonicalAcceleratorFamily 返回加速器名称所属的加速器系列。
 //
-// IT KEEPS AN ACCELERATOR THIS OPERATOR DOES NOT KNOW AS IT IS, because an
-// accelerator this operator cannot name is still one accelerator.
+// 对于当前 operator 未知的加速器，该函数会原样保留其名称，
+// 因为即使 operator 无法识别该名称，它仍然是一种独立的加速器。
 func CanonicalAcceleratorFamily(name string) string {
 	if family := nodefeature.ResolveAcceleratorFamily(name); family != "" {
 		return family

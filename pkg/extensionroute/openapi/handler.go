@@ -20,10 +20,10 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// Extender extends the given OpenAPI3 spec and return it.
+// Extender 扩展给定的 OpenAPI3 规范并返回。
 type Extender func(spec *openspec3.OpenAPI) *openspec3.OpenAPI
 
-// Route registers the OpenAPI route with the given extenders.
+// Route 使用给定的 extender 注册 OpenAPI 路由。
 func Route(gvs []meta.GroupVersion, r *mux.Route, extenders ...Extender) {
 	p, _ := r.GetPathTemplate()
 	r.Handler(http.StripPrefix(p, index(gvs, extenders...)))
@@ -178,12 +178,12 @@ func decoratePathOperation(spec *openspec3.Operation, pResM map[string]string, p
 		return
 	}
 
-	// Secure operations.
+	// 为操作配置安全要求。
 	spec.SecurityRequirement = []map[string][]string{
 		{"BearerAuth": {}},
 	}
 
-	// Replace request body.
+	// 替换请求体。
 	if spec.RequestBody != nil && spec.RequestBody.Content != nil {
 		if v, ok := spec.RequestBody.Content["*/*"]; ok {
 			spec.RequestBody.Content["application/json"] = v
@@ -191,10 +191,10 @@ func decoratePathOperation(spec *openspec3.Operation, pResM map[string]string, p
 		}
 	}
 
-	// Parameters.
+	// 参数。
 	decoratePathParameters(spec.Parameters)
 
-	// Retag operations.
+	// 重新标记操作标签。
 	if kind := pResM[pRes]; kind != "" {
 		spec.Tags = []string{kind}
 		return

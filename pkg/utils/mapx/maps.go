@@ -2,7 +2,7 @@ package mapx
 
 import "strings"
 
-// Contain returns true if a contains all the keys in b with the same value.
+// Contain 在 a 包含 b 中所有键且对应值相同时返回 true。
 func Contain[K, V comparable, M ~map[K]V](a, b M) bool {
 	for k, bv := range b {
 		if av, found := a[k]; !found || av != bv {
@@ -12,9 +12,9 @@ func Contain[K, V comparable, M ~map[K]V](a, b M) bool {
 	return true
 }
 
-// FilterSlice filters and maps the provided map m to a slice using the function f.
-// For each key-value pair in m, f is called with the key and value as arguments.
-// If f returns true, the returned value is included in the resulting slice.
+// FilterSlice 使用函数 f 对提供的 map m 进行过滤并映射为切片。
+// 对于 m 中的每个键值对，都会以键和值作为参数调用 f。
+// 如果 f 返回 true，则将返回的值包含在结果切片中。
 func FilterSlice[K comparable, V, Y any, M ~map[K]V](m M, f func(K, V) (Y, bool)) []Y {
 	if len(m) == 0 {
 		return nil
@@ -31,8 +31,8 @@ func FilterSlice[K comparable, V, Y any, M ~map[K]V](m M, f func(K, V) (Y, bool)
 	return ret
 }
 
-// Filter filters the provided map m using the function f.
-// For each key-value pair in m, f is called with the key and value as arguments.
+// Filter 使用函数 f 对提供的 map m 进行过滤。
+// 对于 m 中的每个键值对，都会以键和值作为参数调用 f。
 func Filter[K comparable, V any, M ~map[K]V](m M, f func(K, V) bool) M {
 	if len(m) == 0 {
 		return nil
@@ -49,9 +49,9 @@ func Filter[K comparable, V any, M ~map[K]V](m M, f func(K, V) bool) M {
 	return ret
 }
 
-// Merge returns a new map combining the entries of the provided maps.
-// When several maps share a key, the value from the last map wins.
-// Nil or empty maps are skipped. Returns nil when the result would be empty.
+// Merge 返回一个合并了所提供各 map 条目的新 map。
+// 当多个 map 共享同一个键时，以最后一个 map 的值为准。
+// 会跳过 nil 或空 map。当结果为空时返回 nil。
 func Merge[K comparable, V any, M ~map[K]V](ms ...M) M {
 	ret := make(map[K]V)
 	for i := range ms {
@@ -65,8 +65,8 @@ func Merge[K comparable, V any, M ~map[K]V](ms ...M) M {
 	return ret
 }
 
-// EqualWithKey reports whether two maps contain the same value for each specified key.
-// Returns true when neither map contains a given key (treated as equal absence).
+// EqualWithKey 报告两个 map 在每个指定键上是否包含相同的值。
+// 当两个 map 都不包含某个键时返回 true（视为同样缺失）。
 func EqualWithKey[K, V comparable, M ~map[K]V](a, b M, k K, ks ...K) bool {
 	check := func(k K) bool {
 		av, aok := a[k]
@@ -87,9 +87,9 @@ func EqualWithKey[K, V comparable, M ~map[K]V](a, b M, k K, ks ...K) bool {
 	return true
 }
 
-// EqualWithStringPrefix reports whether two maps
-// contain the same key/value pairs for keys matching the specified prefix or any of the specified prefixes.
-// Returns true when neither map contains any key matching any prefix.
+// EqualWithStringPrefix 报告两个 map 中
+// 匹配指定前缀或任一指定前缀的键是否包含相同的键值对。
+// 当两个 map 都不包含任何匹配任一前缀的键时返回 true。
 func EqualWithStringPrefix[V comparable, M ~map[string]V](a, b M, prefix string, prefixes ...string) bool {
 	match := func(k string) bool {
 		if strings.HasPrefix(k, prefix) {

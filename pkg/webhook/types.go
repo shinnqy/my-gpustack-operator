@@ -9,25 +9,20 @@ import (
 )
 
 type (
-	// SetupOptions is the options for setting up a webhook.
+	// SetupOptions 是设置 Webhook 的选项。
 	SetupOptions struct {
-		// Manager is the controller-runtime manager.
+		// Manager 是 controller-runtime 管理器。
 		Manager ctrl.Manager
 	}
 
-	// Setup is the interface for the webhook setup.
+	// Setup 是用于初始化 Webhook 的接口。
 	Setup interface {
-		// SetupWebhook returns the webhook affected object if successful.
-		//
-		// SetupWebhook is called before the Cache is started,
-		// you should not do anything that requires the Cache to be started.
-		// Instead, you can configure the Cache, like IndexField or something else.
+		// SetupWebhook 在成功时返回受该 Webhook 影响的对象。\n//\n// SetupWebhook 在 Cache 启动前调用，\n// 因此不应执行任何依赖 Cache 已启动的操作；\n// 但可以配置 Cache，例如调用 IndexField 等。
 		SetupWebhook(context.Context, SetupOptions) (runtime.Object, error)
 	}
 )
 
-// DefaultValidator implements admission.Validator,
-// which is used to combine and override the required methods.
+// DefaultValidator 实现了 admission.Validator，\n// 用于组合和覆盖所需的方法。
 type DefaultValidator struct{}
 
 var _ ctrladmission.Validator[runtime.Object] = (*DefaultValidator)(nil)

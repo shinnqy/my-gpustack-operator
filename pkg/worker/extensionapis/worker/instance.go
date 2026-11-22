@@ -22,10 +22,9 @@ const (
 	_InstanceKind     = "Instance"
 )
 
-// InstanceHandler handles v1.Instance objects.
+// InstanceHandler 处理 v1.Instance 对象。
 //
-// InstanceHandler maps the v1.Instance to a Kubernetes Pod resource,
-// which is named as the Instance's name.
+// InstanceHandler 将 v1.Instance 映射到与 Instance 同名的 Kubernetes Pod 资源。
 type InstanceHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -35,7 +34,7 @@ func (h *InstanceHandler) SetupHandler(
 	ctx context.Context,
 	opts extensionapi.SetupOptions,
 ) (gvr schema.GroupVersionResource, srs map[string]rest.Storage, err error) {
-	// Configure field indexer.
+	// 配置字段索引器。
 	fi := opts.Manager.GetFieldIndexer()
 	err = fi.IndexField(ctx, &workercore.Instance{}, "metadata.name",
 		func(obj ctrlcli.Object) []string {
@@ -48,10 +47,10 @@ func (h *InstanceHandler) SetupHandler(
 		return schema.GroupVersionResource{}, srs, err
 	}
 
-	// Declare GVR.
+	// 声明 GVR。
 	gvr = worker.SchemeGroupVersionResource(_InstanceResource)
 
-	// Create table converter to pretty the kubectl's output.
+	// 创建表格转换器以美化 kubectl 输出。
 	tc, err := extensionapi.NewJSONPathTemplateTableConvertor(
 		extensionapi.JSONPathTemplateColumn("Type", "{.spec.type}"),
 		extensionapi.JSONPathTemplateColumn("Access", "{.status.accessAddresses[0]}"),
@@ -70,13 +69,13 @@ func (h *InstanceHandler) SetupHandler(
 		return gvr, srs, err
 	}
 
-	// As storage.
+	// 作为存储。
 	h.ObjectInfo = &worker.Instance{}
 	h.CurdOperations = extensionapi.WithCurdProxy[
 		*worker.Instance, *worker.InstanceList, *workercore.Instance, *workercore.InstanceList,
 	](tc, h, opts.Manager.GetClient().(ctrlcli.WithWatch), opts.Manager.GetAPIReader())
 
-	// Create subresource handlers.
+	// 创建子资源处理器。
 	srs = map[string]rest.Storage{
 		"log":     newInstanceLogHandler(h.ObjectInfo, opts),
 		"events":  newInstanceEventsHandler(h.ObjectInfo, opts),

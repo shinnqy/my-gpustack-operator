@@ -13,13 +13,12 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// KVCachePoolBindingHandler proxies a v1alpha1.KVCachePoolBinding as the public KVCachePoolBinding
-// resource.
+// KVCachePoolBindingHandler 将 v1alpha1.KVCachePoolBinding 代理为公开的 KVCachePoolBinding
+// 资源。
 //
-// No status proxy is exposed because the status carries the effective quota grant and the
-// over-quota evidence, written by the pool's controller, while the proxy writes with the worker's
-// identity. The storage resource's status subresource keeps the status as it is on main-resource
-// writes, so the status is read through the main resource.
+// 此处不暴露 status 子资源代理，因为 status 承载了由资源池控制器写入的有效配额授予与
+// 超额证据，而代理以 worker 身份执行写入。底层存储资源的 status 子资源会在主资源写入时
+// 保持原状，因此 status 通过主资源读取。
 type KVCachePoolBindingHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations

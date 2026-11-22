@@ -7,22 +7,19 @@ import (
 	gpustack "gpustack.ai/gpustack/api/v1"
 )
 
-// ModelPrefetch is the schema for worker.gpustack.ai.
+// ModelPrefetch 是 worker.gpustack.ai 的 schema。
 //
-// It is a tenant's RESIDENCY INTENT for one model artifact: keep the artifact's weights on a set of
-// nodes ahead of any Pod that mounts them. The worker delivers it the same way it delivers a cold
-// mount — one warm-up Pod per target node, the artifact's own CSI volume, no accelerator request —
-// so the bytes land through the node cache's ordinary path, once per node, verified, and Pod exits
-// once the tree is readable. The Pod IS the delivery operation; there is no separate job state.
+// 它表达租户对单个模型制品的驻留意图：在任何挂载权重文件的 Pod 启动前，将制品的权重提前
+// 保留在一组节点上。worker 采用与冷挂载相同的方式交付——每个目标节点一个预热 Pod、使用制品自身
+// 的 CSI 卷、不请求加速器——使数据通过节点缓存的常规路径落盘，每个节点仅下载一次并经校验，
+// 目录树可读后 Pod 即退出。Pod 本身就是交付操作；没有独立的任务状态。
 //
-// Placement narrows the target set: the InstanceTypes of a node pool, or a nodeSelector for named
-// nodes, or — when both are left out — the InstanceTypes of the namespace's own deployments that
-// reference the artifact. Retention decides what happens after: whether the content is pinned
-// against collection (an admin-granted capability) and how long a node keeps it after its last use.
+// Placement 用于缩小目标节点集合：可以指定节点池的 InstanceTypes，或通过 nodeSelector 指定节点；
+// 若两者都省略，则取该 Namespace 中引用此制品的部署所使用的 InstanceTypes。Retention 决定
+// 后续行为：内容是否被固定以防止回收（管理员授予的能力），以及节点在最后一次使用后保留多长时间。
 //
-// Deleting the object revokes the intent: the warm-up Pods go, the nodes' pins drop, and the bytes
-// are reclaimed by the node cache's own collection once they are unreferenced and past its grace.
-// Nothing is torn out from under a Pod still reading the tree.
+// 删除该对象即撤销此意图：预热 Pod 被清理，节点的固定标记被移除，一旦数据不再被引用且超过宽限期，
+// 便由节点缓存自身的回收机制回收。仍在读取目录树的 Pod 不会受到任何破坏。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -43,57 +40,56 @@ type ModelPrefetch struct {
 
 var _ runtime.Object = (*ModelPrefetch)(nil)
 
-// ModelPrefetchSpec is the residency intent.
+// ModelPrefetchSpec 定义驻留意图。
 type ModelPrefetchSpec struct {
-	// ArtifactRef names the ModelArtifact in this namespace whose weights warm the target set. It
-	// must be resolved before any Pod is rendered: admission and delivery both read its digest.
+	// ArtifactRef 指定当前 Namespace 中用于预热目标集合权重的 ModelArtifact 名称。
+	// 在渲染任何 Pod 之前必须先解析它：准入和交付阶段都会读取其摘要（digest）。
 	//
 	// +required
 	ArtifactRef ModelPrefetchArtifactReference `json:"artifactRef" protobuf:"bytes,1,name=artifactRef"`
 
-	// BindingRef names the ModelStoreBinding in this namespace that pays for the bytes. It must
-	// grant a store covering the target set, and its budget bounds the prefetch at admission.
+	// BindingRef 指定当前 Namespace 中承担字节配额的 ModelStoreBinding 名称。它必须
+	// 授予覆盖目标集合的存储，且其预算在准入时限制预取规模。
 	//
 	// +required
 	BindingRef ModelPrefetchBindingReference `json:"bindingRef" protobuf:"bytes,2,name=bindingRef"`
 
-	// Placement narrows the target set. InstanceTypes and NodeSelector are mutually exclusive;
-	// both set is refused, and both left out derives the target set from the namespace's own
-	// deployments that reference the artifact. The relational rules are webhook-enforced.
+	// Placement 用于缩小目标节点集合。InstanceTypes 和 NodeSelector 互斥；
+	// 同时设置会被拒绝，均省略时则从当前 Namespace 中引用该制品的部署推导目标集合。
+	// 这些关联规则由 Webhook 强制执行。
 	//
 	// +optional
 	Placement *ModelPrefetchPlacement `json:"placement,omitempty" protobuf:"bytes,3,opt,name=placement"`
 
-	// MinReady is how many target nodes holding the content make the prefetch Available; 0 means
-	// all of them.
+	// MinReady 表示持有内容的目标节点达到多少个时预取即视为 Available；0 表示全部节点。
 	//
 	// +optional
 	// +k8s:validation:default=0
 	// +k8s:validation:minimum=0
 	MinReady int32 `json:"minReady,omitempty" protobuf:"varint,4,opt,name=minReady"`
 
-	// Retention decides what happens to the content after it has landed.
+	// Retention 决定内容落盘后的保留策略。
 	//
 	// +optional
 	Retention ModelPrefetchRetention `json:"retention,omitempty" protobuf:"bytes,5,opt,name=retention"`
 }
 
-// ModelPrefetchArtifactReference names an artifact in the prefetch's own namespace.
+// ModelPrefetchArtifactReference 指定预取对象所属 Namespace 中的制品名称。
 type ModelPrefetchArtifactReference struct {
 	// +required
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 }
 
-// ModelPrefetchBindingReference names a binding in the prefetch's own namespace.
+// ModelPrefetchBindingReference 指定预取对象所属 Namespace 中的绑定名称。
 type ModelPrefetchBindingReference struct {
 	// +required
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 }
 
-// ModelPrefetchPlacement narrows the target set of nodes the artifact warms.
+// ModelPrefetchPlacement 用于缩小制品预热的目标节点集合。
 type ModelPrefetchPlacement struct {
-	// InstanceTypes names the node pools to warm, by the InstanceType objects the scheduling chain
-	// already publishes. The target set is every node carrying one of these types' flavors.
+	// InstanceTypes 通过调度链已发布的 InstanceType 对象指定要预热的节点池。
+	// 目标集合为带有这些类型所对应 Flavor 的所有节点。
 	//
 	// +optional
 	// +listType=atomic
@@ -101,50 +97,48 @@ type ModelPrefetchPlacement struct {
 	// +k8s:validation:maxItems=8
 	InstanceTypes []string `json:"instanceTypes,omitempty" protobuf:"bytes,1,rep,name=instanceTypes"`
 
-	// NodeSelector selects the target nodes directly, the "download to these nodes" form.
+	// NodeSelector 直接选择目标节点，即“下载到这些节点”的形式。
 	//
 	// +optional
 	NodeSelector *meta.LabelSelector `json:"nodeSelector,omitempty" protobuf:"bytes,2,opt,name=nodeSelector"`
 }
 
-// ModelPrefetchRetention decides what happens to the content after it has landed.
+// ModelPrefetchRetention 决定内容落盘后的保留策略。
 type ModelPrefetchRetention struct {
-	// Pinned keeps the content on every target node against the node cache's collection: a pinned
-	// digest is never an eviction candidate, though it still counts toward usage. It requires the
-	// Binding to allow pinning, and admission refuses it otherwise.
+	// Pinned 使内容在每个目标节点上免受节点缓存回收：被固定的摘要（digest）永远不会成为
+	// 驱逐候选，但仍计入已用空间。它要求关联的 Binding 允许固定，否则准入时会被拒绝。
 	//
 	// +optional
 	Pinned bool `json:"pinned,omitempty" protobuf:"varint,1,opt,name=pinned"`
 
-	// TTLAfterLastUse unpins a node's copy once nothing mounted it for this long. It is enforced
-	// at the hour granularity the node's report already carries: retention does not need finer
-	// precision, and finer recording would multiply the node's writes for a decision that cannot
-	// tell the difference.
+	// TTLAfterLastUse 在节点副本超过该时长未被任何挂载使用后取消固定。它按节点上报已包含的
+	// 小时粒度执行：保留策略不需要更高精度，更精细的记录只会成倍增加节点写入开销，
+	// 而对决策并无实质区别。
 	//
 	// +optional
 	TTLAfterLastUse *meta.Duration `json:"ttlAfterLastUse,omitempty" protobuf:"bytes,2,opt,name=ttlAfterLastUse"`
 }
 
-// ModelPrefetchStatus is the prefetch's own view of its delivery, aggregated from the target
-// nodes' reports: which node holds the digest, which is fetching it, and whether enough do.
+// ModelPrefetchStatus 是预取任务对交付状态的视图，从目标节点的上报聚合而来：
+// 哪些节点已持有摘要、哪些正在拉取，以及是否已有足够节点就绪。
 type ModelPrefetchStatus struct {
-	// DesiredNodes is the size of the target set the current placement resolves to.
+	// DesiredNodes 是当前 Placement 解析出的目标节点集合大小。
 	//
 	// +optional
 	DesiredNodes int32 `json:"desiredNodes,omitempty" protobuf:"varint,1,opt,name=desiredNodes"`
 
-	// ReadyNodes is how many target nodes report the digest published and mountable.
+	// ReadyNodes 是上报摘要已发布且可挂载的目标节点数量。
 	//
 	// +optional
 	ReadyNodes int32 `json:"readyNodes,omitempty" protobuf:"varint,2,opt,name=readyNodes"`
 
-	// DownloadingNodes is how many target nodes are still fetching it.
+	// DownloadingNodes 是仍在拉取该摘要的目标节点数量。
 	//
 	// +optional
 	DownloadingNodes int32 `json:"downloadingNodes,omitempty" protobuf:"varint,3,opt,name=downloadingNodes"`
 
-	// Conditions: Progressing says delivery is under way; Available says ReadyNodes reached the
-	// MinReady bar; Degraded says a target node gave up, and the message says why.
+	// Conditions：Progressing 表示交付正在进行中；Available 表示 ReadyNodes 已达到
+	// MinReady 阈值；Degraded 表示某个目标节点已放弃交付，具体原因见 message。
 	//
 	// +patchMergeKey=type
 	// +patchStrategy=merge
@@ -153,7 +147,7 @@ type ModelPrefetchStatus struct {
 	Conditions []gpustack.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,4,rep,name=conditions"` // nolint: lll
 }
 
-// ModelPrefetchList holds the list of ModelPrefetch.
+// ModelPrefetchList 包含 ModelPrefetch 列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelPrefetchList struct {

@@ -5,8 +5,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstanceLog is the subresource of Instance for extracting logs,
-// which is the same as Kubernetes PodLog.
+// InstanceLog 是 Instance 用于提取日志的子资源，
+// 其行为与 Kubernetes PodLog 相同。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceLog struct {
@@ -16,43 +16,41 @@ type InstanceLog struct {
 
 var _ runtime.Object = (*InstanceLog)(nil)
 
-// TODO(thxCode): Support swagger doc generation for *Options types.
+// TODO(thxCode): 为 *Options 类型支持 swagger 文档生成。
 
-// InstanceLogOptions is the options of InstanceLog,
-// which is the same as Kubernetes PodLogOptions.
+// InstanceLogOptions 是 InstanceLog 的选项，
+// 其定义与 Kubernetes PodLogOptions 相同。
 //
 // +k8s:conversion-gen:explicit-from=net/url.Values
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceLogOptions struct {
 	meta.TypeMeta `json:",inline"`
 
-	// Follow the log stream of the Instance.
+	// Follow 持续跟踪 Instance 的日志流。
 	Follow bool `json:"follow,omitempty" protobuf:"varint,1,opt,name=follow"`
 
-	// A relative time in seconds before the current time from which to show logs.
-	// If this value precedes the time an Instance was started,
-	// only logs since the Instance start will be returned.
-	// If this value is in the future, no logs will be returned.
-	// Only one of sinceSeconds or sinceTime may be specified.
+	// 从当前时间往前推算的相对时间（单位为秒），用于指定从何时开始显示日志。
+	// 如果该时间早于 Instance 启动的时间，
+	// 则仅返回自 Instance 启动以来的日志。
+	// 如果该时间位于将来，则不返回任何日志。
+	// sinceSeconds 和 sinceTime 只能指定其中一个。
 	//
 	SinceSeconds *int64 `json:"sinceSeconds,omitempty" protobuf:"varint,2,opt,name=sinceSeconds"`
 
-	// An RFC3339 timestamp from which to show logs. If this value
-	// precedes the time an Instance was started, only logs since the Instance start will be returned.
-	// If this value is in the future, no logs will be returned.
-	// Only one of sinceSeconds or sinceTime may be specified.
+	// 用于指定从何时开始显示日志的 RFC3339 时间戳。如果该时间
+	// 早于 Instance 启动的时间，则仅返回自 Instance 启动以来的日志。
+	// 如果该时间位于将来，则不返回任何日志。
+	// sinceSeconds 和 sinceTime 只能指定其中一个。
 	SinceTime *meta.Time `json:"sinceTime,omitempty" protobuf:"bytes,3,opt,name=sinceTime"`
 
-	// If true, add an RFC3339 or RFC3339Nano timestamp at the beginning of every line
-	// of log output.
+	// 如果为 true，则在日志输出的每一行开头添加 RFC3339 或 RFC3339Nano 时间戳。
 	Timestamps bool `json:"timestamps,omitempty" protobuf:"varint,4,opt,name=timestamps"`
 
-	// If set, the number of lines from the end of the logs to show. If not specified,
-	// logs are shown from the creation of the container or sinceSeconds or sinceTime.
+	// 如果设置，则表示从日志末尾开始显示的行数。如果未指定，
+	// 则从容器创建时或 sinceSeconds、sinceTime 指定的时间点开始显示日志。
 	TailLines *int64 `json:"tailLines,omitempty" protobuf:"varint,5,opt,name=tailLines"`
 
-	// If set, the number of bytes to read from the server before terminating the
-	// log output. This may not display a complete final line of logging, and may return
-	// slightly more or slightly less than the specified limit.
+	// 如果设置，则表示在终止日志输出前从服务端读取的字节数上限。
+	// 这可能不会显示完整的最后一行日志，实际返回的字节数也可能略多或略少于指定的上限。
 	LimitBytes *int64 `json:"limitBytes,omitempty" protobuf:"varint,6,opt,name=limitBytes"`
 }

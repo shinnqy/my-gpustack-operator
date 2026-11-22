@@ -13,12 +13,11 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// TopologySourceHandler proxies a v1alpha1.TopologySource as the public TopologySource resource.
+// TopologySourceHandler 将 v1alpha1.TopologySource 代理为公开的 TopologySource 资源。
 //
-// No status proxy is exposed because the status is the topology controller's record of the
-// inventory, while the proxy writes with the worker's identity. The storage resource's status
-// subresource keeps the status as it is on main-resource writes, so the status is read through
-// the main resource.
+// 这里不暴露 status 代理，因为 status 是拓扑控制器记录的资产清单，
+// 而代理以 worker 的身份执行写入。底层存储资源的 status 子资源会在主资源写入时保持 status 不变，
+// 因此 status 通过主资源读取。
 type TopologySourceHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations

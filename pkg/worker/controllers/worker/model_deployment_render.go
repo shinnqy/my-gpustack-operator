@@ -20,255 +20,200 @@ import (
 )
 
 const (
-	// ModelDeploymentResourceType is the resource note every object a ModelDeployment renders
-	// carries, so a watch can tell them from every other Pod in the namespace.
+	// ModelDeploymentResourceType 是 ModelDeployment 渲染的每个对象都会携带的资源标记（resource note），
+	// 以便 watch 逻辑将其与 Namespace 中的其他 Pod 区分开来。
 	ModelDeploymentResourceType = "modeldeployments"
-	// ModelDeploymentResourceNoteRole names the role a rendered object belongs to.
+	// ModelDeploymentResourceNoteRole 标识被渲染对象所属的角色。
 	ModelDeploymentResourceNoteRole = "role"
 
-	// modelDeploymentLabelKeyName, modelDeploymentLabelKeyInstance and
-	// modelDeploymentLabelKeyComponent are the identity labels a replica's Pod carries.
+	// modelDeploymentLabelKeyName、modelDeploymentLabelKeyInstance 和
+	// modelDeploymentLabelKeyComponent 是副本 Pod 携带的身份标签。
 	//
-	// They exist alongside the resource note because a Service selects on LABELS and cannot read an
-	// annotation, and because they carry only identity — which deployment, which role — and never
-	// anything a spec update can move. A selector that moved would orphan the Pods it used to
-	// front. The same three keys, with the same meanings, front the KV cache backend's leader.
+	// 它们与资源标记（resource note）并存，因为 Service 只能按 label 选择而无法读取 annotation，
+	// 且这些标签只承载不可变身份（属于哪个部署、哪个角色），绝不包含任何 spec 更新可能改变的内容。
+	// 一旦 selector 发生变化，就会导致原先关联的 Pod 成为孤立对象。这三个完全相同的键及其含义同样用于挂载在 KVCache 后端 leader 前方的服务。
 	modelDeploymentLabelKeyName      = "app.kubernetes.io/name"
 	modelDeploymentLabelKeyInstance  = "app.kubernetes.io/instance"
 	modelDeploymentLabelKeyComponent = "app.kubernetes.io/component"
 	modelDeploymentLabelValueName    = "model-deployment"
 
-	// modelDeploymentLabelKeyRoleKind carries the role's EFFECTIVE kind, so that something in front
-	// of the replicas can tell a prefiller from a decoder by selector. It is the resolved value, not
-	// the field: a role that names no kind is a server, and a selector matching the empty string
-	// would miss every replica of the default shape.
+	// modelDeploymentLabelKeyRoleKind 承载角色的有效类型（effective kind），使副本前端组件能够通过 selector 区分 prefiller 和 decoder。
+	// 它是解析后的实际值，而非原始字段值：未指定 kind 的角色默认为 server，若按空字符串匹配 selector，则会漏掉所有默认形态的副本。
 	//
-	// It is rendered for every deployment, including one whose only role is a server. A key that
-	// appeared only under disaggregation would make "no prefiller exists" and "this deployment does
-	// not label roles" the same query result.
+	// 每个部署都会渲染该标签，包括仅含单个 server 角色的部署。
+	// 若仅在分离式部署（disaggregation）下才出现该键，会导致“不存在 prefiller”和“该部署未标注角色类型”产生相同的查询结果。
 	//
-	// It is NOT in the selector labels. A Service's selector cannot change without orphaning the
-	// replicas it used to front, and while a role's kind is immutable today, the reason this key
-	// stays out is the same one that keeps the entrance label out: the selector carries identity,
-	// and the kind is a property of the role rather than a name for it.
+	// 该标签不包含在 selector 标签中。Service 的 selector 一旦更改就会使原先关联的 Pod 成为孤立对象；
+	// 尽管目前角色类型不可变，不将其放入 selector 的原因与不放入入口标签相同：selector 只承载身份标识，而 kind 是角色的属性而非角色的名称。
 	//
-	// Adding it rolls every existing deployment once. The Pod spec hash covers the labels -- see
-	// modelDeploymentPodSpecHash -- so every replica rendered before this key existed has a stale
-	// fingerprint, and the recreate rollout replaces it. The rebuild is the one the recreate policy
-	// already describes, and a replica that leaves loses its cached blocks to its siblings.
+	// 添加该标签会触发所有现有部署滚动重建一次。由于 Pod spec 哈希覆盖了标签（参见 modelDeploymentPodSpecHash），
+	// 在此键引入之前渲染的所有副本都会出现指纹过期，并由重建滚动策略（recreate rollout）进行替换。
+	// 这种重建正是 recreate 策略所定义的行为，退出的副本会将其缓存块释放给同组其他副本。
 	modelDeploymentLabelKeyRoleKind = "modeldeployment." + systemname.LabelPrefix + "role-kind"
 
-	// modelDeploymentRouterCandidateLabel marks a member as a routing candidate of its group.
+	// modelDeploymentRouterCandidateLabel 将某个成员标记为其所属组的路由候选者（routing candidate）。
 	//
-	// IT IS A ROUTING FACT AND NOT A QUALIFICATION: it says the member may be discovered, never
-	// that it passed a probe.
+	// 它表示的是一项路由事实，而非就绪资格认证：它说明该成员可被发现，但绝不代表它已通过探针检查。
 	//
-	// A MEMBER OF A ROLE THE OPERATOR JUDGES CARRIES IT WHILE ITS GROUP IS ELIGIBLE, and it gains
-	// and loses it in the same write as the eligibility label. The judged roles are the ones the
-	// operator decides on its own: a protected managed group, an encoder, and an ordinary
-	// single-member server. A MANAGED PREFILL OR DECODE PAIR IS ONE OF THEM WHEN THE OPERATOR CAN
-	// OBSERVE THE PAIR, and a pair whose probe path is unavailable is not judged at all. THE
-	// PROTECTED CLASS AND THE JUDGED CLASS ARE TWO DIFFERENT QUESTIONS: the requirement is in force
-	// from the first enable either way, and the native selectors still require eligibility.
+	// 属于本 operator 负责判定角色的成员，在其所属组具备资格（eligible）期间会携带此标签，并在与资格标签相同的写入操作中一同添加或移除。
+	// 由本 operator 独立判定的角色包括：受保护的托管组（protected managed group）、encoder 以及普通的单成员 server。
+	// 托管的 prefill 或 decode 对（pair）在本 operator 能够观测该 pair 时也属于此类，而探针路径不可用的 pair 则完全不由本 operator 判定。
+	// 受保护类别与可判定类别是两个不同的维度：无论哪种情况，准入要求从首次启用时起即生效，且原生 selector 仍要求具备资格。
 	//
-	// A MEMBER OF A ROLE THE OPERATOR CANNOT JUDGE CARRIES IT WHILE THE DEPLOYED SHAPE LETS IT
-	// ANSWER, which is the membership it always had: a route this operator cannot judge is
-	// discovered by its own rules, and the marker says the same thing about it.
+	// 属于本 operator 无法判定角色的成员，只要所部署的形态允许其响应请求，就会一直携带该标签，
+	// 这与它一贯的成员身份规则一致：对于本 operator 无法判定的路由，由其自身规则决定发现时机，该标记对此表达同样的语义。
 	//
-	// IT EXISTS FOR THE MIXED UNION, where one deployment-wide selector has to name the candidates
-	// of roles whose requirements differ. There the eligibility term cannot be used, because it
-	// would withhold the roles that carry no requirement, and the per-kind filters cannot hold the
-	// requirements apart either, because they are per kind and two roles of one kind share one.
+	// 该标签专为混合并集（mixed union）场景设计，在此场景下需要一个部署级 selector 来筛选要求各不相同的各角色候选者。
+	// 此时不能使用资格标签，否则会遗漏不带该要求的角色；而按 kind 过滤也无法区分各自的要求，因为过滤器按 kind 生效，同一 kind 的两个角色会共享同一过滤条件。
 	modelDeploymentRouterCandidateLabel = "modeldeployment." + systemname.LabelPrefix + "router-candidate"
 
-	// modelDeploymentPodSpecHashAnnotation carries the fingerprint of the explicit spec inputs and
-	// external resource bindings a replica member was built from.
+	// modelDeploymentPodSpecHashAnnotation 记录用于构建副本成员的显式 spec 输入与外部资源绑定的指纹。
 	modelDeploymentPodSpecHashAnnotation = "modeldeployment." + systemname.LabelPrefix + "pod-spec-hash"
-	// modelDeploymentRenderVersionAnnotation records the operator render version a replica's Pod
-	// was synthesized under.
+	// modelDeploymentRenderVersionAnnotation 记录合成副本 Pod 时所使用的 operator 渲染版本。
 	modelDeploymentRenderVersionAnnotation = "modeldeployment." + systemname.LabelPrefix + "render-version"
-	// modelDeploymentMinRenderVersionAnnotation is the per-deployment annotation that raises the
-	// minimum acceptable render version for running replicas.
+	// modelDeploymentMinRenderVersionAnnotation 是部署级别的 annotation，用于提高运行中副本可接受的最低渲染版本。
 	modelDeploymentMinRenderVersionAnnotation = "modeldeployment." + systemname.LabelPrefix + "min-render-version"
-	// modelDeploymentTemplateBindingHashAnnotation carries the template-level external binding digest
-	// from renderModelDeploymentPodTemplate into stampModelDeploymentPod and is stripped when stamped.
+	// modelDeploymentTemplateBindingHashAnnotation 将模板级外部绑定摘要从 renderModelDeploymentPodTemplate 传递到 stampModelDeploymentPod，并在落盘打标（stamp）时移除。
 	modelDeploymentTemplateBindingHashAnnotation = "modeldeployment." + systemname.LabelPrefix + "template-binding-hash"
 
-	// modelDeploymentRenderVersion is the current operator Pod rendering baseline. Bump this
-	// constant whenever a change modifies the rendered Pod output of any ModelDeployment shape.
+	// modelDeploymentRenderVersion 是当前 operator Pod 渲染基线版本。每当有变更修改了任意 ModelDeployment 形态的 Pod 渲染输出时，都应递增此常量。
 	modelDeploymentRenderVersion = 4
-	// modelDeploymentMinSupportedRenderVersion is the lowest render version that remains compatible
-	// with the current controller without replacing running Pods.
+	// modelDeploymentMinSupportedRenderVersion 是当前控制器仍可兼容而无需替换运行中 Pod 的最低渲染版本。
 	modelDeploymentMinSupportedRenderVersion = 1
 
-	// modelDeploymentDefaultPort is the port a replica serves on when the role names
-	// none, and it is RENDERED INTO THE ENGINE'S OWN LISTEN ARGUMENT rather than left to the engine
-	// to pick, because the supported engines do not agree on a default. vLLM opens 8000 on every
-	// interface; SGLang opens 30000 on the loopback address alone, which neither a Service endpoint
-	// nor a kubelet probe can reach.
+	// modelDeploymentDefaultPort 是角色未指定端口时副本提供服务的默认端口。
+	// 该端口会被显式渲染进引擎自身的监听参数中，而不是交给引擎自行选择，因为各受支持的引擎对默认值的约定并不一致。
+	// vLLM 会在所有网卡接口上监听 8000 端口；而 SGLang 仅在回环地址（loopback）上监听 30000 端口，导致 Service 端点和 kubelet 探针都无法访问。
 	modelDeploymentDefaultPort int32 = 8000
-	// modelDeploymentDefaultPortName names that port on the container and on the Service fronting it.
+	// modelDeploymentDefaultPortName 为容器及前端 Service 上该端口的名称。
 	modelDeploymentDefaultPortName = "http"
-	// A managed decoder's routing proxy owns the serving port, while vLLM listens behind it here.
+	// 托管 decoder 的路由代理占用对外服务端口，而 vLLM 在其后方通过此端口监听。
 	modelDeploymentInternalPort int32 = 8200
-	// modelDeploymentMainContainerName is the container the role's own image and command run in,
-	// and the only one a rank belongs to: every other container a Pod here carries is this
-	// operator's, and joins no collective.
+	// modelDeploymentMainContainerName 是运行角色自身镜像和命令的容器名称，也是唯一属于集合通信 rank 的容器：
+	// Pod 中携带的所有其他容器均属于本 operator，不参与任何集合通信。
 	modelDeploymentMainContainerName = "main"
 
-	// modelDeploymentLeaderAddressEnv, modelDeploymentReplicaSizeEnv and
-	// modelDeploymentMemberIndexEnv publish the rank layout of an instance that spans several Pods.
-	// They appear only above size one, so a single-Pod instance renders exactly as it did before
-	// the field existed.
+	// modelDeploymentLeaderAddressEnv、modelDeploymentReplicaSizeEnv 和
+	// modelDeploymentMemberIndexEnv 用于发布跨多个 Pod 的实例的 rank 拓扑布局。
+	// 它们仅在副本规模大于 1 时出现，因此单 Pod 实例的渲染结果与该字段引入前完全一致。
 	//
-	// THEY ARE OWNED FOR EVERY ENGINE, unlike the connector's keys, because they describe the
-	// Kubernetes shape the Pod was rendered in rather than anything one engine understands. The
-	// ownership is not a preference: a user entry of the same name would be merged by VALUE onto an
-	// entry that carries a fieldRef instead, and an EnvVar holding both is rejected by the API
-	// server -- so an unowned key here turns a legal deployment into one that cannot render.
+	// 与连接器的环境变量键不同，这些环境变量对所有引擎均由系统独占管理（owned），因为它们描述的是 Pod 在 Kubernetes 中的渲染形态，而非特定引擎专有的配置。
+	// 这种独占权并非风格偏好：若允许用户定义同名条目，系统会按值（VALUE）合并到原本携带 fieldRef 的条目上，而同时包含两者的 EnvVar 会被 API server 拒绝——因此只要有一个键未受独占保护，合法的部署就会变成无法渲染的部署。
 	modelDeploymentLeaderAddressEnv = "GPUSTACK_REPLICA_LEADER_ADDRESS"
 	modelDeploymentReplicaSizeEnv   = "GPUSTACK_REPLICA_SIZE"
 	modelDeploymentMemberIndexEnv   = "GPUSTACK_MEMBER_INDEX"
 
-	// modelDeploymentEngineHostArg and modelDeploymentEnginePortArg are the two flags that decide
-	// where an engine listens. They are FILLED RATHER THAN OWNED: a role that passes either one
-	// keeps its own value, which is the rule the non-Kubernetes worker applies to the same two flags.
+	// modelDeploymentEngineHostArg 和 modelDeploymentEnginePortArg 是决定引擎监听位置和端口的两个参数。
+	// 它们采用“缺省填充”而非“独占覆盖”策略：若角色自身传入了其中任一参数，则保留其自定义值，这与非 Kubernetes 场景下 worker 对这两个参数的处理规则一致。
 	modelDeploymentEngineHostArg = "--host"
 	modelDeploymentEnginePortArg = "--port"
-	// modelDeploymentEngineBindHost is every interface in the Pod's network namespace, which is what
-	// a Service endpoint and a kubelet probe both dial. An engine left on its own default may open
-	// the loopback address instead, where only a process inside that container can reach it.
+	// modelDeploymentEngineBindHost 表示 Pod 网络命名空间中的所有网卡接口，Service 端点和 kubelet 探针都会访问该地址。
+	// 若让引擎使用其自身默认值，它可能只监听回环地址，导致只有容器内部的进程才能访问。
 	modelDeploymentEngineBindHost = "0.0.0.0"
-	// modelDeploymentEngineTLSCertArg and modelDeploymentEngineTLSKeyArg are the ONLY two flags that
-	// turn the engine's listener into a TLS one, and the whole --ssl-* family is deliberately not
-	// used in their place.
+	// modelDeploymentEngineTLSCertArg 和 modelDeploymentEngineTLSKeyArg 是唯二会将引擎监听器切换为 TLS 模式的参数，
+	// 此处刻意没有将整个 --ssl-* 参数族都纳入判定。
 	//
-	// Both supported engines pass every ssl argument straight to uvicorn, which enables TLS on
-	// `ssl_keyfile or ssl_certfile` and on nothing else. --ssl-ca-certs, --ssl-ciphers,
-	// --ssl-keyfile-password and --ssl-cert-reqs passed ALONE all leave an ordinary HTTP server, so
-	// treating the prefix as the family would publish an https:// address for a listener serving
-	// plaintext.
+	// 两个受支持的引擎都会将所有 ssl 参数直接透传给 uvicorn，而 uvicorn 仅在存在 `ssl_keyfile or ssl_certfile` 时才启用 TLS。
+	// 若单独传入 --ssl-ca-certs、--ssl-ciphers、--ssl-keyfile-password 或 --ssl-cert-reqs，服务端仍只是一个普通 HTTP 服务器，
+	// 因此若按整个参数前缀统一判定，就会为实际提供明文服务的监听器发布 https:// 地址。
 	//
-	// WHERE TO RE-CHECK THIS, since it is engine behavior and nothing here can enforce it: uvicorn's
-	// Config.is_ssl, reached from vllm's api_server.py serve_http call and from sglang's
-	// http_server.py launch_server. Each engine ALSO logs a line of its own about SSL being enabled,
-	// computed differently -- vllm from keyfile AND certfile -- and neither line decides the
-	// listener. Read the uvicorn property, not the log statement.
+	// 如需复核此行为（由于这是引擎自身行为，此处代码无法强制约束）：请查看 uvicorn 的 Config.is_ssl，
+	// 其调用路径分别位于 vllm 的 api_server.py（serve_http 调用）和 sglang 的 http_server.py（launch_server 调用）。
+	// 此外，两个引擎各自还会打印一条关于是否启用 SSL 的日志，但其计算方式不同——vllm 要求同时存在 keyfile 和 certfile——而且日志均不决定监听器的实际行为。
+	// 请以 uvicorn 的属性为准，而非日志输出。
 	//
-	// THE SCOPE IS COMMAND-LINE FLAGS. An engine that grew an environment variable putting the same
-	// listener on TLS would not be seen here, and both the probe and the published address would
-	// then say http:// for a TLS listener. No such variable exists in either engine today.
+	// 此判定仅覆盖命令行参数范围。如果某引擎后续新增了能将同一监听器切换为 TLS 的环境变量，此处将无法感知，
+	// 进而导致探针和对外发布的地址都将 TLS 监听器标记为 http://。目前两个引擎均不存在此类环境变量。
 	modelDeploymentEngineTLSCertArg = "--ssl-certfile"
 	modelDeploymentEngineTLSKeyArg  = "--ssl-keyfile"
-	// modelDeploymentEngineTLSClientAuthArg is the one TLS-related flag a gate cannot always follow:
-	// it can demand a CLIENT certificate, and a kubelet probe has none to present. It withdraws the
-	// gate only where one of the two above turned TLS on -- uvicorn builds no TLS context for it to
-	// apply to otherwise -- and only at the VALUE below.
+	// modelDeploymentEngineTLSClientAuthArg 是门控无法始终兼容的唯一一个 TLS 相关参数：
+	// 它可以要求提供客户端证书，而 kubelet 探针并没有证书可以出示。
+	// 仅当上述两个参数之一已开启 TLS（否则 uvicorn 根本不会构建 TLS 上下文使该参数生效），且其取值不在下方允许的值范围内时，才会撤回门控。
 	modelDeploymentEngineTLSClientAuthArg = "--ssl-cert-reqs"
-	// modelDeploymentEngineTLSClientAuthNone and modelDeploymentEngineTLSClientAuthOptional are
-	// ssl.CERT_NONE and ssl.CERT_OPTIONAL, the only two values of that flag under which a kubelet
-	// probe still completes: the first asks for no certificate, the second verifies one only if the
-	// client offers it.
+	// modelDeploymentEngineTLSClientAuthNone 和 modelDeploymentEngineTLSClientAuthOptional 对应
+	// ssl.CERT_NONE 和 ssl.CERT_OPTIONAL，即该参数下 kubelet 探针仍能正常完成的唯二取值：
+	// 前者不要求证书，后者仅在客户端主动提供时才校验证书。
 	//
-	// THEY ARE AN ALLOW LIST, not a "reject on CERT_REQUIRED" test, and the difference shows on a
-	// value outside the enum. ssl defines exactly these plus CERT_REQUIRED, so a 3 or a -1 is a
-	// configuration this operator cannot reason about; a test naming only the rejecting value would
-	// read it as safe and gate a listener whose behavior is unknown. Everything not on this list
-	// withdraws the gates, which matches how an unreadable value is treated below and for the same
-	// reason.
+	// 这两个常量构成的是白名单，而非“遇到 CERT_REQUIRED 则拒绝”的检查，两者的差异会在出现枚举外的值时显现。
+	// Python ssl 模块恰好只定义了这两个值加上 CERT_REQUIRED，因此诸如 3 或 -1 属于本 operator 无法推理的配置；
+	// 若只检查拒绝值，则会误将这些未知值视为安全并放行行为未知的监听器。
+	// 凡是不在此白名单中的取值一律撤回门控，这与下文对不可读值的处理方式及其原因一致。
 	modelDeploymentEngineTLSClientAuthNone     = 0
 	modelDeploymentEngineTLSClientAuthOptional = 1
 
-	// modelDeploymentProbePath is the route all three gates read, and it is the ONLY route both supported
-	// engines answer usefully -- which they do for OPPOSITE reasons, so neither engine's behavior
-	// may be used to reason about the other.
+	// modelDeploymentProbePath 是所有三个门控共同读取的路由，也是两个受支持引擎都能给出有效响应的唯一路由——
+	// 但它们这样做的原因截然相反，因此绝不能用其中一个引擎的行为来推论另一个引擎。
 	//
-	// On vllm the handler is a LIVENESS check: it answers 200 in every state and 503 only once the
-	// engine is dead, and it answers 200 outright when the server carries no engine at all. What
-	// makes it a readiness signal there is one layer below the handler: the server socket is bound
-	// before the engine is built but never listened on until uvicorn serves, which happens after the
-	// engine finishes loading. Until then the probe does not get a response to grade -- the
-	// connection is refused.
+	// 在 vLLM 上，该处理器实际上是一个存活检查（liveness check）：只要引擎未崩溃，它在任何状态下都会返回 200，仅在引擎死亡后才返回 503，
+	// 甚至当服务器根本未加载任何引擎时也会直接返回 200。
+	// 使它在这里成为就绪信号（readiness signal）的是处理器下方的一层机制：服务器 socket 在引擎构建之前就已绑定（bind），
+	// 但直到引擎加载完成、uvicorn 开始服务时才会执行监听（listen）。在此之前，探针收不到任何可供判断的响应——连接会被直接拒绝。
 	//
-	// On sglang the handler IS the readiness check: the server listens from the start and answers
-	// 503 while its status is still starting.
+	// 在 SGLang 上，该处理器本身就是就绪检查（readiness check）：服务器从启动之初就开始监听，并在状态仍处于启动中时返回 503。
 	//
-	// A TCP probe would therefore be correct on vllm and vacuous on sglang, whose port accepts
-	// immediately. So would /v1/models. Nothing else is shared: vllm's /ready and /readyz exist only
-	// in its data-parallel supervisor, not in the server a role runs.
+	// 因此，TCP 探针在 vLLM 上是正确的，但在 SGLang 上却毫无意义（因为其端口会立即接受连接）。/v1/models 亦然。
+	// 除此之外两者别无共通之处：vLLM 的 /ready 和 /readyz 仅存在于其数据并行（data-parallel）监督进程中，而不在角色运行的服务器进程中。
 	modelDeploymentProbePath = "/health"
 
-	// modelDeploymentDirectDecodeProbePath is the route the gates read in the direct-decode shape,
-	// where a routing sidecar owns the service port the gates grade. The sidecar answers /health
-	// itself, in every state, so that path grades the sidecar and stops saying anything about the
-	// engine the moment the Pod starts. Every other route the sidecar forwards to the engine, whose
-	// port refuses connections until the engine finishes loading and serves -- a refusal the
-	// sidecar answers with a 503. Reading /v1/models through the sidecar therefore keeps the gates
-	// on the address the Service fronts while the answer once again turns on the engine.
+	// modelDeploymentDirectDecodeProbePath 是 direct-decode 形态下各探针读取的路由，
+	// 在该形态中由路由 sidecar 占用各探针评估的 Service 端口。sidecar 在任何状态下都会自行响应
+	// /health，因此该路径评估的是 sidecar 本身，一旦 Pod 启动就无法再反映引擎状态。
+	// sidecar 会把其他所有路由转发给引擎，而在引擎完成加载并开始提供服务之前，其端口会拒绝连接，
+	// sidecar 对此返回 503。因此通过 sidecar 读取 /v1/models 既能使探针继续访问
+	// Service 前端的地址，又能让响应结果重新取决于引擎状态。
 	//
-	// The vacuity recorded above does not follow this route into the branch: the direct-decode
-	// shape renders only for vLLM, the engine whose /v1/models is a readiness signal.
+	// 上述空洞问题不会随此路由带入该分支：direct-decode 形态仅针对 vLLM 渲染，
+	// 而该引擎的 /v1/models 正是就绪信号。
 	modelDeploymentDirectDecodeProbePath = "/v1/models"
 
-	// modelDeploymentProbePeriodSeconds paces all three gates, which is what makes their failure
-	// thresholds comparable to each other.
+	// modelDeploymentProbePeriodSeconds 为三个探针设定统一的执行周期，从而使它们的失败阈值相互可比。
 	modelDeploymentProbePeriodSeconds int32 = 10
-	// modelDeploymentProbeTimeoutSeconds bounds one probe request. It is above the kubelet's
-	// one-second default because the route is served by the same process that is loading the
-	// model, and it is wide enough that a probe which arrives while a large weight shard is being
-	// read reports a timeout rather than cutting the read short.
+	// modelDeploymentProbeTimeoutSeconds 限制单次探测请求的超时时间。它高于 kubelet 默认的 1 秒，
+	// 因为该路由由正在加载模型的同一进程提供服务，并且足够宽松，使在读取大权重分片期间到达的探测
+	// 报告超时，而不会打断读取操作。
 	modelDeploymentProbeTimeoutSeconds int32 = 5
-	// modelDeploymentStartupFailureThreshold is how many periods a replica that declared no
-	// startup budget may take to load before the kubelet gives up on it, which at the period above
-	// and DefaultModelDeploymentStartupTimeoutSeconds is thirty minutes. A role that declares a
-	// budget gets its own threshold, derived from that budget rather than from this constant.
+	// modelDeploymentStartupFailureThreshold 表示未声明启动预算的副本在 kubelet 放弃前允许用于
+	// 加载的周期数；按上述周期和 DefaultModelDeploymentStartupTimeoutSeconds 计算，该时间为 30 分钟。
+	// 声明了预算的角色会获得由该预算推导出的独立阈值，而不使用此常量。
 	//
-	// The budget is generous on purpose: load time grows with model size and with how the weights
-	// arrive, and a threshold that fits the smallest model turns a slow start into a restart loop.
-	// Overshooting costs only a replica that is already broken staying broken for longer, which the
-	// deployment's own status already reports.
+	// 该预算刻意设置得较为宽松：加载时间会随模型规模和权重获取方式增长，按最小模型设定的阈值
+	// 会把慢启动变成重启循环。超出所需宽限的代价仅在于本已异常的副本在异常状态多停留一段时间，
+	// 而 Deployment 自身状态已能反映这一点。
 	modelDeploymentStartupFailureThreshold int32 = 180
-	// modelDeploymentReadinessFailureThreshold is how many consecutive failures take a replica that
-	// HAS served out of the Service's endpoints.
+	// modelDeploymentReadinessFailureThreshold 表示曾正常提供服务的副本在连续失败多少次后
+	// 会被移出 Service 的 endpoints。
 	modelDeploymentReadinessFailureThreshold int32 = 3
-	// modelDeploymentLivenessFailureThreshold is how many consecutive failures restart a replica
-	// whose engine answered once and then stopped answering.
+	// modelDeploymentLivenessFailureThreshold 表示引擎在曾经响应后停止响应时，连续失败多少次会触发副本重启。
 	//
-	// It is deliberately wider than the readiness threshold, because the two failures cost different
-	// things. Losing readiness withdraws a replica from the Service and is recovered by answering
-	// again, so a brief stall should reach it first. A restart throws away a model that took the
-	// startup budget above to load, so only a failure that outlives the readiness one should reach
-	// it.
+	// 该阈值刻意大于就绪阈值，因为两种失败的代价不同。失去就绪状态只会将副本从 Service 中摘除，
+	// 并在重新响应后恢复，因此短暂卡顿应先触发就绪失败。而重启会丢弃耗时上述启动预算才加载好的
+	// 模型，因此只有持续时间超过就绪失败的故障才应触发重启。
 	modelDeploymentLivenessFailureThreshold int32 = 6
 
-	// The three values below replace their counterparts above on a prefiller that dials an encoder
-	// stage by address. Its health route answers late, or not at all, while the encoder is busy
-	// with a large media payload or is restarting. With the defaults, an encoder stall would both
-	// withdraw a healthy prefiller and, through the liveness gate, restart it. The wider gates keep
-	// the same ratio between readiness and liveness: sixty and one hundred and twenty seconds at
-	// the period above.
+	// 以下三个值在按地址连接编码器阶段的 prefiller 上替代上面对应的默认值。在编码器处理大媒体
+	// 载荷或正在重启期间，其健康检查路由可能响应延迟甚至无响应。若使用默认值，编码器卡顿既会
+	// 摘除健康的 prefiller，又会通过存活探针将其重启。更宽松的阈值在就绪与存活之间保持相同比例：
+	// 按上述周期计算分别为 60 秒和 120 秒。
 	modelDeploymentEncoderProbeTimeoutSeconds       int32 = 5
 	modelDeploymentEncoderReadinessFailureThreshold int32 = 6
 	modelDeploymentEncoderLivenessFailureThreshold  int32 = 12
 
-	// modelDeploymentVLLMEngramConfigArg and modelDeploymentSGLangEngramHostTableEnv are the
-	// engine settings that place an Engram lookup table in pinned host DRAM.
+	// modelDeploymentVLLMEngramConfigArg 和 modelDeploymentSGLangEngramHostTableEnv 是
+	// 将 Engram 查找表放置在固定主机内存（pinned host DRAM）中的引擎设置。
 	modelDeploymentVLLMEngramConfigArg      = "--engram-config"
 	modelDeploymentSGLangEngramHostTableEnv = "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"
 )
 
-// modelDeploymentListenArgs are the listen and TLS flags each engine registers: the set the render
-// reads back off a command line, through ModelDeploymentResolveArg, to learn where and how the
-// engine listens. It is per engine because the sets differ -- SGLang registers no --ssl-cert-reqs,
-// so "--ssl-cert" is its certificate flag, while vLLM calls the same prefix ambiguous.
+// modelDeploymentListenArgs 是各引擎注册的监听和 TLS 参数：渲染器会通过 ModelDeploymentResolveArg
+// 从命令行中回读这组参数，以获知引擎的监听位置和方式。该映射按引擎区分，因为各引擎注册集不同——
+// SGLang 未注册 --ssl-cert-reqs，因此 "--ssl-cert" 即是其证书参数，而 vLLM 会认为该前缀存在歧义。
 //
-// A PREFIX OF A KEY IS READ AS THAT KEY, and that is the engine's own reading wherever the engine
-// starts at all: no flag either engine registers is a strict prefix of one of these, so a prefix
-// the engine accepts is one it resolved to the key, and a prefix it calls ambiguous stops it before
-// anything listens, which leaves nothing to read back. That premise is engine behavior nothing here
-// enforces. Re-check it on an engine bump by listing, for each key, the option strings of the
-// engine's parser that are a strict prefix of it (vLLM's make_arg_parser, SGLang's
-// ServerArgs.add_cli_args); a non-empty list means that spelling is read as the wrong flag here.
+// 键的前缀会被识别为该键，只要引擎能够启动，这也是引擎自身的解析行为：两个引擎所注册的参数中
+// 没有任何一个是此处任一键的严格前缀，因此引擎接受的前缀必然会解析为该键，而引擎判定为歧义的
+// 前缀会在启动任何监听之前中止进程，从而没有可回读的监听信息。该前提属于引擎自身行为，此处并不
+// 强制校验。升级引擎版本时应重新核查：针对每个键列出引擎解析器中作为其严格前缀的选项字符串
+// （vLLM 的 make_arg_parser，SGLang 的 ServerArgs.add_cli_args）；若列表非空，则说明此处会将该拼写
+// 误识别为错误的参数。
 var modelDeploymentListenArgs = map[string][]string{
 	workercore.ModelDeploymentEngineVLLM: {
 		modelDeploymentEngineHostArg, modelDeploymentEnginePortArg,
@@ -281,86 +226,77 @@ var modelDeploymentListenArgs = map[string][]string{
 	},
 }
 
-// ModelDeploymentListenArg reports which listen or TLS flag the engine's own parser reads a
-// command-line entry as, and "" for any other entry.
+// ModelDeploymentListenArg 报告引擎自身解析器会将某条命令行参数识别为哪个监听或 TLS 参数，
+// 对其他任意参数则返回 ""。
 func ModelDeploymentListenArg(engine, arg string) string {
 	key, _ := ModelDeploymentResolveArg(engine, arg, modelDeploymentListenArgs[engine])
 
 	return key
 }
 
-// ModelDeploymentRenderInput is everything one replica's Pod is rendered from.
+// ModelDeploymentRenderInput 包含渲染单个副本 Pod 所需的全部信息。
 //
-// The InstanceType and the connector arrive as values rather than being read here, because the
-// render must stay a pure function of its inputs: the reconciler converges the same object on every
-// pass, so a render that reached for a client could return two different Pods for one spec and roll
-// the deployment forever.
+// InstanceType 和 connector 以值形式传入而非在此处读取，因为渲染必须保持为对其输入的纯函数：
+// 调谐器在每次循环中都会收敛同一对象，若渲染过程主动调用客户端，就可能为同一 spec 返回两个
+// 不同的 Pod，导致 Deployment 持续滚动更新。
 type ModelDeploymentRenderInput struct {
-	// Deployment is the object being rendered.
+	// Deployment 是正在渲染的对象。
 	Deployment *workercore.ModelDeployment
-	// Role is the entry of Deployment.Spec.Roles this replica belongs to.
+	// Role 是该副本所属的 Deployment.Spec.Roles 条目。
 	Role *workercore.ModelDeploymentRole
-	// InstanceType is the type the role's Pods are admitted against. It supplies how to spell the
-	// accelerator keys and the per-card unit resources the host request is derived from.
+	// InstanceType 是该角色的 Pod 准入所依据的实例类型。它提供了加速器资源键的拼写方式以及
+	// 用于推导主机资源请求的单卡单位资源。
 	InstanceType *worker.InstanceType
-	// Connector is what the engine needs to reach the pool. Its zero value renders a replica with
-	// no connector at all, which is what a deployment whose Binding has not been resolved yet gets.
+	// Connector 是引擎连接资源池所需的配置。其零值会渲染出完全不带 connector 的副本，
+	// 适用于 Binding 尚未解析完成的 Deployment。
 	Connector ModelDeploymentConnectorRender
-	// ECConnector is the encoder-cache connector the decode sidecar is told to drive, in the
-	// SIDECAR's own spelling, or empty when this deployment runs no encoder stage.
+	// ECConnector 是告知解码 sidecar 使用的编码器缓存连接器，采用 sidecar 自身的拼写方式；
+	// 当该 Deployment 不运行编码器阶段时为空。
 	//
-	// IT IS THE MATRIX ROW'S ANSWER, RESOLVED BY THE CALLER rather than re-derived from the
-	// platform here. The row is admission's whole answer for a router/engine/accelerator
-	// combination, and the render already carries a copy of it inside Connector.Args for the engine
-	// half; re-deriving the sidecar half from the platform beside it would be a second switch over
-	// one platform, and two switches are two answers to one question. Empty renders no flag, which
-	// the sidecar reads as "skip the encoder stage" -- so the two reasons an empty value occurs
-	// (no Encode role, or an unadmitted combination) render identically rather than differently.
+	// 它是由调用方解析出的矩阵行结果，而非在此处根据平台重新推导。矩阵行代表了准入阶段针对某组
+	// 路由器/引擎/加速器组合的完整结论，而渲染器已在 Connector.Args 中为引擎侧携带了其副本；
+	// 若在旁边再针对同一平台重新推导 sidecar 侧，就会形成对同一问题的两套 switch 逻辑，进而可能
+	// 给出两个不同答案。空值不会渲染任何参数，sidecar 会将其解释为“跳过编码器阶段”——因此空值出现的
+	// 两种原因（无 Encode 角色，或未准入的组合）最终渲染结果完全一致而非有所区别。
 	ECConnector string
-	// InterfaceResource is the extended resource selected from the role's effective fabric
-	// protocol. It is empty when the role requests no interface.
+	// InterfaceResource 是根据角色有效网络协议选出的扩展资源。当角色未请求网卡接口时为空。
 	InterfaceResource core.ResourceName
-	// There is NO ConfigMap name here, and there is no object to name: the client configuration
-	// travels in Connector.PodAnnotations and reaches the container as a downwardAPI projection of
-	// it. The field this struct used to carry was never filled by anything, so the mount it guarded
-	// was dead code; Connector.PodAnnotations is the carrier.
-	// RuntimeClassName is the runtime class an accelerated replica needs. The reconciler resolves it,
-	// because deciding it requires reading whether the class exists on the cluster.
+	// 此处没有 ConfigMap 名称，也没有需要命名的对象：客户端配置通过 Connector.PodAnnotations 传递，
+	// 并以 downwardAPI 投射的方式进入容器。该结构体原先携带的字段从未被填充，因此它所控制的挂载属于
+	// 死代码；Connector.PodAnnotations 才是实际载体。
+	// RuntimeClassName 是使用加速器的副本所需的运行时类。由调谐器负责解析，
+	// 因为确定该值需要检查集群中是否存在该类。
 	RuntimeClassName string
-	// GeneralResourcesOvercommit mirrors the Instance path's overcommit setting, which decides
-	// whether the derived CPU and memory are requested at full size or scaled down.
+	// GeneralResourcesOvercommit 对应 Instance 路径的过载超卖设置，用于决定推导出的 CPU 和内存
+	// 是按完整大小请求还是按比例缩减。
 	GeneralResourcesOvercommit bool
-	// TCPTWReuse mirrors the model-deployment-tcp-tw-reuse setting. It is the cluster's answer, not
-	// the role's: which Pods turn it into a sysctl is decided by modelDeploymentTakesTCPTWReuse.
+	// TCPTWReuse 对应 model-deployment-tcp-tw-reuse 设置。它是集群级别的设定，而非角色级别：
+	// 哪些 Pod 会将其转化为 sysctl 由 modelDeploymentTakesTCPTWReuse 决定。
 	TCPTWReuse bool
-	// NativeSidecar decides which shape a direct decoder's routing proxy is rendered in: a native
-	// sidecar -- an init container carrying restartPolicy: Always -- when the cluster keeps that
-	// field, or a classic regular container when it does not. The reconciler resolves it from the
-	// cluster's version rather than the render guessing, because the field is DROPPED without an
-	// error below 1.29, and a Pod rendered with it there never leaves Init.
+	// NativeSidecar 决定直接解码器（direct decoder）的路由代理以哪种形态渲染：当集群保留该字段时，
+	// 渲染为原生 sidecar（即带有 restartPolicy: Always 的 init 容器）；否则渲染为传统的普通容器。
+	// 该值由调谐器根据集群版本解析，而非由渲染器猜测，因为在 1.29 以下版本中该字段会被静默丢弃
+	// 而不报错，导致带该字段渲染出的 Pod 永远无法离开 Init 阶段。
 	NativeSidecar bool
-	// Ordinal is the replica this render is for, stamped into the group metadata. The template
-	// half never reads it -- only the stamp does -- and the zero value renders the first replica,
-	// which is what a caller with no particular replica in mind gets.
+	// Ordinal 是此次渲染对应的副本序号，会写入组元数据中。模板部分从不读取该值——只有打标（stamp）
+	// 部分会读取——其零值渲染第一个副本，供未指定特定副本的调用方使用。
 	Ordinal int
 
-	// Artifact is how the weights spec.model.artifactRef names reach the engine, resolved by the
-	// reconciler. Nil renders a deployment naming no artifact exactly as before the field existed;
-	// a deployment that names one is not rendered at all until it resolves.
+	// Artifact 表示 spec.model.artifactRef 指定的权重如何送达引擎，由调谐器负责解析。
+	// 为 nil 时会按该字段引入前的方式渲染未指定制品的 Deployment；
+	// 指定了制品的 Deployment 在其解析完成前完全不会进行渲染。
 	Artifact *ModelDeploymentArtifactRender
 
-	// Member is which Pod of that replica this render is for, counting from zero. It is stamped,
-	// never templated, for the same reason Ordinal is: the template is what every Pod of the role
-	// shares, and a value naming one Pod inside it would make two members of one replica hash
-	// differently and read as a permanent rollout.
+	// Member 是此次渲染对应该副本中的第几个 Pod（从 0 开始计数）。它与 Ordinal 出于相同原因
+	// 仅在打标（stamp）阶段写入而绝不进入模板：模板是同一角色所有 Pod 共享的内容，若模板中包含
+	// 指向某个特定 Pod 的值，会导致同一副本的两个成员算出不同的哈希并被误判为持续滚动发布。
 	//
-	// The zero value is the leader, which is what a caller with no particular member in mind gets
-	// and is also the only member a replica of size one has.
+	// 零值代表 leader，未指定具体成员的调用方会得到该值，它也是大小为 1 的副本唯一的成员。
 	Member int
 }
 
-// modelDeploymentSelectorLabels is what fronts a role's replicas: the identity of the deployment and
-// of the role, and nothing a spec update can move.
+// modelDeploymentSelectorLabels 用于匹配角色下的各副本：仅包含 Deployment 与角色的标识，
+// 不包含任何会因 spec 更新而变动的字段。
 func modelDeploymentSelectorLabels(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 ) map[string]string {
@@ -371,36 +307,32 @@ func modelDeploymentSelectorLabels(
 	}
 }
 
-// renderModelDeploymentPodTemplate renders the whole of a replica's Pod that its role's spec
-// states: the labels, the annotations, the PodSpec and every container in it.
+// renderModelDeploymentPodTemplate 渲染副本 Pod 中由其角色 spec 声明的全部内容：
+// labels、annotations、PodSpec 以及其中的所有容器。
 //
-// IT PRODUCES NOTHING THAT VARIES FROM ONE REPLICA OF A ROLE TO THE NEXT, and that is the property
-// the split into a template and a stamp exists to keep checkable: the Kueue group metadata and the
-// spec-hash fingerprint are stamped on afterwards, because a per-replica group name differs between
-// the members of one role, and a value naming one member leaking into this function would render
-// each replica a different Pod with nothing erroring anywhere. The connector's PodAnnotations are
-// written here rather than in the stamp because they carry the pool's endpoint and domain, which
-// every replica of the role shares.
+// 它不会生成任何在同角色不同副本之间变化的内容，而拆分为模板与打标（stamp）两步正是为了确保
+// 这一性质可被检查：Kueue 组元数据和 spec 哈希指纹在之后写入，因为按副本区分的组名在同角色
+// 成员间各不相同，一旦指向单个成员的值泄漏进此函数，就会为每个副本渲染出不同的 Pod 且不会在
+// 任何地方报错。connector 的 PodAnnotations 写入此处而非打标阶段，是因为它们携带的是整个角色
+// 所有副本共享的池端点与域信息。
 func renderModelDeploymentPodTemplate(ctx context.Context, in ModelDeploymentRenderInput) (*core.Pod, error) {
-	// Implement this function in chapter 19.
+	// 在第 19 章实现此函数。
 	var result0 *core.Pod
 	var result1 error
 	return result0, result1
 }
 
-// modelDeploymentStampRouterCandidate marks a rendered Pod that is a routing candidate.
+// modelDeploymentStampRouterCandidate 标记作为路由候选者的已渲染 Pod。
 //
-// IT READS THE COMPLETED POD AND NOT THE DESIRED ROLE. The Pod says which mode it runs: a Pod that
-// took its command line over carries no metrics annotation, because the operator did not build that
-// command line and cannot claim the container serves the metrics the hook reads. The desired role
-// says what this Pod is asked to run, and a Pod is what is actually running.
+// 它读取的是已完成的 Pod 而非期望的 Role。Pod 反映了其实际运行的模式：接管了自身命令行的
+// Pod 不会携带指标注解，因为该命令行并非由 operator 构建，无法保证容器会提供钩子读取的指标。
+// 期望的 Role 描述要求该 Pod 运行什么，而 Pod 才代表实际正在运行的内容。
 //
-// A ROLE THE OPERATOR CONTROLS IS NOT A CANDIDATE AT BIRTH. It has not been judged, and the marker
-// is written to such a member only while its group is eligible, so a managed newborn starts
-// unmarked and gains the marker with the eligibility label.
+// 由 operator 控制的角色在创建时并非候选者。它尚未经过评估，仅当其所属组符合资格时才会向此类
+// 成员写入该标记，因此受管的新建 Pod 初始无标记，随后与资格标签一同获得该标记。
 //
-// A ROLE THE OPERATOR CANNOT JUDGE IS A CANDIDATE FROM BIRTH, and only the members the shape lets
-// answer carry it: the leader of a leader-served replica, and every member of an External-DP one.
+// operator 无法评估的角色自创建起即为候选者，且仅由形态允许响应的成员携带该标记：
+// leader-served 副本中的 leader，以及 External-DP 副本中的每个成员。
 func modelDeploymentStampRouterCandidate(
 	pod *core.Pod, md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, member int,
 ) {
@@ -410,15 +342,13 @@ func modelDeploymentStampRouterCandidate(
 	managed, _ := modelDeploymentMemberExecution(pod)
 	effective := *role
 	if managed {
-		// THE REPLICA RUNS THE OPERATOR'S COMMAND LINE, so the role's own command says nothing
-		// about the mode the replica is in.
+		// 该副本运行的是 operator 生成的命令行，因此角色自身的 command 无法说明副本所处的模式。
 		effective.Command = nil
 	}
 	if modelDeploymentGroupForwardActivatable(md, &effective) {
 		return
 	}
-	// A MEMBER THIS OPERATOR DID NOT BUILD CARRIES NO MANAGED LOAD BALANCE, which is an
-	// established answer and not a missing one.
+	// 非本 operator 构建的成员不携带受管负载均衡配置，这是明确确定的结果，而非缺失信息。
 	externalDP := managed && modelDeploymentRoleExternalDP(md, &effective)
 	switch modelDeploymentAnsweringShapeOf(externalDP, modelDeploymentRoleSize(&effective)) {
 	case modelDeploymentAnsweringAll, modelDeploymentAnsweringSole:
@@ -435,7 +365,7 @@ func modelDeploymentStampRouterCandidate(
 	pod.Labels[modelDeploymentRouterCandidateLabel] = modelDeploymentEndpointEligibleValue
 }
 
-// modelDeploymentSharedMemoryVolumes adds the role's default mount unless one is explicit.
+// modelDeploymentSharedMemoryVolumes 为角色添加默认的共享内存挂载，除非已显式配置。
 func modelDeploymentSharedMemoryVolumes(
 	role *workercore.ModelDeploymentRole, vols []core.Volume, mounts []core.VolumeMount,
 ) ([]core.Volume, []core.VolumeMount) {
@@ -456,43 +386,38 @@ func modelDeploymentSharedMemoryVolumes(
 	return vols, mounts
 }
 
-// stampModelDeploymentPod puts the Kueue group metadata on a rendered replica and then writes the
-// explicit spec-hash fingerprint and the operator render-version annotation.
+// stampModelDeploymentPod 为已渲染的副本写入 Kueue 组元数据，随后写入显式的 spec 哈希指纹
+// 以及 operator 渲染版本注解。
 func stampModelDeploymentPod(
 	pod *core.Pod, md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 	ordinal, member int,
 ) {
-	// THE NAME IS DERIVED RATHER THAN GENERATED, above size one, and that is what the whole
-	// multi-Member shape rests on: a member cannot join a collective it cannot address, and a Pod
-	// created by GenerateName has no name any sibling can predict. Every reader -- this renderer,
-	// the converger, a sibling's entrypoint -- derives the same string from the same four values
-	// without reading anything.
+	// 规模大于 1 时，名称通过推导得出而非自动生成，整个多成员（multi-Member）形态正依赖于此：
+	// 成员无法加入一个自己无法寻址的集合通信组，而通过 GenerateName 创建的 Pod 其名称无法被
+	// 兄弟节点预测。每个读取方——本渲染器、收敛器以及兄弟节点的入口脚本——都无需读取外部状态，
+	// 仅凭相同的四个值即可推导出完全一致的字符串。
 	//
-	// AT SIZE ONE THE NAME STAYS GENERATED, deliberately. A replica's identity is obtained from its
-	// ordinal label rather than from its name, so naming single-Member replicas would buy nothing
-	// and would cost the one thing GenerateName gives: a create that cannot collide with a Pod of
-	// the same ordinal still draining, which is exactly the state the converger's create gate waits
-	// out. Above one the collision is unavoidable -- the address IS the name -- and the gate is
-	// what handles it instead.
+	// 规模为 1 时名称刻意保持自动生成。单副本的身份来自其 ordinal 标签而非名称，因此为单成员
+	// 副本固定命名没有任何收益，反而会失去 GenerateName 带来的关键好处：新建操作不会与仍在
+	// 排空（draining）的同 ordinal 旧 Pod 发生命名冲突，而这正是收敛器的创建门控所等待的状态。
+	// 规模大于 1 时冲突无法避免——地址即名称——此时改由该门控负责处理。
 	if modelDeploymentRoleSize(role) > 1 {
 		pod.Name = modelDeploymentMemberName(md, role.Name, ordinal, member)
 		pod.GenerateName = ""
 
-		// hostname and subdomain are what turn that name into a DNS record: the headless Service
-		// named here publishes <hostname>.<subdomain> for every Pod that names it, which is
-		// core/v1 behavior owing nothing to any controller.
+		// hostname 和 subdomain 将该名称转换为 DNS 记录：此处指定的无头 Service 会为每个声明它的 Pod
+		// 发布 <hostname>.<subdomain>，这是 core/v1 的原生行为，不依赖任何控制器。
 		pod.Spec.Hostname = pod.Name
 		pod.Spec.Subdomain = modelDeploymentReplicaServiceName(md, role.Name, ordinal)
 
 		stampModelDeploymentRankEnv(pod, md, role, ordinal)
 	}
 
-	// The Kueue group metadata, which is what makes a replica's admission unit that replica alone:
-	// the group name is derived per (role, ordinal), so each Pod joins its own one-member group.
+	// Kueue 组元数据使单个副本成为独立的准入单元：组名按 (role, ordinal) 推导，因此每个 Pod
+	// 加入其各自的成员组。
 	//
-	// The labels and the annotations are applied together because the group's own type returns them
-	// together -- a Pod carrying the membership label without the total count joins a group whose
-	// size Kueue cannot learn, and no Workload is composed at all.
+	// 标签与注解必须一起应用，因为该组类型本身会同时返回两者——如果 Pod 仅携带成员关系标签而缺少
+	// 总数信息，它加入的组将无法让 Kueue 获知规模，从而根本无法组成 Workload。
 	group := ModelDeploymentPodGroup(md, role, ordinal, member)
 	for k, v := range group.Labels {
 		pod.Labels[k] = v
@@ -513,32 +438,27 @@ func stampModelDeploymentPod(
 	modelDeploymentStampRouterCandidate(pod, md, role, member)
 }
 
-// stampModelDeploymentRankEnv publishes the three facts a member needs to join its collective: who
-// the leader is, how many members there are, and which one this is.
+// stampModelDeploymentRankEnv 发布成员加入其集合通信组所需的三个事实：谁是 leader、
+// 共有多少成员，以及当前是第几个成员。
 //
-// IT PUBLISHES FACTS AND COMPOSES NO ARGUMENT. Which parallelism an engine turns on, and over how
-// many ranks, stays the author's to say: the member count is a product of degrees that cannot be
-// decomposed from one number, so a formula here would be a guess that runs instead of an error.
-// The declared degrees ARE read elsewhere -- the transfer document's parallel blocks are parsed
-// out of the roles' own books, their extra arguments and, for vLLM's data-parallel width, a
-// literal VLLM_DP_SIZE entry -- but that read copies the author's numbers into another document
-// and changes none of the membership facts published here.
+// 它只发布事实，不拼装任何参数。引擎开启哪种并行模式以及跨越多少 rank，始终由作者决定：
+// 成员总数是多个并行度之积，无法从单个数字反推拆解，因此此处的公式推导只会变成能跑起来
+// 却错误的猜测。已声明的并行度确实会在别处被读取——传输文档的并行块会从角色自身配置、
+// extra arguments 以及针对 vLLM 数据并行宽度的字面量 VLLM_DP_SIZE 条目中解析——但该读取仅把
+// 作者的数字复制到另一份文档中，不会改变此处发布的任何成员关系事实。
 //
-// THE INDEX COMES THROUGH THE DOWNWARD API RATHER THAN AS A LITERAL, and that is what keeps one
-// template per ReplicaGroup: every member's container declares the same `fieldRef`, so the three
-// entries are byte-identical across the members of a replica and only the label the stamp already
-// wrote differs. Writing the index as a literal would work -- a live Pod is compared against the
-// render of its own member index, not its replica's -- but it would make the container spec a
-// per-member document, and the Boundaries invariant that one template describes a whole replica is
-// worth more than the two lines it saves.
+// 索引通过 downward API 而非字面量传入，这保证了每个 ReplicaGroup 共用同一份模板：每个成员的
+// 容器都声明相同的 `fieldRef`，因此这三条环境变量在副本的所有成员间逐字节一致，唯一不同的只有
+// 打标阶段已经写入的标签。把索引写成字面量也能工作——线上 Pod 是与其自身成员索引的渲染结果而非
+// 副本整体对比——但那会让容器 spec 变成按成员区分的文档，而“一份模板描述整个副本”这一
+// Boundaries 不变量比省下两行代码更有价值。
 //
-// ONLY THE MAIN CONTAINER IS STAMPED. The routing proxy is this operator's own sidecar and joins no
-// collective; giving it ranks would describe a membership nothing acts on.
+// 仅为主容器写入该信息。路由代理是本 operator 自身的 sidecar，不加入任何集合通信组；
+// 为其注入 rank 只会描述一段没有任何组件会使用的成员关系。
 //
-// A ROLE THAT TOOK OVER ITS COMMAND LINE IS STAMPED TOO, which is where the connector's rule does
-// NOT carry over. The connector's entries name a config file the operator also wrote, so a take-over
-// argv that never reads it has no use for them; these describe the cluster the Pod is running in, and
-// an entrypoint composing its own launch is exactly what needs them.
+// 接管了自身命令行的角色同样会写入该信息，这一点与 connector 的规则不同。connector 的条目
+// 指向同样由 operator 编写的配置文件，因此不读取该配置的接管 argv 用不到它们；而这些环境变量
+// 描述的是 Pod 所运行的集群信息，自行拼装启动命令的入口脚本恰好需要它们。
 func stampModelDeploymentRankEnv(
 	pod *core.Pod, md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, ordinal int,
 ) {
@@ -591,50 +511,42 @@ func modelDeploymentCommandPort(engine string, command []string) (int32, error) 
 	return 0, fmt.Errorf("%s is missing", modelDeploymentEnginePortArg)
 }
 
-// renderModelDeploymentRoutingSidecar builds the decode Pod's routing proxy. Which handshake it
-// speaks follows the ENGINE and the pool's vendor, because the connector is how the sidecar asks
-// the prefiller's bootstrap registry for transfer endpoints and each engine serves a different
-// one: the value names a connector the sidecar dispatches on, not a flavor of one protocol.
+// renderModelDeploymentRoutingSidecar 构建解码 Pod 的路由代理。它采用哪种握手协议取决于 ENGINE
+// 和资源池的厂商，因为 connector 决定了 sidecar 如何向 prefiller 的 bootstrap 注册表请求传输端点，
+// 而每种引擎提供的注册表各不相同：该值指定的是 sidecar 据以分发实现的 connector，而非同一协议的不同变体。
 //
-// THE BOOTSTRAP PORT IS ONE VALUE WRITTEN AT BOTH ENDS. The prefiller names it in its own launch
-// argument, rendered by the inject package from its constant, and the sidecar reads it here. Under
-// mooncake the port travels as a flag; under SGLang it cannot, because the sidecar's SGLang port
-// is a process-wide constant with no flag at all, overridable only through the
-// SGLANG_BOOTSTRAP_PORT environment variable (llm-d/llm-d-router@v0.10.0
-// `pkg/sidecar/proxy/connector_sglang.go:38-50`). Both ends read the same constant, so a pair
-// cannot disagree about where the registry lives.
+// BOOTSTRAP 端口是在两端写入的同一数值。prefiller 在其自身的启动参数中指定该端口（由 inject 包
+// 根据其常量渲染），sidecar 则在此处读取它。在 Mooncake 下该端口作为命令行参数传递；在 SGLang 下
+// 则不能，因为 sidecar 的 SGLang 端口是一个完全没有命令行参数的进程级常量，只能通过
+// SGLANG_BOOTSTRAP_PORT 环境变量覆盖（llm-d/llm-d-router@v0.10.0
+// `pkg/sidecar/proxy/connector_sglang.go:38-50`）。两端读取同一个常量，因此配对双方绝不会对
+// 注册表所在位置产生分歧。
 //
-// ASCEND GETS NO PORT FLAG, because its pair has no registry to point at: the vLLM-Ascend
-// connector hands the decoder the prefiller's host and port inside the per-request
-// kv_transfer_params, and the sidecar's nixlv2 mode relays exactly that document
-// (llm-d/llm-d-router@v0.10.0 `pkg/sidecar/proxy/connector_nixlv2.go:162-170,405`). The connector
-// value is the sidecar's own constant vocabulary (`pkg/sidecar/constants/constants.go:21`,
-// KVConnectorNIXLV2), spelled here rather than derived from anything the engine names.
-// The encoder-cache connectors the decode sidecar pulls embeddings through. These are the
-// sidecar's own words, NOT the engine connector names they correspond to: the engine runs
-// ECCPUConnector or ECExampleConnector, while the sidecar either pulls the encoder's output over
-// NIXL or reads it from the directory both roles mount.
+// ASCEND 不传端口参数，因为其配对模式没有可供指向的注册表：vLLM-Ascend connector 会在每次请求的
+// kv_transfer_params 中把 prefiller 的主机和端口交给解码器，而 sidecar 的 nixlv2 模式原封不动地
+// 转发该文档（llm-d/llm-d-router@v0.10.0 `pkg/sidecar/proxy/connector_nixlv2.go:162-170,405`）。
+// 该 connector 值属于 sidecar 自身的常量词汇表（`pkg/sidecar/constants/constants.go:21`，
+// KVConnectorNIXLV2），在此处直接拼写而非从引擎名称推导。
+// 解码 sidecar 用于拉取编码器嵌入（embeddings）的编码器缓存连接器。这些是 sidecar 自身的术语，
+// 而非它们对应的引擎连接器名称：引擎运行 ECCPUConnector 或 ECExampleConnector，而 sidecar 要么通过
+// NIXL 拉取编码器输出，要么从两个角色共同挂载的目录中读取。
 //
-//	llm-d/llm-d-router@v0.11.0 `pkg/sidecar/constants/constants.go:35-39`, validated against
-//	`pkg/sidecar/proxy/options.go:180-183,671-673`.
+//	llm-d/llm-d-router@v0.11.0 `pkg/sidecar/constants/constants.go:35-39`，依据
+//	`pkg/sidecar/proxy/options.go:180-183,671-673` 校验。
 //
-// The set is closed and a value outside it is fatal rather than degraded: the sidecar refuses to
-// start on an unrecognized connector, so a decoder rendered with a third spelling never becomes
-// ready and never answers.
+// 该集合是封闭的，集合之外的值会导致致命错误而非降级运行：sidecar 遇到未识别的 connector 会拒绝启动，
+// 因此使用第三种拼写渲染出的解码器永远不会进入就绪状态，也永远不会响应请求。
 const (
-	// modelDeploymentECConnectorNIXL is the network path, for the platforms whose copy path
-	// NIXL supports.
+	// modelDeploymentECConnectorNIXL 是网络路径，适用于其复制路径受 NIXL 支持的平台。
 	modelDeploymentECConnectorNIXL = "ec-nixl"
-	// modelDeploymentECConnectorExample is the shared-directory path, which needs no copy path
-	// of any kind and is the only one the Ascend example runs.
+	// modelDeploymentECConnectorExample 是共享目录路径，不需要任何形式的复制路径，也是 Ascend 示例唯一运行的路径。
 	modelDeploymentECConnectorExample = "ec-example"
 )
 
-// modelDeploymentContainerPorts renders the ports a replica exposes.
+// modelDeploymentContainerPorts 渲染副本暴露的端口。
 //
-// A role that names none still gets one, because a replica nothing can reach serves nothing and the
-// Service fronting the deployment needs a target. Every supported engine's OpenAI-compatible server
-// listens on 8000 by default.
+// 未指定任何端口的 role 仍会获得一个默认端口，因为无法访问的副本无法提供任何服务，且前端的
+// Service 需要一个目标端口。所有受支持引擎的 OpenAI 兼容服务器默认均监听 8000 端口。
 func modelDeploymentContainerPorts(role *workercore.ModelDeploymentRole) []core.ContainerPort {
 	if len(role.Ports) == 0 {
 		return []core.ContainerPort{{
@@ -653,16 +565,12 @@ func modelDeploymentContainerPorts(role *workercore.ModelDeploymentRole) []core.
 	})
 }
 
-// modelDeploymentPortName derives a container port's name from its protocol and number, because a
-// container port name must satisfy Kubernetes' own DNS-label rule and a user-supplied free-form
-// name need not. The Instance path derives its own names the same way.
+// modelDeploymentPortName 根据容器端口的协议和端口号推导其名称，因为容器端口名称必须符合 Kubernetes 的 DNS 标签规则，而用户提供的自由格式名称不一定满足该要求。Instance 路径也以相同方式推导端口名称。
 func modelDeploymentPortName(port workercore.ModelDeploymentPort) string {
 	return strings.ToLower(fmt.Sprintf("%s-%d", port.Protocol, port.Port))
 }
 
-// convertModelDeploymentAdditionalVolumes turns a role's declared volumes into Pod volumes and
-// container mounts. An entry with no source is skipped rather than rendered: a volume with an empty
-// source would make the API server refuse the whole Pod on every reconcile.
+// convertModelDeploymentAdditionalVolumes 将 role 声明的卷转换为 Pod 卷和容器挂载点。未指定源的条目会被跳过而不进行渲染：空源的卷会导致 API server 在每次 reconcile 时拒绝整个 Pod。
 func convertModelDeploymentAdditionalVolumes(
 	avs []workercore.ModelDeploymentAdditionalVolume,
 ) (vols []core.Volume, mounts []core.VolumeMount) {
@@ -688,8 +596,7 @@ func convertModelDeploymentAdditionalVolumes(
 		case av.HostPath != nil:
 			vs.HostPath = av.HostPath.DeepCopy()
 		case av.PersistentVolumeClaim != nil:
-			// The claim name and its own read-only are copied as they arrive: a Pod volume
-			// reaches a claim in the Pod's namespace only, so there is no namespace to add.
+			// claim 名称及其自身的只读属性按原样复制：Pod 卷只能引用 Pod 所在 Namespace 中的 claim，因此无需添加命名空间。
 			vs.PersistentVolumeClaim = av.PersistentVolumeClaim.DeepCopy()
 		default:
 			continue
@@ -711,37 +618,17 @@ func convertModelDeploymentAdditionalVolumes(
 	return vols, mounts
 }
 
-// modelDeploymentEngineTransport reports the scheme the engine's listener speaks, and whether the
-// operator can grade that listener at all.
+// modelDeploymentEngineTransport 返回引擎监听器使用的协议方案，以及 operator 是否可以对该监听器设置探针门控。
 //
-// TWO FLAGS TURN THE LISTENER INTO A TLS ONE, and the rest of the --ssl-* family does not. Both
-// supported engines hand every ssl argument to uvicorn without deciding anything themselves, and
-// uvicorn enables TLS on `ssl_keyfile or ssl_certfile` alone. A CA bundle, a cipher list, a key
-// password or a client-certificate mode passed BY ITSELF leaves an ordinary HTTP server -- so a
-// prefix over the whole family would publish https:// for a listener serving plaintext, and withhold
-// a gate that would have worked. Each engine also logs its own idea of "SSL enabled" from a
-// different expression; those lines decide nothing and are not what this follows.
+// 只有两个参数会将监听器开启为 TLS，其余 --ssl-* 系列参数均不会。两种受支持的引擎都会将所有 ssl 参数原样传给 uvicorn 而自身不做判断，而 uvicorn 仅在配置了 `ssl_keyfile` 或 `ssl_certfile` 时才会启用 TLS。单独传入 CA 证书包、密码套件列表、密钥口令或客户端证书模式时，服务仍为普通 HTTP——因此若按整个参数族前缀判断，就会为明文监听器发布 https:// 地址，并撤回本可正常工作的门控。各引擎还会按各自不同的表达式打印 "SSL enabled" 日志；这些日志不具决定性，此处也不遵循它们。
 //
-// THE TWO ANSWERS ARE INDEPENDENT, and deciding either one mid-scan would decide the other. Whether
-// a client certificate may be demanded is only meaningful once TLS is on, and the two flags can
-// arrive in either order, so both are collected before either answer is formed.
+// 这两个结果彼此独立，在扫描中途就确定其中之一会干扰另一项判断。只有在开启 TLS 后，是否要求客户端证书才有意义，且两个参数可能以任意顺序传入，因此需先收集全部信息再给出结论。
 //
-// IT READS THE RENDERED COMMAND LINE where one exists, and it must then be called BEFORE the listen
-// address is filled in. The fill skips a flag wherever it already appears -- base argv, connector
-// arguments, extra arguments -- so a check reading a narrower list would honor a connector-supplied
-// port and then grade the operator's own.
+// 若存在已渲染的命令行，该函数会读取该命令行，因此必须在填充监听地址之前调用。填充逻辑会跳过已出现该参数的任意位置（base argv、connector 参数、额外参数），因此如果检查只读取更窄的列表，就会沿用 connector 提供的端口，转而对 operator 自己的默认地址施加门控。
 //
-// WHAT WITHDRAWS THE GATE. --host moves WHERE the engine listens, and the operator then leaves it
-// alone, so it no longer knows whether a probe reaches the address and cannot grade it; the scheme
-// such a listener speaks is still observable, and is still reported. --port does NOT withdraw it:
-// the port the role names is read back and the gates follow it there, and the caller withdraws them
-// only where the engine and the Service's target disagree. --ssl-cert-reqs can demand a CLIENT
-// certificate, which a kubelet probe has none to present -- but only where TLS is actually on,
-// because uvicorn builds no TLS context for it to apply to otherwise.
+// 撤回门控的情况：--host 会改变引擎监听的地址，之后 operator 不再干预，因而无法得知探针能否到达该地址，也就不能设置门控；但此类监听器使用的协议方案仍可观测，因此仍会上报。--port 不会撤回门控：系统会回读 role 指定的端口并让门控跟随该端口，仅在引擎端口与 Service 目标端口不一致时，调用方才会撤回门控。--ssl-cert-reqs 可能要求客户端证书，而 kubelet 探针无法提供客户端证书——但仅在实际启用 TLS 时才适用，因为未启用 TLS 时 uvicorn 不会构建可供该选项生效的 TLS 上下文。
 //
-// Everything else about TLS stays gated: the address is still the operator's own, only the transport
-// moved, and the kubelet does not verify the server certificate on an HTTPS probe, so a self-signed
-// pair is graded as readily as a public one.
+// 其余所有 TLS 场景均保留门控：地址仍由 operator 控制，变化的只是传输层，且 kubelet 执行 HTTPS 探针时不验证服务端证书，因此自签名证书与公共证书同样可以通过探测。
 func modelDeploymentEngineTransport(engine string, command []string) (core.URIScheme, bool) {
 	var tls, clientAuth, moved bool
 
@@ -752,8 +639,7 @@ func modelDeploymentEngineTransport(engine string, command []string) (core.URISc
 		case modelDeploymentEngineTLSCertArg, modelDeploymentEngineTLSKeyArg:
 			tls = true
 		case modelDeploymentEngineTLSClientAuthArg:
-			// Assigned rather than OR-ed, so a repeated flag settles on its last occurrence, which
-			// is the value the engine's own parser keeps.
+			// 采用赋值而非逻辑或，从而使重复出现的参数以其最后一次出现的值为准，这与引擎自身解析器保留的值一致。
 			clientAuth = modelDeploymentDemandsClientCert(command, i)
 		}
 	}
@@ -766,23 +652,16 @@ func modelDeploymentEngineTransport(engine string, command []string) (core.URISc
 	return scheme, !moved && (!tls || !clientAuth)
 }
 
-// modelDeploymentDemandsClientCert reports whether the --ssl-cert-reqs at index i asks for a client
-// certificate the kubelet cannot present.
+// modelDeploymentDemandsClientCert 判断索引 i 处的 --ssl-cert-reqs 是否要求 kubelet 无法提供的客户端证书。
 //
-// ANYTHING BUT A KNOWN-PERMISSIVE VALUE MEANS YES, which is the cautious direction for this
-// particular question. Withdrawing a gate costs a replica the readiness signal it had before any of
-// this existed; fitting one to a listener that then refuses the probe leaves a replica serving every
-// real client while the kubelet restarts it every startup budget. The first is a lost improvement,
-// the second is an outage -- so an unreadable value, a missing one, and a number outside the enum
-// are all treated alike as the refusal.
+// 除已知允许放行的值外一律视为需要客户端证书，这是针对该问题更稳妥的保守策略。撤回门控只是让副本失去此前原本没有的就绪信号；而如果为随后会拒绝探针的监听器加上门控，则会导致副本在正常服务真实客户端的同时，每个启动预算周期都被 kubelet 重启一次。前者只是少了一项改进，后者则会造成服务中断——因此无法解析的值、缺失的值以及枚举范围之外的数值都会统一视为拒绝放行。
 //
-// The value is read as an INTEGER rather than compared as text, because the engine's parser does the
-// same and "02" is CERT_REQUIRED to it.
+// 该值按整数解析而非按文本比较，因为引擎自身的解析器也是如此处理，对它而言 "02" 等同于 CERT_REQUIRED。
 func modelDeploymentDemandsClientCert(command []string, i int) bool {
 	_, value, ok := strings.Cut(command[i], "=")
 	if !ok {
 		if i+1 >= len(command) {
-			// The flag ends the command line, so it has no value to read at all.
+			// 该参数位于命令行末尾，因此没有任何值可供读取。
 			return true
 		}
 
@@ -798,38 +677,23 @@ func modelDeploymentDemandsClientCert(command []string, i int) bool {
 		mode != modelDeploymentEngineTLSClientAuthOptional
 }
 
-// ModelDeploymentRoleArgs is the part of a replica's command line the ROLE contributes, which is
-// the only part that can carry a listen or a TLS flag.
+// ModelDeploymentRoleArgs 返回副本命令行中由 role 贡献的部分，这也是唯一可能包含监听或 TLS 参数的部分。
 //
-// It exists so that a caller with nothing but the spec -- the published endpoint is derived from the
-// spec alone -- reaches the same answer the rendered command line would give it. It is also the
-// stream the parallelism declaration parses: the engine reads exactly these tokens under either
-// tier, so the books and the document can never come from different command lines.
+// 该函数存在的目的是让仅持有 spec 的调用方（已发布的端点仅由 spec 推导）得出与已渲染命令行相同的结论。它同时也是并行度声明所解析的 token 流：引擎在两种层级下读取的正是这些 token，从而保证内部记录与生成配置绝不会来自不同的命令行。
 //
-// IT IS A NARROWER LIST THAN THE RENDER SCANS, and the two agree only because of an invariant this
-// function cannot enforce: the engine's base argv and the connector's rendered arguments carry no
-// listen or TLS flag. A connector that grew one would put an HTTPS probe on a replica whose
-// published address still said http://. That is why the invariant is asserted against what
-// inject.Render actually emits, rather than left as a promise here.
+// 该列表比渲染阶段扫描的范围更窄，两者之所以保持一致，完全依赖于一个本函数无法强制保证的不变量：引擎的 base argv 与 connector 渲染出的参数中不包含任何监听或 TLS 参数。一旦 connector 引入了此类参数，就会出现已发布地址仍显示 http://、副本却挂载了 HTTPS 探针的情况。因此，该不变量会直接针对 inject.Render 的实际输出进行断言，而不是在这里仅作口头保证。
 //
-// A take-over role contributes its whole argv and nothing else: the extra arguments are not appended
-// to a command the user replaced, so reading them here would describe a command line that is not
-// being run.
+// 接管命令行的 role 只贡献其完整的 argv，而不附加其他内容：extra arguments 不会追加到用户已替换的命令之后，因此在这里读取它们只会描述一条并未实际运行的命令行。
 func ModelDeploymentRoleArgs(role *workercore.ModelDeploymentRole) []string {
-	// Implement this function in chapter 19.
+	// 在第 19 章中实现此函数。
 	return nil
 }
 
-// mergeModelDeploymentEnv folds the operator's environment and the role's into one list.
+// mergeModelDeploymentEnv 将 operator 的环境变量与 role 的环境变量合并为一个列表。
 //
-// The order of the result is the order of authority, most authoritative first, so that reading a
-// rendered Pod answers "who set this" without consulting the table: what the operator OWNS, then
-// what it merely DEFAULTS, then what the user appended. Owned entries are refused at admission, so
-// skipping them here is belt and braces rather than the enforcement — but a renderer that let one
-// through would hand the failure to the engine, one layer away from the field that caused it.
+// 结果顺序按权威优先级从高到低排列，以便查看已渲染的 Pod 时无需查表即可回答“是谁设置了该变量”：依次为 operator 拥有（owned）的变量、operator 仅设默认值（defaulted）的变量、以及用户追加的变量。owned 条目在准入阶段会被拒绝，因此此处跳过它们只是双重保险——但若渲染器放行了这些条目，失败就会推迟到引擎侧才暴露，远离真正引发问题的字段。
 //
-// A role that takes over the command line gets none of the operator's entries. Its argv never names
-// the file they point at, so setting them would describe a configuration nothing reads.
+// 接管命令行的 role 不会获得任何 operator 环境变量。其 argv 从不引用这些变量指向的文件，设置它们只会描述一套没有任何进程读取的配置。
 func mergeModelDeploymentEnv(
 	engine string, role *workercore.ModelDeploymentRole,
 	connector ModelDeploymentConnectorRender, artifact *ModelDeploymentArtifactRender, takeOver bool,
@@ -843,15 +707,9 @@ func mergeModelDeploymentEnv(
 		artifactEnv, artifactDefaulted = artifact.env(takeOver, engine)
 	}
 
-	// THE CACHE ROOT IS DEFAULTED, not owned, and the tier is what says so. A user who mounts the
-	// cache somewhere else, or runs an image whose engine spells the variable differently, has to
-	// be able to say so and have the entry survive: the operator's claim is only about the default,
-	// which the volume mounted above is what makes true.
+	// 缓存根目录属于默认值而非 owned，分层机制正是为此而设。将缓存挂载到其他位置，或运行对变量拼写不同的引擎镜像时，用户必须能够自行指定并保留其配置：operator 仅保证默认路径生效，而这由上方挂载的卷来保证。
 	//
-	// THE ENGINE'S OTHER STARTUP CACHES ARE DEFAULTED ALONGSIDE IT, for the same reason and for
-	// one more: each of them defaults to the container's writable layer, which the pod's
-	// ephemeral-storage limit measures, so a cache that grows there evicts the pod filling it
-	// while the same bytes on the mounted cache do not count against the limit at all.
+	// 引擎的其他启动缓存也一并设为默认值，原因相同且还有另一点考量：这些缓存默认写入容器的可写层，而 Pod 的 ephemeral-storage 限制会计入该层占用，因此写往该处的缓存增长时会驱逐 Pod，而落在挂载缓存卷上的相同字节数则完全不计入该限制。
 	defaulted := slices.Concat(
 		connector.DefaultedEnv, artifactDefaulted,
 		modelDeploymentCompileCacheDefaultedEnv(engine),
@@ -872,10 +730,7 @@ func mergeModelDeploymentEnv(
 	return mergeModelDeploymentUserEnv(env, engine, role.Env, artifact != nil)
 }
 
-// mergeModelDeploymentUserEnv appends the user's entries to what the operator already rendered,
-// letting a later tier replace an earlier one by name and never replacing what the operator owns.
-// With an artifact the artifact-owned names are the operator's too; admission refuses them, and
-// dropping them here keeps an object stored before that rule from overriding the artifact's.
+// mergeModelDeploymentUserEnv 将用户环境变量追加到 operator 已渲染的结果之后，允许高优先级条目按名称覆盖低优先级条目，但绝不允许替换 operator 拥有的变量。存在 artifact 时，artifact 拥有的变量名同样归 operator 所有；准入阶段会拒绝用户覆盖这些变量，在此丢弃它们可防止准入规则生效前已存储的对象覆盖 artifact 的配置。
 func mergeModelDeploymentUserEnv(
 	env []core.EnvVar, engine string, userEnv []workercore.ModelDeploymentEnvVar, artifact bool,
 ) []core.EnvVar {
@@ -902,7 +757,7 @@ func mergeModelDeploymentUserEnv(
 	return env
 }
 
-// modelDeploymentUserSetsEnv reports whether the user supplied the named variable.
+// modelDeploymentUserSetsEnv 判断用户是否提供了指定名称的环境变量。
 func modelDeploymentUserSetsEnv(userEnv []workercore.ModelDeploymentEnvVar, name string) bool {
 	for i := range userEnv {
 		if userEnv[i].Name == name {
@@ -918,8 +773,7 @@ type modelDeploymentRoleSiblingHashInput struct {
 	Kind workercore.ModelDeploymentRoleKind `json:"kind,omitempty"`
 }
 
-// modelDeploymentExplicitSpecHash fingerprints the explicit user-configured ModelDeployment and
-// role spec together with the resolved external binding digest and replica seat coordinates.
+// modelDeploymentExplicitSpecHash 对用户显式配置的 ModelDeployment 和 role spec，以及解析后的外部绑定摘要和副本席位坐标生成指纹。
 func modelDeploymentExplicitSpecHash(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 	ordinal, member int, bindingHash string,
@@ -990,8 +844,7 @@ func modelDeploymentExplicitSpecHash(
 	return stringx.SumBytesBySHA256(encoded)
 }
 
-// modelDeploymentEffectiveMinRenderVersion computes the minimum acceptable render version for a
-// deployment's running replicas, clamped to [modelDeploymentMinSupportedRenderVersion, modelDeploymentRenderVersion].
+// modelDeploymentEffectiveMinRenderVersion 计算 deployment 运行中副本可接受的最低渲染版本，并将其限制在 [modelDeploymentMinSupportedRenderVersion, modelDeploymentRenderVersion] 区间内。
 func modelDeploymentEffectiveMinRenderVersion(md *workercore.ModelDeployment) int {
 	floor := modelDeploymentMinSupportedRenderVersion
 	if md == nil {
@@ -1006,8 +859,7 @@ func modelDeploymentEffectiveMinRenderVersion(md *workercore.ModelDeployment) in
 	return floor
 }
 
-// modelDeploymentPodRenderVersion returns the integer render version stamped on a Pod, or 0 when
-// the annotation is absent or invalid.
+// modelDeploymentPodRenderVersion 返回 Pod 上标注的整数渲染版本；当注解不存在或无效时返回 0。
 func modelDeploymentPodRenderVersion(pod *core.Pod) int {
 	if pod == nil {
 		return 0
@@ -1020,8 +872,7 @@ func modelDeploymentPodRenderVersion(pod *core.Pod) int {
 	return v
 }
 
-// modelDeploymentPodMatchesCurrency reports whether a live Pod matches the desired explicit spec
-// hash and meets the deployment's minimum render version floor.
+// modelDeploymentPodMatchesCurrency 判断运行中的 Pod 是否匹配期望的显式 spec 哈希，且满足 deployment 的最低渲染版本下限。
 func modelDeploymentPodMatchesCurrency(actual, desired *core.Pod, minRenderVersion int) bool {
 	if actual == nil || desired == nil {
 		return false
@@ -1032,8 +883,7 @@ func modelDeploymentPodMatchesCurrency(actual, desired *core.Pod, minRenderVersi
 		modelDeploymentPodRenderVersion(actual) >= minRenderVersion
 }
 
-// modelDeploymentReplicaRenderVersionUniform reports whether all members of a replica carry the
-// same render version.
+// modelDeploymentReplicaRenderVersionUniform 判断一个副本的所有成员是否具有相同的渲染版本。
 func modelDeploymentReplicaRenderVersionUniform(members []*core.Pod) bool {
 	if len(members) <= 1 {
 		return true

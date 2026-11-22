@@ -32,14 +32,14 @@ import (
 )
 
 const (
-	// _ModelArtifactProgressTimeout bounds the fixed part of one progress answer: the artifact
-	// read, the store list and the aggregation, without the live fan-out.
+	// _ModelArtifactProgressTimeout 限制单次 progress 响应中固定部分的耗时：包括读取
+	// artifact、列举 store 及聚合操作，不含实时扇出查询。
 	_ModelArtifactProgressTimeout = 5 * time.Second
-	// _ModelArtifactProgressNodeTimeout bounds one node's live read; a node slower than this
-	// contributes the value it last wrote.
+	// _ModelArtifactProgressNodeTimeout 限制单个节点的实时读取耗时；超时的节点将沿用其
+	// 上次写入的值。
 	_ModelArtifactProgressNodeTimeout = 2 * time.Second
-	// _ModelArtifactProgressMaxNodes bounds the live reads of one answer, and _ModelArtifactProgressParallel
-	// how many run at once.
+	// _ModelArtifactProgressMaxNodes 限制单次响应的实时读取节点上限，_ModelArtifactProgressParallel
+	// 限制并发读取数。
 	_ModelArtifactProgressMaxNodes  = 64
 	_ModelArtifactProgressParallel  = 16
 	_ModelArtifactProgressMaxBytes  = 1 << 20
@@ -47,30 +47,28 @@ const (
 	_ModelArtifactProgressClaim     = "a claim source is mounted from its volume and never downloaded"
 )
 
-// modelArtifactProgressTimeout bounds one whole answer: the fixed part plus the live fan-out's
-// worst case — the nodes in waves of _ModelArtifactProgressParallel, each wave bounded by
-// _ModelArtifactProgressNodeTimeout — so a full fan-out still finishes inside the deadline
-// instead of being born canceled.
+// modelArtifactProgressTimeout 限制完整单次响应的总耗时：固定部分加上实时扇出的最坏情况
+// （节点按每批 _ModelArtifactProgressParallel 个分波次执行，每波受限于
+// _ModelArtifactProgressNodeTimeout），从而确保完整扇出也能在截止时间内完成，而不会
+// 一开始就被取消。
 func modelArtifactProgressTimeout() time.Duration {
 	waves := (_ModelArtifactProgressMaxNodes + _ModelArtifactProgressParallel - 1) / _ModelArtifactProgressParallel
 	return _ModelArtifactProgressTimeout + time.Duration(waves)*_ModelArtifactProgressNodeTimeout
 }
 
-// ModelArtifactProgressHandler handles the "progress" subresource of v1.ModelArtifact objects: where
-// the artifact's content is across the nodes, computed on each request and never stored.
+// ModelArtifactProgressHandler 处理 v1.ModelArtifact 对象的 "progress" 子资源：统计
+// artifact 内容在各节点上的分布与进度，每次请求时实时计算而不持久化。
 //
-// It reads the artifact, the NodeModelStores listing its digest, and, for each node downloading it,
-// that node's plugin's running downloads, whose bytes move between the 5% steps the node's status is
-// written on. A plugin that does not answer in time leaves its node's stored value. The answer is an
-// aggregate that names no node.
+// 它会读取该 artifact、包含其摘要的 NodeModelStore，以及每个正在下载该 artifact 的节点上
+// 插件的运行中下载字节数（在节点 status 按 5% 步长更新的间隔之间实时变化）。未能及时响应的
+// 插件将保留其节点已存储的值。返回结果为不具名任何节点的聚合视图。
 type ModelArtifactProgressHandler struct {
 	extensionapi.GetOperation
 
-	// APIReader reads the artifact and the plugin Pods; Client lists the NodeModelStores from the
-	// worker's cache.
+	// APIReader 用于读取 artifact 和插件 Pod；Client 从 worker 缓存中列举 NodeModelStore。
 	APIReader ctrlcli.Reader
 	Client    ctrlcli.Reader
-	// Downloads reads a plugin's running downloads at a URL; nil uses the shared client.
+	// Downloads 从指定 URL 读取插件正在进行的下载信息；为 nil 时使用共享客户端。
 	Downloads func(ctx context.Context, url string) (*modelstore.Downloads, error)
 	Now       func() time.Time
 }
@@ -135,8 +133,8 @@ func (h *ModelArtifactProgressHandler) OnGet(ctx context.Context, key types.Name
 	return out, nil
 }
 
-// readLive replaces each downloading node's stored bytes with its plugin's live reading where the
-// plugin answers in time, and returns how many did. A reading never moves a node back.
+// readLive 在插件及时响应时，用实时读取值替换正在下载节点的已存储字节数，并返回成功响应的
+// 节点数量。实时读数绝不会使节点进度倒退。
 func (h *ModelArtifactProgressHandler) readLive(
 	ctx context.Context, digest string, entries map[string]workercore.NodeModelStoreModel,
 ) int32 {
@@ -200,7 +198,7 @@ func (h *ModelArtifactProgressHandler) readLive(
 	return live
 }
 
-// pluginPods returns the ready model-manager plugin Pod of each node, by node name.
+// pluginPods 按节点名称返回每个节点上就绪的 model-manager 插件 Pod。
 func (h *ModelArtifactProgressHandler) pluginPods(ctx context.Context) (map[string]*core.Pod, error) {
 	list := new(core.PodList)
 	if err := h.APIReader.List(ctx, list,
@@ -221,7 +219,7 @@ func (h *ModelArtifactProgressHandler) pluginPods(ctx context.Context) (map[stri
 	return pods, nil
 }
 
-// pluginSecurePortOf returns the plugin container's named secure port, or the chart's default.
+// pluginSecurePortOf 返回插件容器的命名安全端口，或返回 chart 的默认端口。
 func pluginSecurePortOf(pod *core.Pod) int {
 	for i := range pod.Spec.Containers {
 		for j := range pod.Spec.Containers[i].Ports {
@@ -247,17 +245,16 @@ func (h *ModelArtifactProgressHandler) downloads(ctx context.Context, url string
 	return fetchPluginDownloads(ctx, url)
 }
 
-// _pluginDownloadsClient reads the plugins' downloads: one keep-alive transport per process.
+// _pluginDownloadsClient 读取插件的下载任务：每个进程使用一个长连接 Transport。
 var _pluginDownloadsClient = &http.Client{
 	Transport: httpx.Transport(httpx.TransportOptions().WithoutProxy().WithTLSClientConfig(
 		&tls.Config{InsecureSkipVerify: true}, // nolint: gosec
 	)),
 }
 
-// fetchPluginDownloads GETs a plugin's running downloads. The plugin serves a self-signed
-// certificate, as the device manager does, inside the same trust domain; its answer carries no
-// secret, and the body is bounded because the peer is not verified. Proxying is disabled: a
-// proxy must never carry Pod-to-Pod traffic.
+// fetchPluginDownloads 通过 GET 获取插件正在进行的下载任务。与 device manager 一样，
+// 该插件在同一信任域内提供自签名证书；其响应不包含机密信息，且由于未校验对端身份，
+// 响应体大小受到限制。代理已禁用：Pod 间流量绝不能经过代理。
 func fetchPluginDownloads(ctx context.Context, url string) (*modelstore.Downloads, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

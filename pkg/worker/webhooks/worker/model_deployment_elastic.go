@@ -28,10 +28,9 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/elasticprofile"
 )
 
-// modelDeploymentElasticOwnedFlags are the engine flags the elastic renderer writes itself.
-// An entry on the role's own argv would race the operator for one argument, so it is refused
-// rather than merged. The list is narrow by design: unrelated engine tuning stays the
-// author's, and unrelated Ray_* tuning keys are not banned.
+// modelDeploymentElasticOwnedFlags 是弹性渲染器自行写入的引擎标志。
+// 若 role 自身的 argv 中也出现这些条目，就会与 Operator 竞争同一个参数，因此直接拒绝而非合并。
+// 该列表设计得尽可能窄：无关的引擎调优参数仍由作者自行控制，无关的 Ray_* 调优键也不会被禁止。
 var modelDeploymentElasticOwnedFlags = sets.New(
 	"--data-parallel-size",
 	"--data-parallel-backend",
@@ -44,8 +43,7 @@ var modelDeploymentElasticOwnedFlags = sets.New(
 	"--ray-address",
 )
 
-// modelDeploymentElasticOwnedEnv are the environment entries the elastic renderer writes
-// itself, refused on the same terms as the flags.
+// modelDeploymentElasticOwnedEnv 是弹性渲染器自行写入的环境变量条目，拒绝条件与标志相同。
 var modelDeploymentElasticOwnedEnv = sets.New(
 	"VLLM_DP_SIZE",
 	"VLLM_DATA_PARALLEL_SIZE_LOCAL",
@@ -61,9 +59,8 @@ var modelDeploymentElasticOwnedEnv = sets.New(
 	"RAY_OVERRIDE_LABELS",
 )
 
-// ValidateModelDeploymentElasticEP validates the elastic-EP profile of a deployment against
-// its previous state. A nil old is a create. The check runs on every create and update; the
-// immutability half only fires when the profile existed before.
+// ValidateModelDeploymentElasticEP 结合历史状态校验部署的弹性 EP（elastic-EP）配置。
+// old 为 nil 表示创建操作。该检查在每次创建和更新时都会运行；不可变性检查仅在配置此前已存在时触发。
 func (r *ModelDeploymentWebhook) ValidateModelDeploymentElasticEP(
 	ctx context.Context, md, old *workercore.ModelDeployment,
 ) field.ErrorList {
@@ -85,7 +82,7 @@ func (r *ModelDeploymentWebhook) ValidateModelDeploymentElasticEP(
 	return errs
 }
 
-// elasticRoleOf returns the single elastic role of the deployment, or nil.
+// elasticRoleOf 返回部署中唯一的弹性 role，若不存在则返回 nil。
 func elasticRoleOf(md *workercore.ModelDeployment) *workercore.ModelDeploymentRole {
 	for i := range md.Spec.Roles {
 		if md.Spec.Roles[i].ElasticEP != nil {
@@ -105,7 +102,7 @@ func modelDeploymentElasticRoles(md *workercore.ModelDeployment) []*workercore.M
 	return roles
 }
 
-// modelDeploymentElasticRolePath returns the list path of the elastic role.
+// modelDeploymentElasticRolePath 返回弹性 role 在列表中的字段路径。
 func modelDeploymentElasticRolePath(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 ) *field.Path {
@@ -117,9 +114,9 @@ func modelDeploymentElasticRolePath(
 	return field.NewPath("spec", "roles")
 }
 
-// validateModelDeploymentElasticShape enforces the profile's shape rules on the new object:
-// one elastic role on the vLLM engine, a single managed Server instance, whole non-sliced
-// accelerator per member, no argv take-over, no renderer-owned native flag or env entry.
+// validateModelDeploymentElasticShape 对新对象强制执行配置的结构规则：
+// 在 vLLM 引擎上仅有一个弹性 role、单个受管 Server 实例、每个成员使用整张且未切片的加速卡、
+// 不接管 argv，且不包含渲染器独占的原生标志或环境变量。
 func validateModelDeploymentElasticShape(
 	md *workercore.ModelDeployment, elasticRoles []*workercore.ModelDeploymentRole,
 ) field.ErrorList {
@@ -202,8 +199,8 @@ func validateModelDeploymentElasticShape(
 	return errs
 }
 
-// validateModelDeploymentElasticResources requires the complete fixed TP group per member.
-// Every accelerator is whole, unsliced and unpartitioned.
+// validateModelDeploymentElasticResources 要求每个成员具备完整且固定的 TP 组。
+// 每张加速卡都必须是整卡、未切片且未切分的。
 func validateModelDeploymentElasticResources(
 	role *workercore.ModelDeploymentRole, rolePath *field.Path, tp int,
 ) field.ErrorList {
@@ -242,9 +239,8 @@ func validateModelDeploymentElasticResources(
 	return errs
 }
 
-// validateModelDeploymentElasticOwnedKeys refuses the renderer-owned native flags and env
-// entries. The match is narrow: an entry the operator itself writes is a conflict, unrelated
-// tuning keys are the author's.
+// validateModelDeploymentElasticOwnedKeys 拒绝渲染器独占的原生标志和环境变量条目。
+// 匹配范围很窄：只有与 Operator 自身写入冲突的条目才会被拒绝，无关的调优键仍交由作者配置。
 func validateModelDeploymentElasticOwnedKeys(
 	role *workercore.ModelDeploymentRole, rolePath *field.Path,
 ) field.ErrorList {
@@ -285,9 +281,9 @@ func validateModelDeploymentElasticOwnedKeys(
 	return errs
 }
 
-// validateModelDeploymentElasticIdentity enforces the frozen half of the profile: presence,
-// head placement, the role's pool and card shape, and the declared TP and width ceiling are
-// identity; width is the running state. The profile must also stay on the role that carried it.
+// validateModelDeploymentElasticIdentity 强制执行配置中冻结的半数属性：存在性、head 调度位置、
+// role 的资源池与卡型规格，以及声明的 TP 和宽度上限均属于不可变身份；宽度则是运行期状态。
+// 此外，该配置必须始终保留在最初携带它的那个 role 上。
 func validateModelDeploymentElasticIdentity(
 	md, old *workercore.ModelDeployment,
 ) field.ErrorList {
@@ -322,9 +318,8 @@ func validateModelDeploymentElasticIdentity(
 			"the elastic profile must stay on the role it was created with: "+modelDeploymentIdentityMessage,
 		))
 	}
-	// The profile pins what the ordinary contract lets move: an elastic role's member shape is
-	// fixed at creation, and width is the only running-state field. ReplicaSize stays at one and
-	// a command stays forbidden through the shape rules.
+	// 该配置锁定了常规契约原本允许变动的字段：弹性 role 的成员规格在创建时即固定，
+	// 宽度是唯一可变的运行期状态字段。ReplicaSize 保持为 1，且通过结构规则持续禁止自定义 command。
 	if newElastic.InstanceType != oldElastic.InstanceType {
 		errs = append(errs, field.Invalid(
 			modelDeploymentElasticRolePath(md, newElastic).Child("instanceType"),

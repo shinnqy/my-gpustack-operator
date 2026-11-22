@@ -4,19 +4,18 @@ import (
 	"slices"
 )
 
-// LockedResourceFinalizer is the finalizer to indicate the resource is locked by system.
+// LockedResourceFinalizer 是用于标识资源已被系统锁定的 finalizer。
 const LockedResourceFinalizer = "gpustack.ai/controlled"
 
-// Lock adds a finalizer to the given resource.
+// Lock 向指定资源添加 finalizer。
 //
-// If the resource has been controlled, returns true,
-// otherwise, returns false.
+// 如果资源已被托管，返回 true，
+// 否则返回 false。
 //
-// THE RESULT IS NAMED FOR THE STATE IT FOUND, not for the operation, and that is what the name has to
-// carry: a true means the finalizer was already there and nothing changed, which is the opposite of
-// what "locked" reads as. A signature is what an editor puts at the call site while this comment is
-// not, so a result named after the operation invites the caller to write back on the one branch that
-// has nothing to write. It has already cost one object a finalizer nothing would ever remove.
+// 返回值以检测到的状态命名，而非操作本身，这正是其命名所要表达的含义：
+// true 表示 finalizer 原本就存在且未发生变更，这与字面上理解的“已加锁”相反。
+// 编辑器在调用处提示的是函数签名而非这段注释，因此若返回值按操作结果命名，
+// 会误导调用方在无需写回的分支上执行更新。此前已有一个对象因此带上了一个永远不会被移除的 finalizer。
 //
 //	if !systemmeta.Lock(obj) {
 //	    _, _ = kubeclientset.UpdateWithCtrlClient(ctx, r.Client, obj)
@@ -36,19 +35,19 @@ func Lock(obj MetaObject) (alreadyLocked bool) {
 	return false
 }
 
-// Unlock removes a finalizer from the given resource.
+// Unlock 从指定资源移除 finalizer。
 //
-// If the resource is not controlled, returns true,
-// otherwise, returns false.
+// 如果资源未被托管，返回 true，
+// 否则返回 false。
 //
-// THE RESULT IS NAMED FOR THE STATE IT FOUND, on the same terms as Lock above and for the same
-// reason: a true means the finalizer was already absent and this call removed nothing. Read as the
-// operation, it is exactly backwards -- the branch that needs the write back is the false one.
+// 与上文的 Lock 同理，返回值同样以检测到的状态命名：
+// true 表示 finalizer 原本就不存在且本次调用未移除任何内容。若按操作结果来理解，
+// 语义则完全相反——真正需要写回的分支是 false 分支。
 //
 //	if systemmeta.Unlock(obj) {
 //	    return ctrl.Result{}, nil
 //	}
-//	// Clean
+//	// 清理
 //	_, _ = kubeclientset.UpdateWithCtrlClient(ctx, r.Client, obj)
 func Unlock(obj MetaObject) (alreadyUnlocked bool) {
 	if obj == nil {
@@ -66,7 +65,7 @@ func Unlock(obj MetaObject) (alreadyUnlocked bool) {
 	return false
 }
 
-// IsLocked returns true if the resource is locked by system.
+// IsLocked 在资源被系统锁定时返回 true。
 func IsLocked(obj MetaObject) (locked bool) {
 	if obj == nil {
 		panic("object is nil")

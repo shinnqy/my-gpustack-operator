@@ -13,12 +13,11 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// KVCacheBackendHandler proxies a v1alpha1.KVCacheBackend as the public KVCacheBackend resource.
+// KVCacheBackendHandler 将 v1alpha1.KVCacheBackend 代理为公开的 KVCacheBackend 资源。
 //
-// No status proxy is exposed because the status is the backend controller's record of endpoint
-// publication and member accounting, while the proxy writes with the worker's identity. The
-// storage resource's status subresource keeps the status as it is on main-resource writes, so
-// the status is read through the main resource.
+// 此处不暴露 status 子资源代理，因为 status 记录了后端控制器的端点发布与成员统计信息，
+// 而代理以 worker 身份执行写入。底层存储资源的 status 子资源会在主资源写入时保持原状，
+// 因此 status 通过主资源读取。
 type KVCacheBackendHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations

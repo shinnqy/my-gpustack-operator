@@ -14,15 +14,13 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// NodeModelStoreHandler exposes the v1 view of a v1alpha1.NodeModelStore: get, list, watch and
-// delete, never create or update. Its writers, the worker and the node's plugin, write the v1alpha1
-// resource, whose status guard judges each by its own identity; a writable proxy would write with
-// the worker's.
+// NodeModelStoreHandler 暴露 v1alpha1.NodeModelStore 的 v1 视图：仅支持 get、list、watch 和 delete，
+// 不支持 create 或 update。其写入方（worker 和节点插件）直接写入 v1alpha1 资源，
+// 该资源的 status 守卫按各自身份进行校验；若代理可写，则会以 worker 的身份执行写入。
 //
-// DELETE IS SERVED FOR THE GARBAGE COLLECTOR. It watches each resource at the group's preferred
-// version, v1 here, and only resources that version can delete: without delete no NodeModelStore
-// is collected with its Node (measured on Kubernetes 1.36). A deleted object is created again by
-// the worker while its node runs the plugin.
+// 提供 DELETE 是为了支持垃圾回收器。垃圾回收器按 API 组的首选版本（此处为 v1）监听各资源，
+// 且仅删除该版本支持的资源：若没有 delete，NodeModelStore 不会随其 Node 一起被回收（在 Kubernetes 1.36 上实测）。
+// 只要节点仍在运行该插件，被删除的对象会由 worker 重新创建。
 type NodeModelStoreHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.ListWatchOperation
@@ -54,7 +52,7 @@ func (h *NodeModelStoreHandler) SetupHandler(
 		return gvr, nil, err
 	}
 	h.ObjectInfo = &worker.NodeModelStore{}
-	// The proxy serves every verb; only its reads and deletes are exposed.
+	// 该代理实现所有动词；仅对外暴露读取和删除操作。
 	ops := extensionapi.WithCurdProxy[
 		*worker.NodeModelStore, *worker.NodeModelStoreList,
 		*workercore.NodeModelStore, *workercore.NodeModelStoreList,

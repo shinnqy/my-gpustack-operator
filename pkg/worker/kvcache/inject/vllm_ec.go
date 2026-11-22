@@ -1,138 +1,114 @@
-// This file renders the encoder-cache leg of an encoder/prefill/decode deployment for the vLLM
-// family: the arguments, the variables and the port that move a multimodal encoding from the
-// encoder stage to the prefiller.
+// 本文件负责为 vLLM 系列引擎渲染 encoder/prefill/decode 部署中的编码器缓存分支：
+// 即用于将多模态编码结果从 encoder 阶段传输到 prefiller 的参数、环境变量和端口。
 //
-// It is an arm of its own beside the KV rendering, because the two caches are unrelated. One moves
-// attention blocks from a prefill half to a decode half; the other moves encodings from an encoder
-// stage to the prefill half. A Pod therefore renders one, the other, or - the prefiller - both, and
-// the encoder renders only this one.
+// 它是独立于 KV 渲染之外的分支，因为这两种缓存互不相关。一种将注意力块从 prefill 端传向
+// decode 端；另一种将编码结果从 encoder 阶段传向 prefill 端。因此一个 Pod 会渲染其中之一，
+// 或（作为 prefiller 时）同时渲染两者，而 encoder 仅渲染此分支。
 package inject
 
 const (
-	// vllmECTransferConfigArg selects the encoder-cache connector and the role. Like its KV
-	// sibling it is an EngineArgs field parsed off the command line (`ec_transfer_config`, read
-	// at vLLM v0.30.0 `vllm/engine/arg_utils.py:1717`) and has no environment equivalent, so
-	// this leg cannot be configured without appending an argument.
+	// vllmECTransferConfigArg 用于选择编码器缓存连接器和角色。与对应的 KV 参数一样，它是从命令行
+	// 解析的 EngineArgs 字段（`ec_transfer_config`，见 vLLM v0.30.0 `vllm/engine/arg_utils.py:1717`），
+	// 没有对应的环境变量，因此配置该分支必须追加命令行参数。
 	vllmECTransferConfigArg = "--ec-transfer-config"
 
-	// vllmECCPUConnector is the name vLLM PROPER registers for the encoder-cache connector that
-	// offloads encodings into a CPU mmap region and hands them to a peer with NIXL (read at v0.30.0
-	// `docs/features/ec_cpu_connector.md`).
+	// vllmECCPUConnector 是上游原版 vLLM 为编码器缓存连接器注册的名称，该连接器将编码结果卸载到
+	// CPU mmap 区域并通过 NIXL 传递给对端（见 v0.30.0 `docs/features/ec_cpu_connector.md`）。
 	//
-	// Reach it through the caller-supplied connector name, which the selector below checks, rather
-	// than by rendering it unconditionally: which spellings any one engine's registry resolves is
-	// upstream state this repository neither controls nor observes.
+	// 应通过调用方传入并经下方选择器校验的连接器名称来使用，而不是无条件渲染：任一引擎注册表能解析哪些
+	// 拼写属于上游状态，本仓库既不控制也不观测。
 	vllmECCPUConnector = "ECCPUConnector"
 
-	// vllmECExampleConnector is the name vLLM PROPER registers for the encoder-cache connector
-	// that writes encodings to a shared directory as safetensors (`example_connector.py:53-56`,
-	// read at v0.30.0), which is what the upstream encoder example ships
-	// (`examples/disaggregated/disaggregated_encoder/README.md:69-89`).
+	// vllmECExampleConnector 是上游原版 vLLM 为编码器缓存连接器注册的名称，该连接器将编码结果以
+	// safetensors 格式写入共享目录（见 v0.30.0 `example_connector.py:53-56`），即上游编码器示例
+	// 所采用的实现（`examples/disaggregated/disaggregated_encoder/README.md:69-89`）。
 	vllmECExampleConnector = "ECExampleConnector"
 
-	// vllmECProducerRole and vllmECConsumerRole are the connector's own spellings of the two ends
-	// of the leg (`ECProducer`/`ECConsumer`, read at v0.30.0 `vllm/config/ec_transfer.py:12-14`).
-	// Upstream also accepts "ec_both", which this renderer never names: one of these roles is one
-	// engine each here, and a Pod that both produced and consumed its own encodings would be a
-	// deployment shape nothing in this repository builds.
+	// vllmECProducerRole 和 vllmECConsumerRole 是连接器自身对传输两端角色的拼写
+	// （`ECProducer`/`ECConsumer`，见 v0.30.0 `vllm/config/ec_transfer.py:12-14`）。
+	// 上游还接受 "ec_both"，但本渲染器从不指定该值：此处每个引擎实例对应其中一个角色，
+	// 既生产又消费自身编码结果的 Pod 形态并不在本仓库的任何部署形态之列。
 	vllmECProducerRole = "ec_producer"
 	vllmECConsumerRole = "ec_consumer"
 
-	// VLLMECSideChannelPort is where an NIXL producer binds the ZMQ ROUTER socket its consumers
-	// pull from. It is the upstream default (v0.30.0 `vllm/envs.py:231`), which is where a
-	// measured value beats one chosen here. It is separate from every other port this package
-	// renders because every other one carries a different protocol: HTTP, metrics and the KV
-	// event publisher each sit on their own, and the KV transfer handshake sits on a fourth.
+	// VLLMECSideChannelPort 是 NIXL 生产端绑定供消费端拉取的 ZMQ ROUTER socket 的端口。
+	// 该值采用上游默认值（v0.30.0 `vllm/envs.py:231`），此处沿用经过验证的默认端口优于自行指定。
+	// 它与本包渲染的所有其他端口均不重叠，因为其余端口各自承载不同协议：HTTP、指标和 KV 事件发布器
+	// 各自占用独立端口，KV 传输握手占用第四个端口。
 	VLLMECSideChannelPort int32 = 5601
 
-	// vllmECSideChannelHostEnv is the bind address of that socket. Upstream reads the pair only on
-	// a producer with NIXL transfer enabled (v0.30.0 `docs/features/ec_cpu_connector.md:108`), and
-	// its default of "localhost" works only when a producer and its consumer share a host
-	// (`:105`) - which two Pods never do, so the renderer names the Pod's own address.
+	// vllmECSideChannelHostEnv 是该 socket 的绑定地址。上游仅在启用 NIXL 传输的生产端读取这一对
+	// 变量（v0.30.0 `docs/features/ec_cpu_connector.md:108`），其默认值 "localhost" 仅在生产端与
+	// 消费端共享主机时有效（`:105`）——而两个 Pod 不会共享主机，因此渲染器将其设为 Pod 自身的地址。
 	vllmECSideChannelHostEnv = "VLLM_EC_SIDE_CHANNEL_HOST"
 
-	// vllmECSideChannelPortEnv is the port half of the same pair.
+	// vllmECSideChannelPortEnv 是同一组配置中的端口环境变量。
 	vllmECSideChannelPortEnv = "VLLM_EC_SIDE_CHANNEL_PORT"
 
-	// vllmModelRunnerEnv selects the engine's model runner. ECCPUConnector requires the second one
-	// and raises ValueError at construction without it (v0.30.0
-	// `docs/features/ec_cpu_connector.md:10`), so on this leg the variable is the connector's
-	// precondition rather than a preference, and it is owned rather than defaulted.
+	// vllmModelRunnerEnv 用于选择引擎的模型运行器。ECCPUConnector 必须使用第二个（V2）运行器，
+	// 否则会在构造时抛出 ValueError（v0.30.0 `docs/features/ec_cpu_connector.md:10`），
+	// 因此在该分支上此变量是连接器的前置条件而非可选项，属于托管键而非默认值。
 	vllmModelRunnerEnv = "VLLM_USE_V2_MODEL_RUNNER"
 
-	// vllmECPodIPFieldPath is the field the kubelet resolves at container start, which is what
-	// makes the side channel bind address routable without the renderer knowing the Pod's address.
+	// vllmECPodIPFieldPath 是 kubelet 在容器启动时解析的字段路径，使渲染器无需预先知道
+	// Pod 地址即可让侧信道绑定地址可路由。
 	vllmECPodIPFieldPath = "status.podIP"
 
-	// The encoder-instance flags below are the four the upstream example lists for an encoder
-	// (v0.30.0 `examples/disaggregated/disaggregated_encoder/README.md:38-46`). All four are
-	// DEFAULTED rather than owned: upstream marks the first two required, but a workload that
-	// declares the same flag has asked for the same thing, so the group is dropped and nothing is
-	// lost. They render on the producer alone, because every one of them configures an engine that
-	// runs no language model - on a prefiller, --mm-encoder-only would skip the very model that
-	// has to read the encodings.
+	// 下方的编码器实例参数是上游示例为编码器列出的四个参数（v0.30.0
+	// `examples/disaggregated/disaggregated_encoder/README.md:38-46`）。这四个参数均作为默认值而非托管键：
+	// 上游将前两个标记为必需，但如果工作负载已声明同一参数即表达了相同诉求，因此跳过该组默认值不会造成
+	// 遗漏。它们仅在生产端渲染，因为每个参数都用于配置不运行语言模型的引擎——在 prefiller 上使用
+	// --mm-encoder-only 会跳过正需要读取编码结果的语言模型本身。
 	vllmEnforceEagerArg          = "--enforce-eager"
 	vllmNoPrefixCachingArg       = "--no-enable-prefix-caching"
 	vllmECMaxNumBatchedTokensArg = "--max-num-batched-tokens"
 	vllmMMEncoderOnlyArg         = "--mm-encoder-only"
 
-	// vllmECMaxNumBatchedTokens is the token scheduling budget the encoder example sets. Upstream
-	// calls the flag irrelevant to an encoder-only instance and says to set it very high to
-	// bypass scheduler limits, leaving the real budget to the encoder cache manager (README:44);
-	// the example ships 114688 (README:96). It is a default rather than an answer, so a workload
-	// with its own budget names the flag and this one is dropped.
+	// vllmECMaxNumBatchedTokens 是编码器示例设置的 token 调度预算。上游指出该参数对纯编码器实例
+	// 并无实际意义，并建议将其设得足够高以绕过调度器限制，将真正的预算控制交给编码器缓存管理器（README:44）；
+	// 示例中的取值为 114688（README:96）。它是默认值而非强制值，因此带有自定义预算的工作负载只需声明
+	// 该参数，此默认值便会被跳过。
 	vllmECMaxNumBatchedTokens = "114688"
 )
 
-// EncoderCache is the encoder-cache leg one Pod of a deployment runs.
+// EncoderCache 表示部署中单个 Pod 运行的编码器缓存分支配置。
 //
-// The zero value asks for no leg, which is every input this renderer handled before encoder-cache
-// transfer existed. A caller names the connector rather than receiving one because the two paths
-// need different facts: the NIXL path needs a CPU region size and the shared-directory path needs a
-// directory, and neither is derivable from the other or from the role.
+// 其零值表示不启用编码器缓存分支，即编码器缓存传输引入前本渲染器处理的所有输入形式。调用方直接指定
+// 连接器而非由渲染器推导，因为两条路径需要不同的输入信息：NIXL 路径需要 CPU 内存区域大小，
+// 共享目录路径需要目录路径，两者既无法互相推导，也无法从角色推导。
 type EncoderCache struct {
-	// Connector names the connector the engine must resolve: ECCPUConnector moves encodings
-	// between Pods with NIXL, ECExampleConnector through a directory both ends mount. An
-	// unrecognized name is refused, because a name the engine's registry does not resolve stops
-	// it at startup with no way to tell that apart from a misconfigured cache.
+	// Connector 指定引擎必须解析的连接器名称：ECCPUConnector 通过 NIXL 在 Pod 间传输编码结果，
+	// ECExampleConnector 则通过两端共同挂载的目录进行传输。未识别的名称将被拒绝，因为引擎注册表
+	// 无法解析的名称会导致其在启动时终止，且无法与缓存配置错误区分开。
 	Connector string
 
-	// CPUBytes is the total size of the CPU mmap region ECCPUConnector offloads encodings into.
-	// It has no default here: upstream raises ValueError when the key is absent
-	// (v0.30.0 `docs/features/ec_cpu_connector.md:99`), and the region competes for host memory
-	// with everything else on the node, so its size is the caller's capacity decision to make.
+	// CPUBytes 是 ECCPUConnector 用于卸载编码结果的 CPU mmap 区域总大小。此处不设默认值：
+	// 当缺少该键时上游会抛出 ValueError（v0.30.0 `docs/features/ec_cpu_connector.md:99`），且该区域
+	// 会与 Node 上的其他进程竞争宿主机内存，因此其大小应由调用方根据容量规划决定。
 	CPUBytes int64
 
-	// SharedStoragePath is the directory ECExampleConnector reads and writes the encodings in.
-	// It is the mount path the caller attached, and both ends must name the same one: the
-	// connector falls back to "/tmp" when the key is absent
-	// (`example_connector.py:53-56`, read at v0.30.0), which in a Pod is a directory neither end
-	// shares, so an unset value would look configured and move nothing.
+	// SharedStoragePath 是 ECExampleConnector 读写编码结果的目录。它是调用方挂载的路径，
+	// 且两端必须指定同一路径：缺少该键时连接器会回退到 "/tmp"（见 v0.30.0 `example_connector.py:53-56`），
+	// 而在 Pod 中该目录并非两端共享，未设置时虽看似已配置，实则无法传输任何数据。
 	SharedStoragePath string
 }
 
-// EncoderCacheOwnedKeys returns the flags and the variables the encoder-cache leg writes for the
-// given request, and therefore resolves itself.
+// EncoderCacheOwnedKeys 返回编码器缓存分支针对给定请求写入并自行决定的命令行参数和环境变量。
 //
-// A caller uses this to refuse a workload that also declares one of them. Both would otherwise be
-// honored and the engine would read whichever it parsed last, so a workload could turn NIXL
-// transfer off, point the side channel at a host no consumer dials, or swap the connector under a
-// deployment that is already running - none of which any engine log distinguishes from the leg
-// simply not working.
+// 调用方使用此函数拒绝同时声明了其中任一项的工作负载。否则两份配置都会生效，引擎将采用最后解析到的
+// 值，从而可能关闭 NIXL 传输、将侧信道指向消费端无法连接的地址，或在运行中的部署下偷偷更换连接器——
+// 而引擎日志无法将这些情况与分支单纯失效区分开来。
 //
-// The two lists are exact rather than a fixed set, because what the leg writes depends on both the
-// connector and the role: the model runner belongs to the NIXL leg on either role, while the side
-// channel belongs to its producer alone. They are returned separately because a flag and a variable
-// are refused through different mechanisms, and each is always a list - empty where the leg owns
-// nothing of that kind - so a caller can compare them against what a render produced without
-// normalizing either side.
+// 返回的两个列表是精确集合而非固定集合，因为该分支写入的内容同时取决于连接器和角色：模型运行器在
+// 两种角色下都属于 NIXL 分支，而侧信道仅属于生产端。两者分别返回是因为命令行参数和环境变量通过不同
+// 机制进行拒绝校验，且每个返回值始终为列表（该类别下无托管键时为空列表），以便调用方无需归一化即可
+// 直接与渲染输出比对。
 //
-// A request naming no connector owns nothing because it renders nothing, and the caller in
-// model_deployment_connector.go that builds the operator's owned-key set always names a connector,
-// so the keys are owned on every deployment.
+// 未指定连接器的请求不拥有任何键，因为它不会渲染任何内容；而 model_deployment_connector.go 中
+// 构建 operator 托管键集合的调用方始终会指定连接器，因此这些键在每次部署中均受托管。
 //
-// The role is taken alongside the request because a request alone cannot answer the question: the
-// same NIXL leg owns one variable as a consumer and three as a producer.
+// 之所以同时接收角色参数，是因为仅凭请求本身无法确定结果：同一个 NIXL 分支在消费端仅托管一个
+// 环境变量，在生产端则托管三个。
 func EncoderCacheOwnedKeys(role Role, ec EncoderCache) (args, env []string) {
 	if ec.Connector == "" {
 		return []string{}, []string{}

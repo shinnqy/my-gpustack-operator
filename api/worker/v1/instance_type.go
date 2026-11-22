@@ -7,10 +7,10 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// InstanceType is the schema for worker.gpustack.ai.
+// InstanceType 是 worker.gpustack.ai 的 schema。
 //
-// Underhood, an InstanceType is mapping to a Kueue ClusterQueue,
-// and the InstanceType's name is the same as the ClusterQueue's name.
+// 在底层，一个 InstanceType 映射到一个 Kueue ClusterQueue，
+// 且 InstanceType 的名称与该 ClusterQueue 的名称相同。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -20,7 +20,7 @@ type InstanceType workercore.InstanceType
 
 var _ runtime.Object = (*InstanceType)(nil)
 
-// InstanceTypeList holds the list of InstanceType.
+// InstanceTypeList 保存 InstanceType 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceTypeList struct {

@@ -30,21 +30,7 @@ type (
 		ctrladmission.Validator[runtime.Object]
 		ValidatePath() string
 	}
-	// ReceiveDeletionUpdate opts a webhook out of the deletion guard. By default a
-	// handler's Default and ValidateUpdate are skipped for an object that carries a
-	// deletion timestamp, so a finalizer-clearing update is never rejected; a handler
-	// that implements this marker keeps receiving those calls during deletion.
-	//
-	// REQUIRED before implementing it: every rule the handler's ValidateUpdate can reach
-	// on an update that leaves the spec where it was must be answerable from the two
-	// objects the handler is handed. A cross-object read is compatible with the marker
-	// only while it is gated on the field it answers for having moved, which the update
-	// that clears a finalizer does not do.
-	//
-	// LIMITED: it is ONE decision covering BOTH halves. There is no way to keep the guard
-	// on Default while opting ValidateUpdate out, so a handler whose defaulting reads
-	// another object and refuses when it is absent keeps the guard however pure its
-	// validation is — the alternative is an object its own teardown can never release.
+	// ReceiveDeletionUpdate 使 Webhook 退出删除保护机制。默认情况下，对于带有删除时间戳的对象，\n// 处理器的 Default 和 ValidateUpdate 会被跳过，从而确保清除 finalizer 的更新不会被拒绝；\n// 实现此标记接口的处理器在对象删除期间仍会继续收到这些调用。\n//\n// 实现前必须满足：当更新操作未改动 spec 时，处理器 ValidateUpdate 可能触及的每一条规则\n// 都必须仅凭传入的两个对象即可判定。仅当跨对象读取受限于其所检查字段发生变更时，\n// 才与该标记兼容，因为清除 finalizer 的更新不会改动这些字段。\n//\n// 限制：这是一个同时覆盖两部分的单一决策，无法在保留 Default 保护的同时仅让 ValidateUpdate 退出。\n// 因此，如果处理器的默认值设置逻辑需要读取其他对象并在其缺失时拒绝请求，\n// 则无论其校验逻辑多么纯粹都必须保留该保护——否则对象在销毁时将永远无法释放。
 	ReceiveDeletionUpdate interface {
 		ReceiveDeletionUpdate()
 	}
@@ -57,7 +43,7 @@ type (
 	}
 )
 
-// ExecuteSetup executes the given setup to register the webhook API.
+// ExecuteSetup 执行给定的 setup 以注册 Webhook API。
 func ExecuteSetup(ctx context.Context, mgr ctrl.Manager, mux HTTPServeMux, setups []Setup) error {
 	scheme := mgr.GetScheme()
 	for i := range setups {
@@ -74,7 +60,7 @@ func ExecuteSetup(ctx context.Context, mgr ctrl.Manager, mux HTTPServeMux, setup
 			return fmt.Errorf("webhook setup: %s: %w", spew.Sdump(setups[i]), err)
 		}
 
-		// Guard defaulting/update-validation against deletion unless the handler opts out.
+		// 除非处理器显式退出，否则在删除期间跳过默认值设置与更新校验。
 		_, keepDeletionUpdate := setups[i].(ReceiveDeletionUpdate)
 		if d, ok := setups[i].(_DefaultWebhookHandler); ok {
 			var defaulter ctrladmission.Defaulter[runtime.Object] = d
@@ -97,7 +83,7 @@ func ExecuteSetup(ctx context.Context, mgr ctrl.Manager, mux HTTPServeMux, setup
 	return nil
 }
 
-// objectBeingDeleted reports whether obj carries a deletion timestamp.
+// objectBeingDeleted 返回 obj 是否带有删除时间戳。
 func objectBeingDeleted(obj runtime.Object) bool {
 	accessor, err := apimeta.Accessor(obj)
 	if err != nil {
@@ -106,9 +92,7 @@ func objectBeingDeleted(obj runtime.Object) bool {
 	return accessor.GetDeletionTimestamp() != nil
 }
 
-// deletionGuardedDefaulter skips defaulting once the object is being deleted, so an
-// update that only clears a finalizer is never rejected by defaulting that depends on
-// state which may already be gone.
+// deletionGuardedDefaulter 在对象处于删除过程中时跳过默认值设置，\n// 避免仅用于清除 finalizer 的更新因依赖可能已不存在的状态而被默认值逻辑拒绝。
 type deletionGuardedDefaulter struct {
 	delegate ctrladmission.Defaulter[runtime.Object]
 }
@@ -120,9 +104,7 @@ func (g deletionGuardedDefaulter) Default(ctx context.Context, obj runtime.Objec
 	return g.delegate.Default(ctx, obj)
 }
 
-// deletionGuardedValidator skips update validation once the object is being deleted, so
-// an update that only clears a finalizer is never rejected by update validation. Create
-// and delete validation are delegated unchanged.
+// deletionGuardedValidator 在对象处于删除过程中时跳过更新校验，\n// 避免仅用于清除 finalizer 的更新被更新校验逻辑拒绝。创建和删除校验仍按原样委托执行。
 type deletionGuardedValidator struct {
 	delegate ctrladmission.Validator[runtime.Object]
 }
@@ -142,7 +124,7 @@ func (g deletionGuardedValidator) ValidateDelete(ctx context.Context, obj runtim
 	return g.delegate.ValidateDelete(ctx, obj)
 }
 
-// InstallConfigurations installs the webhook configurations.
+// InstallConfigurations 安装 Webhook 配置。
 func InstallConfigurations(
 	ctx context.Context,
 	prefix string,
@@ -174,13 +156,11 @@ func InstallConfigurations(
 	mwCli := cli.AdmissionregistrationV1().MutatingWebhookConfigurations()
 
 	vwc, mwc := MergeConfigurations(cc, prefix, getters)
-	// The align functions are what make a losing writer retry instead of returning the
-	// conflict: every replica installs the configurations before leader election, so
-	// without them a concurrent boot fails one of them.
+	// 对齐函数可使竞争失败的写入方重试而非直接返回冲突：\n// 每个副本在选主前都会安装配置，若缺少对齐逻辑，并发启动时会导致其中一方失败。
 	if vwc != nil {
 		vwcAlignFn := func(aVwc *admreg.ValidatingWebhookConfiguration) (_ *admreg.ValidatingWebhookConfiguration, skip bool, err error) {
 			skip = true
-			// Align webhooks.
+			// 对齐 Webhook 配置。
 			if !kubemeta.DeepEqual(aVwc.Webhooks, vwc.Webhooks) {
 				aVwc.Webhooks = vwc.DeepCopy().Webhooks
 				skip = false
@@ -198,7 +178,7 @@ func InstallConfigurations(
 	if mwc != nil {
 		mwcAlignFn := func(aMwc *admreg.MutatingWebhookConfiguration) (_ *admreg.MutatingWebhookConfiguration, skip bool, err error) {
 			skip = true
-			// Align webhooks.
+			// 对齐 Webhook 配置。
 			if !kubemeta.DeepEqual(aMwc.Webhooks, mwc.Webhooks) {
 				aMwc.Webhooks = mwc.DeepCopy().Webhooks
 				skip = false
@@ -217,9 +197,7 @@ func InstallConfigurations(
 	return nil
 }
 
-// DeleteConfigurations deletes the webhook configurations the prefix names,
-// "<prefix>-validation" and "<prefix>-mutation". An absent configuration is already deleted,
-// and both are attempted even after one fails.
+// DeleteConfigurations 删除以 prefix 命名的 Webhook 配置，\n// 即 "<prefix>-validation" 和 "<prefix>-mutation"。不存在的配置视为已删除，\n// 且即使其中一个删除失败，仍会尝试删除另一个。
 func DeleteConfigurations(ctx context.Context, prefix string, cli kubernetes.Interface) error {
 	var errs []error
 	if err := cli.AdmissionregistrationV1().ValidatingWebhookConfigurations().
@@ -235,7 +213,7 @@ func DeleteConfigurations(ctx context.Context, prefix string, cli kubernetes.Int
 	return multierr.Combine(errs...)
 }
 
-// MergeConfigurations merges the webhook configurations from the getters and returns the validating and mutating webhook configurations.
+// MergeConfigurations 合并来自各 getter 的 Webhook 配置，并返回校验型和变更型 Webhook 配置。
 func MergeConfigurations(
 	cc admreg.WebhookClientConfig,
 	prefix string,
@@ -244,8 +222,7 @@ func MergeConfigurations(
 	*admreg.ValidatingWebhookConfiguration,
 	*admreg.MutatingWebhookConfiguration,
 ) {
-	// NB(thxCode): add more webhook configurations getters here.
-	// Merge all the webhook configurations from the getters.
+	// NB(thxCode): 可在此处添加更多 Webhook 配置 getter。\n// 合并来自所有 getter 的 Webhook 配置。
 	var (
 		vret = make([]*admreg.ValidatingWebhookConfiguration, len(getters))
 		vwsc int

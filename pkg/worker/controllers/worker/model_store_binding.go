@@ -16,15 +16,13 @@ import (
 	"gpustack.ai/gpustack/pkg/controller"
 )
 
-// ModelStoreBindingReconciler keeps a grant's status equal to what its namespace actually warms:
-// usedBytes counts each distinct digest any of the namespace's prefetches targets, at its full
-// size, for every TARGET node holding it — a digest a workload mounted on a node the prefetch
-// never asked for belongs to the node's watermarks, not to this budget. A shared tree charges
-// every namespace whose prefetches target it, and a digest nobody holds charges nothing.
+// ModelStoreBindingReconciler 使授权对象的状态与所属 Namespace 实际预热的数据保持一致：
+// usedBytes 按完整大小统计该 Namespace 下任意预取任务所指定的每个去重 digest，计及持有它的每个目标 Node——
+// 若某个工作负载将 digest 挂载到了预取从未请求的 Node 上，则该副本归入 Node 水位线，不计入此配额预算。
+// 共享目录树会对每个预取指向它的 Namespace 分别计费，而没有任何 Node 持有的 digest 不计入。
 //
-// An unmeasurable contribution — an artifact that has not resolved, mostly — leaves the whole
-// figure absent rather than half a number: a usedBytes that silently excluded a prefetch would
-// read as headroom the namespace does not have.
+// 若存在无法度量的贡献（主要指尚未解析的 artifact），则整体不输出该数值，而非给出残缺值：
+// 静默排除某个预取的 usedBytes 会使 Namespace 看起来拥有并不存在的剩余空间。
 type ModelStoreBindingReconciler struct {
 	Client ctrlcli.Client
 	Now    func() time.Time
@@ -33,7 +31,7 @@ type ModelStoreBindingReconciler struct {
 var _ ctrlreconcile.Reconciler = (*ModelStoreBindingReconciler)(nil)
 
 func (r *ModelStoreBindingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Implement this function in chapter 16.
+	// 在第 16 章中实现此函数。
 	var result0 ctrl.Result
 	var result1 error
 	return result0, result1
@@ -63,8 +61,7 @@ func (r *ModelStoreBindingReconciler) SetupController(_ context.Context, opts co
 		Complete(r)
 }
 
-// enqueueAllBindings re-enqueues every grant: the accounting reads across namespaces by design, and
-// grants are few.
+// enqueueAllBindings 将所有授权对象重新加入队列：配额核算按设计跨 Namespace 读取数据，且授权对象数量很少。
 func (r *ModelStoreBindingReconciler) enqueueAllBindings(ctx context.Context, _ ctrlcli.Object) []ctrlreconcile.Request {
 	bindings := new(workercore.ModelStoreBindingList)
 	if err := r.Client.List(ctx, bindings); err != nil {

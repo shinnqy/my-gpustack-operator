@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 )
 
-// _RingNode is a node in the ring, containing a sequence number and a value.
+// _RingNode 是环形缓冲区中的节点，包含一个序列号和一个值。
 type _RingNode[T any] struct {
 	seq atomic.Uint64
 	val T

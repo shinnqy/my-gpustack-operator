@@ -9,8 +9,8 @@ import (
 
 type LinkOptions func(*linkOptions)
 
-// LinkEvenIfNotFound links the src,
-// and create the src with given perm if not found.
+// LinkEvenIfNotFound 链接 src，
+// 如果未找到则使用给定权限创建 src。
 func LinkEvenIfNotFound(isFile bool, perm os.FileMode) LinkOptions {
 	return func(o *linkOptions) {
 		o.create = true
@@ -22,7 +22,7 @@ func LinkEvenIfNotFound(isFile bool, perm os.FileMode) LinkOptions {
 	}
 }
 
-// LinkInReplace deletes dst if found.
+// LinkInReplace 在找到 dst 时将其删除。
 func LinkInReplace() LinkOptions {
 	return func(o *linkOptions) {
 		o.replace = true

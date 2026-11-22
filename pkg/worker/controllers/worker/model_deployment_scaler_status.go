@@ -14,18 +14,16 @@ import (
 
 const modelDeploymentScalerPredictorCheckpointStep = int32(16)
 
-// modelDeploymentScalerStatusChanged reports whether the control-plane state of a scaler
-// changed between two observations.
+// modelDeploymentScalerStatusChanged 报告 scaler 的控制面状态在两次观测之间是否发生了变化。
 //
-// IT IGNORES THE SLIDING WINDOWS AND THE RAW METRICS, because those change on every
-// sampling tick while the control-plane state does not: a scaler that is steady is not
-// observed to be different, and a write per sampling tick puts every scaler of the cluster
-// on the write path of the apiserver once per interval.
+// 该函数会忽略滑动窗口和原始指标，因为它们在每次采样周期都会变化，而控制面状态不会：
+// 处于稳定状态的 scaler 不应被判定为发生变化，且每次采样周期都写入会让集群中每个
+// scaler 在每个周期内都走一次 apiserver 写入路径。
 //
-// THE WINDOWS ARE NOT LOST BY THIS, because the sampler keeps them in memory and grows them
-// on every tick whether the status is written or not. Predictor state is additionally
-// checkpointed every modelDeploymentScalerPredictorCheckpointStep samples during steady
-// state so an operator restart bounds Kalman filter state loss without writing per tick.
+// 这不会导致滑动窗口丢失，因为采样器会在内存中保留这些窗口并在每个周期持续累积，无论
+// status 是否写入。此外，在稳定状态下每经过 modelDeploymentScalerPredictorCheckpointStep
+// 次采样就会对预测器状态执行一次 checkpoint，从而在无需每次采样都写入的情况下，将
+// operator 重启带来的 Kalman 滤波器状态损失限制在可控范围内。
 func modelDeploymentScalerStatusChanged(before, after *workercore.ModelDeploymentScalerStatus) bool {
 	if before == nil || after == nil {
 		return true
@@ -33,8 +31,8 @@ func modelDeploymentScalerStatusChanged(before, after *workercore.ModelDeploymen
 	if before.ObservedGeneration != after.ObservedGeneration {
 		return true
 	}
-	// THE QUANTILE IS COMPARED, because it changes when the configuration
-	// changes and the status has to say which quantile the scaler is held to.
+	// 需要比较分位数，因为配置变更时它会随之改变，且 status 必须明确反映 scaler 当前
+	// 所依据的分位数。
 	if before.LatencyQuantile != after.LatencyQuantile {
 		return true
 	}
@@ -93,10 +91,9 @@ func equalScalerPredictorCheckpoints(
 	return true
 }
 
-// equalScalerConditions reports whether two lists of conditions describe the same state.
+// equalScalerConditions 报告两个 Condition 列表是否描述了相同的状态。
 //
-// IT IGNORES THE TRANSITION TIME of a condition, because a condition that did not change
-// its status did not transition.
+// 该函数会忽略 Condition 的转换时间，因为状态未发生变化的 Condition 并没有发生转换。
 func equalScalerConditions(before, after []gpustack.Condition) bool {
 	if len(before) != len(after) {
 		return false
@@ -113,11 +110,9 @@ func equalScalerConditions(before, after []gpustack.Condition) bool {
 	return true
 }
 
-// equalScalerRoleStatuses reports whether two lists of role statuses describe the same
-// control-plane state.
+// equalScalerRoleStatuses 报告两个角色状态列表是否描述了相同的控制面状态。
 //
-// IT IGNORES THE METRICS AND THE STABILIZATION HISTORY of a role, because they are read on
-// every tick and change on every tick.
+// 该函数会忽略角色的指标与稳定化历史，因为它们在每个周期都会被读取并发生变化。
 func equalScalerRoleStatuses(before, after []workercore.ModelDeploymentScalerRoleStatus) bool {
 	if len(before) != len(after) {
 		return false
@@ -139,7 +134,7 @@ func equalScalerRoleStatuses(before, after []workercore.ModelDeploymentScalerRol
 	return true
 }
 
-// equalScalerTime reports whether two timestamps are the same moment.
+// equalScalerTime 报告两个时间戳是否表示同一时刻。
 func equalScalerTime(before, after *meta.Time) bool {
 	if before == nil || after == nil {
 		return before == after
@@ -190,19 +185,18 @@ func (r *ModelDeploymentScalerReconciler) setCondition(
 	})
 }
 
-// updateStatus writes the status of a scaler when its control-plane state changed.
+// updateStatus 在 scaler 的控制面状态发生变化时写入其 status。
 //
-// IT WRITES NOTHING WHEN THE SCALER IS STEADY, because the sliding windows and the raw
-// metrics of a scaler change on every sampling tick and writing them would put every
-// scaler of the cluster on the write path of the apiserver once per interval.
+// 当 scaler 处于稳定状态时不执行写入，因为滑动窗口和原始指标在每次采样周期都会变化，
+// 写入它们会让集群中每个 scaler 在每个周期内都走一次 apiserver 写入路径。
 //
-// IT SAYS WHICH QUANTILE THE SCALER IS HELD TO, and it says the one the specification names,
-// because a status that keeps the quantile of another configuration describes a quantile the
-// scaler is no longer held to. The quantile is read here, where every status is written, so
-// that a scaler whose planning did not run still says which quantile its specification names.
+// status 会说明 scaler 所依据的分位数，并且记录 spec 中指定的分位数；若 status
+// 仍保留旧配置的分位数，就会描述一个 scaler 已不再遵循的分位数。分位数在此处（即所有
+// status 写入的统一位置）读取，使得即使规划逻辑未运行的 scaler，也能反映其 spec
+// 所指定的分位数。
 //
-// IT LEAVES THE GENERATION UNOBSERVED WHEN THE QUANTILE CANNOT BE READ, because a scaler that
-// cannot say which quantile it is held to has not observed the specification it was given.
+// 当无法读取分位数时，保留 generation 为未观测状态，因为无法说明所依据分位数的
+// scaler 尚未观测到其所给定的 spec。
 func (r *ModelDeploymentScalerReconciler) updateStatus(
 	ctx context.Context, before, scaler *workercore.ModelDeploymentScaler,
 ) error {

@@ -15,13 +15,12 @@ import (
 	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// DedupEnqueueRequestsFromMapFunc copies from the controller-runtime EnqueueRequestsFromMapFunc,
-// but supports to configure a TTL to deduplicate requests for the same object within a specified time window.
+// DedupEnqueueRequestsFromMapFunc 复制自 controller-runtime 的 EnqueueRequestsFromMapFunc，
+// 但支持配置 TTL，以便在指定时间窗口内对同一对象的请求去重。
 //
-// Within the TTL window after the most recent fire, subsequent events for the
-// same request are coalesced into a single deferred enqueue scheduled at the
-// end of the window via q.AddAfter — so the latest event is always covered,
-// never silently dropped.
+// 在最近一次触发后的 TTL 窗口内，同一请求的后续事件会通过 q.AddAfter
+// 合并为一次安排在窗口结束时的延迟入队——因此最新事件始终会被覆盖，
+// 绝不会静默丢弃。
 func DedupEnqueueRequestsFromMapFunc(
 	ttl time.Duration,
 	fn ctrlhandler.MapFunc,
@@ -29,9 +28,8 @@ func DedupEnqueueRequestsFromMapFunc(
 	return TypedDedupEnqueueRequestsFromMapFunc(ttl, fn)
 }
 
-// DedupEnqueueRequestsFromMapFuncWithWindow is the same as
-// DedupEnqueueRequestsFromMapFunc, but allows handlers from different watches
-// to share one dedup window and coalesce duplicate requests together.
+// DedupEnqueueRequestsFromMapFuncWithWindow 与 DedupEnqueueRequestsFromMapFunc 相同，
+// 但允许来自不同 watch 的处理器共享同一个去重窗口，并将重复请求合并在一起。
 func DedupEnqueueRequestsFromMapFuncWithWindow(
 	ttl time.Duration,
 	window *DedupWindow[ctrlreconcile.Request],
@@ -40,13 +38,12 @@ func DedupEnqueueRequestsFromMapFuncWithWindow(
 	return TypedDedupEnqueueRequestsFromMapFuncWithWindow(ttl, window, fn)
 }
 
-// TypedDedupEnqueueRequestsFromMapFunc copies from the controller-runtime TypedEnqueueRequestsFromMapFunc,
-// but supports to configure a TTL to deduplicate requests for the same object within a specified time window.
+// TypedDedupEnqueueRequestsFromMapFunc 复制自 controller-runtime 的 TypedEnqueueRequestsFromMapFunc，
+// 但支持配置 TTL，以便在指定时间窗口内对同一对象的请求去重。
 //
-// Within the TTL window after the most recent fire, subsequent events for the
-// same request are coalesced into a single deferred enqueue scheduled at the
-// end of the window via q.AddAfter — so the latest event is always covered,
-// never silently dropped.
+// 在最近一次触发后的 TTL 窗口内，同一请求的后续事件会通过 q.AddAfter
+// 合并为一次安排在窗口结束时的延迟入队——因此最新事件始终会被覆盖，
+// 绝不会静默丢弃。
 func TypedDedupEnqueueRequestsFromMapFunc[object any, request comparable](
 	ttl time.Duration,
 	fn ctrlhandler.TypedMapFunc[object, request],
@@ -54,9 +51,8 @@ func TypedDedupEnqueueRequestsFromMapFunc[object any, request comparable](
 	return TypedDedupEnqueueRequestsFromMapFuncWithWindow(ttl, nil, fn)
 }
 
-// TypedDedupEnqueueRequestsFromMapFuncWithWindow is the same as
-// TypedDedupEnqueueRequestsFromMapFunc, but allows sharing a dedup window
-// between handlers, which enables cross-watch deduplication.
+// TypedDedupEnqueueRequestsFromMapFuncWithWindow 与 TypedDedupEnqueueRequestsFromMapFunc 相同，
+// 但允许在处理器之间共享去重窗口，从而实现跨 watch 去重。
 func TypedDedupEnqueueRequestsFromMapFuncWithWindow[object any, request comparable](
 	ttl time.Duration,
 	window *DedupWindow[request],
@@ -73,15 +69,15 @@ func TypedDedupEnqueueRequestsFromMapFuncWithWindow[object any, request comparab
 	}
 }
 
-// DedupWindow tracks the last enqueue/scheduled time per request.
-// Reuse one DedupWindow across handlers to dedup duplicate requests globally.
+// DedupWindow 跟踪每个请求的最后一次入队/调度时间。
+// 在多个处理器间复用同一个 DedupWindow 可实现全局重复请求去重。
 type DedupWindow[request comparable] struct {
 	m     sync.RWMutex
 	until map[request]time.Time
 }
 
-// NewDedupWindow creates a new DedupWindow,
-// which tracks the last enqueue/scheduled time per request for deduplication.
+// NewDedupWindow 创建一个新的 DedupWindow，
+// 用于跟踪每个请求的最后一次入队/调度时间以进行去重。
 func NewDedupWindow[request comparable]() *DedupWindow[request] {
 	return &DedupWindow[request]{
 		until: make(map[request]time.Time),
@@ -97,7 +93,7 @@ type dedupEnqueueRequestsFromMapFunc[object any, request comparable] struct {
 	objectImplementsClientObject bool
 }
 
-// Create implements EventHandler.
+// Create 实现 EventHandler 接口。
 func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Create(
 	ctx context.Context,
 	evt event.TypedCreateEvent[object],
@@ -114,7 +110,7 @@ func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Create(
 	e.mapAndEnqueue(ctx, q, evt.Object, reqs, lowPriority)
 }
 
-// Update implements EventHandler.
+// Update 实现 EventHandler 接口。
 func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Update(
 	ctx context.Context,
 	evt event.TypedUpdateEvent[object],
@@ -129,7 +125,7 @@ func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Update(
 	e.mapAndEnqueue(ctx, q, evt.ObjectNew, reqs, lowPriority)
 }
 
-// Delete implements EventHandler.
+// Delete 实现 EventHandler 接口。
 func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Delete(
 	ctx context.Context,
 	evt event.TypedDeleteEvent[object],
@@ -139,7 +135,7 @@ func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Delete(
 	e.mapAndEnqueue(ctx, q, evt.Object, reqs, false)
 }
 
-// Generic implements EventHandler.
+// Generic 实现 EventHandler 接口。
 func (e *dedupEnqueueRequestsFromMapFunc[object, request]) Generic(
 	ctx context.Context,
 	evt event.TypedGenericEvent[object],
@@ -176,35 +172,33 @@ func (e *dedupEnqueueRequestsFromMapFunc[object, request]) mapAndEnqueue(
 		}
 		reqs[req] = empty{}
 
-		// e.until[req] is the timestamp of the last (or scheduled future)
-		// enqueue for req. The active TTL window is [t, t+ttl).
+		// e.until[req] 是 req 最近一次入队（或已调度的未来入队）的时间戳。
+		// 有效的 TTL 窗口为 [t, t+ttl)。
 		t, exists := e.window.until[req]
 		switch {
 		case !exists || !now.Before(t.Add(e.ttl)):
-			// No prior fire or the TTL window has expired — enqueue
-			// immediately and open a new window starting at now.
+			// 此前未触发或 TTL 窗口已过期——立即入队
+			// 并开启从 now 开始的新窗口。
 			e.window.until[req] = now
 			pendings = append(pendings, pending{req: req})
 		case now.Before(t):
-			// A deferred enqueue is already scheduled at t in the future —
-			// the latest event is guaranteed to be covered by it, so this
-			// event can be safely coalesced (dropped).
+			// 已在未来的时间点 t 安排了延迟入队——
+			// 最新事件必然会被该入队覆盖，因此
+			// 可以安全地合并（丢弃）本次事件。
 		default:
-			// Inside the TTL window (t <= now < t+ttl) — defer the enqueue
-			// to the end of the window so that the latest event is still
-			// reconciled. Advance e.until[req] to the scheduled fire time
-			// so further events in the same window fall into the
-			// "now.Before(t)" branch above and are coalesced.
+			// 处于 TTL 窗口内 (t <= now < t+ttl)——将入队延迟到
+			// 窗口结束时执行，以确保最新事件仍会被调谐。
+			// 将 e.until[req] 推进到计划触发时间，
+			// 使同一窗口内的后续事件落入上面的 "now.Before(t)" 分支并被合并。
 			delay := t.Add(e.ttl).Sub(now)
 			e.window.until[req] = now.Add(delay)
 			pendings = append(pendings, pending{req: req, delay: delay})
 		}
 	}
 
-	// Opportunistically drop entries whose TTL window ended at least one
-	// TTL ago — the next event for them would fire immediately anyway, so
-	// keeping the entry serves no purpose. Skips future-scheduled entries
-	// (now.Sub(t) < 0).
+	// 按需清理 TTL 窗口结束已超过至少一个 TTL 的条目——
+	// 它们的下一次事件无论如何都会立即触发，因此保留该条目
+	// 没有任何意义。跳过计划在未来触发的条目 (now.Sub(t) < 0)。
 	for req, t := range e.window.until {
 		if now.Sub(t) >= 2*e.ttl {
 			delete(e.window.until, req)
@@ -217,16 +211,15 @@ func (e *dedupEnqueueRequestsFromMapFunc[object, request]) mapAndEnqueue(
 	}
 }
 
-// enqueue adds req to q. When delay > 0 the deferred add is driven by
-// time.AfterFunc rather than the queue's own After option.
+// enqueue 将 req 添加到 q。当 delay > 0 时，延迟添加由
+// time.AfterFunc 驱动，而不是使用队列自身的 After 选项。
 //
-// We must not feed delay to controller-runtime's priorityqueue.PriorityQueue:
-// it merges concurrent adds for the same key by keeping the earliest ReadyAt,
-// so when the same req is already queued with ReadyAt==nil — e.g. a prior
-// immediate add is sitting in w.ready waiting on a busy worker — a follow-up
-// AddWithOpts({After: X}) silently collapses to immediate and the dedup
-// window's deferred enqueue is lost forever. priorityqueue.AddAfter shares
-// the same code path, so it has the same problem.
+// 我们绝不能将 delay 传给 controller-runtime 的 priorityqueue.PriorityQueue：
+// 它会通过保留最早的 ReadyAt 来合并同一 key 的并发添加，
+// 因此当相同的 req 已经以 ReadyAt==nil 在队列中排队时（例如先前的
+// 立即添加正停留在 w.ready 中等待忙碌的 worker），后续的
+// AddWithOpts({After: X}) 会静默退化为立即入队，从而永久丢失
+// 去重窗口的延迟入队。priorityqueue.AddAfter 共用同一代码路径，因此存在同样的问题。
 func (e *dedupEnqueueRequestsFromMapFunc[object, request]) enqueue(
 	q workqueue.TypedRateLimitingInterface[request],
 	req request,

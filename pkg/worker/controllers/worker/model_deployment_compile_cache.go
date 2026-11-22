@@ -6,13 +6,12 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// modelDeploymentCompileCacheDefaultedEnv returns the defaulted environment variable
-// pointing the engine's compilation cache to ModelDeploymentCompileCacheMountPath.
+// modelDeploymentCompileCacheDefaultedEnv 返回将引擎编译缓存指向
+// ModelDeploymentCompileCacheMountPath 的默认环境变量。
 //
-// IT IS THE CACHE ROOT ALONE. The operator does not name the directory an engine builds inside
-// it, because vLLM partitions that tree by rank and DP rank itself and SGLang does not: writing
-// past their partitioning would put two ranks in one directory and have them overwrite each
-// other's generated code. An engine with no such variable gets nothing rather than a wrong one.
+// 仅设置缓存根目录。operator 不指定引擎在其内部创建的子目录，因为 vLLM 会自行按 rank
+// 和 DP rank 划分目录树，而 SGLang 不会：越过它们的目录划分会让两个 rank 写入同一目录
+// 并互相覆盖生成的代码。没有此类环境变量的引擎不会获得任何设置，以免给出错误配置。
 func modelDeploymentCompileCacheDefaultedEnv(engine string) []core.EnvVar {
 	switch engine {
 	case workercore.ModelDeploymentEngineVLLM:

@@ -11,158 +11,151 @@ import (
 )
 
 const (
-	// memberResourceNoteRole distinguishes a member group's objects from the leader's.
+	// memberResourceNoteRole 用于将 member 组的对象与 leader 的对象区分开来。
 	memberResourceNoteRole = "member"
 
-	// memberEntrypoint is the image's own console script, measured rather than assumed. It builds
-	// the store, mounts a segment and then serves an HTTP API; its main() installs shutdown signal
-	// handlers and its stop() closes the store, so it unmounts on SIGTERM by itself.
+	// memberEntrypoint 是镜像自身的控制台脚本名称，经实测确认而非臆测。它负责
+	// 构建存储、挂载段并随后提供 HTTP API 服务；其 main() 会安装停机信号处理器，
+	// stop() 会关闭存储，因此在收到 SIGTERM 时会自行卸载。
 	memberEntrypoint = "mc_store_rest_server"
 
-	// memberRESTPortBase is where the FIRST group's entrypoint serves its HTTP API, and it is the
-	// entrypoint's own default. Later groups offset from it; see memberRESTPort for why.
+	// memberRESTPortBase 是首个组的入口进程提供 HTTP API 的端口，也是该入口
+	// 自身的默认端口。后续组会在此基础上偏移，原因参见 memberRESTPort。
 	memberRESTPortBase int32 = 8080
 
-	// RDMADevicePath is the host's device tree, and NO member mounts it. Each host fabric's device
-	// plugin injects the verbs node of every device it grants, at this same path inside the
-	// container: this operator's own Device Manager for RDMA, AWS's plugin for EFA.
+	// RDMADevicePath 是宿主机上的设备树路径，任何 member 都不会挂载它。每种宿主机
+	// 网络结构的设备插件都会在容器内的同一路径下注入其分配的每个设备的 verbs 节点：
+	// RDMA 由本 operator 自身的 Device Manager 注入，EFA 则由 AWS 的插件注入。
 	//
-	// Mounting the tree beside that grant is not merely redundant, it breaks a partial one. The tree
-	// carries every OTHER adapter on the node into a container granted some of them, and the verbs
-	// library lists a device by finding its node, so the ungranted ones are listed too. Opening one
-	// of those is refused by the device cgroup with EPERM, and libfabric's EFA provider abandons its
-	// whole device list on the first EPERM it meets: a member granted fewer EFA devices than its node
-	// has fails to initialize the fabric at all, while the same member without the mount starts.
+	// 在该分配之外再挂载整个设备树不仅多余，还会破坏部分设备分配场景。设备树会把
+	// 节点上的所有其他适配器都带入仅被授予其中部分设备的容器中，而 verbs 库通过查找
+	// 设备节点来枚举设备，因此未授予的设备也会被列出。打开未授予设备会被设备 cgroup
+	// 以 EPERM 拒绝，而 libfabric 的 EFA provider 在遇到第一个 EPERM 时就会放弃
+	// 整个设备列表：被授予的 EFA 设备少于节点总数的 member 将完全无法初始化网络结构，
+	// 而不挂载该路径的同一 member 则能正常启动。
 	//
-	// An allocator that injects nothing is therefore not served by mounting the tree back: the mount
-	// makes a device visible, and only the request makes it openable.
+	// 因此，对于未注入任何设备的分配器，把设备树挂载回来也无济于事：挂载只是让设备
+	// 可见，只有设备资源请求才能让设备可被打开。
 	//
-	// Exported because admission has to refuse a declared mount that would land on the injected
-	// device nodes: both end up in one container, and a collision there is resolved by the container
-	// runtime rather than reported by this operator.
+	// 将其导出是因为准入控制必须拒绝会落到已注入设备节点路径上的声明式挂载：两者最终
+	// 位于同一容器内，此处的路径冲突将由容器运行时静默处理，而不会由本 operator 报错。
 	RDMADevicePath = "/dev/infiniband"
 
-	// MemberPodSpecHashAnnotation carries the fingerprint of a member's pod template, minus its node
-	// selector. It rides on the template, so every Pod the DaemonSet creates inherits it and the
-	// reconciler can tell a Pod built from the current spec from one built before a change.
+	// MemberPodSpecHashAnnotation 保存 member 的 Pod 模板（不含节点选择器）的指纹。
+	// 它附着在模板上，因此 DaemonSet 创建的每个 Pod 都会继承它，协调器借此可以区分
+	// 按当前规约构建的 Pod 与变更前构建的 Pod。
 	MemberPodSpecHashAnnotation = "kvcache." + systemname.LabelPrefix + "pod-spec-hash"
 
-	// memberShutdownSeconds is the time the entrypoint needs for its own shutdown: closing its
-	// store and letting the leader see the client go, rather than being cut off mid-shutdown and
-	// leaving the leader to time the client out after its client_ttl instead.
+	// memberShutdownSeconds 是入口进程自行停机所需的时间：关闭其存储并让 leader
+	// 感知到客户端离开，而不是在停机中途被强行截断，导致 leader 只能等其 client_ttl
+	// 超时后才判定客户端离线。
 	//
-	// It is NOT a drain window for the memory segment, and no memory-unmount hook is rendered.
+	// 它不是内存段的排空窗口，这里也不会渲染任何内存卸载钩子。
 	//
-	// THE MEMBER'S OWN API CANNOT UNMOUNT THE SEGMENT THIS RENDERER GIVES IT, which is a stronger
-	// reason than the one this comment used to carry: the segment MOONCAKE_GLOBAL_SEGMENT_SIZE asks
-	// for is mounted by the client's own setup(), and that files it in neither record set the unmount
-	// routes look in. Measured against mooncake 0.3.13:
+	// member 自身的 API 无法卸载本渲染器为其分配的段，这一事实比本注释过去所写的
+	// 理由更具决定性：MOONCAKE_GLOBAL_SEGMENT_SIZE 所请求的段由客户端自身的 setup()
+	// 挂载，而该方法既未将其记录在 /api/unmount 查询的记录集中，也未记录在另一个
+	// 卸载路由查询的记录集中。基于 mooncake 0.3.13 的实测结果：
 	//
-	//   - /api/unmount answers 500 with "segment_id not found in allocated records"
-	//     (real_client.cpp:1791), and /api/unmount_shm answers 500 with "not found in mounted
-	//     records" (real_client.cpp:1626).
-	//   - Both answer in under three milliseconds, at every grace period tried, for the id the
-	//     LEADER itself published for that segment.
-	//   - The same /api/unmount returns 200 for a segment mounted through /api/mount, so the refusal
-	//     is a record-set boundary and not a wrong id.
+	//   - /api/unmount 返回 500，报错 "segment_id not found in allocated records"
+	//     (real_client.cpp:1791)，/api/unmount_shm 返回 500，报错 "not found in mounted
+	//     records" (real_client.cpp:1626)。
+	//   - 无论尝试多长的宽限期，针对 leader 自身为该段发布的 id，两个接口均在
+	//     3 毫秒内返回上述错误。
+	//   - 同一个 /api/unmount 对通过 /api/mount 挂载的段会返回 200，说明被拒绝是
+	//     因为记录集边界所致，而非传错了 id。
 	//
-	// SO IDENTITY WAS NEVER THE BLOCKER. The earlier reason -- that a host-network member cannot
-	// learn its own client id -- describes a problem that is never reached: a member holding exactly
-	// the right id for a segment it is certain is its own is refused just the same. Nothing about
-	// matching members to segments changes that, so no amount of work on this repository's side
-	// reaches a hook that drains. See renderMemberEnv for the segment name correction this
-	// measurement also forced.
+	// 因此，身份识别从来不是阻塞点。先前的理由——即 host-network 模式的 member 无法
+	// 获知自身客户端 id——描述的是一个根本不会触及的问题：即便 member 准确持有属于
+	// 自己的段的正确 id，请求同样会被拒绝。任何将 member 与段进行匹配的逻辑都无法
+	// 改变这一点，因此本仓库侧做再多工作也无法实现能够排空数据的钩子。另见
+	// renderMemberEnv，了解此次实测同时促成的段名称修正。
 	//
-	// A group with a local disk tier adds its scale-in grace ON TOP of this, rather than sharing
-	// it, which is what keeps the kubelet from killing the container in the middle of a wait the
-	// spec asked for. See memberTerminationGracePeriodSeconds.
+	// 带有本地磁盘层的组会在此基础上叠加其缩容宽限期，而非与之共享时间，从而避免
+	// kubelet 在规约要求的等待过程中提前杀死容器。参见 memberTerminationGracePeriodSeconds。
 	memberShutdownSeconds int64 = 60
 
-	// memberProtocolRDMA and memberProtocolEFA are the two RESOLVED protocols that reach the host's
-	// fabric, in the store's own spelling rather than the API's. They are constants because two
-	// places have to agree on the pair -- the host-fabric predicate and the resource derived from
-	// it -- and a third spelling of "efa" is how the two would drift.
+	// memberProtocolRDMA 和 memberProtocolEFA 是访问宿主机网络结构的两个已解析协议，
+	// 采用存储自身的拼写而非 API 层的拼写。它们定义为常量，是因为有两处逻辑必须对
+	// 这对值保持一致——宿主机网络结构判断谓词与据此派生的资源——若出现 "efa" 的
+	// 第三种拼写，二者就会产生偏离。
 	memberProtocolRDMA = "rdma"
 	memberProtocolEFA  = "efa"
 
-	// efaDeviceResource is the extended resource AWS's EFA device plugin advertises. EFA is AWS's own
-	// fabric and its plugin advertises exactly one name, so the protocol selects the resource family.
-	// The plugin advertises one unit per EFA interface, so a member asking for more than its node
-	// has stays Pending.
+	// efaDeviceResource 是 AWS EFA 设备插件通告的扩展资源名称。EFA 是 AWS 专有
+	// 网络结构，其插件只通告这一个资源名，因此协议即可直接确定资源族。该插件按每个
+	// EFA 接口通告 1 个单位资源，因此请求数量超过节点拥有数量的 member 将保持 Pending。
 	//
-	// IT IS WHAT MAKES THE DEVICE OPENABLE. Mounting /dev/infiniband carries the device node into
-	// the container's mount namespace and does nothing else: the device cgroup still denies open(),
-	// which comes back as EPERM even for uid 0 on a node whose file mode already permits everyone.
-	// The store reads that as a host with no fabric -- it discovers zero HCAs and installs a TCP
-	// transport instead, reporting no error. A plugin allocation is what adds the cgroup rule, and
-	// it adds it without the privileged flag that would otherwise be the only way to get one.
+	// 正是该资源请求使设备可被打开。仅仅挂载 /dev/infiniband 只会把设备节点带入
+	// 容器的挂载命名空间而不会产生其他效果：设备 cgroup 仍然会拒绝 open()，即便节点上
+	// 文件权限允许所有人访问且容器内为 uid 0，也会返回 EPERM。存储会将此视作无网络
+	// 结构的宿主机——它发现 0 个 HCA 并转而安装 TCP 传输，且不报任何错误。插件分配
+	// 才会添加对应的 cgroup 规则，而且无需使用原本唯一能绕过该限制的 privileged 标志。
 	//
-	// Requesting it also decides what a node without EFA looks like. Such a node advertises none of
-	// this resource, so the member is never placed there at all, rather than starting and running
-	// TCP under a spec that says EFA. That refusal is the wanted one: a cluster whose nodes cannot
-	// serve the fabric is a cluster whose backend should say TCP.
+	// 请求该资源也决定了无 EFA 节点的调度表现。此类节点完全不通告该资源，因此 member
+	// 根本不会被调度到这些节点上，而不是在规约指定 EFA 的情况下依然启动并退化运行
+	// TCP。这种拒绝调度正是期望行为：若集群中的节点无法提供对应网络结构，则后端规约
+	// 本就应当声明为 TCP。
 	efaDeviceResource core.ResourceName = "vpc.amazonaws.com/efa"
 
-	// memberLocalDiskVolumeName names the host directory holding a group's disk tier.
+	// memberLocalDiskVolumeName 为承载某个组磁盘层的宿主机目录卷命名。
 	memberLocalDiskVolumeName = "local-disk"
 
-	// memberHostPathVolumeNamePrefix prefixes the volume backing one declared host path, which is
-	// suffixed with the entry's position.
+	// memberHostPathVolumeNamePrefix 是为声明的宿主机路径提供支撑的卷名称前缀，
+	// 后面会拼接该条目在列表中的位置索引。
 	//
-	// The position and not the path, because a name derived from user input can collide with the
-	// name above and a DNS label cannot hold a path anyway. The position already identifies an
-	// entry everywhere else, so the mapping needs no state to remember it.
+	// 使用位置索引而非路径本身，是因为由用户输入派生的名称可能与上方的卷名冲突，
+	// 且 DNS 标签本身也无法容纳路径字符串。位置索引在其他所有地方都已经唯一标识了
+	// 各条目，因此这种映射无需额外状态即可记住。
 	memberHostPathVolumeNamePrefix = "host-path"
 
-	// MemberLocalDiskSurveyContainerName names the init container that reports what the tier
-	// directory already held. The controller finds its reading by this name, so the two are one
-	// fact and not two spellings of it.
+	// MemberLocalDiskSurveyContainerName 是用于上报磁盘层目录中已有数据的 init 容器名称。
+	// 控制器按此名称查找其检测结果，因此二者是同一事实，而非同一概念的两种拼写。
 	MemberLocalDiskSurveyContainerName = "local-disk-survey"
 
-	// memberUnmountLocalDiskPath is the entrypoint's own route for deregistering this store's SSD
-	// tier before the process goes away. The master stops naming this store as the owner of its
-	// offloaded keys, so a reader gets a clean miss instead of a peer that is about to disappear.
+	// memberUnmountLocalDiskPath 是入口进程自身的路由，用于在进程退出前注销该存储的
+	// SSD 层。master 会停止将该存储列为其已卸载键的持有者，从而让读取方得到干净的
+	// 未命中结果，而不是去请求一个即将消失的对端节点。
 	//
-	// The call then holds for the grace, and that wait keeps the PROCESS alive -- it does not keep
-	// the tier readable. Deregistration takes effect at once, so it drains nothing; the upstream
-	// docstring says otherwise and was refuted by measurement.
+	// 该调用随后会保持等待直到宽限期结束，而这段等待仅仅维持进程存活——并不会让
+	// 磁盘层继续保持可读。注销会立即生效，因此不会排空任何数据；上游文档注释的说法
+	// 与此相反，并已被实测证伪。
 	//
-	// It needs no segment id, and that is why it is the route that exists here. Memory unmount takes
-	// one, and the segment this renderer gives a member cannot be named to it at all -- see
-	// memberShutdownSeconds for the measurement.
+	// 该接口不需要段 id，这也是此处存在该路由的原因。内存卸载需要段 id，而本渲染器
+	// 为 member 分配的段根本无法向内存卸载接口指明——实测详情参见 memberShutdownSeconds。
 	memberUnmountLocalDiskPath = "/api/unmount_local_disk"
 
-	// MemberMaxGracePeriodSeconds is the entrypoint's own ceiling on that call. Above it the
-	// handler answers 400, so a larger value would render a hook that fails every time it runs.
+	// MemberMaxGracePeriodSeconds 是入口进程对该调用设置的时间上限。超过该值时
+	// 处理程序会返回 400，因此更大的值会渲染出一个每次执行必失败的钩子。
 	//
-	// It is exported because admission is what refuses it, and the rule belongs beside the route
-	// it protects rather than restated as a number in another package.
+	// 将其导出是因为准入控制负责拒绝超限值，而这条规则应当放在它所保护的路由旁边，
+	// 而不是在另一个包里重复写成一个数字。
 	MemberMaxGracePeriodSeconds = 3600
 
-	// memberHookTimeoutMarginSeconds is how much longer than the grace the shutdown hook waits
-	// before giving up on its own request.
+	// memberHookTimeoutMarginSeconds 是停机钩子在放弃自身请求之前，比宽限期额外
+	// 多等待的时长。
 	//
-	// It is deliberately much smaller than memberShutdownSeconds. The Pod's termination budget
-	// covers the hook AND the entrypoint's shutdown, in that order, so every second the hook spends
-	// past the grace is a second taken from the close that follows it.
+	// 该值有意设置得远小于 memberShutdownSeconds。Pod 的终止时间预算按顺序涵盖
+	// 钩子执行和入口进程停机两部分，因此钩子在宽限期之后多消耗的每一秒，都会从
+	// 随后的关闭阶段中扣除。
 	memberHookTimeoutMarginSeconds int64 = 10
 )
 
-// The member's environment. Every key the client reads has a real named variable, so the whole
-// CONFIGURATION renders as environment: no ConfigMap, and nothing mounted or prepared in order to
-// configure the member.
+// member 的环境变量配置。客户端读取的每个配置项都有真实对应的命名变量，因此整个
+// CONFIGURATION 均渲染为环境变量：不使用 ConfigMap，也不挂载或准备任何用于配置
+// member 的文件。
 //
-// A group declaring a disk tier does carry a volume and an init container, and neither of them
-// configures anything - one is the tier itself and the other only reports what was already in it.
-// The claim is about where configuration comes from, and it is written that way because the
-// unqualified version was true when the member had no tier and stopped being true when it got one.
+// 声明了磁盘层的组确实会携带一个卷和一个 init 容器，但两者都不负责配置任何参数——
+// 一个是磁盘层本身，另一个仅上报其中已存在的内容。这里的表述针对的是配置来源，
+// 之所以这样写，是因为不加限定的表述在 member 没有磁盘层时成立，而在引入磁盘层后
+// 不再严格成立。
 const (
-	// memberEnvMetadataServer carries an underscore inside META_DATA. It is NOT
-	// MOONCAKE_TE_METADATA_SERVER, and normalising it to the spelling that reads correctly does not
-	// error — it silently degrades the metadata plane. A unit test asserts this byte for byte.
+	// memberEnvMetadataServer 在 META_DATA 中带有一个下划线。它不是
+	// MOONCAKE_TE_METADATA_SERVER；将其规范化为看起来更顺眼的拼写并不会报错——
+	// 而是会静默地导致元数据平面降级。单元测试会按字节断言该名称。
 	memberEnvMetadataServer = "MOONCAKE_TE_META_DATA_SERVER"
-	// memberMetadataServerValue is the literal the metadata plane takes, unconditionally: this
-	// scope ships a peer-to-peer plane, so there is no store to point at.
+	// memberMetadataServerValue 是元数据平面无条件采用的字面量值：该作用域
+	// 提供的是 peer-to-peer 平面，因此没有需要指向的存储。
 	memberMetadataServerValue = "P2PHANDSHAKE"
 
 	memberEnvMaster            = "MOONCAKE_MASTER"
@@ -171,119 +164,105 @@ const (
 	memberEnvGlobalSegmentSize = "MOONCAKE_GLOBAL_SEGMENT_SIZE"
 	memberEnvLocalBufferSize   = "MOONCAKE_LOCAL_BUFFER_SIZE"
 
-	// The vendor visibility variables, set to "void" on a host-memory group so that no accelerator
-	// is injected into it.
+	// 厂商设备可见性环境变量，在主机内存组上设为 "void"，从而不向其中注入任何加速器。
 	//
-	// "void" is not "none": it tells the vendor's container runtime hook to stay out of the
-	// container entirely, rather than to inject a device list that happens to be empty, so the
-	// driver libraries do not arrive either.
+	// "void" 不同于 "none"：它通知厂商的容器运行时 hook 完全不要介入该容器，而不是
+	// 注入一个恰好为空的设备列表，从而避免驱动库也被引入容器。
 	//
-	// EVERY VENDOR AT ONCE, without asking what the node carries. A group's medium is a property of
-	// what it declares, not of where it lands, and a node this operator manages can carry any of
-	// them; rendering the set that matches the node would make the same spec produce different
-	// containers on different hosts.
+	// 这里会一次性设置全部厂商的变量，而不询问 Node 上实际搭载了什么设备。一个组的介质取决于
+	// 其声明而非调度落点，且该 Operator 管理的 Node 可能搭载其中任意一种设备；若仅渲染匹配
+	// 当前 Node 的集合，会导致同一份 spec 在不同主机上生成不同的容器。
 	//
-	// These five are the vendors whose runtimes take a visibility variable at all. The others
-	// (Ascend, Hygon, Metax, T-Head) reach their devices through an explicitly mounted device
-	// plugin allocation instead, which a container that requested none never receives.
+	// 这五个是目前运行时确实会读取可见性变量的厂商。其余厂商（Ascend、Hygon、Metax、T-Head）
+	// 则是通过显式挂载的 DevicePlugin 分配来访问设备，未请求设备的容器绝不会收到这类分配。
 	memberEnvVisibleDevicesAMD       = "AMD_VISIBLE_DEVICES"
 	memberEnvVisibleDevicesCambricon = "CAMBRICON_VISIBLE_DEVICES"
 	memberEnvVisibleDevicesIluvatar  = "IX_VISIBLE_DEVICES"
 	memberEnvVisibleDevicesMThreads  = "MTHREADS_VISIBLE_DEVICES"
 	memberEnvVisibleDevicesNVIDIA    = "NVIDIA_VISIBLE_DEVICES"
 
-	// memberVisibleDevicesNone is the value each of the above takes on a host-memory group.
+	// memberVisibleDevicesNone 是上述各个变量在主机内存组上取的值。
 	memberVisibleDevicesNone = "void"
 
-	// memberEnvTransferMetrics turns on the transfer engine's own reporting, which is OFF by
-	// default in the artifact and is the only source of the member's throughput and task-latency
-	// distribution. The leader's Prometheus surface counts keys and bytes; it does not measure the
-	// data plane, so without this the receiving half of every transfer is unmeasurable.
+	// memberEnvTransferMetrics 用于开启传输引擎自身的指标上报，该功能在构建产物中默认关闭，
+	// 且是获取成员吞吐量与任务延迟分布的唯一来源。leader 的 Prometheus 接口统计的是键数与字节数，
+	// 并不度量数据平面，因此若不开启此项，每次传输的接收端都将无法度量。
 	//
-	// The engine side already sets it, and setting it here is what makes the two ends of one
-	// transfer symmetric rather than adding a cost the pool did not already carry.
+	// 引擎侧已经设置了该变量，此处同样设置是为了让单次传输的两端保持对称，而不会给池子
+	// 带来原本不存在的开销。
 	//
-	// The reporting goes to the container log rather than to a port: one line per interval, and
-	// none at all in an interval that moved nothing.
+	// 该上报输出到容器日志而非端口：每个时间间隔输出一行，若该间隔内未传输任何数据则完全不输出。
 	memberEnvTransferMetrics   = "MC_TE_METRIC"
 	memberTransferMetricsValue = "1"
 
-	// The local disk tier's keys. The first two are the client's own enable_ssd_offload and
-	// ssd_offload_path; without both, the client registers no local disk segment and the leader's
-	// offload queue has nowhere to send it.
+	// 本地磁盘层的配置键。前两个对应客户端自身的 enable_ssd_offload 与 ssd_offload_path；
+	// 缺少任意一个，客户端都不会注册本地磁盘段，leader 的卸载队列也将无处下发数据。
 	memberEnvOffloadEnabled = "MOONCAKE_OFFLOAD_ENABLED"
 	memberEnvOffloadPath    = "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"
-	// memberEnvOffloadSizeLimit and memberEnvOffloadKeysLimit cap what the tier stores, by bytes and
-	// by key count. Left unrendered, the client's own ceilings apply, so a ceiling that moves
-	// upstream shows up as a change to investigate rather than one this renderer silently restated.
+	// memberEnvOffloadSizeLimit 和 memberEnvOffloadKeysLimit 分别按字节数和键数量限制
+	// 该层级可存储的上限。若不渲染，则使用客户端自身的上限值，这样当上游调整默认上限时，
+	// 变更会作为需要排查的变化显现出来，而不是被本渲染器静默覆盖重写。
 	memberEnvOffloadSizeLimit = "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"
 	memberEnvOffloadKeysLimit = "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT"
 
-	// memberEnvOffloadBucketSizeLimit and memberEnvOffloadBucketKeysLimit are the pair a bucket is
-	// closed on. See MemberBucketSizeLimit for why they are rendered at all.
+	// memberEnvOffloadBucketSizeLimit 和 memberEnvOffloadBucketKeysLimit 是用于判定关闭
+	// 一个 bucket 的阈值对。其渲染原因见 MemberBucketSizeLimit 的说明。
 	memberEnvOffloadBucketSizeLimit = "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"
 	memberEnvOffloadBucketKeysLimit = "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT"
 
-	// memberEnvOffloadBucketMaxTotalSize is the quota the watermarks below are a fraction OF, and it
-	// is a different setting from memberEnvOffloadSizeLimit even though this renderer sends one value
-	// into both. Its own default is 0, which the client's watermark eviction reads as "no quota" and
-	// returns from without evicting anything -- so a watermark rendered without this reaches a path
-	// that is switched off, and the marks would look configured while doing nothing.
+	// memberEnvOffloadBucketMaxTotalSize 是下方水位线所占比例对应的配额基数；尽管本渲染器
+	// 会将同一个值同时写入这两项，但它与 memberEnvOffloadSizeLimit 是不同的配置项。
+	// 其自身默认值为 0，而客户端的水位线驱逐逻辑会将 0 视作"无配额"并直接返回而不执行任何驱逐——
+	// 因此若渲染了水位线却未渲染该项，就会落入被关闭的执行路径，使水位线看似已配置实则毫无作用。
 	memberEnvOffloadBucketMaxTotalSize = "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE"
 
-	// memberEnvOffloadEvictionPolicy is the order buckets leave in.
+	// memberEnvOffloadEvictionPolicy 指定 bucket 淘汰出磁盘层的顺序。
 	//
-	// The client maps a string it does not recognize onto NO EVICTION -- silently, with no error and
-	// no failure to start -- so this renderer sends only values from memberEvictionPolicies, and
-	// never a value that arrived as a string from somewhere else.
+	// 客户端会将无法识别的字符串静默映射为 NO EVICTION，既不返回 error 也不会启动失败——
+	// 因此本渲染器仅发送来自 memberEvictionPolicies 的值，绝不传入从外部直接透传来的字符串。
 	memberEnvOffloadEvictionPolicy = "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY"
 
-	// The watermark eviction switch and its two marks. The switch sits above the on-disk format and
-	// the policy above sits inside it, which is why turning eviction off renders both.
+	// 水位线驱逐开关及其两个水位阈值。该开关位于落盘格式之上，而上述策略位于其内部，
+	// 这就是关闭驱逐时需要同时渲染这两者的原因。
 	memberEnvOffloadWatermarkEnabled = "MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION"
 	memberEnvOffloadWatermarkHigh    = "MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO"
 	memberEnvOffloadWatermarkLow     = "MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO"
 )
 
-// MemberBucketSizeLimit and MemberBucketKeysLimit are the size and the object count at which the
-// client closes a bucket and writes it to the tier. They are RENDERED rather than left at the
-// client's own values, which is the exception to this package's "no setting at its own default" rule
-// and the one place it would be wrong to follow it.
+// MemberBucketSizeLimit 和 MemberBucketKeysLimit 是客户端关闭一个 bucket 并将其写入
+// 磁盘层的大小与对象数量阈值。它们会被显式渲染，而非保留客户端默认值——这是本包
+// "不渲染等于其自身默认值的配置"规则的例外，也是唯一不应遵循该规则的地方。
 //
-// The client assembles offloaded objects into a bucket and writes NOTHING until one of the two
-// thresholds is reached; what is short of it is carried over to the next attempt, indefinitely. Its
-// own pair -- 256Mi and 500 objects -- is sized for a saturated production store, and a backend that
-// never reaches either has a tier that is mounted, publishes its capacity, runs eviction, and holds
-// no data. Nothing reports that: every signal an operator would look at is the declared figure
-// rather than an observed one.
+// 客户端会将卸载的对象拼装进一个 bucket，在达到上述两个阈值之一前完全不会写入；
+// 未达到阈值的内容会无限期滞留到下一次尝试。客户端自身的默认阈值（256Mi 和 500 个对象）
+// 是按高负载生产存储规模设定的，而一个从未触及任一阈值的后端会出现这样的状态：磁盘层已挂载、
+// 已上报容量、驱逐也在运行，但其中却没有任何数据。没有任何信号会报告这一情况：运维人员
+// 能看到的每项指标反映的都是声明值而非实际观测值。
 //
-// So leaving these alone does not preserve a default to investigate later, it ships a feature that
-// does not work. The pair below is small enough that a modest backend closes buckets, and the cost is
-// more and smaller files rather than anything correctness depends on.
+// 因此，放任这些默认值不管并不会保留一个日后可排查的默认行为，而是交付了一个无法工作的特性。
+// 下面这组值足够小，使中等规模的后端也能正常关闭 bucket，代价仅仅是产生更多更小的文件，
+// 而不会影响任何正确性依赖。
 //
-// They are EXPORTED because admission bounds three fields against them -- a group's
-// capacityPerMember, and its tier's capacity and keyLimit -- and each of those bounds is the same
-// fact as this pair rather than a number restated beside it.
+// 将它们导出是因为准入校验会依据这两个阈值来限制三个字段——组的 capacityPerMember，以及
+// 其磁盘层的 capacity 和 keyLimit——且这些边界与这组值表达的是同一个事实，而非在旁另行复述的数字。
 const (
 	MemberBucketSizeLimit int64 = 16 * 1024 * 1024
 	MemberBucketKeysLimit int64 = 64
 )
 
-// memberProtocols maps this API's spelling of a transport onto the artifact's.
+// memberProtocols 将本 API 中的传输协议拼写映射为构建产物的拼写。
 //
-// Auto maps to the artifact's tcp rather than resolving upward against the node, and the two
-// reasons are in the API type's own comment: one DaemonSet covers every node a group selects and so
-// cannot carry a per-node transport, and promoting to RDMA would grant hostNetwork and two
-// capabilities nobody asked for. The artifact has no "auto" of its own either — it looks its
-// protocol string up in a transport map, so rendering the literal would find nothing there.
+// Auto 会映射为构建产物的 tcp，而非根据 Node 向上解析，原因正如 API 类型自身的注释所述：
+// 一个 DaemonSet 覆盖其组选中的所有 Node，因此无法携带按 Node 区分的传输协议，而且自动提升为
+// RDMA 会授予无人请求的 hostNetwork 和两项 capabilities。构建产物自身也没有 "auto"——
+// 它会在传输映射表中查找协议字符串，因此原样渲染该字面量将找不到任何条目。
 //
-// CANN and ROCM are the ONLY two entries whose artifact spelling differs by more than case: the API
-// names the toolchain the member image is built against, matching the published image tags, while
-// the artifact's transport map knows the vendor's own protocol string (ascend and hip). The rest
-// differ only in case, which is enough that comparing an API value against a rendered one as
-// strings finds a difference that is not one.
-// MemberProtocolAuto is the transport the schema defaults to, named because the renderer falls back
-// to it for an object that never reached an API server.
+// CANN 和 ROCM 是仅有的两个在构建产物中不只是大小写差异的条目：API 命名的是成员镜像
+// 所基于的工具链（与已发布的镜像标签一致），而构建产物的传输映射表识别的是厂商自身的
+// 协议字符串（ascend 和 hip）。其余条目仅存在大小写差异，但这也足以使按字符串比较
+// API 值与渲染值时出现本不存在的差异。
+// MemberProtocolAuto 是 schema 默认采用的传输协议，在此命名是因为渲染器会在处理
+// 从未经过 API server 的对象时回退到该值。
 const MemberProtocolAuto = "Auto"
 
 var memberProtocols = map[string]string{
@@ -297,8 +276,8 @@ var memberProtocols = map[string]string{
 	"MACA":             "maca",
 }
 
-// TransportProtocol maps a KVCacheBackend transport value to Mooncake's spelling. An empty
-// value resolves to Auto, which renders tcp; an unknown value returns empty.
+// TransportProtocol 将 KVCacheBackend 的传输协议值映射为 Mooncake 的拼写。空值会
+// 解析为 Auto（渲染为 tcp）；未知值返回空字符串。
 func TransportProtocol(protocol string) string {
 	if protocol == "" {
 		protocol = MemberProtocolAuto
@@ -306,53 +285,51 @@ func TransportProtocol(protocol string) string {
 	return memberProtocols[protocol]
 }
 
-// memberProtocolIsHostFabric reports whether a RESOLVED protocol is one of the two that reach the
-// host's fabric: the ones that take hostNetwork, get the two capabilities and are granted a device.
-// It takes MemberProtocol's output, not the API's spelling.
+// memberProtocolIsHostFabric 报告一个已解析的协议是否属于访问主机 fabric 的那两种协议：
+// 即需要启用 hostNetwork、获取两项 capabilities 并分配设备的协议。
+// 它接收 MemberProtocol 的输出，而非 API 中的拼写。
 //
-// rdma and efa are the only two. musa and maca are intra-node IPC transports, not host fabrics, and
-// the rest never leave the member's own network namespace, so none of them earns hostNetwork, the
-// capabilities or a device.
+// 只有 rdma 和 efa 属于此类。musa 和 maca 是节点内 IPC 传输，而非主机 fabric，
+// 其余协议则从不离开成员自身的网络命名空间，因此它们都不会获得 hostNetwork、
+// capabilities 或设备。
 //
-// Both of the two DO get a device request. The effective protocol selects its resource family and
-// the member's interface count selects its quantity and RDMA allocation mode, so this predicate
-// answers "is a device granted" as well. Neither mounts the device tree; RDMADevicePath says why.
+// 这两种协议都会触发设备请求。生效的协议决定其资源族，而成员的接口数量决定其请求数量
+// 与 RDMA 分配模式，因此该谓词同时也回答了"是否授予设备"。两者均不挂载设备树；
+// 原因见 RDMADevicePath。
 //
-// It is UNEXPORTED so that the pair is stated in exactly two places, both in this file and both
-// total over it — here and in FabricDeviceResource. A second spelling anywhere else is what would
-// let them drift apart the day a third fabric joins. Admission asks the same question through
-// MemberGroupIsHostFabric, which delegates here.
+// 将其设为非导出函数，是为了让这一协议对仅在两处声明，两处均位于本文件且均完全覆盖它——
+// 即此处与 FabricDeviceResource。若在其他任何地方出现第二套拼写，当未来加入第三种
+// fabric 时两者便可能产生漂移。准入逻辑通过 MemberGroupIsHostFabric 询问同一问题，
+// 该函数会委托至此。
 func memberProtocolIsHostFabric(protocol string) bool {
 	return protocol == memberProtocolRDMA || protocol == memberProtocolEFA
 }
 
-// MemberGroupIsHostFabric reports whether one member group's effective protocol is RDMA or EFA,
-// which is where the group's fabric interface count selects a device request.
+// MemberGroupIsHostFabric 报告单个成员组的生效协议是否为 RDMA 或 EFA，
+// 此时由该组的 fabric 接口数量决定设备请求。
 func MemberGroupIsHostFabric(kvcb *workercore.KVCacheBackend, group workercore.KVCacheBackendMember) bool {
 	return memberProtocolIsHostFabric(MemberProtocolForGroup(kvcb, group))
 }
 
-// MemberObjectName is the name of the objects rendered for one member group.
+// MemberObjectName 是为单个成员组渲染的对象的名称。
 //
-// The group's INDEX is in the name because a group has no name of its own, and because the position
-// is what the spec's list already identifies it by. A second group is therefore a second DaemonSet
-// rather than a rename of this one.
+// 名称中包含组的索引，是因为组本身没有名称，且 spec 中的列表本来就是通过位置来标识它的。
+// 因此，第二个组会对应第二个 DaemonSet，而非重命名当前这一个。
 func MemberObjectName(kvcb *workercore.KVCacheBackend, group int) string {
 	return fmt.Sprintf("%s-member-%d", kvcb.Name, group)
 }
 
-// MemberProtocol is the transport a group resolves to, in the artifact's own spelling. An
-// unrecognized value renders nothing rather than a guess: the schema enumerates this field, so an
-// empty result means the object never went through admission.
+// MemberProtocol 返回某个组解析后的传输协议，采用构建产物自身的拼写。未识别的值
+// 不会渲染任何内容而非猜测：schema 已枚举了该字段，因此返回空结果意味着该对象
+// 从未经过准入校验。
 func MemberProtocol(kvcb *workercore.KVCacheBackend) string {
 	return TransportProtocol(kvcb.Spec.Transport.Protocol)
 }
 
-// MemberProtocolForGroup is the transport ONE member group resolves to, in the artifact's own
-// spelling: the group's own transport.protocol when it declares one, and the backend's value —
-// with its Auto and empty handling — when it does not. A group carrying a transport block with no
-// protocol inherits too, which is the shape an object that never reached the API server's
-// defaulting takes.
+// MemberProtocolForGroup 返回单个成员组解析后的传输协议，采用构建产物自身的拼写：
+// 当组自身声明了 transport.protocol 时使用该值，否则使用后端的取值——并沿用其对
+// Auto 与空值的处理逻辑。若组携带了不含 protocol 的 transport 块，同样会继承后端的值，
+// 这是从未经过 API server 默认值填充的对象所呈现的形态。
 func MemberProtocolForGroup(kvcb *workercore.KVCacheBackend, group workercore.KVCacheBackendMember) string {
 	if group.Transport != nil && group.Transport.Protocol != "" {
 		return TransportProtocol(group.Transport.Protocol)
@@ -360,10 +337,9 @@ func MemberProtocolForGroup(kvcb *workercore.KVCacheBackend, group workercore.KV
 	return MemberProtocol(kvcb)
 }
 
-// MemberProtocols is what a pool's backend offers an engine, in group declaration order: each
-// member group's effective protocol, or the backend-wide value alone for a backend that declares
-// no groups — an external one, whose store is somebody else's to describe. The slice is never
-// empty, so a caller matching against it never has to ask whether the pool offers anything.
+// MemberProtocols 按组声明顺序返回池子后端向引擎提供的协议列表：即每个成员组的
+// 生效协议；对于未声明任何组的后端（即其存储由外部描述的外部后端），则仅返回
+// 后端级的值。返回的切片永不为空，因此基于它进行匹配的调用方无需判断是否提供了协议。
 func MemberProtocols(kvcb *workercore.KVCacheBackend) []string {
 	managed := kvcb.Spec.Connection.Managed
 	if managed == nil || len(managed.Members) == 0 {
@@ -377,23 +353,20 @@ func MemberProtocols(kvcb *workercore.KVCacheBackend) []string {
 	return offers
 }
 
-// FabricDeviceResource is the extended resource one host-fabric protocol asks for, and it NAMES ITS
-// PROTOCOLS rather than falling through to one of them.
+// FabricDeviceResource 是主机 fabric 协议所请求的扩展资源，它会显式列举协议名称，
+// 而不会 fallthrough 到其中某一种协议。
 //
-// The fallthrough is the thing to avoid here, not a style preference. Both spellings are correct
-// today, because memberProtocolIsHostFabric admits exactly this pair and applyMemberFabric consults
-// it first. What separates them is the day a third host fabric joins — which the comments in this
-// file expect: a fallthrough hands that fabric's members a seat on an RDMA adapter, silently and
-// with the wrong device, while naming the protocols returns the empty resource and the caller
-// renders no request at all. A member that asks for nothing is a visible failure on a fabric path;
-// a member granted the wrong adapter is not.
+// 此处避免 fallthrough 并非代码风格偏好。今天两种写法结果都正确，因为 memberProtocolIsHostFabric
+// 只放行这一对协议，且 applyMemberFabric 会先查询它。但两者的区别会在引入第三种主机 fabric
+// 之日显现——正如本文件注释所预期的那样：fallthrough 会静默地给该 fabric 的成员分配
+// 一个 RDMA 适配器席位并挂载错误的设备，而显式列举协议则会返回空资源，使调用方完全不渲染
+// 设备请求。未请求任何设备的成员会在 fabric 路径上表现为可见的失败；被授予错误适配器的成员则不会。
 //
-// Deriving the RDMA name rather than writing it here keeps one spelling in the repository: the
-// Device Manager serves whatever GetRDMAResourceName returns, so a member asking for a literal
-// would stop matching the day that function's keys moved and nothing would report it. One interface
-// asks for the SHARED mode because a member wants a seat on an adapter rather than the whole
-// adapter. More than one asks for EXCLUSIVE mode because shared tokens can repeat one endpoint,
-// silently satisfying the quantity without granting distinct interfaces.
+// 通过调用生成而非直接硬编码 RDMA 资源名，可以让仓库中只保留一处拼写：Device Manager
+// 提供的是 GetRDMAResourceName 返回的任意名称，因此若成员请求字面量，一旦该函数的键值
+// 发生变动就会悄无声息地不再匹配。单个接口请求的是 SHARED 模式，因为成员只需要适配器上的
+// 一个席位而非整块适配器。多个接口则请求 EXCLUSIVE 模式，因为共享令牌可能会重复分配
+// 同一个端点，从而在表面上满足数量要求却未能授予互不相同的接口。
 func FabricDeviceResource(protocol string, interfaceCount int32) core.ResourceName {
 	switch protocol {
 	case memberProtocolRDMA:

@@ -18,17 +18,16 @@ import (
 	"gpustack.ai/gpustack/pkg/webhook"
 )
 
-// PodWebhook hooks core Pods routed to a GPUStack queue (selected by the
-// "kueue.x-k8s.io/queue-name" label) and normalizes each container's accelerator request.
+// PodWebhook 拦截路由到 GPUStack 队列（通过 "kueue.x-k8s.io/queue-name" 标签选择）的核心 Pod，
+// 并规范化每个容器的加速器请求。
 //
-//   - Mutating: a logical slice's per-card compute budget (.sliced.cores-percentage) defaults to a
-//     whole card (100), and its per-card VRAM budget (.sliced.memory-percentage or
-//     .sliced.memory-mib) is folded into the credit-counting .sliced.units, while a partition
-//     request folds the profile's VRAM into .partitioned.units. Any client-supplied units value is
-//     ignored and recomputed, since it is webhook-derived only. A shared request of two or more
-//     cards is pinned to nodes carrying that many cards (see pinSharedCardCount).
-//   - Validating: it enforces the normative accelerator request rules (see
-//     validatePodAcceleratorRequest) plus the per-family shape checks.
+//   - Mutating：逻辑切片的单卡算力预算（.sliced.cores-percentage）默认为整卡（100），
+//     其单卡显存（VRAM）预算（.sliced.memory-percentage 或 .sliced.memory-mib）会折算进
+//     用于计费配额的 .sliced.units，而分区请求则将 profile 的 VRAM 折算进 .partitioned.units。
+//     客户端提供的任何 units 值都会被忽略并重新计算，因为该值仅由 webhook 推导。
+//     两张或更多卡的共享请求会被固定到至少拥有相应卡数的节点上（参见 pinSharedCardCount）。
+//   - Validating：强制执行规范化的加速器请求规则（参见 validatePodAcceleratorRequest）
+//     以及各资源族的形态检查。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="",version="v1",resource="pods",scope="Namespaced"
@@ -56,28 +55,24 @@ var (
 	_ ctrladmission.Defaulter[runtime.Object] = (*PodWebhook)(nil)
 )
 
-// containerGroup is the lifetime group a container belongs to. The request rules are
-// scoped by lifetime, not by the field a container sits in, because two accelerator
-// claims in different groups are not free of each other: the kubelet keeps a finished
-// init container's devices in its Pod record for the Pod's whole life, while the
-// scheduler charges the Pod only max(Σ init, Σ app) of each key — so two claims cost one
-// unit of quota and consume two.
+// containerGroup 是容器所属的生命周期组。请求规则按生命周期而非容器所在字段划定范围，
+// 因为不同组中的两个加速器声明并非互不干扰：kubelet 会在 Pod 的整个生命周期内将已完成的
+// init 容器的设备保留在 Pod 记录中，而调度器对 Pod 的每个资源键仅按 max(Σ init, Σ app)
+// 计费——因此两份声明只消耗一份配额却实际占用两份设备。
 type containerGroup string
 
 const (
-	// containerGroupInit is spec.initContainers without restartPolicy: Always.
+	// containerGroupInit 表示未设置 restartPolicy: Always 的 spec.initContainers。
 	containerGroupInit containerGroup = "initContainers"
-	// containerGroupRunning is spec.containers.
+	// containerGroupRunning 表示 spec.containers。
 	containerGroupRunning containerGroup = "containers"
-	// containerGroupSidecar is a restartable init container (a native sidecar). It belongs
-	// to neither group — it starts during the init phase and keeps running, so it overlaps
-	// every later init container as well as every app container — and may not claim an
-	// accelerator at all.
+	// containerGroupSidecar 是可重启的 init 容器（即原生 sidecar）。它不属于上述任何一组——
+	// 它在 init 阶段启动并持续运行，因此与后续所有 init 容器以及所有 app 容器的生命周期重叠——
+	// 并且完全不允许声明任何加速器。
 	containerGroupSidecar containerGroup = "sidecar"
 )
 
-// logicalResourceNames is the per-base family of logical (software) slicing resource
-// names a container may request.
+// logicalResourceNames 是容器可请求的按基础资源划分的逻辑（软件）切片资源名族。
 type logicalResourceNames struct {
 	card     core.ResourceName // <base>.sliced
 	units    core.ResourceName // <base>.sliced.units
@@ -86,8 +81,7 @@ type logicalResourceNames struct {
 	memMib   core.ResourceName // <base>.sliced.memory-mib
 }
 
-// logicalResourceNamesForBase builds the logical slicing resource family for an
-// accelerator base (e.g. "nvidia.com/gpu").
+// logicalResourceNamesForBase 为加速器基础资源（例如 "nvidia.com/gpu"）构建逻辑切片资源族。
 func logicalResourceNamesForBase(base core.ResourceName) logicalResourceNames {
 	return logicalResourceNames{
 		card:     base + core.ResourceName(nodefeature.SlicedResourceNameSuffix),
@@ -98,17 +92,15 @@ func logicalResourceNamesForBase(base core.ResourceName) logicalResourceNames {
 	}
 }
 
-// partitionResourceNames is the per-base family of physical (hardware) partitioning
-// resource names a container may request. The per-profile key is not fixed per base —
-// it carries the manufacturer's partition kind and the profile name — so it is resolved
-// from the container's request instead of built here.
+// partitionResourceNames 是容器可请求的按基础资源划分的物理（硬件）分区资源名族。
+// 按 profile 区分的键并非每个基础资源固定——它携带厂商的分区类型和 profile 名称——
+// 因此是从容器请求中解析得到的，而不在此处构建。
 type partitionResourceNames struct {
 	card  core.ResourceName // <base>.partitioned
 	units core.ResourceName // <base>.partitioned.units
 }
 
-// partitionResourceNamesForBase builds the physical partitioning resource family for an
-// accelerator base (e.g. "nvidia.com/gpu").
+// partitionResourceNamesForBase 为加速器基础资源（例如 "nvidia.com/gpu"）构建物理分区资源族。
 func partitionResourceNamesForBase(base core.ResourceName) partitionResourceNames {
 	return partitionResourceNames{
 		card:  base + core.ResourceName(nodefeature.PartitionedResourceNameSuffix),
@@ -116,10 +108,9 @@ func partitionResourceNamesForBase(base core.ResourceName) partitionResourceName
 	}
 }
 
-// acceleratorBaseOf returns the accelerator base a resource name is a key of, together
-// with the family it belongs to. It reports false for anything outside the four
-// accelerator families, including the visibility resource, which is deliberately outside
-// them so the one-family rules ignore it.
+// acceleratorBaseOf 返回资源名所属的加速器基础资源及其所属资源族。对于四大加速器族之外的
+// 任何资源（包括可见性资源），它都返回 false；可见性资源被刻意排除在这些族之外，以便
+// 单一资源族规则会忽略它。
 func acceleratorBaseOf(name core.ResourceName) (core.ResourceName, nodefeature.ResourceFamily, bool) {
 	family := nodefeature.ResourceFamilyOf(name)
 	s := string(name)
@@ -139,11 +130,10 @@ func acceleratorBaseOf(name core.ResourceName) (core.ResourceName, nodefeature.R
 	return "", nodefeature.ResourceFamilyNone, false
 }
 
-// containerClaims scans a container's Requests and Limits once and returns the sorted,
-// unique accelerator bases it claims, grouped by family. Every key of a family counts —
-// the card key itself and every sub-key such as ".sliced.units" or the per-profile
-// partition key — so a request naming only a sub-key is still validated and folded,
-// never slipping through unchecked.
+// containerClaims 扫描一次容器的 Requests 和 Limits，并按资源族分组返回已排序且去重的
+// 所声明加速器基础资源。资源族中的每个键都会计入——包括卡键本身以及 ".sliced.units" 或
+// 按 profile 区分的分区键等所有子键——因此仅指定子键的请求同样会被校验和折算，
+// 不会未经检查而漏过。
 func containerClaims(ctr *core.Container) map[nodefeature.ResourceFamily][]core.ResourceName {
 	bases := make(map[nodefeature.ResourceFamily]sets.Set[core.ResourceName])
 	for _, rl := range []core.ResourceList{ctr.Resources.Requests, ctr.Resources.Limits} {
@@ -165,18 +155,17 @@ func containerClaims(ctr *core.Container) map[nodefeature.ResourceFamily][]core.
 	return claims
 }
 
-// partitionRequest is one per-profile partition key a container sets, with the profile it
-// names and the quantity it asks for.
+// partitionRequest 表示容器设置的一个按 profile 区分的分区键，包含其指定的 profile 名称
+// 和请求的数量。
 type partitionRequest struct {
 	name     core.ResourceName
 	profile  string
 	quantity resource.Quantity
 }
 
-// containerPartitionRequests returns the per-profile partition keys a container sets for an
-// accelerator base, sorted by profile name. The key embeds the manufacturer's partition kind,
-// so it is read back off the container rather than rebuilt from a base the webhook cannot map
-// to a manufacturer. Requests win over Limits, as everywhere else in this webhook.
+// containerPartitionRequests 返回容器为某个加速器基础资源设置的按 profile 区分的分区键，
+// 按 profile 名称排序。该键内嵌了厂商的分区类型，因此需要直接从容器中读取，而不是根据
+// webhook 无法映射到具体厂商的基础资源重新构造。与本 webhook 的其他位置一致，Requests 优先于 Limits。
 func containerPartitionRequests(ctr *core.Container, base core.ResourceName) []partitionRequest {
 	byProfile := make(map[string]partitionRequest)
 	for _, rl := range []core.ResourceList{ctr.Resources.Limits, ctr.Resources.Requests} {
@@ -197,8 +186,7 @@ func containerPartitionRequests(ctr *core.Container, base core.ResourceName) []p
 	return out
 }
 
-// containerPartitionProfiles returns the sorted, unique partition profile names a container
-// requests for an accelerator base.
+// containerPartitionProfiles 返回容器为某个加速器基础资源请求的已排序且去重的分区 profile 名称。
 func containerPartitionProfiles(ctr *core.Container, base core.ResourceName) []string {
 	reqs := containerPartitionRequests(ctr, base)
 	profiles := make([]string, 0, len(reqs))
@@ -208,15 +196,15 @@ func containerPartitionProfiles(ctr *core.Container, base core.ResourceName) []s
 	return profiles
 }
 
-// podContainer pairs a container with its lifetime group and its field path.
+// podContainer 将容器与其生命周期组及字段路径配对。
 type podContainer struct {
 	ctr   *core.Container
 	group containerGroup
 	path  *field.Path
 }
 
-// podContainers returns every init and app container of the Pod with its lifetime group
-// and field path, in manifest order.
+// podContainers 按清单顺序返回 Pod 的所有 init 容器和 app 容器，及其对应的
+// 生命周期组和字段路径。
 func podContainers(pod *core.Pod) []podContainer {
 	out := make([]podContainer, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
 	for i := range pod.Spec.InitContainers {
@@ -239,8 +227,8 @@ func podContainers(pod *core.Pod) []podContainer {
 	return out
 }
 
-// containerResource returns the requested quantity for name, preferring Requests
-// and falling back to Limits, plus whether it was present at all.
+// containerResource 返回 name 对应的请求数量（优先取 Requests，其次回退到 Limits），
+// 以及该资源键是否存在。
 func containerResource(ctr *core.Container, name core.ResourceName) (resource.Quantity, bool) {
 	if q, ok := ctr.Resources.Requests[name]; ok {
 		return q, true
@@ -254,17 +242,17 @@ func containerResource(ctr *core.Container, name core.ResourceName) (resource.Qu
 func (r *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 	pod := obj.(*core.Pod)
 
-	// The per-card VRAM is looked up lazily, only when a container folds an
-	// absolute .sliced.memory-mib request; -1 means "not looked up yet".
+	// 单卡 VRAM 采用惰性查询，仅在容器需要折算绝对值 .sliced.memory-mib 请求时才查找；
+	// -1 表示"尚未查询"。
 	cardVRAMMib := int64(-1)
 
-	// The fold covers whichever container group holds the claims: the request rules
-	// confine them to one group, so folding every claiming container folds exactly it.
+	// 折算会覆盖持有声明的任一容器组：请求规则将其限制在单个组内，因此折算所有发出
+	// 声明的容器就恰好只折算该组。
 	for _, pc := range podContainers(pod) {
 		ctr := pc.ctr
 		claims := containerClaims(ctr)
 
-		// Fold hardware profile units here.
+		// 在此处折算硬件 profile 对应的 units。
 
 		_, _, _ = ctr, claims, cardVRAMMib
 	}
@@ -272,22 +260,20 @@ func (r *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 	return r.pinSharedCardCount(ctx, pod)
 }
 
-// pinSharedCardCount confines a shared request of N >= 2 to nodes carrying at least N cards of the
-// pool's accelerator, by requiring the per-node card-count label every accelerated flavor and node
-// carries to be greater than N-1. N is the largest container's request, not the Pod's sum: the
-// device plugin allocates each container's tokens on their own, so containers may share cards.
+// pinSharedCardCount 将 N >= 2 的共享请求限定到至少拥有 N 张资源池加速卡的节点上，
+// 具体做法是要求每个加速 flavor 和节点都携带的单节点卡数标签大于 N-1。N 取自最大容器
+// 的请求量而非 Pod 总和：DevicePlugin 会独立为每个容器分配 token，因此容器之间可以共享卡。
 //
-// A shared request names N distinct cards, but a node advertises ten shared tokens per card, so
-// neither Kueue's flavor assignment nor TAS can tell a one-card node from a four-card one by the
-// resource alone. The pool's flavors are tried smallest node first and an AdmissionCheck eviction
-// restarts that scan, so without the label a request TAS places on too few cards is evicted and
-// placed there again for good, even while a larger node has room. Kueue matches a flavor's own
-// nodeLabels against the Pod's required node affinity, which is why the pin is expressed there.
+// 共享请求指定的是 N 张不同的卡，但节点每张卡会通告十个共享 token，因此无论 Kueue 的
+// flavor 分配还是 TAS，仅凭资源本身都无法区分单卡节点与四卡节点。资源池的 flavor 会按
+// 节点从小到大的顺序尝试，且 AdmissionCheck 驱逐会重新从头扫描；若没有该标签，TAS 放到
+// 卡数不足节点上的请求在被驱逐后仍会反复被放回原处，即便更大节点还有空间。Kueue 会将
+// flavor 自身的 nodeLabels 与 Pod 的 required 节点亲和性进行匹配，因此通过该亲和性来表达此约束。
 //
-// The label is the node's total card count, partitioned cards included, and only Pods reach this
-// webhook, so a Workload Kueue builds from a Job template before any Pod exists is not pinned.
+// 该标签表示节点的总卡数（包含已分区的卡），且只有 Pod 会经过此 webhook，因此 Kueue 在任何
+// Pod 存在之前基于 Job 模板构建的 Workload 不会被固定。
 func (r *PodWebhook) pinSharedCardCount(ctx context.Context, pod *core.Pod) error {
-	// Implement this function in chapter 09.
+	// 在第 09 章中实现此函数。
 	return nil
 }
 
@@ -309,18 +295,18 @@ func (r *PodWebhook) ValidateDelete(_ context.Context, _ runtime.Object) (ctrlad
 	return nil, nil
 }
 
-// validatePodAcceleratorRequest enforces the normative accelerator request rules on a Pod:
+// validatePodAcceleratorRequest 对 Pod 强制执行规范化的加速器请求规则：
 //
-//  1. all containers request the same family, and the claims sit in exactly one container group;
-//  2. <base>.sliced is exactly 1 (multi-card logical slicing is deferred);
-//  3. <base>.partitioned is exactly 1;
-//  4. a partition request names exactly one profile shape;
-//  5. each per-profile key's value is exactly 1;
-//  6. at most one container requests a slicing family, logical or physical;
-//  7. a restartable init container requests no accelerator family at all.
+//  1. 所有容器请求同一资源族，且声明仅位于一个容器组中；
+//  2. <base>.sliced 必须恰好为 1（多卡逻辑切片暂缓支持）；
+//  3. <base>.partitioned 必须恰好为 1；
+//  4. 分区请求必须仅指定一种 profile 形态；
+//  5. 每个按 profile 区分的键的值必须恰好为 1；
+//  6. 至多一个容器可以请求切片族（逻辑切片或物理分区）；
+//  7. 可重启的 init 容器完全不能请求任何加速器族。
 //
-// Rules 4 and 6 are scoped to the group holding the claims, which rule 1 makes unique; they are
-// evaluated over every non-sidecar container so that a Pod violating rule 1 still reports them.
+// 规则 4 和规则 6 的作用域为持有声明的容器组（规则 1 保证了其唯一性）；它们会对所有非 sidecar
+// 容器进行求值，以便违反规则 1 的 Pod 仍能报告这些错误。
 func validatePodAcceleratorRequest(pod *core.Pod) field.ErrorList {
 	var errs field.ErrorList
 
@@ -342,9 +328,8 @@ func validatePodAcceleratorRequest(pod *core.Pod) field.ErrorList {
 			continue
 		}
 
-		// Rule 7. A native sidecar overlaps both groups, so it can belong to neither and may
-		// not claim an accelerator. The SSH sidecar is unaffected: the visibility resource is
-		// deliberately outside the accelerator families.
+		// 规则 7。原生 sidecar 与两个组都存在重叠，因此不能属于任何一组，也不得声明加速器。
+		// SSH sidecar 不受影响：可见性资源被刻意排除在加速器族之外。
 		if pc.group == containerGroupSidecar {
 			errs = append(errs, field.Forbidden(pc.path.Child("resources", "limits"),
 				"a restartable init container (a native sidecar) may not request an accelerator; "+
@@ -367,7 +352,7 @@ func validatePodAcceleratorRequest(pod *core.Pod) field.ErrorList {
 		}
 	}
 
-	// Rule 1, family half.
+	// 规则 1，资源族部分。
 	if families.Len() > 1 {
 		names := make([]string, 0, families.Len())
 		for _, f := range sets.List(families) {
@@ -377,9 +362,8 @@ func validatePodAcceleratorRequest(pod *core.Pod) field.ErrorList {
 			fmt.Sprintf("a Pod may request only one accelerator family, found %v", names)))
 	}
 
-	// Rule 1, group half. The init group is the one asked to give up its claim: an init
-	// container's devices stay in the kubelet's Pod record for the Pod's whole life, so the
-	// two claims coexist while the scheduler charges the Pod for only one of them.
+	// 规则 1，容器组部分。此处要求 init 组放弃其声明：init 容器的设备会在 Pod 的整个
+	// 生命周期内保留在 kubelet 的 Pod 记录中，因此两份声明会同时存在，而调度器仅对 Pod 计费一份。
 	if groups.Len() > 1 {
 		errs = append(errs, field.Forbidden(field.NewPath("spec", string(containerGroupInit)),
 			fmt.Sprintf("a Pod's accelerator requests must all sit in one container group; "+
@@ -387,28 +371,27 @@ func validatePodAcceleratorRequest(pod *core.Pod) field.ErrorList {
 				"while the scheduler charges the Pod only once", containerGroupInit)))
 	}
 
-	// Rule 6.
+	// 规则 6。
 	if slicing > 1 {
 		errs = append(errs, field.Forbidden(field.NewPath("spec"),
 			fmt.Sprintf("at most one container may request a slicing family, found %d", slicing)))
 	}
 
-	// Rule 4.
+	// 规则 4。
 	if profiles.Len() > 1 {
 		errs = append(errs, field.Forbidden(field.NewPath("spec"),
 			fmt.Sprintf("a Pod may request only one partition profile, found %v", sets.List(profiles))))
 	}
 
-	// Rules 2, 3 and 5, plus the per-family shape checks. A sidecar is skipped: rule 7 already
-	// told it to drop the request entirely, so grading the request's shape adds only noise.
+	// 规则 2、3 和 5，以及各资源族的形态检查。此处跳过 sidecar：规则 7 已要求其完全移除
+	// 该请求，因此再评估请求形态只会增加冗余噪音。
 	for i := range containers {
 		pc, claim := &containers[i], claims[i]
 		if pc.group == containerGroupSidecar {
 			continue
 		}
-		// Anchor field errors under resources.limits: extended resources (accelerator keys) are
-		// conventionally specified there, so this matches the user's manifest even when only
-		// limits is set (requests is defaulted equal).
+		// 将字段错误锚定在 resources.limits 下：扩展资源（加速器键）通常在此处指定，
+		// 因此即使仅设置了 limits（requests 会被默认设为相等），也能匹配用户的清单。
 		limPath := pc.path.Child("resources", "limits")
 		for _, base := range claim[nodefeature.ResourceFamilySliced] {
 			errs = append(errs, validateLogicalSliceRequest(pc.ctr, base, limPath)...)
@@ -421,17 +404,16 @@ func validatePodAcceleratorRequest(pod *core.Pod) field.ErrorList {
 	return errs
 }
 
-// isExactlyOne reports whether q is exactly one. It compares with Cmp rather than Value(),
-// which rounds a fractional quantity like "1m" up to 1 and would let it pass.
+// isExactlyOne 返回 q 是否恰好等于 1。它使用 Cmp 而非 Value() 进行比较，
+// 因为 Value() 会将 "1m" 这类小数量值向上取整为 1 而误放行。
 func isExactlyOne(q resource.Quantity) bool {
 	return q.Cmp(*resource.NewQuantity(1, resource.DecimalSI)) == 0
 }
 
-// validatePartitionRequest checks one container's physical partitioning request for an
-// accelerator base: it must set the card key at exactly 1 (rule 3), name exactly one profile
-// (rule 4 at container scope — a bare card key has no hardware shape to actuate), and each
-// per-profile key it sets must be exactly 1 (rule 5). Its mutual exclusion with the logical
-// keys is the Pod-wide one-family rule, not a per-container branch.
+// validatePartitionRequest 检查单个容器针对某加速器基础资源的物理分区请求：它必须将
+// 卡键设为恰好 1（规则 3）、指定恰好一个 profile（容器作用域的规则 4——单独的卡键没有
+// 可执行的硬件形态），且设置的每个按 profile 区分的键都必须恰好为 1（规则 5）。它与逻辑
+// 切片键之间的互斥属于 Pod 范围的单一资源族规则，而非单容器分支。
 func validatePartitionRequest(ctr *core.Container, base core.ResourceName, path *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	names := partitionResourceNamesForBase(base)
@@ -468,10 +450,9 @@ func validatePartitionRequest(ctr *core.Container, base core.ResourceName, path 
 	return errs
 }
 
-// validateLogicalSliceRequest checks one container's logical (software) slicing request for an
-// accelerator base: it must set the card key at exactly 1 (rule 2), name exactly one memory
-// budget (percentage or mib), and every budget it sets must be positive, with the percentage
-// budgets capped at 100. The compute and memory budgets are independent dimensions.
+// validateLogicalSliceRequest 检查单个容器针对某加速器基础资源的逻辑（软件）切片请求：
+// 它必须将卡键设为恰好 1（规则 2）、指定恰好一种显存预算（百分比或 mib），且设置的每个
+// 预算都必须为正数，百分比预算上限为 100。算力预算和显存预算是相互独立的维度。
 func validateLogicalSliceRequest(ctr *core.Container, base core.ResourceName, path *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	names := logicalResourceNamesForBase(base)
@@ -480,8 +461,8 @@ func validateLogicalSliceRequest(ctr *core.Container, base core.ResourceName, pa
 	memMibQ, hasMemMib := containerResource(ctr, names.memMib)
 	coresPctQ, hasCoresPct := containerResource(ctr, names.coresPct)
 
-	// A sliced sub-resource is meaningless without the card count it slices; a bare
-	// sub-key alone would otherwise fold to credits with no card request behind it.
+	// 若缺少要切分的卡数，切片子资源便毫无意义；否则单独的子键在背后没有卡请求的情况下
+	// 也会被折算成配额。
 	cardQ, hasCard := containerResource(ctr, names.card)
 	switch {
 	case !hasCard:

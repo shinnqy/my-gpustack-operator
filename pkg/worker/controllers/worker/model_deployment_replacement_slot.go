@@ -27,74 +27,65 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
-// modelDeploymentReplacementSlotsAnnotation carries each role's active replacement slot.
+// modelDeploymentReplacementSlotsAnnotation 保存每个 role 当前活跃的替换槽位（replacement slot）。
 //
-// An annotation rather than a status field: it is bookkeeping, not observed state, and it covers
-// the window between deleting a replica's members and creating its replacement, in which the
-// ordinal is simply empty and no observation can name what is being replaced.
+// 使用注解而非 status 字段：它属于记账信息而非观测状态，用于覆盖从删除旧副本成员到创建替代副本之间的空窗期——在此期间该 ordinal 为空，没有任何观测状态能够指出正在被替换的对象。
 const modelDeploymentReplacementSlotsAnnotation = "modeldeployment.gpustack.ai/replacement-slots"
 
-// modelDeploymentReplacementPhase is how far one slot has been observed to go. Cleanup carries
-// the identities the slot captured; WaitingForAdmission carries the render its replacement is
-// being built from.
+// modelDeploymentReplacementPhase 表示单个槽位目前已推进到的阶段。Cleanup 记录该槽位捕获的旧成员标识；WaitingForAdmission 记录用于构建其替代副本的渲染信息。
 type modelDeploymentReplacementPhase string
 
 const (
-	// modelDeploymentReplacementCleanup is a slot whose old members are still leaving.
+	// modelDeploymentReplacementCleanup 表示旧成员仍在退出中的槽位。
 	modelDeploymentReplacementCleanup modelDeploymentReplacementPhase = "Cleanup"
 
-	// modelDeploymentReplacementWaitingForAdmission holds the role until its replacement is
-	// admitted.
+	// modelDeploymentReplacementWaitingForAdmission 表示在替代副本获得准入前持续锁定该 role。
 	modelDeploymentReplacementWaitingForAdmission modelDeploymentReplacementPhase = "WaitingForAdmission"
 )
 
-// modelDeploymentReplacementSlot is one role's active replacement. At most one exists per role:
-// a role whose slot this pass did not clear turns over no second healthy old replica.
+// modelDeploymentReplacementSlot 表示单个 role 正在进行的替换操作。每个 role 最多存在一个槽位：若本轮未清理某 role 的槽位，就不会再轮换第二个健康的旧副本。
 type modelDeploymentReplacementSlot struct {
-	// Role is the role whose replica is being replaced.
+	// Role 是正在替换其副本的 role 名称。
 	Role string `json:"role"`
 
-	// Ordinal is the slot within that role being replaced.
+	// Ordinal 是该 role 中正在被替换的槽位序号。
 	Ordinal int `json:"ordinal"`
 
-	// Phase is how far the slot has been observed to go.
+	// Phase 是该槽位目前已观测到的推进阶段。
 	Phase modelDeploymentReplacementPhase `json:"phase"`
 
-	// MemberUIDs are the identities the slot may delete. The derived group name locates
-	// candidates; a captured UID is what licenses deleting one.
+	// MemberUIDs 是该槽位允许删除的成员 UID 列表。推导出的组名用于定位候选对象，而捕获到的 UID 才是授权删除的依据。
 	MemberUIDs []types.UID `json:"memberUIDs,omitempty"`
 
-	// WorkloadUID is the departing group's Workload. Empty while none has been observed.
+	// WorkloadUID 是即将退出的成员组对应的 Workload UID。尚未观测到时为空。
 	WorkloadUID types.UID `json:"workloadUID,omitempty"`
 
-	// MemberHashes are the fingerprints the replacement is being built from, recorded once the
-	// old group has left. A later edit differing from them supersedes it in this same slot.
+	// MemberHashes 是构建替代副本所依据的指纹列表，在旧成员组退出后记录。若后续修改与这些指纹不同，将在同一槽位内取代该替换计划。
 	MemberHashes []string `json:"memberHashes,omitempty"`
 
-	// CurrentMemberUIDs and CurrentWorkloadUID retain creation observations through member loss.
+	// CurrentMemberUIDs 和 CurrentWorkloadUID 用于在成员丢失期间保留新建成员的观测记录。
 	CurrentMemberUIDs  []types.UID `json:"currentMemberUIDs,omitempty"`
 	CurrentWorkloadUID types.UID   `json:"currentWorkloadUID,omitempty"`
 }
 
-// modelDeploymentReplacementSlots is every role's slot, keyed by role name.
+// modelDeploymentReplacementSlots 是所有 role 的替换槽位映射，以 role 名称为键。
 type modelDeploymentReplacementSlots map[string]modelDeploymentReplacementSlot
 
-// slotFor returns a role's slot and whether it has one.
+// slotFor 返回指定 role 的槽位以及该槽位是否存在。
 func (s modelDeploymentReplacementSlots) slotFor(role string) (modelDeploymentReplacementSlot, bool) {
 	slot, held := s[role]
 
 	return slot, held
 }
 
-// held reports whether a role has an unresolved replacement.
+// held 判断指定 role 是否存在未完成的替换操作。
 func (s modelDeploymentReplacementSlots) held(role string) bool {
 	_, present := s.slotFor(role)
 
 	return present
 }
 
-// modelDeploymentReplacementSlotsOf returns the recorded slots. A missing or unreadable record is
-// no slots, which is how a deployment that never held one behaves.
+// modelDeploymentReplacementSlotsOf 返回已记录的槽位集合。若记录缺失或无法解析，则返回空，其行为与从未持有过槽位的 deployment 一致。
 func modelDeploymentReplacementSlotsOf(md *workercore.ModelDeployment) modelDeploymentReplacementSlots {
 	raw, present := md.Annotations[modelDeploymentReplacementSlotsAnnotation]
 	if !present {
@@ -109,7 +100,7 @@ func modelDeploymentReplacementSlotsOf(md *workercore.ModelDeployment) modelDepl
 	return slots
 }
 
-// setSlot returns the slots with one role's slot written, leaving every other role's alone.
+// setSlot 返回写入单个 role 槽位后的槽位集合，其余 role 的槽位保持不变。
 func (s modelDeploymentReplacementSlots) setSlot(
 	slot modelDeploymentReplacementSlot,
 ) modelDeploymentReplacementSlots {
@@ -122,7 +113,7 @@ func (s modelDeploymentReplacementSlots) setSlot(
 	return next
 }
 
-// clearRole returns the slots with one role's slot removed, or nil once none remain.
+// clearRole 返回移除指定 role 槽位后的槽位集合；若不再剩余任何槽位，则返回 nil。
 func (s modelDeploymentReplacementSlots) clearRole(role string) modelDeploymentReplacementSlots {
 	next := make(modelDeploymentReplacementSlots, len(s))
 	for name, held := range s {
@@ -137,24 +128,22 @@ func (s modelDeploymentReplacementSlots) clearRole(role string) modelDeploymentR
 	return next
 }
 
-// replacementDescription names one slot in words.
+// replacementDescription 用文字描述单个替换槽位。
 func replacementDescription(slot modelDeploymentReplacementSlot) string {
 	return fmt.Sprintf("role %s replica %d", slot.Role, slot.Ordinal)
 }
 
-// replacementCapturesMember reports whether a Pod is one the slot captured.
+// replacementCapturesMember 判断 Pod 是否属于该槽位已捕获的成员。
 func replacementCapturesMember(slot modelDeploymentReplacementSlot, uid types.UID) bool {
 	return slices.Contains(slot.MemberUIDs, uid)
 }
 
-// replacementCapturesWorkload reports whether a Workload is the one the slot captured. A Workload
-// the slot never saw carries no authority, whatever its name reads.
+// replacementCapturesWorkload 判断 Workload 是否为该槽位捕获的 Workload。槽位从未见过的 Workload 不具有操作权限，无论其名称如何。
 func replacementCapturesWorkload(slot modelDeploymentReplacementSlot, wl *kueue.Workload) bool {
 	return slot.WorkloadUID != "" && slot.WorkloadUID == wl.UID
 }
 
-// loadReplacementSlots reads the current record from the API server rather than the cache, so
-// another role's slot written by a concurrent pass survives this pass's write.
+// loadReplacementSlots 直接从 API server 而非缓存中读取当前记录，从而确保并发轮次为其他 role 写入的槽位不会在本轮写入时丢失。
 func (r *ModelDeploymentReconciler) loadReplacementSlots(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (*workercore.ModelDeployment, modelDeploymentReplacementSlots, error) {
@@ -163,8 +152,7 @@ func (r *ModelDeploymentReconciler) loadReplacementSlots(
 		return nil, nil, fmt.Errorf("read the deployment's replacement slots: %w", err)
 	}
 
-	// The record names a role of this deployment, so a delete and recreate between the read and
-	// the write would leave it describing replicas of an object that no longer exists.
+	// 该记录引用的是当前 deployment 的 role，若在读取与写入之间发生删除并重建，就会导致它描述一个已不存在对象的副本。
 	if current.UID != md.UID {
 		return nil, nil, fmt.Errorf(
 			"the deployment was replaced while this pass ran: read UID %s, expected %s",
@@ -175,13 +163,9 @@ func (r *ModelDeploymentReconciler) loadReplacementSlots(
 	return current, modelDeploymentReplacementSlotsOf(current), nil
 }
 
-// writeReplacementSlots persists the slots, or writes nothing when they already say what this
-// pass reached.
+// writeReplacementSlots 持久化槽位记录；如果现有记录已与本轮结果一致，则不执行写入。
 //
-// The base is the server's own record and the patch carries the resourceVersion it was read at,
-// so two passes writing different roles cannot overwrite one another and a record that moved
-// underneath is a Conflict rather than a silent loss. The caller's object carries the new record
-// and version forward, so a second write in the same pass is checked against the server.
+// 补丁基于服务端自身的记录构建，并携带读取时的 resourceVersion，这样写入不同 role 的两个轮次不会互相覆盖，若底层记录已被修改则会返回 Conflict 而非静默丢失。调用方持有的对象会向前传递新记录和版本号，以便同一轮次中的第二次写入同样接受服务端校验。
 func (r *ModelDeploymentReconciler) writeReplacementSlots(
 	ctx context.Context, current *workercore.ModelDeployment,
 	slots modelDeploymentReplacementSlots, carried *workercore.ModelDeployment,
@@ -197,8 +181,7 @@ func (r *ModelDeploymentReconciler) writeReplacementSlots(
 		candidate.Annotations = map[string]string{}
 	}
 	if len(slots) == 0 {
-		// The key is removed rather than emptied: a merge patch that merely omits it leaves
-		// whatever was there, and a finished record must not survive naming a replacement.
+		// 此处移除该键而非将其置空：仅省略该键的 merge patch 会保留原有内容，而已经完成的记录绝不能继续保留从而错误标识某次替换。
 		delete(candidate.Annotations, modelDeploymentReplacementSlotsAnnotation)
 	} else {
 		raw, err := json.Marshal(slots)
@@ -231,9 +214,7 @@ func (r *ModelDeploymentReconciler) writeReplacementSlots(
 	return nil
 }
 
-// beginReplacementSlot records a role's replacement before anything is deleted. The captured
-// identities are the only record of what the departing replica was; once its members are gone an
-// empty ordinal names no replica to recover.
+// beginReplacementSlot 在删除任何对象之前先记录该 role 的替换槽位。捕获到的标识是记录即将退出副本的唯一依据；一旦其成员消失，空的 ordinal 便无法指明需要恢复的旧副本。
 func (r *ModelDeploymentReconciler) beginReplacementSlot(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 ) error {
@@ -248,7 +229,7 @@ func (r *ModelDeploymentReconciler) beginReplacementSlot(
 	return r.writeReplacementSlots(ctx, current, observed.setSlot(slot), md)
 }
 
-// advanceReplacementSlot persists a change to a slot this pass did not create.
+// advanceReplacementSlot 持久化对非本轮创建的槽位所做的状态推进修改。
 func (r *ModelDeploymentReconciler) advanceReplacementSlot(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 ) error {
@@ -260,7 +241,7 @@ func (r *ModelDeploymentReconciler) advanceReplacementSlot(
 	return r.writeReplacementSlots(ctx, current, observed.setSlot(slot), md)
 }
 
-// endReplacementSlot removes a slot that has finished.
+// endReplacementSlot 移除已完成的替换槽位。
 func (r *ModelDeploymentReconciler) endReplacementSlot(
 	ctx context.Context, md *workercore.ModelDeployment, role string,
 ) error {
@@ -275,8 +256,7 @@ func (r *ModelDeploymentReconciler) endReplacementSlot(
 	return r.writeReplacementSlots(ctx, current, observed.clearRole(role), md)
 }
 
-// replacementCapturedIdentities builds the slot a selection pass writes: the members it is about
-// to delete and the Workload that owns them, captured from the objects as they are now.
+// replacementCapturedIdentities 构建选择轮次所要写入的槽位：按当前对象状态捕获即将删除的成员及其所属的 Workload。
 func replacementCapturedIdentities(
 	view modelDeploymentReplicaView, workloads []kueue.Workload,
 ) modelDeploymentReplacementSlot {
@@ -299,7 +279,7 @@ func replacementCapturedIdentities(
 	return slot
 }
 
-// workloadPointers views a listed Workload list as the pointers the ownership helpers take.
+// workloadPointers 将列出的 Workload 切片转换为所有权辅助函数所需的指针切片。
 func workloadPointers(workloads []kueue.Workload) []*kueue.Workload {
 	pointers := make([]*kueue.Workload, 0, len(workloads))
 	for i := range workloads {
@@ -309,8 +289,7 @@ func workloadPointers(workloads []kueue.Workload) []*kueue.Workload {
 	return pointers
 }
 
-// replicaOwningWorkload returns the Workload claiming any of a replica's members. A Workload that
-// merely carries the group's name is not this replica's.
+// replicaOwningWorkload 返回声明拥有某副本任意成员的 Workload。仅名称与组名相同的 Workload 并不属于该副本。
 func replicaOwningWorkload(members []*core.Pod, workloads []*kueue.Workload) *kueue.Workload {
 	pods := make([]core.Pod, 0, len(members))
 	for _, member := range members {
@@ -327,8 +306,7 @@ func replicaOwningWorkload(members []*core.Pod, workloads []*kueue.Workload) *ku
 	return nil
 }
 
-// replacementMemberDeletes returns the captured members still standing. The caller deletes each
-// under its captured UID, so a Pod that took the name after the capture is not removed.
+// replacementMemberDeletes 返回槽位中捕获的、当前仍然存在的成员。调用方按捕获到的 UID 逐一删除，因此捕获后才占用该名称的 Pod 不会被误删。
 func replacementMemberDeletes(
 	slot modelDeploymentReplacementSlot, members []*core.Pod,
 ) []*core.Pod {
@@ -343,10 +321,7 @@ func replacementMemberDeletes(
 	return deletes
 }
 
-// replacementWorkloadDeletes returns the Workloads the slot may delete: the one it captured, and a
-// Workload that names one of the members it captured as an owner. The second covers a slot written
-// before the informer delivered the departing group's Workload, which carries no WorkloadUID but is
-// still provably that group's. A matching name, or an ownerless shape, is not authority.
+// replacementWorkloadDeletes 返回槽位允许删除的 Workload：包括槽位直接捕获的 Workload，以及将槽位捕获的某个成员列为 owner 的 Workload。后一种情况用于处理 informer 尚未同步退出组 Workload 时就已写入的槽位，这类槽位虽然未记录 WorkloadUID，但仍可确证其属于该成员组。仅凭名称匹配或无 owner 的形态均不构成删除授权。
 func replacementWorkloadDeletes(
 	slot modelDeploymentReplacementSlot, workloads []*kueue.Workload,
 ) []*kueue.Workload {
@@ -362,8 +337,7 @@ func replacementWorkloadDeletes(
 	return deletes
 }
 
-// workloadOwnsGroupName reports whether a Workload stands on a group's derived name. It locates
-// an object; it never authorizes deleting or adopting one.
+// workloadOwnsGroupName 判断 Workload 是否使用了某个成员组的派生名称。该函数仅用于定位对象，绝不用于授权删除或接管对象。
 func workloadOwnsGroupName(wl *kueue.Workload, group string) bool {
 	if wl.Name == group {
 		return true
@@ -377,8 +351,8 @@ func workloadOwnsGroupName(wl *kueue.Workload, group string) bool {
 	return false
 }
 
-// replacementOccupancyOnServer lists the API server's members of a role at one ordinal,
-// terminating ones included: a departing member still on the server holds the slot.
+// replacementOccupancyOnServer 列出 API server 上某一角色在指定 ordinal 处的成员，
+// 包括正在终止的成员：仍在服务端存在的离场成员仍占用该 slot。
 func (r *ModelDeploymentReconciler) replacementOccupancyOnServer(
 	ctx context.Context, md *workercore.ModelDeployment, role string, ordinal int,
 ) ([]core.Pod, error) {
@@ -407,26 +381,26 @@ func (r *ModelDeploymentReconciler) replacementOccupancyOnServer(
 	return held, nil
 }
 
-// modelDeploymentPartialGroupMembers reports which members a replacement slot's group is still
-// missing, and whether filling them is this operator's to do.
+// modelDeploymentPartialGroupMembers 报告替换 slot 的成员组还缺少哪些成员，
+// 以及是否应由本 operator 补全它们。
 //
-// A PARTIAL CREATE LEAVES THE REPLICA'S GROUP SHORT OF ITS TOTAL, and Kueue composes no Workload for
-// an incomplete group, so a slot waiting on one waits forever. Filling it is safe only under three
-// conditions, and each of them is checked rather than assumed:
+// 部分创建会使副本组少于其应有总数，而 Kueue 不会为不完整的组组合 Workload，
+// 因此等待它的 slot 会无限期等待。仅在满足以下三个条件时补全才是安全的，且每个条件
+// 都必须经过显式检查而非假设成立：
 //
-//   - the group is declared at the size this pass renders it, so the member to add agrees with the
-//     members already there about what the group is;
-//   - every member standing carries this pass's own render, so the group is the configuration the
-//     spec states now rather than a survivor of an earlier one;
-//   - the group holds no Workload, so nothing has been composed against it and nothing admitted is
-//     being extended.
+//   - 该组声明的规模与本轮渲染的规模一致，因此待添加的成员与组内已有成员
+//     对该组的定义保持一致；
+//   - 当前存在的每个成员都带有本轮自身的渲染结果，因此该组体现的是当前 spec
+//     所声明的配置，而非早期配置的残留；
+//   - 该组未持有任何 Workload，因此尚未针对它组合任何对象，也不会延长
+//     任何已准入的作业。
 //
-// A group failing any of them is not filled here. A replica that lost a member under an earlier
-// render waits behind the slot and is replaced whole, because adding a member from the current spec
-// beside one from the previous spec is a group whose members disagree about what they are.
+// 不满足上述任一条件的组不会在此处补全。在早期渲染下丢失成员的副本会在 slot 后
+// 等待并被整体替换，因为将当前 spec 的成员与上一版 spec 的成员放在同一组中，
+// 会导致组内成员对自身身份产生分歧。
 //
-// The occupancy and the Workloads are read on the API server, because the state this question lives
-// in is exactly the window the cache lags in: the members were created moments ago.
+// 成员占用情况和 Workload 均直接从 API server 读取，因为该判断所处的正是
+// 缓存滞后的时间窗口：成员刚刚在不久前被创建。
 func (r *ModelDeploymentReconciler) modelDeploymentPartialGroupMembers(
 	ctx context.Context, md *workercore.ModelDeployment,
 	slot modelDeploymentReplacementSlot, want []*core.Pod,
@@ -443,15 +417,14 @@ func (r *ModelDeploymentReconciler) modelDeploymentPartialGroupMembers(
 		}
 	}
 
-	// Nothing standing is not a partial create: an empty ordinal is the create gate's own case, and
-	// it waits for the vacancy to be proved before anything is built there.
+	// 没有任何成员存在不属于部分创建：空 ordinal 属于创建门控自身处理的情况，
+	// 它会先等待空位得到证实，再在该位置创建任何对象。
 	if len(standing) == 0 || len(standing) >= len(want) {
 		return nil, false, nil
 	}
 
-	// Every member standing must be seated on a seat this render has, and must carry this render's
-	// own fingerprint and render version for it. The group being short is expected here; the group
-	// being made of something else is not.
+	// 每个已存在的成员都必须落在当前渲染所包含的位置上，并且必须带有当前渲染
+	// 自身的指纹与渲染版本。此处允许组内成员尚不完整，但不允许成员来自其他渲染版本。
 	seated := make(map[int]*core.Pod, len(standing))
 	for _, member := range standing {
 		seat := modelDeploymentPodMemberIndex(member)
@@ -495,11 +468,11 @@ func (r *ModelDeploymentReconciler) modelDeploymentPartialGroupMembers(
 	return missing, len(missing) > 0, nil
 }
 
-// modelDeploymentLiveRoleSelectors reads the selector each role's Service is published with, so a
-// deployment whose eligibility was enabled keeps routing by it on the passes that did not decide it.
+// modelDeploymentLiveRoleSelectors 读取每个角色的 Service 当前发布时使用的选择器，
+// 以便已启用准入资格判断的部署在未重新决策的轮次中仍按该选择器路由。
 //
-// The read is uncached. A selector published by the previous pass is the fact being asked about, and
-// the informer lags the writer on exactly the pass that published it.
+// 此读取绕过缓存。上一轮发布的选择器正是当前要查询的事实，而在发布它的那一轮中，
+// informer 正好滞后于写入方。
 func (r *ModelDeploymentReconciler) modelDeploymentLiveRoleSelectors(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (map[string]map[string]string, error) {
@@ -526,11 +499,11 @@ func (r *ModelDeploymentReconciler) modelDeploymentLiveRoleSelectors(
 	return selectors, nil
 }
 
-// replacementVacant reports whether the slot's ordinal is provably free on the server.
+// replacementVacant 报告该 slot 的 ordinal 在服务端是否已可证实为空闲。
 //
-// The reads are uncached because the informer lags the writer in exactly this window: a departing
-// member the cache still lists, a create whose response was lost, an old Workload already gone.
-// A lost response is not absence.
+// 此读取绕过缓存，因为 informer 恰好在此时间窗口内滞后于写入方：缓存中仍列出的
+// 离场成员、响应丢失的创建请求、以及实际上已消失的旧 Workload。
+// 丢失响应并不代表对象不存在。
 func (r *ModelDeploymentReconciler) replacementVacant(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 ) (vacant bool, why string, err error) {
@@ -548,9 +521,9 @@ func (r *ModelDeploymentReconciler) replacementVacant(
 		return false, fmt.Sprintf("the server still holds %s", strings.Join(names, ", ")), nil
 	}
 
-	// An occupied name holds the slot even by a Workload this operator cannot prove it composed.
-	// Such a Workload is never deleted and never adopted, but a replacement composed beside it
-	// would collide, so the wait stands until it goes.
+	// 即使是一个本 operator 无法证明由自己组合的 Workload，只要其名称处于占用状态，
+	// 也会占用该 slot。这类 Workload 绝不会被删除或收编，但在其旁侧创建替换组
+	// 会发生名称冲突，因此必须持续等待直至其离开。
 	blocking, err := r.replacementGroupWorkload(ctx, md, slot)
 	if err != nil {
 		return false, "", err
@@ -566,8 +539,8 @@ func (r *ModelDeploymentReconciler) replacementVacant(
 	return true, "", nil
 }
 
-// replacementGroupWorkload returns the Workload still standing on a slot's derived group name,
-// and nil when the group holds none.
+// replacementGroupWorkload 返回仍停留在 slot 派生组名上的 Workload，
+// 若该组未持有任何 Workload 则返回 nil。
 func (r *ModelDeploymentReconciler) replacementGroupWorkload(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 ) (*kueue.Workload, error) {
@@ -585,10 +558,9 @@ func (r *ModelDeploymentReconciler) replacementGroupWorkload(
 	return nil, nil
 }
 
-// replacementAdmitted reports whether the slot's ordinal now holds a complete current group whose
-// Workload is admitted. Quota reservation is not admission: a reserved group is a request Kueue
-// agreed to consider, and releasing the role on it would release it while the replacement holds
-// nothing.
+// replacementAdmitted 报告该 slot 的 ordinal 当前是否已持有一个完整且对应的当前组，
+// 且其 Workload 已被准入。配额预留不等于准入：被预留的组仅表示 Kueue 同意考虑该请求，
+// 若基于预留就释放角色，会在替换组尚未持有任何资源时就将其释放。
 func (r *ModelDeploymentReconciler) replacementAdmitted(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 	want []*core.Pod,
@@ -625,13 +597,12 @@ func (r *ModelDeploymentReconciler) replacementAdmitted(
 	return true, "", nil
 }
 
-// replacementAdmissionHolds reports whether an admitted Workload is fresh admission for the group
-// its current members make, and why it is not when it is not.
+// replacementAdmissionHolds 报告一个已准入的 Workload 是否是对当前成员所组成之组的
+// 全新准入，若不是则说明原因。
 //
-// Ownership alone is not enough: a recreated Pod takes the same name and the same group, so a
-// Workload composed for the departing replica can own the members that replaced it. An admission is
-// fresh when its scheduling inputs describe the group standing now -- same members, count,
-// template, reservation and queue.
+// 仅靠属主关系是不够的：重建的 Pod 会使用相同的名称和相同的组，因此为离场副本
+// 组合的 Workload 也可能拥有替换它的成员。仅当调度输入描述的就是当前存在的
+// 组时（相同的成员、数量、模板、资源预留与队列），该准入才算全新准入。
 func replacementAdmissionHolds(wl *kueue.Workload, standing, want []*core.Pod) string {
 	if !kubeapistatus.ConditionType(kueue.WorkloadAdmitted).IsTrue(wl) {
 		return fmt.Sprintf("workload %s is not admitted yet", wl.Name)
@@ -654,8 +625,7 @@ func replacementAdmissionHolds(wl *kueue.Workload, standing, want []*core.Pod) s
 		return reason
 	}
 
-	// The queue is compared unconditionally: a Workload naming none has not proved it submitted
-	// where its members were sent.
+	// 无条件比较队列名称：未指定队列的 Workload 无法证明其提交目标与成员所发往的队列一致。
 	if queue := replacementQueueName(want); queue != "" && string(wl.Spec.QueueName) != queue {
 		return fmt.Sprintf("workload %s is queued on %q rather than %q", wl.Name, wl.Spec.QueueName, queue)
 	}
@@ -663,15 +633,15 @@ func replacementAdmissionHolds(wl *kueue.Workload, standing, want []*core.Pod) s
 	return ""
 }
 
-// replacementCompositionHolds compares a Workload's scheduling inputs against the composition its
-// own current members produce, and names the first difference.
+// replacementCompositionHolds 将 Workload 的调度输入与其当前自身成员产生的组合
+// 进行比较，并指出第一处差异。
 //
-// The composition is rebuilt from the members standing now rather than copied from the Workload:
-// grouped by role hash as Kueue groups them, each count read from the members carrying it.
+// 该组合基于当前存在的成员重新构建，而非直接从 Workload 复制：按照 Kueue
+// 的分组方式按 role hash 分组，每组的数量均从携带该 hash 的成员中读取。
 func replacementCompositionHolds(wl *kueue.Workload, members []*core.Pod) string {
 	pinned := replacementPinnedPodSets(members)
-	// Members sharing a role hash compose one podset carrying that count, so the number of
-	// podsets is the number of distinct hashes among them, not the number of members.
+	// 共享同一 role hash 的成员会组合成一个携带该数量的 PodSet，因此 PodSet 的数量
+	// 等于其中不同 hash 的数量，而非成员的数量。
 	if len(wl.Spec.PodSets) != len(pinned) {
 		return fmt.Sprintf("workload %s describes %d podsets for members composing %d",
 			wl.Name, len(wl.Spec.PodSets), len(pinned))
@@ -706,19 +676,19 @@ func replacementCompositionHolds(wl *kueue.Workload, members []*core.Pod) string
 	return ""
 }
 
-// replacementTemplateMatches reports whether a Workload's PodSet describes one of a group's members.
+// replacementTemplateMatches 报告 Workload 的 PodSet 是否描述了组内的某一个成员。
 //
-// Any member matches, not only the one Kueue listed first: its List carries no order and rank-specific
-// members share a role hash, so a template composed from m1 is correct even when the reader sees m0
-// first.
+// 只要匹配任意一个成员即可，而不限于 Kueue 排在首位的成员：其 List 本身无序，
+// 且带 rank 的成员共享同一个 role hash，因此即使读取方先看到 m0，基于 m1
+// 组合的模板也是正确的。
 func replacementTemplateMatches(
 	wl *kueue.Workload, got kueue.PodSet, members []*core.Pod,
 ) string {
 	for _, member := range members {
 		template := core.PodTemplateSpec{Spec: *member.Spec.DeepCopy()}
 		if replacementPodShapesMatch(got.Template.Spec, template.Spec) {
-			// Kueue states no separate request on a PodSet: what it reserves on is the request it
-			// derives from the template's containers.
+			// Kueue 不会在 PodSet 上单独声明请求量：它用于预留配额的请求量是从模板的
+			// 容器中推导出来的。
 			if resourceQuantityListEqual(
 				replacementPodRequests(&core.Pod{Spec: got.Template.Spec}),
 				replacementPodRequests(&core.Pod{Spec: template.Spec}),
@@ -735,8 +705,8 @@ func replacementTemplateMatches(
 		wl.Name, got.Name)
 }
 
-// replacementPinnedPodSets rebuilds the PodSets a set of members composes to, following Kueue's
-// own rule: grouped by the role hash read verbatim, each count taken from the members carrying it.
+// replacementPinnedPodSets 遵循 Kueue 自身的规则，根据一组给定的成员重建它们
+// 应组合出的 PodSet：按原样读取的 role hash 分组，每组数量取自携带该 hash 的成员数。
 func replacementPinnedPodSets(members []*core.Pod) []kueue.PodSet {
 	order := make([]kueue.PodSetReference, 0, len(members))
 	grouped := make(map[kueue.PodSetReference][]*core.Pod, len(members))
@@ -760,12 +730,12 @@ func replacementPinnedPodSets(members []*core.Pod) []kueue.PodSet {
 	return pinned
 }
 
-// replacementPodSetFor is the PodSet one role hash composes to: the count of the members carrying
-// it, and the template of whichever of them Kueue listed first.
+// replacementPodSetFor 表示单个 role hash 组合出的 PodSet：数量为携带该 hash 的
+// 成员数，模板取自 Kueue 排在首位的成员。
 //
-// Which member that is does not matter, and the pinned set keeps all of them because Kueue's List
-// carries no order: rank-specific members share one role hash by design, and a template taken from
-// whichever member happened to come first would read a valid placement as a stale one.
+// 具体是哪一个成员并不重要，且固定集合会保留所有成员，因为 Kueue 的 List
+// 并不保证顺序：按设计带 rank 的成员共享同一 role hash，若只取恰好排在首位
+// 的成员模板，可能会将有效的调度放置误判为过期配置。
 func replacementPodSetFor(hash kueue.PodSetReference, members []*core.Pod) kueue.PodSet {
 	return kueue.PodSet{
 		Name:     hash,
@@ -774,8 +744,8 @@ func replacementPodSetFor(hash kueue.PodSetReference, members []*core.Pod) kueue
 	}
 }
 
-// replacementRoleHash is the group name Kueue gives a PodSet: the annotation this operator writes,
-// read verbatim when present, and otherwise the digest Kueue derives from the Pod's shape.
+// replacementRoleHash 是 Kueue 赋予 PodSet 的组名：当本 operator 写入的注解存在时
+// 原样读取，否则使用 Kueue 根据 Pod 结构推导出的摘要值。
 func replacementRoleHash(pod *core.Pod) (kueue.PodSetReference, error) {
 	if hash, present := pod.Annotations[kueuepodconst.RoleHashAnnotation]; present && hash != "" {
 		return kueue.NewPodSetReference(hash), nil
@@ -789,18 +759,18 @@ func replacementRoleHash(pod *core.Pod) (kueue.PodSetReference, error) {
 	return kueue.NewPodSetReference(hash), nil
 }
 
-// replacementPodRequests is what a member contributes to its PodSet's reservation.
+// replacementPodRequests 计算单个成员对其所属 PodSet 资源预留的贡献。
 //
-// IT IS KUBERNETES' OWN HELPER rather than a rule written here, because the rule is not this
-// operator's to state: requests win over limits, several containers sum, and init containers carry
-// the pod maximum. A hand-rolled aggregation agreeing with it on one shape is not agreement, and
-// the reservation being compared is the one Kueue will charge.
+// 此处直接调用 Kubernetes 自身的辅助函数，而非在此处自定规则，因为该规则不应由
+// 本 operator 定义：requests 优先于 limits、多个普通容器累加、init 容器取最大值。
+// 手写聚合逻辑即便在某一结构上与其一致，也不代表在所有场景下等价，而此处需要
+// 比对的正是 Kueue 实际扣减的预留量。
 func replacementPodRequests(pod *core.Pod) core.ResourceList {
 	return resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
 }
 
-// replacementPodShapesMatch compares the Pod specs Kueue reserved quota against, ignoring what
-// admission is expected to have changed between the two.
+// replacementPodShapesMatch 比较 Kueue 据以预留配额的 Pod spec，
+// 并忽略预期在准入过程中会发生变化的部分。
 func replacementPodShapesMatch(got, want core.PodSpec) bool {
 	actual, member := replacementComparablePod(got), replacementComparablePod(want)
 	actual.Affinity = replacementWorkloadAffinity(actual.Affinity, member.Affinity)
@@ -808,9 +778,9 @@ func replacementPodShapesMatch(got, want core.PodSpec) bool {
 	return kubemeta.DeepEqual(actual, member)
 }
 
-// replacementWorkloadAffinity removes only Workload webhook pins absent from the member.
-// Fit and model-manager pins constrain Kueue placement but are not copied to the Pod.
-// Required terms and all other affinity must still describe the member's placement.
+// replacementWorkloadAffinity 仅移除成员中不存在的 Workload webhook 固定约束。
+// 适配与 model-manager 的固定约束用于限制 Kueue 放置，但不会被复制到 Pod 上。
+// 其余必要条件和所有其他亲和性仍须与成员的放置约束一致。
 func replacementWorkloadAffinity(got, want *core.Affinity) *core.Affinity {
 	if got == nil || got.NodeAffinity == nil || got.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
 		return got
@@ -852,14 +822,14 @@ func replacementWorkloadAffinity(got, want *core.Affinity) *core.Affinity {
 	return got
 }
 
-// replacementComparablePod reduces a Pod spec to what the operator rendered, which is what Kueue
-// reserved on.
+// replacementComparablePod 将 Pod spec 精简为 operator 所渲染的形态，这正是
+// Kueue 据以预留配额的基准。
 //
-// The PodSet holds the pre-admission template, so the live Pod carries the placement the cluster made
-// after Kueue read it: a node selector and tolerations the admission chain added, a scheduling gate
-// it consumed, and the node the scheduler bound. Those are one configuration seen before and after,
-// so they are compared out. Everything the operator renders is still compared, so a template
-// describing a different configuration is still refused.
+// PodSet 保存的是准入前的模板，而运行中的 Pod 则带有集群在 Kueue 读取之后
+// 施加的放置结果：准入链添加的 node selector 与 toleration、被消费的
+// scheduling gate，以及调度器绑定的节点。这些只是同一配置在准入前后的不同体现，
+// 因此在比较中予以剔除。其余由 operator 渲染的内容仍会参与比较，以确保描述
+// 不同配置的模板仍会被拒绝。
 func replacementComparablePod(spec core.PodSpec) core.PodSpec {
 	reduced := *spec.DeepCopy()
 	reduced.Volumes = nil
@@ -877,14 +847,14 @@ func replacementComparablePod(spec core.PodSpec) core.PodSpec {
 		reduced.Containers[i].TerminationMessagePath = ""
 		reduced.Containers[i].TerminationMessagePolicy = ""
 		reduced.Containers[i].ImagePullPolicy = ""
-		// Resources are compared on their own, since that is what Kueue reserves on.
+		// 资源单独进行比较，因为这正是 Kueue 据以预留配额的依据。
 		reduced.Containers[i].Resources = core.ResourceRequirements{}
 	}
 
 	return reduced
 }
 
-// resourceQuantityListEqual compares two resource lists by value rather than by representation.
+// resourceQuantityListEqual 按数值而非表示形式比较两个资源列表是否相等。
 func resourceQuantityListEqual(got, want core.ResourceList) bool {
 	if len(got) != len(want) {
 		return false
@@ -902,8 +872,8 @@ func resourceQuantityListEqual(got, want core.ResourceList) bool {
 	return true
 }
 
-// replacementMembersMatch reports whether a standing group matches the desired spec and render
-// version requirements, and names the first difference.
+// replacementMembersMatch 报告当前存在的组是否符合期望的 spec 与渲染版本要求，
+// 并指出第一处差异。
 func replacementMembersMatch(want, standing []*core.Pod, minRenderVersion int) string {
 	if len(standing) != len(want) {
 		return fmt.Sprintf("the replica holds %d of the %d members it is rendered at",
@@ -936,8 +906,8 @@ func replacementMembersMatch(want, standing []*core.Pod, minRenderVersion int) s
 	return ""
 }
 
-// replacementQueueName is the LocalQueue a rendered replica submits to, read off the render so
-// this check and the label Kueue admits the group by cannot disagree.
+// replacementQueueName 是渲染后的副本所提交到的 LocalQueue，直接从渲染结果中读取，
+// 从而确保此检查与 Kueue 准入该组所依据的标签不会不一致。
 func replacementQueueName(want []*core.Pod) string {
 	for _, rendered := range want {
 		if entrance := rendered.Labels[kueuectrlconst.QueueLabel]; entrance != "" {
@@ -948,7 +918,7 @@ func replacementQueueName(want []*core.Pod) string {
 	return ""
 }
 
-// replacementRenderHashes are the fingerprints a render produced for one replica, in member order.
+// replacementRenderHashes 是某次渲染为单个副本生成的一组指纹，按成员顺序排列。
 func replacementRenderHashes(want []*core.Pod) []string {
 	hashes := make([]string, 0, len(want))
 	for _, rendered := range want {
@@ -958,15 +928,14 @@ func replacementRenderHashes(want []*core.Pod) []string {
 	return hashes
 }
 
-// replacementSuperseded reports whether the slot's replacement was rendered from a configuration
-// the spec has since replaced.
+// replacementSuperseded 报告该 slot 中的替换副本是否基于随后已被 spec 替换掉的
+// 配置渲染而成。
 //
-// The comparison is on rendered fingerprints, not on the generation: a replica-count edit moves
-// the generation without moving any member's render, and treating that as a configuration change
-// would tear down a healthy replacement and rebuild it identically.
+// 此处比较的是渲染指纹而非 generation：仅修改副本数会推进 generation，但不会改变
+// 任何成员的渲染结果；若将其视为配置变更，会导致健康的替换副本被拆除并按相同配置重建。
 func replacementSuperseded(slot modelDeploymentReplacementSlot, want []*core.Pod) bool {
 	if len(slot.MemberHashes) == 0 {
-		// The slot has not recorded its target render yet, so nothing is known to be obsolete.
+		// 该 slot 尚未记录目标渲染结果，因此尚不能判定为已过时。
 		return false
 	}
 	if len(slot.MemberHashes) != len(want) {
@@ -976,24 +945,23 @@ func replacementSuperseded(slot modelDeploymentReplacementSlot, want []*core.Pod
 	return !slices.Equal(slot.MemberHashes, replacementRenderHashes(want))
 }
 
-// modelDeploymentReplacementProgress is what one pass did about a role's active slot.
+// modelDeploymentReplacementProgress 表示单次调谐对某个角色当前活跃 slot 所做的推进。
 type modelDeploymentReplacementProgress struct {
-	// slot is the record to carry into the rest of the pass.
+	// slot 是需要延续到本轮调谐其余阶段的记录。
 	slot modelDeploymentReplacementSlot
 
-	// cleared is that the replacement holds an admission and the role no longer holds a slot.
+	// cleared 表示替换副本已获得准入，且该角色不再持有该 slot。
 	cleared bool
 
-	// requeue is that nothing else will wake this deployment before the slot can move.
+	// requeue 表示在该 slot 能够继续推进之前，没有其他事件会唤醒此部署。
 	requeue bool
 }
 
-// resolveReplacementSlot advances one role's active slot by one step.
+// resolveReplacementSlot 将某个角色的活跃 slot 向前推进一个步骤。
 //
-// The order of the questions is the lifecycle: an ordinal the spec no longer declares is finished
-// by cleanup alone; then the captured members are removed; then vacancy is proved on the server,
-// because a lost delete response is not absence; then a superseded replacement is rebuilt in this
-// same slot; then an admitted replacement releases the role.
+// 检查问题的顺序即为其生命周期：spec 中不再声明的 ordinal 仅通过清理即可结束；
+// 接着移除已捕获的成员；随后在服务端证实空位，因为丢失删除响应不等于对象已消失；
+// 再接着在同一个 slot 内重建已过时的替换副本；最后在替换副本获准入后释放该角色。
 func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 	role *workercore.ModelDeploymentRole, want []*core.Pod,
@@ -1002,9 +970,9 @@ func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 	progress := modelDeploymentReplacementProgress{slot: slot}
 	minRenderVersion := modelDeploymentEffectiveMinRenderVersion(md)
 
-	// A REPLICA COUNT THAT NO LONGER DECLARES THIS ORDINAL CANCELS THE SLOT, and the cancellation
-	// runs through the same cleanup: the members and the Workload the slot captured still have to
-	// leave before the record can be dropped, or the finalizer and the reservation outlive it.
+	// 当副本数不再声明此 ordinal 时会取消该 slot，且取消流程同样要走完清理步骤：
+	// 该 slot 捕获的成员与 Workload 仍须先离开，才能清除该记录，否则 finalizer
+	// 与资源预留会在记录消失后继续残留。
 	if slot.Ordinal >= int(role.Replicas) {
 		members, err := r.replacementOccupancyOnServer(ctx, md, slot.Role, slot.Ordinal)
 		if err != nil {
@@ -1029,15 +997,15 @@ func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 		return progress, nil
 	}
 
-	// Whatever the slot captured is removed first, on its own authority. Members that arrived
-	// afterwards belong to a replacement this slot is waiting on and are left standing.
+	// 首先依据自身权限移除 slot 所捕获的对象。此后才新到达的成员属于当前 slot
+	// 正在等待的替换副本，应保留不动。
 	captured, err := r.replacementOccupancyOnServer(ctx, md, slot.Role, slot.Ordinal)
 	if err != nil {
 		return progress, err
 	}
-	// A CAPTURED MEMBER ALREADY ON ITS WAY OUT IS LEFT TO ITS FINALIZER. Re-issuing the delete
-	// would say nothing and would keep this pass reporting that it issued a cleanup it had not,
-	// which is the one state the vacancy question below is asked from.
+	// 已经在退出过程中的被捕获成员交由其 finalizer 处理。重新发起删除没有任何意义，
+	// 还会导致本轮调谐持续报告自己发起了实际未执行的清理，而下文关于空位的判断
+	// 正是基于该状态进行的。
 	mine := replacementStandingMemberDeletes(slot, replacementPodPointers(captured))
 	if slot.Phase == modelDeploymentReplacementCleanup {
 		if err = r.cleanReplacementSlot(ctx, md, slot, mine); err != nil {
@@ -1074,7 +1042,7 @@ func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 		for _, uid := range slot.CurrentMemberUIDs {
 			broken = broken || !present.Has(uid)
 		}
-		// A composed group cannot be filled beside its existing reservation.
+		// 不能在已组合的组现有的资源预留旁再填充成员。
 		ownsCurrent := wl != nil && (wl.UID == slot.CurrentWorkloadUID ||
 			modelDeploymentWorkloadOwnsAny(wl, present.Union(sets.New(slot.CurrentMemberUIDs...))))
 		if ownsCurrent && len(standing) < len(want) {
@@ -1099,7 +1067,7 @@ func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 			progress.requeue = true
 			return progress, nil
 		}
-		// Persist identities before admission or cleanup can remove their observable evidence.
+		// 在准入或清理抹除可观测证据之前，先持久化成员与 Workload 的身份标识。
 		slot.CurrentMemberUIDs = sets.List(present)
 		if ownsCurrent {
 			slot.CurrentWorkloadUID = wl.UID
@@ -1110,26 +1078,24 @@ func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 		progress.slot = slot
 	}
 
-	// The replacement exists once a member the slot did not capture is standing. From there the
-	// slot waits on admission rather than on vacancy, and the two questions are different: vacancy
-	// is about the old group leaving, admission about the new one being granted quota.
+	// 一旦存在未被 slot 捕获的成员，即视为替换副本已存在。此后 slot 将转为等待
+	// 准入而非等待空位，这是两个不同的问题：空位关注的是旧组是否离开，
+	// 而准入关注的是新组是否已获得配额。
 	if len(standing) == 0 {
 		vacant, why, err := r.replacementVacant(ctx, md, slot)
 		if err != nil {
 			return progress, err
 		}
 		if !vacant {
-			// Something still holds the ordinal. That is the ordinary waiting state -- a member
-			// draining behind its finalizer, a Workload not yet gone -- and it ends through the Pod
-			// and Workload events rather than through a timer.
+			// 仍有对象占用着该 ordinal。这是正常的等待状态（例如成员正在其 finalizer 下排空，
+			// 或 Workload 尚未消失），它应通过 Pod 和 Workload 事件来结束，而非依赖定时器。
 			logger.V(3).Info("waiting for the replaced group to leave",
 				"slot", replacementDescription(slot), "because", why)
 
 			return progress, nil
 		}
 
-		// The target render is recorded once the old group has left, which is what a later edit is
-		// compared against.
+		// 一旦旧组离开，便记录目标渲染结果，后续配置修改将以此作为比对基准。
 		if slot.Phase == modelDeploymentReplacementCleanup || len(slot.MemberHashes) == 0 {
 			progress.slot = modelDeploymentReplacementSlot{
 				Role:         slot.Role,
@@ -1160,8 +1126,8 @@ func (r *ModelDeploymentReconciler) resolveReplacementSlot(
 	return progress, nil
 }
 
-// replacementStandingMemberDeletes returns the captured members still standing, skipping those
-// already terminating. A member past its delete is on its way out whatever this pass does.
+// replacementStandingMemberDeletes 返回仍在运行的被捕获成员，跳过已在终止中的成员。
+// 已执行过删除的成员无论本轮是否操作都已处于退出流程中。
 func replacementStandingMemberDeletes(
 	slot modelDeploymentReplacementSlot, members []*core.Pod,
 ) []*core.Pod {
@@ -1175,8 +1141,8 @@ func replacementStandingMemberDeletes(
 	return deletes
 }
 
-// replacementUncapturedMembers returns the members on a slot's ordinal that it did not capture:
-// the replacement, wherever an earlier pass managed to create it.
+// replacementUncapturedMembers 返回位于 slot 所在 ordinal 上、但未被该 slot 捕获的成员：
+// 即此前某轮调谐成功创建出来的替换副本成员。
 func replacementUncapturedMembers(
 	slot modelDeploymentReplacementSlot, live []core.Pod,
 ) []*core.Pod {
@@ -1192,7 +1158,7 @@ func replacementUncapturedMembers(
 	return uncaptured
 }
 
-// replacementPodPointers views a list of Pod values as the pointers the cleanup helpers take.
+// replacementPodPointers 将 Pod 值切片转换为清理辅助函数所需的指针切片。
 func replacementPodPointers(pods []core.Pod) []*core.Pod {
 	pointers := make([]*core.Pod, 0, len(pods))
 	for i := range pods {
@@ -1202,12 +1168,12 @@ func replacementPodPointers(pods []core.Pod) []*core.Pod {
 	return pointers
 }
 
-// cleanReplacementSlot removes what a slot captured: its members under their own UIDs, then the
-// Workload holding them.
+// cleanReplacementSlot 移除 slot 所捕获的对象：先按各自的 UID 移除其成员，
+// 再移除持有这些成员的 Workload。
 //
-// A member and its Workload are deleted only under captured UIDs. The group name locates
-// vacancy blockers and never authorizes cleanup, so a Workload this operator
-// cannot prove it composed is left standing and the vacancy proof waits on it.
+// 成员及其 Workload 仅依据已捕获的 UID 删除。组名仅用于定位阻塞空位的对象，
+// 绝不能作为授权清理的依据，因此无法证明由本 operator 组合的 Workload 会被保留，
+// 进而由空位检查继续等待它离开。
 func (r *ModelDeploymentReconciler) cleanReplacementSlot(
 	ctx context.Context, md *workercore.ModelDeployment, slot modelDeploymentReplacementSlot,
 	members []*core.Pod,
@@ -1220,9 +1186,9 @@ func (r *ModelDeploymentReconciler) cleanReplacementSlot(
 		}
 	}
 
-	// A SLOT WHOSE MEMBERS ARE ALL GONE STILL OWES ITS WORKLOAD A DELETE. That Workload is what
-	// releases Kueue's finalizer on the Pods and gives the reservation back, and reading it as
-	// already done because the members left is what strands a group holding quota forever.
+	// 即使所有成员都已消失，slot 仍须删除其对应的 Workload。正是该 Workload 负责
+	// 释放 Pod 上 Kueue 的 finalizer 并归还配额预留；若因成员已离开而误以为一切完成，
+	// 会导致该组永久占用配额。
 	listed := new(kueue.WorkloadList)
 	if err := r.APIReader.List(ctx, listed, ctrlcli.InNamespace(md.Namespace)); err != nil {
 		return fmt.Errorf("list replaced workloads: %w", err)

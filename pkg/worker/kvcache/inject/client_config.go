@@ -1,36 +1,32 @@
-// This file holds what every engine is told, and the artifact only the vLLM family takes: its config
-// file. "The vLLM family" is two engines with two connector names and two readers closed at
-// different key sets, which is why the values below are described per reader rather than per family.
+// 本文件保存所有引擎通用的注入信息，以及仅 vLLM 系列使用的产物：其配置文件。
+// “vLLM 系列”指两个引擎，它们使用两个连接器名称，以及分别限定于不同键集合的两个读取器，
+// 因此下文按读取器而非按系列说明各项取值。
 //
-// The values below are rendered for a Mooncake client that stores nothing of its own. That is a role
-// rather than a size setting: a client with a local buffer and no global segment can Get and Put and
-// contributes no memory, which is what an inference engine needs. Declaring the other shapes by
-// accident is the failure this file is arranged to prevent, so the keys that declare the role are
-// written together and never one at a time.
+// 下文配置针对自身不存储任何数据的 Mooncake 客户端渲染。这是一种角色设定而非容量设置：
+// 拥有本地缓冲区且无全局段的客户端可执行 Get 和 Put，同时不贡献内存，这正是推理引擎所需的。
+// 本文件的组织方式旨在防止意外声明其他形态，因此声明该角色的键会一并写入，绝不单独写入。
 package inject
 
 import (
 	"gpustack.ai/gpustack/pkg/systemname"
 )
 
-// ClientConfigAnnotationKey carries the rendered client configuration on the Pod that consumes it, for
-// engines that take a file. The file is a downwardAPI projection of this annotation, so the caller
-// creates no ConfigMap, needs no RBAC for one, and leaves nothing to garbage-collect: the
-// configuration's lifetime is exactly the Pod's.
+// ClientConfigAnnotationKey 用于在使用配置文件的引擎对应的 Pod 上承载渲染后的客户端配置。
+// 该文件是此 annotation 的 downwardAPI 投影，因此调用方无需创建 ConfigMap，无需相关 RBAC 权限，
+// 也不会留下需要垃圾回收的资源：配置的生命周期与 Pod 完全一致。
 //
-// It is declared here rather than beside the annotations a caller READS, because this one is an output
-// of rendering. A caller that refuses a user-supplied value for it reads the constant from here.
+// 它声明于此，而非放在调用方读取的 annotation 旁边，因为该键是渲染的输出结果。
+// 拒绝用户传入该值的调用方会从此处读取该常量。
 const ClientConfigAnnotationKey = "kvcache." + systemname.LabelPrefix + "client-config"
 
 const (
-	// ConfigVolumeName and ConfigMountPath are where the rendered file lands. The mount is read-only:
-	// nothing in the container has any reason to write it, and a writable projection would let a
-	// process edit the record of what was injected.
+	// ConfigVolumeName 和 ConfigMountPath 指定渲染文件在容器内的挂载卷名与路径。该挂载为只读：
+	// 容器内没有任何理由写入该文件，而可写投影会让进程篡改已注入配置的记录。
 	ConfigVolumeName = "gpustack-kvcache-config"
 	ConfigMountPath  = "/etc/gpustack/kvcache"
 
-	// ConfigFileName is the file's name inside the mount, and ConfigFilePath the two joined - the
-	// value the engine's own path variable is set to.
+	// ConfigFileName 是挂载目录内的文件名，ConfigFilePath 是两者的拼接结果——
+	// 即引擎自身的路径变量所设置的值。
 	ConfigFileName = "mooncake.json"
 	ConfigFilePath = ConfigMountPath + "/" + ConfigFileName
 )

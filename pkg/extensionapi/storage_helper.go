@@ -87,9 +87,9 @@ func convertCtrlListOptionsFromMeta(ctx context.Context, in *internalversion.Lis
 	return opts
 }
 
-// KeyFuncForNamespacedScope returns a key function for namespaced scoped resource.
-// It will extract namespace from request context and combine it with name to create a NamespacedName object as the key.
-// It will also validate the name and namespace, and return error if validation fails.
+// KeyFuncForNamespacedScope 返回用于命名空间作用域资源的键生成函数。
+// 它会从请求上下文中提取 Namespace 并与名称组合，创建 NamespacedName 对象作为键。
+// 同时会校验名称和 Namespace，如果校验失败则返回 error。
 func KeyFuncForNamespacedScope(ctx context.Context, name string) (types.NamespacedName, error) {
 	ns, ok := request.NamespaceFrom(ctx)
 	if !ok || len(ns) == 0 {
@@ -107,9 +107,9 @@ func KeyFuncForNamespacedScope(ctx context.Context, name string) (types.Namespac
 	return types.NamespacedName{Name: name, Namespace: ns}, nil
 }
 
-// KeyFuncForClusterScope returns a key function for cluster scoped resource.
-// It will create a NamespacedName object with empty namespace and name as the key.
-// It will also validate the name, and return error if validation fails.
+// KeyFuncForClusterScope 返回用于集群作用域资源的键生成函数。
+// 它会使用空的 Namespace 和名称创建 NamespacedName 对象作为键。
+// 同时会校验名称，如果校验失败则返回 error。
 func KeyFuncForClusterScope(ctx context.Context, name string) (types.NamespacedName, error) {
 	if len(name) == 0 {
 		return types.NamespacedName{},

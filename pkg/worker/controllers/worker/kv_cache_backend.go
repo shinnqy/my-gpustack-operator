@@ -28,56 +28,49 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/kvcache/mooncake"
 )
 
-// KVCacheBackendReconciler reconciles a KVCacheBackend.
+// KVCacheBackendReconciler 调谐 KVCacheBackend。
 //
-// It owns the object's lifecycle and, from later tasks on, the workloads that serve it:
+// 它管理该对象的生命周期，并在后续任务中一并管理为其提供服务的工作负载：
 //
-//   - A live object is locked with the repository's own finalizer, so nothing it renders is
-//     orphaned by a delete that races the reconcile.
-//   - On delete the finalizer is held while status.usedBy names a consumer. The refusal is not a
-//     requeue: usedBy is written by the consumer's own controller onto this object's status, and
-//     that write is the event that brings the teardown back. A timer would only re-ask a question
-//     whose answer has not changed.
-//   - Status is written wholesale under a DeepEqual guard, so a settled backend produces no write
-//     and therefore no event of its own.
+//   - 存活对象会附加本仓库专属的 finalizer 加以锁定，防止与调谐并发的删除操作遗留孤儿
+//     资源。
+//   - 删除时若 status.usedBy 仍列有使用方，则保留 finalizer。此处的阻塞无需重新入队：
+//     usedBy 由使用方自身的控制器写入本对象的 status，该写入事件自然会重新触发清理流程。
+//     使用定时器只会反复查询一个答案尚未改变的问题。
+//   - status 在 DeepEqual 保护下整块写入，因此处于稳态的后端不会产生写入操作，也就不会
+//     自身触发额外事件。
 type KVCacheBackendReconciler struct {
 	Client ctrlcli.Client
 
-	// AdminHTTP reads the leader's admin surface. It carries its own timeout, because a leader that
-	// accepts a connection and then stalls would otherwise hold this reconcile open for as long as
-	// the transport allows.
+	// AdminHTTP 用于读取 leader 的管理接口。它自带独立超时控制，因为若 leader 接受连接后
+	// 发生阻塞，没有超时将会使本次调谐一直挂起直至传输层超时。
 	//
-	// The timeout bounds one stall; it does not isolate the others from it. That is what
-	// kvCacheBackendConcurrency is for, and the two are only useful together.
+	// 该超时仅限制单次阻塞的时长，并不能隔离其他后端受其影响；这正是 kvCacheBackendConcurrency
+	// 的作用，两者配合使用才能发挥效果。
 	AdminHTTP *http.Client
 
-	// Recorder publishes what a status field cannot hold. The disk tier's cleanup records against
-	// the NODE rather than against this backend, because the backend is being deleted at the moment
-	// there is something to say and would take the record with it.
+	// Recorder 用于发布 status 字段无法承载的事件信息。磁盘层的清理事件记录在 Node 而非本
+	// 后端对象上，因为需要记录该信息时后端正在被删除，记录在后端上会随对象一并销毁。
 	Recorder ctrlrecord.EventRecorder
 
-	// leaseHolders is the only state this reconciler keeps between passes, and it keeps it because
-	// the question it answers is about a TRANSITION: a lease that changed hands and one that was
-	// merely renewed are the same object read twice. Its zero value is usable, so no construction
-	// path has to remember it.
+	// leaseHolders 是该调谐器在多次调谐之间保留的唯一状态，保留它是为了识别状态跃迁：
+	// 租约易主与单纯续约在连续两次读取中表现为同一个对象。其零值即可直接使用，因此
+	// 无需在构造路径中额外初始化。
 	leaseHolders leaseHolders
 }
 
-// adminReadTimeout bounds one read of the leader's admin surface. It is short: everything read there
-// is served out of memory by a process in the same cluster, so a read that takes longer is a leader
-// in trouble, and reporting that quickly is more useful than waiting for it.
+// adminReadTimeout 限制单次读取 leader 管理接口的耗时。该超时较短：此处读取的所有数据
+// 均由同一集群内的进程从内存提供，耗时更长说明 leader 已出现异常，尽快上报比苦等更有价值。
 const adminReadTimeout = 5 * time.Second
 
-// newAdminHTTPClient builds the client every admin read goes through. One client for the
-// controller's whole life, so its connection pool is reused across reconciles: building one per pass
-// would reconnect to the same leader every time.
+// newAdminHTTPClient 构建所有管理接口读取共用的客户端。该客户端在控制器整个生命周期内
+// 仅创建一次，以便在多次调谐之间复用连接池：每次调谐新建客户端会导致每次都重新连接
+// 同一个 leader。
 //
-// Redirects are refused rather than followed. For an external backend the address is the spec
-// author's, and the default client would follow a 302 from it to any host this operator can reach —
-// reading it with the operator's network identity, and then copying an excerpt of the answer into a
-// status that everyone who can read the object can read. The three reads are fixed paths on an
-// address admission has already validated, so a redirect away from it is never something to honor;
-// the response that carried it is what gets reported.
+// 客户端会拒绝重定向而非自动跟随。对于外部后端，地址由 spec 编写者指定，默认客户端会
+// 跟随其返回的 302 重定向访问本算子可达的任意主机——即以算子的网络身份发起读取，并将
+// 响应摘录写入所有拥有该对象读权限的用户皆可查看的 status 中。这三次读取均针对准入校验
+// 已验证地址上的固定路径，因此绝不应采信指向别处的重定向，而是直接上报携带该重定向的响应。
 func newAdminHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: adminReadTimeout,
@@ -90,18 +83,17 @@ func newAdminHTTPClient() *http.Client {
 var _ ctrlreconcile.Reconciler = (*KVCacheBackendReconciler)(nil)
 
 func (r *KVCacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Implement this function in chapter 22.
+	// 在第 22 章中实现此函数。
 	var result0 ctrl.Result
 	var result1 error
 	return result0, result1
 }
 
-// isTerminalWaitReason reports whether a waiting container is stuck rather than starting.
+// isTerminalWaitReason 判断处于等待状态的容器是否已陷入卡死而非正在启动。
 //
-// The two excluded reasons are the kubelet's own progress states: a container being created, and a
-// Pod whose init containers have not finished. Everything else it reports while waiting — every
-// image pull failure, every backoff — is a state that persists until something outside this reconcile
-// changes.
+// 被排除的两个原因属于 kubelet 自身的推进状态：容器正在创建，以及 Pod 的 init 容器
+// 尚未完成。等待期间上报的其他所有原因——包括镜像拉取失败、各种退避重试——都会持续
+// 存在，直到本次调谐之外的某些条件发生改变。
 func isTerminalWaitReason(reason string) bool {
 	switch reason {
 	case "", "ContainerCreating", "PodInitializing":
@@ -110,10 +102,9 @@ func isTerminalWaitReason(reason string) bool {
 	return true
 }
 
-// podIsReady reports the Pod's own readiness, which for a member is the store client having mounted
-// its segment and not merely started: the readiness probe connects to a port the entrypoint serves
-// only after the mount. Without that probe this would be true the moment the container ran, and
-// every member would spend its startup counted as a shortfall.
+// podIsReady 报告 Pod 自身的就绪状态。对于 member 而言，就绪意味着存储客户端已挂载其
+// 分段，而不仅仅是容器已启动：就绪探针连接的是入口进程在挂载完成后才会开启服务的端口。
+// 若没有该探针，容器一运行该状态就会为 true，使每个 member 在启动期间都会被计为缺口。
 func podIsReady(pod *core.Pod) bool {
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == core.PodReady {
@@ -123,29 +114,27 @@ func podIsReady(pod *core.Pod) bool {
 	return false
 }
 
-// alignRenderedContainer copies the rendered fields onto a running container and reports whether
-// anything moved. The fields are named one by one because the ones NOT named here are the server's
-// to default; overwriting them is what would make every pass a write.
+// alignRenderedContainer 将渲染出的字段复制到运行中的容器对象，并返回是否发生变更。
+// 此处逐一显式列出字段，因为未列出的字段由 API Server 填充默认值，若覆盖它们会导致
+// 每次调谐都产生写入。
 //
-// One function serves the leader and the members. A field only one of them uses compares equal on
-// the other, and keeping the list in one place is what stops a field added to a renderer from being
-// rendered but never converged.
+// 该函数同时服务于 leader 和 member。仅其中一方使用的字段在另一方上比较时自然相等，
+// 将字段列表集中在一处维护，可以防止渲染器新增字段后只渲染却永不收敛的问题。
 func alignRenderedContainer(actual *core.Container, expected core.Container) (changed bool) {
 	if actual.Image != expected.Image {
 		actual.Image = expected.Image
 		changed = true
 	}
-	// Unconditional, because the renderer resolves the policy rather than leaving it empty. An
-	// empty expectation was the problem: the API server fills the field in on write, so comparing
-	// against its default rolls the workload forever, and skipping the comparison to avoid that
-	// left a stale policy standing — a value that was removed from the spec, or one derived from an
-	// image tag the spec has since moved off. kvcache.EffectivePullPolicy owns that rule now.
+	// 无条件比对，因为渲染器会直接解析出策略而非将其留空。此前的问题恰恰出在期望值为空：
+	// API Server 会在写入时填充该字段，导致拿空值与默认值比对时工作负载不断滚动更新；
+	// 而为规避该问题跳过比对又会遗留过期策略——例如已从 spec 中移除的值，或基于 spec 已
+	// 不再使用的镜像标签推导出的值。如今该规则统一由 kvcache.EffectivePullPolicy 负责。
 	if actual.ImagePullPolicy != expected.ImagePullPolicy {
 		actual.ImagePullPolicy = expected.ImagePullPolicy
 		changed = true
 	}
-	// Safe to compare, unlike the pull policy: the renderer names a non-empty value, and the API
-	// server only defaults an empty one.
+	// 与拉取策略不同，此处可安全比对：渲染器会指定非空值，而 API Server 仅在字段为空时
+	// 填充默认值。
 	if actual.TerminationMessagePolicy != expected.TerminationMessagePolicy {
 		actual.TerminationMessagePolicy = expected.TerminationMessagePolicy
 		changed = true
@@ -174,11 +163,11 @@ func alignRenderedContainer(actual *core.Container, expected core.Container) (ch
 		actual.LivenessProbe = expected.LivenessProbe
 		changed = true
 	}
-	// The whole value, not only Requests. The renderers set no limits at all, so a limit is a field
-	// they leave at its zero value — and comparing only what a renderer fills in is exactly how an
-	// injected one survives: a low memory limit OOM-kills the container on a loop, and nothing in
-	// this object says why. The backend's own claim is a REQUEST by design, since a member sizes its
-	// segment from the same figure and a limit under it would kill the member that fits.
+	// 比对整个字段值，而非仅比对 Requests。渲染器完全不设置 limits，即将其保持为零值——而
+	// 仅比对渲染器所填字段恰恰会让外部注入的 limit 残留下来：过低的内存 limit 会导致容器
+	// 陷入 OOM 崩溃循环，且本对象中没有任何信息能解释原因。后端自身的声明在设计上就是
+	// REQUEST，因为 member 会依据同一数值计算其分段大小，低于该值的 limit 会杀死本可正常
+	// 容下的 member。
 	if !kubemeta.DeepEqual(actual.Resources, expected.Resources) {
 		actual.Resources = expected.Resources
 		changed = true
@@ -187,17 +176,16 @@ func alignRenderedContainer(actual *core.Container, expected core.Container) (ch
 		actual.VolumeMounts = expected.VolumeMounts
 		changed = true
 	}
-	// The security context is compared as a whole rather than capability by capability: it is
-	// rendered as a whole, and a running container that acquired one out of band must lose it.
+	// 安全上下文按整体比对，而非逐个 capability 比对：它是作为整体渲染的，运行中的容器若
+	// 通过带外方式获得了额外配置，必须予以清除。
 	if !kubemeta.DeepEqual(actual.SecurityContext, expected.SecurityContext) {
 		actual.SecurityContext = expected.SecurityContext
 		changed = true
 	}
-	// The shutdown hook carries the scale-in grace INSIDE its argv, and that grace is editable. Left
-	// out of this comparison the hook is written once and never again: the pod fingerprint moves
-	// with it, so the members are deleted and recreated — from a template whose hook still holds the
-	// old grace. The result is worse than not converging, because everything else says the change
-	// took effect.
+	// 停机钩子的 argv 内部携带了缩容宽限时间，且该宽限时间可编辑。若将其排除在比对之外，
+	// 该钩子只会被写入一次而不再更新：Pod 指纹会随变更移动，从而触发 member 被删除重建——
+	// 但所使用的模板中钩子仍保留旧的宽限时间。其结果比不收敛更糟，因为其余一切都表现为
+	// 变更已经生效。
 	if !kubemeta.DeepEqual(actual.Lifecycle, expected.Lifecycle) {
 		actual.Lifecycle = expected.Lifecycle
 		changed = true
@@ -205,10 +193,10 @@ func alignRenderedContainer(actual *core.Container, expected core.Container) (ch
 	return changed
 }
 
-// enqueueKVCacheBackendWhenPoolChanged maps a pool back to every backend it draws from.
+// enqueueKVCacheBackendWhenPoolChanged 将 pool 映射回其引用的所有后端。
 //
-// It reads the pool's spec rather than the backends' usedBy, because the event that matters most is
-// the pool's DELETE — and a delete carries the object's last known state, which still names them.
+// 它读取 pool 的 spec 而非后端的 usedBy，因为最关键的事件是 pool 的删除操作——而删除
+// 事件会携带对象的最后已知状态，其中仍列出了这些后端。
 func (r *KVCacheBackendReconciler) enqueueKVCacheBackendWhenPoolChanged(
 	_ context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {
@@ -224,11 +212,11 @@ func (r *KVCacheBackendReconciler) enqueueKVCacheBackendWhenPoolChanged(
 	return reqs
 }
 
-// enqueueKVCacheBackendWhenWorkloadChanged maps a rendered object back to the backend that owns it.
+// enqueueKVCacheBackendWhenWorkloadChanged 将渲染出的对象映射回拥有它的后端。
 //
-// It reads the backend's name from the object's own resource note rather than walking its owner
-// references: the note is what the predicate has already filtered on, so the two agree by
-// construction, and a delete event carries the note as readily as an update does.
+// 它直接从对象自身的资源注解中读取后端名称，而非遍历其 owner references：该注解正是
+// predicate 已经筛选过的依据，因此两者在构造上天然一致，且删除事件与更新事件同样
+// 携带该注解。
 func (r *KVCacheBackendReconciler) enqueueKVCacheBackendWhenWorkloadChanged(
 	_ context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {
@@ -239,14 +227,13 @@ func (r *KVCacheBackendReconciler) enqueueKVCacheBackendWhenWorkloadChanged(
 	return []ctrlreconcile.Request{{NamespacedName: ctrlcli.ObjectKey{Name: name}}}
 }
 
-// kvCacheBackendWorkloadPredicate keeps the watches to this operator's own objects. Without it every
-// Deployment and Service in the cluster would wake this reconciler.
+// kvCacheBackendWorkloadPredicate 将监听范围限定为本算子自身创建的对象。若无此过滤，
+// 集群中的每个 Deployment 和 Service 都会唤醒该调谐器。
 //
-// The namespace is half of the test, and it is the half that is not about noise. A resource note is
-// an annotation, so anyone who can create an object in ANY namespace can write one that matches —
-// and each match costs the named backend a reconcile, which is three HTTP reads against its admin
-// surface. Rendering only ever happens in the system namespace, so nothing outside it can be one of
-// this operator's objects, whatever it says about itself.
+// Namespace 校验占检查条件的一半，且这一半并非为了降噪。资源注解本质上是 annotation，
+// 任何能在任意 Namespace 创建对象的人都可以写入匹配的注解——每次匹配都会触发对应后端
+// 的一次调谐，即对其管理接口发起三次 HTTP 读取。渲染只会在系统 Namespace 中进行，
+// 因此无论其他 Namespace 中的对象如何标注自身，都不可能是本算子的对象。
 func kvCacheBackendWorkloadPredicate() ctrlpredicate.Predicate {
 	return ctrlpredicate.NewPredicateFuncs(func(obj ctrlcli.Object) bool {
 		return obj.GetNamespace() == kuberess.SystemNamespaceName &&
@@ -267,22 +254,20 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 		Named("kvcachebackend").
 		For(&workercore.KVCacheBackend{}).
 		Watches(
-			// A pool claims this backend by writing itself into status.usedBy, and its own reconciler
-			// clears that entry on the way out — so ordinarily this backend is woken by its own status
-			// changing and this watch adds nothing. What it covers is the pool going away WITHOUT
-			// clearing the entry, which nothing else can wake: the claim would name an object that no
-			// longer exists and hold the teardown with no event ever arriving to re-examine it.
+			// pool 会通过将自身写入 status.usedBy 来占用该后端，并在退出时由其自身的调谐器清除
+			// 该条目——因此通常后端会由自身 status 变更唤醒，此监听并无额外作用。它所兜底的是
+			// pool 在未清除该条目的情况下消失的场景，否则没有任何事件能唤醒后端：该占用记录会
+			// 指向一个已不存在的对象并卡住销毁流程，且再无事件触发重新检查。
 			//
-			// Not deduped, unlike the workload watches. Those fire per rendered object and collapse
-			// onto one backend; this one fires per pool, and a pool names each of its backends once.
+			// 与工作负载监听不同，此处不做去重。前者按渲染对象触发并聚合到同一后端；此处按 pool
+			// 触发，而每个 pool 对其引用的每个后端仅列出一次。
 			&workercore.KVCachePool{},
 			ctrlhandler.EnqueueRequestsFromMapFunc(r.enqueueKVCacheBackendWhenPoolChanged),
 		).
 		Watches(
-			// Watch the leader's Deployment and enqueue the backend that owns it. Without this the
-			// reconciler converges the rendered objects only when the BACKEND changes, so a hand
-			// edit to the Deployment would stand until something else happened to the object —
-			// which is not continuous reconciliation, it is reconciliation on a coincidence.
+			// 监听 leader 的 Deployment 并将拥有它的后端入队。若无此监听，调谐器只会在后端对象
+			// 自身变化时才收敛渲染出的对象，人工对 Deployment 的修改将一直保留，直到后端对象
+			// 恰好发生其他变更——这并非持续调谐，而是碰巧调谐。
 			&apps.Deployment{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -292,7 +277,7 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 			ctrlbuilder.WithPredicates(kvCacheBackendWorkloadPredicate()),
 		).
 		Watches(
-			// Same for the Service in front of it, which carries the published endpoints.
+			// 对其前端承载已发布端点的 Service 同样如此。
 			&core.Service{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -302,8 +287,7 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 			ctrlbuilder.WithPredicates(kvCacheBackendWorkloadPredicate()),
 		).
 		Watches(
-			// And the member groups' DaemonSets, which is where a node joining or leaving a group
-			// first becomes visible.
+			// 以及各 member 组的 DaemonSet，节点加入或离开分组最先在此体现。
 			&apps.DaemonSet{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -313,11 +297,10 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 			ctrlbuilder.WithPredicates(kvCacheBackendWorkloadPredicate()),
 		).
 		Watches(
-			// And the leader's own Pods, for the one fault that is only ever written there. The
-			// scheduler records "no node will take this" on the POD, as PodScheduled=False, and that
-			// write moves nothing on the Deployment — whose own account of it arrives ten minutes
-			// later as ProgressDeadlineExceeded. Without this watch the pass that reports an
-			// unschedulable leader would have to be the one some other event happened to trigger.
+			// 以及 leader 自身的 Pod，用于捕获仅会写入 Pod 的那类故障。调度器会将“无可用节点”
+			// 记录在 Pod 上（表现为 PodScheduled=False），而该写入不会引起 Deployment 的任何变化——
+			// Deployment 自身要到十分钟后才会上报 ProgressDeadlineExceeded。若无此监听，上报
+			// leader 不可调度的那次调谐就只能被动等待其他事件恰好触发。
 			&core.Pod{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -327,14 +310,13 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 			ctrlbuilder.WithPredicates(kvCacheBackendLeaderPodPredicate()),
 		).
 		Watches(
-			// And the Lease the election runs through, which is the only object that says a handover
-			// happened. It is created by the STORE rather than by this operator, so it carries no
-			// resource note and the map function has to earn the link back from the name.
+			// 以及选主所依赖的 Lease，它是唯一能反映主备切换发生的对象。该对象由存储引擎而非
+			// 本算子创建，因此不携带资源注解，映射函数必须依据名称反推出归属关系。
 			//
-			// The predicate is not tidiness. A lease is renewed every few seconds for the life of
-			// every leader, and an unfiltered watch would turn each renewal into a reconcile costing
-			// three sequential reads of that backend's admin surface -- a permanent load on every
-			// store in the cluster, produced by a feature that records one event per failover.
+			// 此处设置 predicate 并非出于代码整洁。在每个 leader 的整个生命周期中，租约每隔几秒
+			// 就会续约一次，若不过滤监听事件，每次续约都会触发一次调谐，进而对该后端的管理接口
+			// 发起三次串行读取——这相当于一个仅在每次故障切换时记录一条事件的功能，却对集群中的
+			// 每个存储引擎施加持续负载。
 			&coordination.Lease{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -342,16 +324,15 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 				r.enqueueKVCacheBackendWhenLeaseChanged,
 			),
 			ctrlbuilder.WithPredicates(ctrlpredicate.Funcs{
-				// A lease appearing for the first time establishes the baseline rather than
-				// reporting anything, and the pass it wakes is what stores it.
+				// 首次出现的 Lease 用于建立基线而非上报任何事件，它所唤醒的该次调谐负责保存该基线。
 				CreateFunc: func(e ctrlevent.CreateEvent) bool {
 					return e.Object.GetNamespace() == kuberess.SystemNamespaceName
 				},
 				UpdateFunc: func(e ctrlevent.UpdateEvent) bool {
 					return kvCacheBackendLeaseHolderChanged(e.ObjectOld, e.ObjectNew)
 				},
-				// A deleted lease says the election stopped, not that it moved. The pass that would
-				// forget the holder is the one the backend's own change wakes.
+				// 被删除的 Lease 表示选主已停止，而非发生主备切换。负责清除持有者记录的调谐将由后端
+				// 自身的变更唤醒。
 				DeleteFunc:  func(ctrlevent.DeleteEvent) bool { return false },
 				GenericFunc: func(ctrlevent.GenericEvent) bool { return false },
 			}),
@@ -362,28 +343,25 @@ func (r *KVCacheBackendReconciler) SetupController(_ context.Context, opts contr
 		Complete(r)
 }
 
-// kvCacheBackendConcurrency is how many backends this controller reconciles at once.
+// kvCacheBackendConcurrency 指定该控制器同时调谐的后端数量。
 //
-// It is set because this reconciler is the only one here that BLOCKS on something outside the
-// cluster: every backend re-enqueues itself on a timer and each pass makes three sequential reads
-// against an address the object names — for an external backend, an address this operator has no
-// control over at all. On the default single worker, one endpoint that accepts a connection and then
-// stalls holds the queue for its timeout on every pass, and every other backend waits behind it —
-// including one being deleted.
+// 设置该并发度的原因在于，这是此处唯一会阻塞在集群外部操作上的调谐器：每个后端都会
+// 按定时器重新入队，且每次调谐都会向对象指定的地址发起三次串行读取——对于外部后端，
+// 该地址完全不受本算子控制。在默认的单 worker 模式下，只要有一个端点在建立连接后
+// 阻塞，就会在每次调谐中占用队列直至超时，导致其他所有后端（包括正在删除的后端）
+// 都在其后排队等待。
 //
-// A per-request timeout does not substitute for this. It bounds how long one stall lasts and says
-// nothing about who else is blocked by it.
+// 单请求超时无法替代并发控制。它仅限制单次阻塞的持续时间，无法避免其他后端被其阻塞。
 //
-// Four rather than more: the work is one HTTP read at a time against distinct hosts, so this is
-// about not letting a few bad addresses monopolize the queue, not about throughput.
+// 取值为 4 而非更大值：该工作每次仅针对不同主机发起一次 HTTP 读取，因此目的在于防止
+// 少数异常地址独占队列，而非追求高吞吐量。
 const kvCacheBackendConcurrency = 4
 
-// kvCacheBackendLeaderPodPredicate keeps the Pod watch to this operator's leaders.
+// kvCacheBackendLeaderPodPredicate 将 Pod 的 watch 范围限制为本 operator 的 leader Pod。
 //
-// It cannot use the resource note the other three watches filter on: a Pod is made by the
-// Deployment's controller from a template, and the note is on the Deployment rather than inside that
-// template. The identity labels are what a leader's Pod does carry — and a label is cheaper to
-// forge than a note, so the namespace matters here for the same reason it does there.
+// 它不能像另外三个 watch 那样按资源标记过滤：Pod 由 Deployment 的控制器根据模板创建，
+// 而该标记位于 Deployment 上，而非模板内部。leader Pod 上确实带有身份标签——而伪造标签
+// 比伪造标记更容易，因此这里的 Namespace 同样起着关键的校验作用。
 func kvCacheBackendLeaderPodPredicate() ctrlpredicate.Predicate {
 	return ctrlpredicate.NewPredicateFuncs(func(obj ctrlcli.Object) bool {
 		return obj.GetNamespace() == kuberess.SystemNamespaceName &&
@@ -391,7 +369,7 @@ func kvCacheBackendLeaderPodPredicate() ctrlpredicate.Predicate {
 	})
 }
 
-// enqueueKVCacheBackendWhenLeaderPodChanged maps a leader's Pod back to the backend that owns it.
+// enqueueKVCacheBackendWhenLeaderPodChanged 将 leader Pod 映射回其所属的 backend。
 func (r *KVCacheBackendReconciler) enqueueKVCacheBackendWhenLeaderPodChanged(
 	_ context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {

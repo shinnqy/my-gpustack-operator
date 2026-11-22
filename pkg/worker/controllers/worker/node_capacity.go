@@ -30,25 +30,20 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/mapx"
 )
 
-// NodeCapacityReconciler reconciles the accelerator counting extended resources on a managed
-// Kubernetes Node's status.capacity, driven by Node feature-label/capacity changes and by the
-// same-named Devices object:
-//   - Software slicing and hardware partitioning are two families over two card populations
-//     that never overlap, so each has its own counting keys and each is presence-gated on its
-//     own bare device-plugin token pool. A manufacturer's ".sliced.*" keys appear only while
-//     its ".sliced" pool does, and its ".partitioned.*" keys only while its ".partitioned"
-//     pool does; a pool that disappears or reaches 0 reverse-patches its family's keys away.
-//     See desiredAcceleratorCapacity for the key set and how each is valued.
-//   - The per-profile partition keys are derived from the runtime ledger rather than from a
-//     static ceiling, because the profiles compete for the same physical slices: carving one
-//     shape consumes room another shape needed. That makes an allocation or a release move a
-//     capacity value with the capability untouched, which is why the Devices watch reacts to
-//     the status side as well as the spec side.
-//   - It re-applies level-based after a kubelet restart wipes the capacity.
+// NodeCapacityReconciler 协调受管 Kubernetes Node 的 status.capacity 上的加速器计数扩展资源，
+// 由 Node 的特征标签/容量变更以及同名 Devices 对象驱动：
+//   - 软件切片与硬件分区是针对两组永不重叠的物理卡群的两个系列，因此各自拥有独立的计数键，
+//     且分别以其自身的裸 device-plugin 令牌池是否存在作为门控。厂商的 ".sliced.*" 键仅在其
+//     ".sliced" 池存在时出现，".partitioned.*" 键仅在其 ".partitioned" 池存在时出现；
+//     当令牌池消失或降为 0 时，会反向 patch 移除对应系列的键。
+//     参见 desiredAcceleratorCapacity 了解键集合及各自的计算方式。
+//   - 每个 profile 的分区键基于运行时账本而非静态上限推导，因为不同 profile 会竞争同一批
+//     物理切片：切分出一种规格会占用另一种规格所需的空间。这使得分配或释放操作即使在能力不变的
+//     情况下也会改变容量值，因此 Devices watch 需要同时响应 status 侧与 spec 侧的变更。
+//   - 当 kubelet 重启清空容量后，采用基于状态（level-based）的机制重新应用。
 //
-// The large magnitude of the ".units" keys (D per card) is reported here rather than through
-// the device-plugin's fake-device pool, which would otherwise pressure the kubelet device
-// manager.
+// ".units" 键的较大数值（每张卡 D 个）由本控制器上报，而非通过 device-plugin 的虚拟设备池上报，
+// 以免给 kubelet 设备管理器带来压力。
 type NodeCapacityReconciler struct {
 	Client ctrlcli.Client
 }
@@ -58,27 +53,25 @@ var _ ctrlreconcile.Reconciler = (*NodeCapacityReconciler)(nil)
 func (r *NodeCapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := ctrllog.FromContext(ctx)
 
-	// Fetch. Read-only (the capacity patch below targets a fresh Node object), so the
-	// deep copy is skipped.
+	// 获取 Node。此处为只读操作（下方的容量 patch 针对新建的 Node 对象），因此跳过深拷贝。
 	nd := new(core.Node)
 	err := r.Client.Get(ctx, req.NamespacedName, nd, ctrlcli.UnsafeDisableDeepCopy)
 	if err != nil {
-		// A deleted Node has nothing left to reconcile.
+		// 已删除的 Node 无需再进行协调。
 		if err = ctrlcli.IgnoreNotFound(err); err != nil {
 			logger.Error(err, "fetch node")
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Skip if deleted.
+	// 若已删除则跳过。
 	if nd.DeletionTimestamp != nil {
 		logger.V(3).Info("skip deleted node")
 		return ctrl.Result{}, nil
 	}
 
-	// Fetch the same-named Devices CR (one per node); it supplies the per-manufacturer
-	// max slice count and compute-overcommit flag. A missing ledger yields no slicing
-	// capability, so the ".sliced.*" keys stay reverse-patched until it reports.
+	// 获取同名的 Devices CR（每个 Node 一个）；它提供各厂商的最大切片数与算力超卖标志。
+	// 若账本缺失则视为无切片能力，".sliced.*" 键将保持反向 patch 移除状态，直到账本上报。
 	devs := new(workercore.Devices)
 	err = r.Client.Get(ctx, ctrlcli.ObjectKey{Name: nd.Name}, devs, ctrlcli.UnsafeDisableDeepCopy)
 	if err != nil {
@@ -89,8 +82,7 @@ func (r *NodeCapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		devs = nil
 	}
 
-	// Converge the node's ".sliced.*" capacities onto the desired set (empty for an
-	// unmanaged or non-acceleratable node, which removes any stale key).
+	// 将 Node 的 ".sliced.*" 容量收敛到期望集合（对于未纳管或不支持加速的 Node 为空集，从而移除任何陈旧键）。
 	capacityPatch := buildAcceleratorCapacityPatch(desiredAcceleratorCapacity(nd, devs), nd.Status.Capacity)
 	if capacityPatch == nil {
 		return ctrl.Result{}, nil
@@ -98,9 +90,8 @@ func (r *NodeCapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	data := json.ShouldMarshal(map[string]any{
 		"status": map[string]any{"capacity": capacityPatch},
 	})
-	// Patch a fresh Node object rather than nd: the merge-patch response is decoded back
-	// into the target, and nd was read without a deep copy (mutating it would corrupt the
-	// shared informer cache).
+	// 对新建的 Node 对象而非 nd 执行 patch：merge-patch 响应会解码回目标对象，
+	// 而 nd 是在未深拷贝的情况下读取的（直接修改它会污染共享 informer 缓存）。
 	patchNode := &core.Node{ObjectMeta: meta.ObjectMeta{Name: nd.Name}}
 	err = r.Client.Status().Patch(ctx, patchNode, ctrlcli.RawPatch(types.MergePatchType, data))
 	if err != nil {
@@ -111,46 +102,38 @@ func (r *NodeCapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
-// desiredAcceleratorCapacity computes the counting extended resources a managed node should
-// advertise, summed per manufacturer over that manufacturer's models whose same-named Devices
-// group reports a slicing capability (so a non-sliceable model — e.g. an Ascend 310 sharing a
-// node with a sliceable 910B — adds nothing).
+// desiredAcceleratorCapacity 计算受管 Node 应当上报的计数扩展资源，按厂商对其同名 Devices 组
+// 中上报了切片能力的型号求和（因此不支持切片的型号——例如与支持切片的 Ascend 910B 共用同一 Node
+// 的 Ascend 310——不会计入任何值）。
 //
-// The two families count disjoint card populations, because a card in a hardware partitioning
-// mode can serve no software slice and vice versa:
-//   - ".sliced.units"                     = Σ logicalCards × D
-//   - ".sliced.cores-percentage"          = Σ Detail.Logical.Count × 100 (overcommit) else Σ logicalCards × 100
-//   - ".sliced.memory-percentage"         = Σ logicalCards × 100
-//   - ".sliced.memory-mib"                = Σ logicalCards × per-card VRAM MiB
-//   - ".partitioned.units"                = Σ partitionedCards × D
-//   - ".partitioned.<kind>-<profile>"     = Σ (allocated + remaining) instances of that profile
+// 两个系列统计互不相交的卡群，因为处于硬件分区模式的卡无法提供软件切片，反之亦然：
+//   - ".sliced.units"                 = Σ logicalCards × D
+//   - ".sliced.cores-percentage"      = Σ Detail.Logical.Count × 100（开启超卖时），否则为 Σ logicalCards × 100
+//   - ".sliced.memory-percentage"     = Σ logicalCards × 100
+//   - ".sliced.memory-mib"            = Σ logicalCards × 单卡显存 MiB
+//   - ".partitioned.units"            = Σ partitionedCards × D
+//   - ".partitioned.<kind>-<profile>" = Σ 该 profile 的（已分配 + 剩余）实例数
 //
-// Each family is presence-gated on its own bare device-plugin token pool, so a node advertises
-// a family's counting keys only while the plugin is actually serving that family here. The gate
-// reads capacity rather than allocatable: capacity already falls to zero on a node whose cards
-// cannot serve the family, while allocatable also falls to zero whenever the family is merely
-// saturated or held — gating on that would delete the counting keys while instances are live and
-// re-add them on release.
+// 每个系列均以其自身的裸 device-plugin 令牌池是否存在作为门控，因此只有当插件确实在此 Node 上
+// 提供该系列服务时，Node 才会通告该系列的计数键。门控读取 capacity 而非 allocatable：
+// 在物理卡无法提供该系列服务的 Node 上 capacity 本就会降为 0；而当该系列仅仅是资源饱和或被占用时
+// allocatable 也会降为 0——若以 allocatable 为门控，会导致实例运行期间计数键被删除，并在释放后重新添加。
 //
-// All card counts come from the Devices ledger's per-card data as the single source of truth —
-// never mixed with the Node ".count" label — resolved to each model by the full acceleratable
-// node key ("${manufacturer}-${group ID}"), so models of one manufacturer that differ in VRAM
-// (or slice count / overcommit) are summed correctly. A family with no cards emits no key, so
-// buildAcceleratorCapacityPatch reverse-patches any stale one.
+// 所有卡数量均以 Devices 账本的逐卡数据作为唯一事实来源——绝不与 Node 的 ".count" 标签混用——
+// 并通过完整的可加速节点键（"${manufacturer}-${group ID}"）解析到各型号，从而确保同一厂商下
+// 显存（或切片数/超卖配置）不同的型号能够正确求和。若某系列没有可用的卡，则不输出对应键，
+// 由 buildAcceleratorCapacityPatch 反向 patch 移除任何陈旧键。
 //
-// The per-card VRAM stays the lossy ".memory" label (rounded to Gi), never the exact
-// DevicesGroup.Memory, so the advertised memory-mib matches the Pod-webhook anchor. It returns
-// nil for an unmanaged node.
+// 单卡显存仍采用取整到 Gi 的有损 ".memory" 标签值，而非精确的 DevicesGroup.Memory，
+// 以保证通告的 memory-mib 与 Pod Webhook 锚点一致。对于未纳管 Node 返回 nil。
 func desiredAcceleratorCapacity(nd *core.Node, devs *workercore.Devices) core.ResourceList {
-	// Implement this function in chapter 10.
+	// 在第 10 章中实现此函数。
 	return nil
 }
 
-// acceleratorCards splits a Devices group's cards into the two populations that can never
-// overlap: logical counts the cards offering software slicing, partitioned the cards put into a
-// hardware partitioning mode. logicalSlices is Σ the logical cards' slice counts. A card belongs
-// to at most one population — that is what keeps a card from being counted by both families'
-// capacity keys — and a card offering neither belongs to none.
+// acceleratorCards 将 Devices 组中的卡划分为两个永不重叠的集合：logical 统计提供软件切片的卡数，
+// partitioned 统计处于硬件分区模式的卡数。logicalSlices 为所有 logical 卡的切片数之和。
+// 每张卡至多属于一个集合——从而避免同一张卡同时被两个系列的容量键统计——两者均不提供的卡则不归入任何集合。
 func acceleratorCards(g *workercore.DevicesGroup) (logical, logicalSlices, partitioned int64) {
 	for i := range g.Accelerators {
 		st := g.Accelerators[i].Status
@@ -165,19 +148,16 @@ func acceleratorCards(g *workercore.DevicesGroup) (logical, logicalSlices, parti
 	return logical, logicalSlices, partitioned
 }
 
-// partitionInstancesByProfile counts, per profile name, the hardware partitions a group's
-// partitioned cards can account for: summed over those cards, each profile's allocated instances
-// plus the instances it can still host.
+// partitionInstancesByProfile 按 profile 名称统计一组处于分区模式的卡所能提供的硬件分区总数：
+// 对这些卡求和，累计每个 profile 已分配的实例数加上仍可容纳的实例数。
 //
-// Both terms are needed. The scheduler fits a Pod by subtracting the requests of the Pods already
-// on the node from the advertised capacity, so publishing only what is still free would subtract
-// every live instance twice and the key would read one short per running partition.
+// 这两项缺一不可。调度器在放置 Pod 时会从通告容量中减去 Node 上已有 Pod 的请求量，
+// 因此若只上报仍空闲的数量，会导致每个运行中的实例被重复扣减，该键值会比实际少一个。
 //
-// A card whose ledger entry reports neither allocated nor remaining instances has no usable
-// ledger yet — the runtime status is rebuilt from the card's cached placement geometry, which an
-// older device manager did not record — so it falls back to the capability's static per-profile
-// ceiling. That over-states a card that is in fact occupied, which converges as soon as the
-// ledger reports, whereas publishing zero would strand a working node.
+// 若某张卡的账本条目既未上报已分配实例也未上报剩余实例，说明尚无可用的账本——
+// 运行时状态是根据卡缓存的放置拓扑重建的，而旧版 DeviceManager 未记录该信息——
+// 此时回退到能力声明中的静态每 profile 上限。对于实际已被占用的卡，这会暂时高估可用量，
+// 一旦账本上报即会收敛；而若上报 0，则会使正常工作的 Node 陷入不可调度状态。
 func partitionInstancesByProfile(g *workercore.DevicesGroup, ledger map[string]*workercore.AcceleratorAllocation) map[string]int64 {
 	out := make(map[string]int64)
 	for i := range g.Accelerators {
@@ -187,10 +167,9 @@ func partitionInstancesByProfile(g *workercore.DevicesGroup, ledger map[string]*
 		}
 		alloc := ledger[acc.ID]
 		ready := device.PartitionLedgerReady(alloc)
-		// Every profile the card offers gets an entry, even at zero. A profile whose room another
-		// profile's instance consumed then reads zero instead of vanishing, so the key's value
-		// moves as the card fills rather than the key itself appearing and disappearing — one
-		// fewer reason to rewrite the node object on every carve and release.
+		// 为卡提供的每个 profile 都生成条目，即使值为 0。这样当某个 profile 的空间被其他 profile 的
+		// 实例占用时，其值变为 0 而非直接消失，从而在卡填充过程中仅数值变化而键本身保持存在——
+		// 减少每次切分和释放时重写 Node 对象的理由。
 		for k := range acc.Status.PhysicalSliced.Profiles {
 			p := &acc.Status.PhysicalSliced.Profiles[k]
 			if _, seen := out[p.Name]; !seen {
@@ -213,13 +192,11 @@ func partitionInstancesByProfile(g *workercore.DevicesGroup, ledger map[string]*
 	return out
 }
 
-// devicesLedgerByGroup indexes a node's runtime allocation ledger by the same
-// "${manufacturer}-${group ID}" key the spec side uses, and then by accelerator ID. The
-// capability lives on the Devices spec and the occupancy on its status, so the per-profile
-// capacity key is a join of the two; reading occupancy off the spec silently yields nothing.
-// The key is manufacturer-qualified for the same reason the spec index is: ConstructGroupID
-// strips the vendor prefix, so a bare group ID can collide across manufacturers on one node and
-// one vendor's ledger would then be read for another vendor's cards.
+// devicesLedgerByGroup 按与 spec 侧相同的 "${manufacturer}-${group ID}" 键建立 Node 运行时
+// 分配账本的索引，再按加速器 ID 索引。能力信息位于 Devices 的 spec，占用状态位于其 status，
+// 因此按 profile 划分的容量键是两者的连接结果；直接从 spec 读取占用状态会静默返回空值。
+// 键中包含厂商前缀的原因与 spec 索引相同：ConstructGroupID 会剥离厂商前缀，
+// 裸 group ID 在同一 Node 上可能跨厂商冲突，从而导致误将某厂商的账本用于另一厂商的卡。
 func devicesLedgerByGroup(devs *workercore.Devices) map[string]map[string]*workercore.AcceleratorAllocation {
 	if devs == nil {
 		return nil
@@ -236,11 +213,10 @@ func devicesLedgerByGroup(devs *workercore.Devices) map[string]map[string]*worke
 	return out
 }
 
-// ownedCapacitySuffixes are the fixed counting-key suffixes the NodeCapacityReconciler owns via
-// Patch Node. The per-profile ".partitioned.<kind>-<profile>" keys have a variable suffix (the
-// profile name) and are matched by parsing instead (see isOwnedCapacityKey). The bare ".sliced",
-// ".partitioned" and ".shared" keys the device-plugin advertises are deliberately excluded so
-// they are never nulled out.
+// ownedCapacitySuffixes 是 NodeCapacityReconciler 通过 Patch Node 管理的固定计数键后缀。
+// 按 profile 划分的 ".partitioned.<kind>-<profile>" 键具有可变后缀（profile 名称），
+// 改由解析匹配（见 isOwnedCapacityKey）。device-plugin 通告的裸 ".sliced"、
+// ".partitioned" 与 ".shared" 键被刻意排除在外，确保它们绝不会被置空移除。
 var ownedCapacitySuffixes = []string{
 	nodefeature.SlicedUnitsResourceNameSuffix,
 	nodefeature.SlicedCoresPercentageResourceNameSuffix,
@@ -249,23 +225,20 @@ var ownedCapacitySuffixes = []string{
 	nodefeature.PartitionedUnitsResourceNameSuffix,
 }
 
-// isOwnedCapacityKey reports whether name is one of the counting keys this reconciler owns —
-// the five fixed keys or a per-profile ".partitioned.<kind>-<profile>" key — and not a bare
-// device-plugin token key.
+// isOwnedCapacityKey 判断 name 是否属于本控制器管理的计数键——即五个固定键或按 profile
+// 划分的 ".partitioned.<kind>-<profile>" 键——而非裸 device-plugin 令牌键。
 func isOwnedCapacityKey(name core.ResourceName) bool {
-	// Positively identify a per-profile key (known accelerator base, known partition kind,
-	// non-empty profile) rather than matching a raw infix, so a foreign extended resource that
-	// merely looks similar is never claimed as owned and nulled out when absent from desired.
+	// 精确识别按 profile 划分的键（已知的加速器前缀、已知的分区类型、非空 profile），
+	// 而非仅匹配原始中缀，从而避免外表相似的外部扩展资源被误判为本控制器所有，并在未出现在期望集合时被置空移除。
 	if _, ok := nodefeature.PartitionedProfileOf(name); ok {
 		return true
 	}
 	return hasAcceleratorSuffix(name, ownedCapacitySuffixes...)
 }
 
-// isAcceleratorFamilyCapacityKey reports whether name is any capacity key this reconciler must
-// react to: a bare device-plugin token pool for either slicing family (the presence gate that
-// decides whether to advertise) or one of the owned counting keys. Only the owned keys are ever
-// patched (see isOwnedCapacityKey); the bare pools are watched but never written.
+// isAcceleratorFamilyCapacityKey 判断 name 是否为本控制器必须响应的容量键：
+// 任一切片系列的裸 device-plugin 令牌池（决定是否通告的存在性门控）或任一归属本控制器的计数键。
+// 只有归属本控制器的键才会被 patch（见 isOwnedCapacityKey）；裸令牌池只监听而不写入。
 func isAcceleratorFamilyCapacityKey(name core.ResourceName) bool {
 	return isOwnedCapacityKey(name) ||
 		hasAcceleratorSuffix(name,
@@ -273,10 +246,9 @@ func isAcceleratorFamilyCapacityKey(name core.ResourceName) bool {
 			nodefeature.PartitionedResourceNameSuffix)
 }
 
-// hasAcceleratorSuffix reports whether name is one of our suffixes behind a known accelerator
-// base. The base check is what keeps a foreign extended resource that happens to end the same
-// way — another plugin's "example.com/foo.partitioned.units" — from being claimed as ours and
-// then nulled out for being absent from the desired set.
+// hasAcceleratorSuffix 判断 name 是否在已知的加速器前缀之后带有指定后缀之一。
+// 前缀检查可防止其他插件恰好以相同后缀结尾的外部扩展资源（如 "example.com/foo.partitioned.units"）
+// 被误认为归属本控制器，并在未出现在期望集合时被置空移除。
 func hasAcceleratorSuffix(name core.ResourceName, suffixes ...string) bool {
 	for _, suffix := range suffixes {
 		base, ok := strings.CutSuffix(string(name), suffix)
@@ -287,11 +259,10 @@ func hasAcceleratorSuffix(name core.ResourceName, suffixes ...string) bool {
 	return false
 }
 
-// buildAcceleratorCapacityPatch returns the status.capacity entries needed to converge the node
-// onto desired: each desired counting key whose current value differs is set, and any stale
-// owned key absent from desired is nulled out (removed). It returns nil when the capacity
-// already matches, so the caller can skip the patch — keeping the repatch idempotent. Only
-// owned keys are ever emitted, so kubelet-managed capacity is never touched.
+// buildAcceleratorCapacityPatch 返回将 Node 收敛到 desired 所需的 status.capacity 条目：
+// 设置当前值与期望不同的每个期望计数键，并将不在 desired 中的陈旧归属键置为 null（移除）。
+// 若当前容量已完全匹配则返回 nil，调用方即可跳过 patch——从而保持重复 patch 的幂等性。
+// 仅输出归属本控制器的键，因此绝不会触及 kubelet 管理的容量。
 func buildAcceleratorCapacityPatch(desired, current core.ResourceList) map[string]any {
 	patch := make(map[string]any)
 	for name, q := range desired {
@@ -313,9 +284,8 @@ func buildAcceleratorCapacityPatch(desired, current core.ResourceList) map[strin
 	return patch
 }
 
-// acceleratorFamilyCapacityChanged reports whether any capacity entry this reconciler reacts to
-// — a bare device-plugin token pool for either family, or one of the owned counting keys — was
-// added, removed, or changed between the two capacity maps.
+// acceleratorFamilyCapacityChanged 判断两个容量映射之间是否有本控制器关注的容量条目
+// （任一系列的裸 device-plugin 令牌池，或任一归属计数键）被添加、移除或变更。
 func acceleratorFamilyCapacityChanged(oldCap, newCap core.ResourceList) bool {
 	for name, q := range newCap {
 		if !isAcceleratorFamilyCapacityKey(name) {
@@ -346,15 +316,12 @@ func (r *NodeCapacityReconciler) SetupController(_ context.Context, opts control
 		For(
 			&core.Node{},
 			ctrlbuilder.WithPredicates(
-				// Trigger reconciliation when a Node is:
-				// - created.
-				// - updated if its managed/acceleratable feature labels changed
-				//   (model added/removed or card count changed), or a ".sliced"-family
-				//   capacity entry changed — either the device-plugin's bare ".sliced"
-				//   token pool appearing/disappearing/resizing (the presence gate) or an
-				//   owned ".sliced.*" key (self-heal after a kubelet restart wipes it). A
-				//   change to the per-card slicing detail itself arrives via the Devices
-				//   watch below.
+				// 在以下情况下触发对 Node 的协调：
+				// - 创建。
+				// - 更新时若其受管/可加速特征标签发生变化（新增/移除型号或卡数变化），或 ".sliced" 系列
+				//   容量条目发生变化——包括 device-plugin 的裸 ".sliced" 令牌池出现/消失/扩缩（存在性门控），
+				//   或归属本控制器的 ".sliced.*" 键发生变化（kubelet 重启清空后的自愈）。
+				//   逐卡切片细节本身的变更则通过下方的 Devices watch 传入。
 				ctrlpredicate.Funcs{
 					DeleteFunc: func(ctrlevent.DeleteEvent) bool {
 						return false
@@ -375,14 +342,10 @@ func (r *NodeCapacityReconciler) SetupController(_ context.Context, opts control
 			),
 		).
 		Watches(
-			// A Devices change moves the desired counting capacity without necessarily
-			// moving the bare token pools the Node predicate watches, so enqueue the
-			// name-identical node. Two kinds of change matter: a capability change on the
-			// spec side (notably a partitioning-mode toggle, which re-splits the per-card
-			// populations), and an occupancy change on the status side, since the
-			// per-profile partition key is now derived from the runtime ledger — carving or
-			// freeing a partition must re-patch the node. The 3s dedup window coalesces
-			// the resulting bursts.
+			// Devices 的变更可能改变期望的计数容量，而不一定会改动 Node predicate 监听的裸令牌池，
+			// 因此需要将同名的 Node 加入队列。有两类变更值得关注：spec 侧的能力变更（尤其是分区模式切换，
+			// 它会重新划分卡群），以及 status 侧的占用变更——由于按 profile 划分的分区键现已基于运行时账本推导，
+			// 切分或释放分区必须重新 patch Node。3s 的去重窗口用于合并由此产生的突发事件。
 			&workercore.Devices{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -390,9 +353,8 @@ func (r *NodeCapacityReconciler) SetupController(_ context.Context, opts control
 				r.enqueueNodeWhenDevicesChanged,
 			),
 			ctrlbuilder.WithPredicates(ctrlpredicate.Funcs{
-				// A managed Devices' slicing detail: on create/delete the whole capability
-				// appears/vanishes; on update fire only when the spec slicing detail changed,
-				// never on Status (allocation) churn or non-slicing spec fields like health.
+				// 受管 Devices 的切片细节：创建/删除时整个能力出现/消失；更新时仅在 spec 切片细节变更时触发，
+				// 绝不因 Status（分配）抖动或健康状态等非切片 spec 字段而触发。
 				CreateFunc: func(e ctrlevent.CreateEvent) bool {
 					return isManagedDevices(e.Object)
 				},
@@ -411,14 +373,13 @@ func (r *NodeCapacityReconciler) SetupController(_ context.Context, opts control
 		Complete(r)
 }
 
-// isManagedDevices reports whether a Devices ledger belongs to an operator-managed node.
+// isManagedDevices 判断 Devices 账本是否属于受 Operator 管理的 Node。
 func isManagedDevices(obj ctrlcli.Object) bool {
 	return obj.GetLabels()[systemname.ManagedLabelKey] == "true"
 }
 
-// enqueueNodeWhenDevicesChanged maps a changed Devices ledger to its name-identical Node
-// (both are cluster-scoped and share the node name), so a per-card slicing detail change
-// reconciles that node's ".sliced.*" capacity.
+// enqueueNodeWhenDevicesChanged 将发生变更的 Devices 账本映射到与其同名的 Node
+// （两者均为集群作用域且共享 Node 名称），从而在逐卡切片细节变更时协调该 Node 的 ".sliced.*" 容量。
 func (r *NodeCapacityReconciler) enqueueNodeWhenDevicesChanged(
 	ctx context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {
@@ -427,12 +388,10 @@ func (r *NodeCapacityReconciler) enqueueNodeWhenDevicesChanged(
 	return []ctrlreconcile.Request{req}
 }
 
-// acceleratorSignature captures exactly the Devices fields the desired capacity is computed
-// from: the per-card logical/partitioned split, the logical detail (count + overcommit), and the
-// per-profile partition instance counts. Comparing signatures lets the Devices watch fire only on
-// a change that can move a capacity key, including a re-partition that changes the profile set
-// without moving the card counts. It must stay comparable (it is a maps.Equal value), so the
-// profiles are folded into a canonical string, not a map.
+// acceleratorSignature 精确捕获用于计算期望容量的 Devices 字段：逐卡的逻辑/分区划分、
+// 逻辑切片详情（数量与超卖标志）以及各 profile 的分区实例数。通过比较签名，可使 Devices watch
+// 仅在可能影响容量键的变更时触发，包括卡数不变但 profile 集合发生变化的重新分区。
+// 该类型必须保持可比较性（用作 maps.Equal 的值），因此将 profile 折叠为规范字符串而非 map。
 type acceleratorSignature struct {
 	logicalCards      int64
 	partitionedCards  int64
@@ -441,9 +400,9 @@ type acceleratorSignature struct {
 	partitionProfiles string
 }
 
-// partitionProfileSignature renders a group's per-profile partition instance counts as a
-// canonical, order-independent "name=count;..." string, so a change to the profile set or to any
-// profile's count re-enqueues the node while identical inventories compare equal.
+// partitionProfileSignature 将组的各 profile 分区实例数渲染为规范且与顺序无关的
+// "name=count;..." 字符串，使得 profile 集合或任意 profile 数量变更时重新入队 Node，
+// 而相同清单比较结果相等。
 func partitionProfileSignature(profiles map[string]int64) string {
 	if len(profiles) == 0 {
 		return ""
@@ -456,17 +415,16 @@ func partitionProfileSignature(profiles map[string]int64) string {
 	return strings.Join(parts, ";")
 }
 
-// acceleratorDetailChanged reports whether anything the desired capacity is computed from moved
-// between two Devices snapshots. Unlike its predecessor it reads the status side as well as the
-// spec: the per-profile partition key is derived from the runtime ledger, so an allocation or a
-// release changes a capacity value with the spec untouched. Everything else on the status side —
-// a mode flip, a units movement — projects to the same signature and still does not fire.
+// acceleratorDetailChanged 判断两份 Devices 快照之间影响期望容量计算的内容是否发生变动。
+// 与早期实现不同，它会同时读取 status 侧与 spec 侧：由于按 profile 划分的分区键源自运行时账本，
+// 分配或释放操作会在 spec 不变的情况下改变容量值。status 侧的其他变动（如模式切换、units 波动）
+// 仍映射到相同签名，因此不会触发协调。
 func acceleratorDetailChanged(oldDevs, newDevs *workercore.Devices) bool {
 	return !maps.Equal(acceleratorSignatures(oldDevs), acceleratorSignatures(newDevs))
 }
 
-// acceleratorSignatures projects a Devices object's groups to their signatures, keyed by the
-// "${manufacturer}-${group ID}" acceleratable key.
+// acceleratorSignatures 将 Devices 对象的各个组投影为其签名，并以 "${manufacturer}-${group ID}"
+// 可加速键作为索引。
 func acceleratorSignatures(devs *workercore.Devices) map[string]acceleratorSignature {
 	if devs == nil {
 		return nil

@@ -19,19 +19,18 @@ import (
 	workersettings "gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// The cells this view's own columns occupy. The framework books the object's name first and the
-// age last, so the columns between them are addressed by position.
+// 该视图自有列所占用的单元格位置。框架会将对象名称排在首位、存在时间排在末位，
+// 因此两者之间的列按位置索引。
 const (
 	modelStoreHighCell = 2
 	modelStoreLowCell  = 3
 )
 
-// ModelStoreHandler proxies a v1alpha1.ModelStore as the public ModelStore resource.
+// ModelStoreHandler 将 v1alpha1.ModelStore 代理为公开的 ModelStore 资源。
 //
-// No status proxy is exposed because the status is the controller's observation of the matched
-// nodes' residency, while the proxy writes with the worker's identity. The storage resource's
-// status subresource keeps the status as it is on main-resource writes, so the status is read
-// through the main resource.
+// 这里不暴露 status 代理，因为 status 是控制器对所匹配节点驻留情况的观测结果，
+// 而代理以 worker 的身份执行写入。底层存储资源的 status 子资源会在主资源写入时保持 status 不变，
+// 因此 status 通过主资源读取。
 type ModelStoreHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -53,12 +52,11 @@ func (h *ModelStoreHandler) SetupHandler(
 	return gvr, map[string]rest.Storage{}, nil
 }
 
-// modelStoreTable is the view's kubectl table: the columns a ModelStore's own object answers, with
-// the two watermark cells completed from the cluster Settings wherever the pool states none.
+// modelStoreTable 是该视图的 kubectl 表格：展示 ModelStore 对象自身的列，
+// 并在存储池未指定水位线时从集群 Settings 中补全两个水位线单元格。
 //
-// It states the pool's own cache policy, which is the layer above the cluster defaults. It is not a
-// report of what a node has applied: a node's own kubelet thresholds can cap the high watermark
-// below the pool's, and only that node's NodeModelStore shows the result.
+// 它反映存储池自身的缓存策略（位于集群默认值之上的一层），而非节点实际生效的报告：
+// 节点自身的 kubelet 阈值可能会将高水位线限制在存储池设定之下，只有该节点的 NodeModelStore 才显示最终结果。
 func modelStoreTable(reader ctrlcli.Reader) (rest.TableConvertor, error) {
 	columns, err := extensionapi.NewJSONPathTemplateTableConvertor(
 		extensionapi.JSONPathTemplateColumn("Nodes", "{.status.nodes}"),
@@ -71,15 +69,12 @@ func modelStoreTable(reader ctrlcli.Reader) (rest.TableConvertor, error) {
 	return modelStoreTableConvertor{columns: columns, reader: reader}, nil
 }
 
-// modelStoreTableConvertor fills the two watermark cells of the rows whose pool states none, from
-// one reading of the cluster Settings.
+// modelStoreTableConvertor 通过单次读取集群 Settings，为存储池未设置水位线的行填充两个水位线单元格。
 //
-// It wraps the view's own columns rather than replacing them, so the headers, the list metadata and
-// the object each row carries are the ones the table framework already produces. The cluster values
-// are read once, at the first row that needs them, and the rest of the rows share that reading, so
-// a request that inherits nothing never reads the Secret at all. Only the cells are written: the
-// object a pool was read from is left as it is, so a pool that inherits still states no watermarks
-// and the table's own copy of the object says the same.
+// 它包装视图的自有列而非替换它们，因此表头、列表元数据以及每行携带的对象均保持表格框架原有输出。
+// 集群值仅在首个需要的行读取一次并由其余行共享，因此没有任何继承的请求完全不会读取 Secret。
+// 修改仅限单元格内容：读取来源的存储池对象保持原样，因此采用继承的存储池仍未显式声明水位线，
+// 表格中携带的对象副本亦如此。
 type modelStoreTableConvertor struct {
 	columns rest.TableConvertor
 	reader  ctrlcli.Reader
@@ -114,21 +109,19 @@ func (c modelStoreTableConvertor) ConvertToTable(
 	return table, nil
 }
 
-// readClusterWatermarks reads the watermarks the cluster Settings hold.
+// readClusterWatermarks 读取集群 Settings 中保存的水位线。
 //
-// It reads through the API reader rather than the Settings package, whose read cache answers for up
-// to thirty seconds: a table should show the values stored now. A Secret that does not exist, and a
-// key it does not carry, fall back to the Setting's own default, which is the cluster layer a pool
-// states nothing over. Any other read failure, and a stored value that is not a percent, are
-// errors: a table that cannot say which cluster values stand must not present a default as if an
-// operator had chosen it.
+// 它通过 API reader 而非 Settings 包读取，因为后者的读缓存有效期可达三十秒，
+// 而表格应展示当前存储的值。不存在的 Secret 以及其中缺失的键会回退到 Setting 自身的默认值，
+// 即存储池未显式覆盖时所依据的集群层设置。其他任何读取失败以及非百分比的存储值均视为错误：
+// 若表格无法确认当前生效的集群值，绝不能将默认值当作运维人员显式选择的值来展示。
 func readClusterWatermarks(ctx context.Context, reader ctrlcli.Reader) (workercore.NodeModelStoreWatermarks, error) {
 	sec := new(core.Secret)
 	key := ctrlcli.ObjectKey{Namespace: setting.DelegatedSecretNamespace, Name: setting.DelegatedSecretName}
 	if err := reader.Get(ctx, key, sec); ctrlcli.IgnoreNotFound(err) != nil {
 		return workercore.NodeModelStoreWatermarks{}, fmt.Errorf("read the settings secret: %w", err)
 	}
-	// A Secret that was not found leaves sec empty, so every key falls back to its default.
+	// 未找到 Secret 时 sec 保持为空，因此所有键都会回退到各自的默认值。
 
 	var wm workercore.NodeModelStoreWatermarks
 	var err error
@@ -141,9 +134,8 @@ func readClusterWatermarks(ctx context.Context, reader ctrlcli.Reader) (workerco
 	return wm, nil
 }
 
-// watermarkPercent reads one watermark's stored value, or the Setting's default when the Secret
-// carries no value for it. Only the two watermark keys are read, so a malformed value in some
-// other Setting is that Setting's business and does not keep a table from rendering.
+// watermarkPercent 读取单个水位线的存储值；当 Secret 中未携带该键时返回 Setting 的默认值。
+// 这里仅读取两个水位线键，因此其他 Setting 中格式错误的值仅影响其自身，不会阻碍表格渲染。
 func watermarkPercent(data map[string][]byte, s setting.Setting) (int32, error) {
 	value := s.DefaultValue()
 	if v, ok := data[s.Name()]; ok {

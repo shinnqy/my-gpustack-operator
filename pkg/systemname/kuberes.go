@@ -2,7 +2,7 @@ package systemname
 
 import "gpustack.ai/gpustack/pkg/utils/osx"
 
-// NamespaceName is the name indicates which Kubernetes Namespace storing system resources.
+// NamespaceName 表示用于存储系统资源的 Kubernetes Namespace 名称。
 var NamespaceName string
 
 func init() {
@@ -10,9 +10,9 @@ func init() {
 }
 
 const (
-	// LabelPrefix is the prefix of all labels used by gpustack.
+	// LabelPrefix 是 gpustack 使用的所有 label 的前缀。
 	LabelPrefix = "gpustack.ai/"
 
-	// ManagedLabelKey is the label key to indicate whether a resource is managed by gpustack.
+	// ManagedLabelKey 是用于标识资源是否由 gpustack 管理的 label key。
 	ManagedLabelKey = LabelPrefix + "managed"
 )

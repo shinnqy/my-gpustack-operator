@@ -13,8 +13,8 @@ import (
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 )
 
-// initialQueuedReplica verifies that every current member still waits for its first admission.
-// Kueue removes the admission gate before starting a Pod. Kubernetes does not permit adding it back.
+// initialQueuedReplica 验证每个当前成员是否仍在等待首次准入。
+// Kueue 会在启动 Pod 前移除准入门控（admission gate），Kubernetes 不允许将其重新添加。
 func (r *ModelDeploymentReconciler) initialQueuedReplica(
 	ctx context.Context, view modelDeploymentReplicaView, workloads []kueue.Workload,
 ) (bool, error) {
@@ -22,9 +22,8 @@ func (r *ModelDeploymentReconciler) initialQueuedReplica(
 		return false, nil
 	}
 
-	// A member whose cached status already shows progress cannot be in the initial queue: the gate
-	// is never added back and a node assignment or container status never goes away. Only the
-	// survivors are confirmed on the API server.
+	// 缓存状态中已显示运行进展的成员不可能仍处于初始队列中：门控不会被重新加回，Node 分配或容器状态也不会消失。
+	// 只有通过筛选的剩余成员才需要向 API server 确认。
 	for _, member := range view.Members {
 		if member.Spec.NodeName != "" || len(member.Status.ContainerStatuses) != 0 ||
 			len(member.Status.InitContainerStatuses) != 0 ||
@@ -65,8 +64,8 @@ func (r *ModelDeploymentReconciler) initialQueuedReplica(
 	return true, nil
 }
 
-// workloadInInitialQueue rejects admission and evidence of an earlier execution or eviction.
-// A false eviction condition can retain history after Kueue grants quota again.
+// workloadInInitialQueue 排除已准入以及存在过往执行或驱逐记录的 Workload。
+// 在 Kueue 重新授予配额后，为 False 的驱逐条件仍可能保留历史记录。
 func workloadInInitialQueue(wl *kueue.Workload) bool {
 	if wl.Status.AccumulatedPastExecutionTimeSeconds != nil || wl.Status.RequeueState != nil ||
 		len(wl.Status.ReclaimablePods) != 0 ||

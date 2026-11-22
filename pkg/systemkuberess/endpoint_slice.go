@@ -19,28 +19,22 @@ import (
 )
 
 const (
-	// routingManagedBy is the manager of the endpoint slice of the system routing.
+	// routingManagedBy 是系统路由 EndpointSlice 的管理者标识。
 	//
-	// It is a value of its own, and not the one of the endpoint slice controller or
-	// the one of the endpoint slice mirroring controller, so that neither of them
-	// takes the slice over, and so that the slice of this operator can be told from
-	// a mirrored one.
+	// 它采用独立的值，而不是 EndpointSlice 控制器或 EndpointSlice 镜像控制器的标识，
+	// 以免二者接管该 Slice，同时也能将本 operator 创建的 Slice 与镜像 Slice 区分开来。
 	routingManagedBy = "gpustack-operator-worker"
 
-	// routingEndpointSliceNameSuffix is the suffix of the name of the endpoint slice
-	// of the system routing.
+	// routingEndpointSliceNameSuffix 是系统路由 EndpointSlice 名称的后缀。
 	//
-	// The slice is named apart from the service it serves, because a mirrored slice
-	// of the legacy endpoints is named after the endpoints with a short random
-	// suffix, and the two must never be the same object.
+	// 该 Slice 的命名与其所服务的 Service 区分开，因为传统 Endpoints 的镜像 Slice
+	// 是以 Endpoints 名称加上简短随机后缀命名的，两者绝不能成为同一个对象。
 	routingEndpointSliceNameSuffix = "-direct"
 )
 
-// addressTypeMismatchError reports that the endpoint slice in the cluster carries another
-// address type than the routing wants.
+// addressTypeMismatchError 报告集群中的 EndpointSlice 所携带的地址类型与路由期望的不一致。
 //
-// The address type of an endpoint slice cannot be changed, so such a slice is replaced
-// rather than updated.
+// EndpointSlice 的地址类型无法更改，因此遇到此类 Slice 时会直接替换而非更新。
 type addressTypeMismatchError struct {
 	name     string
 	actual   discovery.AddressType
@@ -52,12 +46,10 @@ func (e *addressTypeMismatchError) Error() string {
 		e.name, e.actual, e.expected)
 }
 
-// newRoutingEndpointSlice builds the desired endpoint slice of the system routing.
+// newRoutingEndpointSlice 构建系统路由期望的 EndpointSlice。
 //
-// The aggregator reads the slices that carry the name of the service, and takes the
-// first one whose port is named after the service port and whose endpoint is ready.
-// The slice therefore names the service, names the port of the service and carries a
-// ready endpoint on the address of the system.
+// 聚合器会读取携带该 Service 名称的 Slice，并选取第一个端口名与 Service 端口一致且端点就绪的 Slice。
+// 因此，该 Slice 会关联 Service 名称、使用 Service 端口名，并携带指向系统地址的就绪端点。
 func newRoutingEndpointSlice(nsName, svcName, address string, port int32) (*discovery.EndpointSlice, error) {
 	addressType, err := routingAddressType(address)
 	if err != nil {
@@ -97,17 +89,15 @@ func newRoutingEndpointSlice(nsName, svcName, address string, port int32) (*disc
 	}, nil
 }
 
-// routingEndpointSliceName returns the name of the endpoint slice of the system routing.
+// routingEndpointSliceName 返回系统路由 EndpointSlice 的名称。
 func routingEndpointSliceName(svcName string) string {
 	return svcName + routingEndpointSliceNameSuffix
 }
 
-// routingAddressType returns the address type of an endpoint slice that can carry the
-// given address.
+// routingAddressType 返回能够承载给定地址的 EndpointSlice 地址类型。
 //
-// The aggregator prefers the slices of the primary address family of the service, and
-// an endpoint slice only accepts the addresses of its own type, so the type has to
-// follow the address.
+// 聚合器优先选择与 Service 主地址族一致的 Slice，且 EndpointSlice 仅接受与其自身类型匹配的地址，
+// 因此地址类型必须随地址而定。
 func routingAddressType(address string) (discovery.AddressType, error) {
 	ip := net.ParseIP(address)
 	if ip == nil {
@@ -119,16 +109,13 @@ func routingAddressType(address string) (discovery.AddressType, error) {
 	return discovery.AddressTypeIPv6, nil
 }
 
-// installRoutingEndpointSlice creates or updates the endpoint slice of the system
-// routing.
+// installRoutingEndpointSlice 创建或更新系统路由的 EndpointSlice。
 //
-// The address type of an endpoint slice cannot be changed, so a slice that was made for
-// the other address family is replaced instead of updated.
+// EndpointSlice 的地址类型无法修改，因此为另一地址族创建的 Slice 会被替换而非更新。
 //
-// One worker owns the routing of a cluster at a time. The namespace and the routing
-// service name are the same in every installation, so two workers pointing at one
-// cluster write the same slice, and the last write wins. A slice this worker does not
-// own is refused rather than taken over.
+// 同一时间只有一个 worker 拥有集群的路由控制权。由于每次安装的 Namespace 和路由 Service 名称均相同，
+// 若两个 worker 指向同一集群，它们会写入同一个 Slice，以最后写入者为准。
+// 对于不属于当前 worker 的 Slice，会拒绝修改而不是强行接管。
 func installRoutingEndpointSlice(ctx context.Context, cli kubernetes.Interface, nsName string,
 	desired *discovery.EndpointSlice, svc *core.Service,
 ) error {
@@ -146,19 +133,19 @@ func installRoutingEndpointSlice(ctx context.Context, cli kubernetes.Interface, 
 			if err != nil && !kerrors.IsConflict(err) {
 				return err
 			}
-			// A conflict means another actor replaced the slice in between. The
-			// write below reads the slice that is there now and decides on it.
+			// 发生冲突意味着在此期间有其他参与者替换了该 Slice。
+			// 下面的写入操作会读取当前存在的 Slice 并据此作出处理。
 		}
 	case kerrors.IsNotFound(err):
-		// The slice does not exist yet, it is created below.
+		// 该 Slice 尚不存在，将在下方创建。
 	default:
 		return fmt.Errorf("get routing endpoint slice %q: %w", desired.GetName(), err)
 	}
 
 	kubemeta.ControlOn(desired, svc, core.SchemeGroupVersion.WithKind("Service"))
 
-	// The read the create uses can still show the slice of the other address family
-	// after it was deleted, so a family mismatch is retried with the slice gone.
+	// 创建时读取到的内容在删除后仍可能显示旧地址族的 Slice，
+	// 因此在删除该 Slice 后遇到地址族不匹配时会进行重试。
 	for attempt := 0; ; attempt++ {
 		_, err = kubeclientset.Create(ctx, sliceCli, desired,
 			kubeclientset.WithUpdateIfExisted(routingEndpointSliceAlign(desired, svc)))
@@ -179,19 +166,16 @@ func installRoutingEndpointSlice(ctx context.Context, cli kubernetes.Interface, 
 			return fmt.Errorf("get routing endpoint slice %q: %w", desired.GetName(), getErr)
 		}
 
-		// The slice may have been replaced between the read that found the
-		// mismatch and this one, so its identity is checked again before
-		// anything is deleted. The uid precondition of the deletion binds it to
-		// the slice that was read here, and that slice may be one another actor
-		// owns.
+		// 在发现不匹配的读取操作与本次读取之间，该 Slice 可能已被替换，
+		// 因此在执行任何删除操作前会再次校验其身份。删除请求的 UID 前置条件
+		// 会将其绑定到此处读取到的 Slice，而该 Slice 可能由其他参与者拥有。
 		err = checkRoutingSliceIdentity(stale, svc)
 		if err != nil {
 			return err
 		}
 
 		if stale.AddressType == desired.AddressType {
-			// The slice carries the wanted address family now, so the
-			// reconcile converges on it without deleting it.
+			// 该 Slice 当前已携带期望的地址族，因此协调过程可直接基于它收敛，无需删除。
 			continue
 		}
 
@@ -200,19 +184,17 @@ func installRoutingEndpointSlice(ctx context.Context, cli kubernetes.Interface, 
 			if !kerrors.IsConflict(err) {
 				return err
 			}
-			// Another actor replaced the slice in between. The write below reads
-			// the slice that is there now and decides on it.
+			// 在此期间有其他参与者替换了该 Slice。下面的写入操作会读取当前存在的 Slice 并据此作出处理。
 			continue
 		}
 	}
 }
 
-// checkRoutingSliceIdentity refuses an endpoint slice this worker does not own.
+// checkRoutingSliceIdentity 拒绝不属于当前 worker 的 EndpointSlice。
 //
-// A slice belongs to this worker when it carries the managed-by label of this operator
-// and the routing service controls it, or when it carries the label and has no owner at
-// all, which is the state a slice of an earlier version of this operator leaves behind.
-// Any other slice is refused, and the refusal names its owner.
+// 当 Slice 带有本 operator 的 managed-by 标签且由路由 Service 控制，或者带有该标签但完全没有所有者
+// （即本 operator 早期版本遗留的 Slice 状态）时，该 Slice 才属于当前 worker。
+// 其他任何 Slice 都会被拒绝，并在错误信息中指明其所有者。
 func checkRoutingSliceIdentity(slice *discovery.EndpointSlice, svc *core.Service) error {
 	if slice.GetLabels()[discovery.LabelManagedBy] != routingManagedBy {
 		return fmt.Errorf("routing endpoint slice %q is managed by %q, not by this operator",
@@ -222,12 +204,10 @@ func checkRoutingSliceIdentity(slice *discovery.EndpointSlice, svc *core.Service
 	owner := kubemeta.GetControllerOfNoCopy(slice)
 	switch {
 	case owner == nil:
-		// A slice of an earlier version of this operator, which left it without an owner.
+		// 本 operator 早期版本创建的 Slice，当时未设置所有者。
 	case routingServiceOwns(slice, svc):
-		// The routing service controls the slice. The uid of the owner may be that
-		// of the service this installation recreated, which the slice outlived; the
-		// slice is adopted, and its owner reference is rewritten with the service
-		// of now.
+		// 该 Slice 由路由 Service 控制。所有者的 UID 可能属于本次安装中已被重建的旧 Service
+		// （Slice 的生命周期长于旧 Service）；此时会接管该 Slice，并将其 ownerReference 重写为当前的 Service。
 	default:
 		return fmt.Errorf("routing endpoint slice %q is controlled by %s %q with uid %q, not by the routing service",
 			slice.GetName(), owner.Kind, owner.Name, owner.UID)
@@ -236,13 +216,11 @@ func checkRoutingSliceIdentity(slice *discovery.EndpointSlice, svc *core.Service
 	return nil
 }
 
-// routingServiceOwns reports whether the routing service controls the slice.
+// routingServiceOwns 报告路由 Service 是否控制该 Slice。
 //
-// The owner is recognized by the name of the service it names, and not by its uid,
-// because the routing service is recreated whenever its spec changes. The slice that
-// the service of the past owned still belongs to this installation, and one service
-// carries the name in the namespace, so the name proves the owner as well as the uid
-// does, and it survives the recreation of the service.
+// 此处通过引用的 Service 名称而非 UID 来识别所有者，因为每当 spec 变更时路由 Service 都会被重建。
+// 过去 Service 所拥有的 Slice 仍然属于当前安装，且该 Namespace 下同名 Service 只有一个，
+// 因此名称与 UID 同样能够证明所有权，且在 Service 重建后依然有效。
 func routingServiceOwns(slice *discovery.EndpointSlice, svc *core.Service) bool {
 	if svc == nil {
 		return false
@@ -251,11 +229,10 @@ func routingServiceOwns(slice *discovery.EndpointSlice, svc *core.Service) bool 
 	return controlsRoutingOwner(slice, "Service", svc.GetName())
 }
 
-// routingEndpointsOwns reports whether the legacy endpoints control the slice.
+// routingEndpointsOwns 报告传统 Endpoints 是否控制该 Slice。
 //
-// The owner is recognized by the name here for the same reason it is for the routing
-// service: the legacy endpoints are recreated whenever they are deleted, and the
-// mirror of the endpoints of the past still belongs to this installation.
+// 此处同样通过名称识别所有者，原因与路由 Service 相同：传统 Endpoints 在被删除后会重建，
+// 过去 Endpoints 的镜像 Slice 依然属于当前安装。
 func routingEndpointsOwns(slice *discovery.EndpointSlice, ep *core.Endpoints) bool {
 	if ep == nil {
 		return false
@@ -264,8 +241,7 @@ func routingEndpointsOwns(slice *discovery.EndpointSlice, ep *core.Endpoints) bo
 	return controlsRoutingOwner(slice, "Endpoints", ep.GetName())
 }
 
-// controlsRoutingOwner reports whether the controller owner reference of the slice names
-// the resource of the given kind and name.
+// controlsRoutingOwner 报告该 Slice 的控制器 ownerReference 是否指向给定 kind 和名称的资源。
 func controlsRoutingOwner(slice *discovery.EndpointSlice, kind, name string) bool {
 	owner := kubemeta.GetControllerOfNoCopy(slice)
 	if owner == nil {
@@ -277,15 +253,12 @@ func controlsRoutingOwner(slice *discovery.EndpointSlice, kind, name string) boo
 		owner.Name == name
 }
 
-// routingEndpointSliceAlign returns the align function of the endpoint slice of the
-// system routing.
+// routingEndpointSliceAlign 返回系统路由 EndpointSlice 的对齐函数。
 //
-// The endpoints and the ports are replaced, not appended, so that a system that moved
-// to another address or another port does not keep the old one.
+// 端点和端口采用替换而非追加方式，以确保系统迁移到其他地址或端口后不会保留旧值。
 //
-// The identity of the slice is checked on the object that is written, and not only on
-// the one that was read before, so that a slice that was swapped in between the two is
-// not rewritten.
+// 不仅在之前读取的对象上，也会在即将写入的对象上校验 Slice 的身份，
+// 以防止在读写之间被调包的 Slice 被误改写。
 func routingEndpointSliceAlign(desired *discovery.EndpointSlice, svc *core.Service) kubeclientset.AlignWithFn[*discovery.EndpointSlice] {
 	return func(actual *discovery.EndpointSlice) (*discovery.EndpointSlice, bool, error) {
 		err := checkRoutingSliceIdentity(actual, svc)
@@ -305,9 +278,8 @@ func routingEndpointSliceAlign(desired *discovery.EndpointSlice, svc *core.Servi
 		aligned.SetLabels(mergeLabels(actual.GetLabels(), desired.GetLabels()))
 		kubemeta.ControlOn(aligned, svc, core.SchemeGroupVersion.WithKind("Service"))
 
-		// The endpoints and the ports are copied, and not shared with the desired
-		// object, so that a change to the object that is written cannot reach the
-		// object the next attempt writes.
+		// 端点和端口均经过深拷贝，不与 desired 对象共享，
+		// 以避免对写入对象的修改影响到下一次尝试写入的对象。
 		wanted := desired.DeepCopy()
 		aligned.Ports = wanted.Ports
 		aligned.Endpoints = wanted.Endpoints
@@ -319,11 +291,10 @@ func routingEndpointSliceAlign(desired *discovery.EndpointSlice, svc *core.Servi
 	}
 }
 
-// deleteRoutingSlice deletes an endpoint slice of the system routing.
+// deleteRoutingSlice 删除系统路由的一个 EndpointSlice。
 //
-// The deletion is bound to the uid of the slice that was read, so a slice that another
-// actor replaced in between is not destroyed. The api server answers a conflict in
-// that case, and the slice that is there then is read again by the caller.
+// 删除操作绑定了所读取 Slice 的 UID，从而避免误删在此期间被其他参与者替换的 Slice。
+// 若发生替换，API Server 会返回冲突错误，随后由调用方重新读取当前存在的 Slice。
 func deleteRoutingSlice(ctx context.Context, cli kubernetes.Interface, nsName string, slice *discovery.EndpointSlice) error {
 	err := cli.DiscoveryV1().EndpointSlices(nsName).Delete(ctx, slice.GetName(), meta.DeleteOptions{
 		PropagationPolicy: ptr.To(meta.DeletePropagationBackground),
@@ -331,7 +302,7 @@ func deleteRoutingSlice(ctx context.Context, cli kubernetes.Interface, nsName st
 	})
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			// The slice is gone, which is the state the delete aimed at.
+			// 该 Slice 已不存在，已达到删除操作的目标状态。
 			return nil
 		}
 		return fmt.Errorf("delete routing endpoint slice %q: %w", slice.GetName(), err)
@@ -339,20 +310,17 @@ func deleteRoutingSlice(ctx context.Context, cli kubernetes.Interface, nsName st
 	return nil
 }
 
-// cleanupObsoleteRoutingSlices removes the endpoint slices this installation owns and no
-// longer needs: the slice an earlier version of this operator created under another name,
-// and the slice the endpoint slice mirroring controller mirrored from the legacy
-// endpoints.
+// cleanupObsoleteRoutingSlices 移除属于当前安装且不再需要的 EndpointSlice：
+// 包括本 operator 早期版本以其他名称创建的 Slice，以及 EndpointSlice 镜像控制器
+// 从传统 Endpoints 镜像生成的 Slice。
 //
-// Only the slices whose owner reference names the service or the legacy endpoints of
-// this installation are removed. A slice that carries the name of the routing service
-// but belongs to somebody else is left alone, because a label is not a proof of
-// ownership.
+// 仅移除 ownerReference 指向当前安装的 Service 或传统 Endpoints 的 Slice。
+// 带有路由 Service 名称但属于其他所有者的 Slice 会予以保留，因为仅凭标签不足以证明所有权。
 func cleanupObsoleteRoutingSlices(ctx context.Context, cli kubernetes.Interface, nsName string,
 	svc *core.Service, ep *core.Endpoints, keepName string,
 ) error {
 	if svc == nil || ep == nil {
-		// Without the owners there is no proof of ownership, so nothing is removed.
+		// 缺少所有者对象时无法证明所有权，因此不执行任何移除操作。
 		return nil
 	}
 
@@ -370,7 +338,7 @@ func cleanupObsoleteRoutingSlices(ctx context.Context, cli kubernetes.Interface,
 		}
 
 		if !isObsoleteRoutingSlice(slice, svc, ep) {
-			// Not owned by this installation, keep it.
+			// 不属于当前安装，予以保留。
 			continue
 		}
 
@@ -383,18 +351,15 @@ func cleanupObsoleteRoutingSlices(ctx context.Context, cli kubernetes.Interface,
 	return nil
 }
 
-// isObsoleteRoutingSlice reports whether the slice belongs to this installation and is no
-// longer needed.
+// isObsoleteRoutingSlice 报告该 Slice 是否属于当前安装且已不再需要。
 func isObsoleteRoutingSlice(slice *discovery.EndpointSlice, svc *core.Service, ep *core.Endpoints) bool {
 	switch {
 	case routingEndpointsOwns(slice, ep):
-		// A mirror of the legacy endpoints of this installation. It carries the
-		// same address as the direct slice, but the aggregator may pick either
-		// of the two, so the direct slice replaces it.
+		// 当前安装传统 Endpoints 的镜像 Slice。它与直连 Slice 携带相同的地址，
+		// 但聚合器可能会任选其一，因此需要用直连 Slice 替代它。
 	case slice.GetLabels()[discovery.LabelManagedBy] == routingManagedBy &&
 		routingServiceOwns(slice, svc):
-		// A direct slice of this installation under a name this version no
-		// longer uses.
+		// 当前安装使用旧版本命名创建的直连 Slice，当前版本已不再使用该名称。
 	default:
 		return false
 	}
@@ -402,12 +367,10 @@ func isObsoleteRoutingSlice(slice *discovery.EndpointSlice, svc *core.Service, e
 	return true
 }
 
-// deleteObsoleteRoutingSlice removes the obsolete slice, and reads the slice that is
-// there when another actor replaced it in between.
+// deleteObsoleteRoutingSlice 移除过时的 Slice；若在此期间被其他参与者替换，则重新读取当前 Slice。
 //
-// The delete carries the uid of the slice that was read, so the slice that another
-// actor put in its place is not destroyed. The slice that is there then is read again,
-// and it is removed when it is ours and obsolete as well.
+// 删除请求携带所读取 Slice 的 UID，以免误删其他参与者新放入的 Slice。
+// 随后会重新读取当前存在的 Slice，若其同样属于我们且已过时，则会一并移除。
 func deleteObsoleteRoutingSlice(ctx context.Context, cli kubernetes.Interface, nsName string,
 	slice *discovery.EndpointSlice, svc *core.Service, ep *core.Endpoints, keepName string,
 ) error {
@@ -420,15 +383,14 @@ func deleteObsoleteRoutingSlice(ctx context.Context, cli kubernetes.Interface, n
 		Get(ctx, slice.GetName(), meta.GetOptions{})
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			// The slice is gone, which is the state the delete aimed at.
+			// 该 Slice 已不存在，已达到删除操作的目标状态。
 			return nil
 		}
 		return fmt.Errorf("get routing endpoint slice %q: %w", slice.GetName(), err)
 	}
 
 	if current.GetName() == keepName || !isObsoleteRoutingSlice(current, svc, ep) {
-		// The slice that is there now is kept, and it is not ours or it is the
-		// one this installation uses.
+		// 保留当前存在的 Slice，它要么不属于我们，要么正是当前安装正在使用的 Slice。
 		return nil
 	}
 

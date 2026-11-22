@@ -1,22 +1,16 @@
 package typex
 
-// Integer is a constraint that permits any integer type.
-// If future releases of Go add new predeclared integer types,
-// this constraint will be modified to include them.
+// Integer 是允许任何整数类型的约束。\n// 如果未来的 Go 版本添加了新的预声明整数类型，\n// 此约束将相应修改以包含它们。
 type Integer interface {
 	SignedInteger | UnsignedInteger
 }
 
-// SignedInteger is a constraint that permits any signed integer type.
-// If future releases of Go add new predeclared signed integer types,
-// this constraint will be modified to include them.
+// SignedInteger 是允许任何有符号整数类型的约束。\n// 如果未来的 Go 版本添加了新的预声明有符号整数类型，\n// 此约束将相应修改以包含它们。
 type SignedInteger interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64
 }
 
-// UnsignedInteger is a constraint that permits any unsigned integer type.
-// If future releases of Go add new predeclared unsigned integer types,
-// this constraint will be modified to include them.
+// UnsignedInteger 是允许任何无符号整数类型的约束。\n// 如果未来的 Go 版本添加了新的预声明无符号整数类型，\n// 此约束将相应修改以包含它们。
 type UnsignedInteger interface {
 	~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
 }

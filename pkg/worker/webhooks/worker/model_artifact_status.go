@@ -18,17 +18,14 @@ import (
 	"gpustack.ai/gpustack/pkg/system"
 )
 
-// modelArtifactStatusRuleWriter names the rule that refuses a status write from anyone but the
-// worker, so a refusal says which rule fired.
+// modelArtifactStatusRuleWriter 命名了“仅允许 worker 写入 status”的规则，以便在拒绝请求时指明触发的具体规则。
 const modelArtifactStatusRuleWriter = "only the worker writes a ModelArtifact's status"
 
-// validateModelArtifactStatus admits an update of the status subresource only from the worker's
-// own identity.
+// validateModelArtifactStatus 仅放行来自 worker 自身身份的 status 子资源更新请求。
 //
-// A node mounts a tenant's weights on the strength of this status: an artifact resolved in the Pod's
-// namespace, with this UID and this digest. A tenant who could write it could claim any digest on
-// the node. No role this chart installs grants tenants the subresource, but a broad role an
-// administrator grants would, silently, so the rule is enforced here rather than assumed from RBAC.
+// 节点依据该 status 挂载租户的模型权重：即解析自 Pod 所在 namespace、具有该 UID 与 digest 的制品。
+// 若租户能够写入该 status，便可伪造节点上的任意摘要。本 chart 安装的任何角色均未向租户授予该子资源权限，
+// 但管理员授予的宽泛角色可能会在无意中放开权限，因此必须在此处强制执行该规则，而不能假定 RBAC 已做限制。
 func (r *ModelArtifactWebhook) validateModelArtifactStatus(ctx context.Context, ma *workercore.ModelArtifact) error {
 	req, err := ctrladmission.RequestFromContext(ctx)
 	if err != nil {
@@ -44,22 +41,20 @@ func (r *ModelArtifactWebhook) validateModelArtifactStatus(ctx context.Context, 
 	return nil
 }
 
-// isStatusRequest reports whether ctx carries an admission request for the status subresource.
+// isStatusRequest 返回 ctx 中是否携带了针对 status 子资源的准入请求。
 func isStatusRequest(ctx context.Context) bool {
 	req, err := ctrladmission.RequestFromContext(ctx)
 	return err == nil && req.SubResource == "status"
 }
 
-// selfUsername is the identity the worker's own requests carry, asked of the API server, so the
-// answer holds whether the worker runs with a ServiceAccount or with a kubeconfig user.
+// selfUsername 向 API server 查询 worker 自身请求所携带的身份，因此无论 worker 使用 ServiceAccount 还是 kubeconfig 用户运行，结果均有效。
 func selfUsername(ctx context.Context) (string, error) {
 	return learnUsername(ctx, system.LoopbackKubeClient.Get(), loopbackBearerToken)
 }
 
-// learnUsername asks the API server who cli is. SelfSubjectReview is served from Kubernetes 1.28;
-// an older server is asked with a TokenReview of the bearer token cli sends instead, which answers
-// the same authenticated username. Without either there is no writer the status rule could admit,
-// so the error stops the worker rather than leave the rule off.
+// learnUsername 向 API server 查询 cli 的身份。Kubernetes 1.28 起提供 SelfSubjectReview；
+// 对于更早版本的服务端，则改为提交 cli 所发送 bearer token 的 TokenReview，同样可返回经认证的用户名。
+// 若两种方式均不可用，则 status 规则将没有任何可放行的写入方，因此发生错误时会中止 worker，而不是关闭该规则。
 func learnUsername(ctx context.Context, cli kubernetes.Interface, token func() (string, error)) (string, error) {
 	review, err := cli.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authn.SelfSubjectReview{}, meta.CreateOptions{})
 	switch {
@@ -89,8 +84,7 @@ func learnUsername(ctx context.Context, cli kubernetes.Interface, token func() (
 	return tr.Status.User.Username, nil
 }
 
-// loopbackBearerToken is the bearer token the loopback client sends: the file's current content
-// when it reads one, as a ServiceAccount token file is rotated.
+// loopbackBearerToken 返回回环客户端发送的 bearer token：当从文件读取时，由于 ServiceAccount token 文件会定期轮换，因此读取文件当前内容。
 func loopbackBearerToken() (string, error) {
 	cfg := system.LoopbackKubeRestConfig.Get()
 	if cfg.BearerTokenFile != "" {

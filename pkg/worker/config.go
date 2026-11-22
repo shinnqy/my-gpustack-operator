@@ -50,13 +50,13 @@ func (c *Config) Apply(ctx context.Context) (*Worker, error) {
 
 	apiSrvCfg := c.APIServerConfig
 
-	// Apply the server configuration.
+	// 应用服务端配置。
 	err = c.Serve.ApplyTo(&apiSrvCfg.SecureServing)
 	if err != nil {
 		return nil, fmt.Errorf("apply server config: %w", err)
 	}
 
-	// Apply the authentication configuration.
+	// 应用认证配置。
 	if c.Authn != nil {
 		err = c.Authn.ApplyTo(&apiSrvCfg.Authentication, apiSrvCfg.SecureServing, nil)
 		if err != nil {
@@ -64,7 +64,7 @@ func (c *Config) Apply(ctx context.Context) (*Worker, error) {
 		}
 	}
 
-	// Apply the authorization configuration.
+	// 应用鉴权配置。
 	if c.Authz != nil {
 		err = c.Authz.ApplyTo(&apiSrvCfg.Authorization)
 		if err != nil {
@@ -72,13 +72,13 @@ func (c *Config) Apply(ctx context.Context) (*Worker, error) {
 		}
 	}
 
-	// Apply the audit configuration.
+	// 应用审计配置。
 	err = c.Audit.ApplyTo(&apiSrvCfg.Config)
 	if err != nil {
 		return nil, fmt.Errorf("apply audit config: %w", err)
 	}
 
-	// Apply the admission configuration.
+	// 应用准入配置。
 	{
 		dcli, err := dynamic.NewForConfig(apiSrvCfg.ClientConfig)
 		if err != nil {
@@ -97,7 +97,7 @@ func (c *Config) Apply(ctx context.Context) (*Worker, error) {
 		}
 	}
 
-	// Apply OpenAPI configuration.
+	// 应用 OpenAPI 配置。
 	var (
 		title       = "GPUStack - Open Source Accelerator Management Platform"
 		fullVersion = version.Get()
@@ -125,7 +125,7 @@ func (c *Config) Apply(ctx context.Context) (*Worker, error) {
 
 	lpCli := system.LoopbackKubeClient.Get()
 
-	// Get routing port and CA bundle for webhook and extension API services.
+	// 获取 Webhook 和扩展 API 服务的路由端口及 CA 证书包。
 	var (
 		routingPort     = int32(c.Serve.BindPort)
 		routingCaBundle []byte

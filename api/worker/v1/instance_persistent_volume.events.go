@@ -6,8 +6,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstancePersistentVolumeEvents is the events of an InstancePersistentVolume subresource,
-// which provides the events related to the underlying Kubernetes PersistentVolumeClaim.
+// InstancePersistentVolumeEvents 是 InstancePersistentVolume 子资源的事件集合，
+// 用于提供底层 Kubernetes PersistentVolumeClaim 的相关事件。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstancePersistentVolumeEvents struct {

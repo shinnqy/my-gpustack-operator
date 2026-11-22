@@ -7,11 +7,10 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// TopologySource selects the topology inventory used to form Kueue placement hierarchies.
+// TopologySource 选择用于构建 Kueue 放置层级的拓扑清单。
 //
-// Configuration changes proxy to the v1alpha1 resource. Controller-owned status is read-only
-// through the main object; the public API serves no status subresource. Main-resource writes
-// preserve the backing resource's status.
+// 配置变更会代理到 v1alpha1 资源。由控制器管理的 status 通过主对象只读访问；
+// 公共 API 不提供 status 子资源。对主资源的写入会保留底层资源的 status。
 //
 // +genclient
 // +genclient:noStatus
@@ -22,7 +21,7 @@ type TopologySource workercore.TopologySource
 
 var _ runtime.Object = (*TopologySource)(nil)
 
-// TopologySourceList holds the list of TopologySources.
+// TopologySourceList 保存 TopologySource 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type TopologySourceList struct {

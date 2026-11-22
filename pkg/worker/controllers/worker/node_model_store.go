@@ -28,30 +28,20 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// nodeModelStoreInvalidRetry is how soon a node whose computed configuration fails its check is
-// looked at again. Admission refuses such values, so it takes two racing writes to reach here.
+// nodeModelStoreInvalidRetry 是当节点计算出的配置校验失败时再次检查该节点的间隔时间。准入控制会拒绝此类非法值，因此只有两次并发写入竞态时才会走到这里。
 const nodeModelStoreInvalidRetry = time.Minute
 
-// ModelManagerRegisteredLabel is present on a Node while kubelet lists the model-manager CSI driver.
+// ModelManagerRegisteredLabel 在 kubelet 列出 model-manager CSI 驱动期间存在于 Node 上。
 const ModelManagerRegisteredLabel = "model.csi.gpustack.ai/registered"
 
-// NodeModelStoreReconciler keeps one NodeModelStore per node the model-manager plugin registered on,
-// keeps its spec equal to the node's effective configuration, and labels registered nodes for
-// scheduling.
+// NodeModelStoreReconciler 为每个注册了 model-manager 插件的节点维护一个 NodeModelStore，使其 spec 等于该节点的生效配置，并为已注册节点打上标签以便调度。
 //
-// THE OBJECT'S LIFETIME IS THE NODE'S, NOT THE PLUGIN REGISTRATION'S. It is created once the node's
-// CSINode lists the plugin's driver, kubelet's own record that the plugin runs there, and it is not
-// deleted when the driver leaves CSINode: a plugin restart or a rolling upgrade unregisters the driver
-// for a moment, and deleting on that would erase and rewrite every node's object on every upgrade.
-// The owner reference to the Node collects it with the Node. The component's removal is read at the
-// cluster level instead: while the CSIDriver object does not exist, every NodeModelStore is deleted.
+// 该对象的生命周期绑定于 Node 而非插件注册状态。一旦节点的 CSINode 列出了该插件的驱动（即 kubelet 自身记录该插件正在此节点运行），便会创建该对象，并且当驱动从 CSINode 移除时不会删除它：插件重启或滚动升级会短暂注销驱动，若据此删除会导致每次升级都在每个节点上擦除并重建该对象。通过指向 Node 的 owner reference，它会随 Node 一同被回收。组件的卸载则改为在集群级别判断：当 CSIDriver 对象不存在时，删除所有 NodeModelStore。
 //
-// It writes spec only: the Settings' merge, and the node's kubelet thresholds read from its
-// configz, which the plugin must not read itself because nodes/proxy reaches every kubelet endpoint.
-// Status belongs to the plugin on the node.
+// 它仅写入 spec：包括 Settings 的合并结果，以及从节点 configz 读取的 kubelet 阈值——插件自身不能直接读取 configz，因为 nodes/proxy 权限可访问集群中每一个 kubelet 端点。Status 字段则归节点上的插件所有。
 type NodeModelStoreReconciler struct {
 	Client ctrlcli.Client
-	// ReadKubelet reads a node's kubelet thresholds; nil reads its configz through the API server.
+	// ReadKubelet 读取节点的 kubelet 阈值；为 nil 时通过 API server 读取节点的 configz。
 	ReadKubelet func(ctx context.Context, node string) (*workercore.NodeModelStoreKubelet, error)
 	Now         func() time.Time
 
@@ -86,7 +76,7 @@ func (r *NodeModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	nd := new(core.Node)
 	if err := r.Client.Get(ctx, req.NamespacedName, nd); err != nil {
-		// A deleted Node takes its NodeModelStore with it through the owner reference.
+		// 被删除的 Node 会通过 owner reference 一并清理其 NodeModelStore。
 		if kerrors.IsNotFound(err) {
 			r.forgetKubelet(req.Name)
 		}
@@ -121,7 +111,7 @@ func (r *NodeModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	kubelet, read := r.kubeletThresholds(ctx, nd.Name, existing.Spec.Kubelet)
 	spec.Kubelet = kubelet
 	if err := modelstore.Validate(spec); err != nil {
-		// A kubelet answer this check refuses is not written; the node keeps kubelet's defaults.
+		// 校验未通过的 kubelet 响应不会被写入；节点保留 kubelet 的默认阈值。
 		logger.Error(err, "the node's kubelet thresholds fail their check and are not written")
 		spec.Kubelet = nil
 	}
@@ -133,10 +123,7 @@ func (r *NodeModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	kubemeta.ControlOnWithoutBlock(eNms, nd, core.SchemeGroupVersion.WithKind("Node"))
 	alignFn := func(aNms *workercore.NodeModelStore) (_ *workercore.NodeModelStore, skip bool, err error) {
 		skip = true
-		// spec.pinned belongs to the prefetch controller: carry the stored value into the desired
-		// spec, so a configuration write never drops it and a pinned-only change never shows up in
-		// this diff. A pinned write racing this one lands on a stale resourceVersion, fails, and is
-		// retried.
+		// spec.pinned 归预取控制器所有：将已存储的值保留到期望 spec 中，这样配置写入绝不会覆盖丢弃它，且仅 pinned 变更也不会出现在此差异比对中。若与本写入竞态的 pinned 写入落在了过时的 resourceVersion 上，则会失败并重试。
 		eNms.Spec.Pinned = aNms.Spec.Pinned
 		if !kubemeta.DeepEqual(aNms.Spec, eNms.Spec) {
 			aNms.Spec = eNms.Spec
@@ -150,20 +137,19 @@ func (r *NodeModelStoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	if _, err := kubeclientset.CreateWithCtrlClient(ctx, r.Client, eNms,
 		kubeclientset.WithUpdateIfExisted(alignFn)); err != nil {
-		// The watch on this object passes spec changes only, so a conflict with the plugin's status
-		// write would not come back as an event.
+		// 该对象的 watch 仅传递 spec 变更，因此与插件 status 写入产生的冲突不会以事件形式回传。
 		return objectWriteResult(logger, err, "sync node model store", _requeueAfterConflict)
 	}
 
 	if !read {
-		// The kubelet's answer is missing or stale; try it again well before the next refresh.
+		// kubelet 的响应缺失或已过期；在下次常规刷新之前尽早重试。
 		return ctrl.Result{RequeueAfter: nodeModelStoreKubeletRetry}, nil
 	}
 
 	return ctrl.Result{RequeueAfter: nodeModelStoreKubeletRefresh}, nil
 }
 
-// driverInstalled reports whether the plugin's CSIDriver object exists.
+// driverInstalled 报告插件的 CSIDriver 对象是否存在。
 func (r *NodeModelStoreReconciler) driverInstalled(ctx context.Context) (bool, error) {
 	err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: modelstore.DriverName}, new(storage.CSIDriver))
 	switch {
@@ -176,7 +162,7 @@ func (r *NodeModelStoreReconciler) driverInstalled(ctx context.Context) (bool, e
 	}
 }
 
-// driverRegistered reports whether the node's CSINode lists the plugin's driver.
+// driverRegistered 报告节点的 CSINode 是否列出了该插件的驱动。
 func (r *NodeModelStoreReconciler) driverRegistered(ctx context.Context, node string) (bool, error) {
 	csiNode := new(storage.CSINode)
 	if err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: node}, csiNode); err != nil {
@@ -192,18 +178,13 @@ func csiNodeListsModelDriver(csiNode *storage.CSINode) bool {
 	})
 }
 
-// syncRegistrationLabel keeps scheduling in step with kubelet's plugin registration.
+// syncRegistrationLabel 使调度标签与 kubelet 的插件注册状态保持同步。
 func (r *NodeModelStoreReconciler) syncRegistrationLabel(ctx context.Context, nd *core.Node, registered bool) error {
-	// Implement this function in chapter 16.
+	// 在第 16 章中实现此函数。
 	return nil
 }
 
-// effectiveSpec merges the configuration layers into a node's spec and checks it. The base layer
-// is the cluster's Settings, read from the Settings store this controller watches rather than
-// through the Settings package's read cache, so a change reaches every node on its own event; the
-// pool layer is the alphabetically first ModelStore whose selector matches the node, overriding
-// only the fields it states. The winner's name rides along in the spec, and an overlap is the
-// stores' status business, not a spec error.
+// effectiveSpec 将配置层级合并为节点的 spec 并执行校验。基础层是集群的 Settings，从本控制器 watch 的 Settings 存储中读取，而非通过 Settings 包的读缓存读取，以便变更能随自身事件立即触达每个节点；资源池层是选择器匹配该节点的按字母序排在第一位的 ModelStore，仅覆盖其显式声明的字段。胜出者的名称会一并写入 spec，而选择器重叠则属于 ModelStore 自身 status 处理的范畴，不作为 spec 错误。
 func (r *NodeModelStoreReconciler) effectiveSpec(ctx context.Context, nd *core.Node) (workercore.NodeModelStoreSpec, error) {
 	sec := new(core.Secret)
 	key := ctrlcli.ObjectKey{Namespace: setting.DelegatedSecretNamespace, Name: setting.DelegatedSecretName}
@@ -300,8 +281,7 @@ func (r *NodeModelStoreReconciler) SetupController(_ context.Context, opts contr
 		Complete(r)
 }
 
-// enqueueEveryNode enqueues every node that has a NodeModelStore or whose CSINode lists the driver:
-// a Settings change reaches every node's spec, and the CSIDriver's removal every node's object.
+// enqueueEveryNode 将所有拥有 NodeModelStore 或其 CSINode 列出该驱动的节点加入队列：Settings 的变更会影响每个节点的 spec，而 CSIDriver 的移除会影响每个节点的对象。
 func (r *NodeModelStoreReconciler) enqueueEveryNode(ctx context.Context, _ ctrlcli.Object) []ctrlreconcile.Request {
 	names := map[string]struct{}{}
 

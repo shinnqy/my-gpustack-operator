@@ -22,17 +22,12 @@ import (
 	"gpustack.ai/gpustack/pkg/nodefeature"
 )
 
-// A Workload answered Ready holds no card in the ledger until the device plugin's Allocate records
-// its Pods, which happens only after Kueue admits it, the scheduler binds its Pods and the kubelet
-// starts them. A second Workload judged inside that window would see the first one's cards as free.
-// So every judgment counts, per node, the Pods of the Workloads already answered Ready that the
-// ledger does not hold yet: the inflight Pods.
+// 回复了 Ready 的 Workload 在设备插件的 Allocate 记录其 Pod 之前，在账本（ledger）中并不占用任何加速卡，而 Allocate 只有在 Kueue 准入该 Workload、调度器绑定其 Pod 且 kubelet 启动它们之后才会发生。在此时间窗口内判定的第二个 Workload 会误以为第一个 Workload 的卡仍是空闲的。因此，每次判定都会按节点统计那些已经回复 Ready、但账本尚未记录的 Workload 所对应的 Pod，即在途 Pod。
 
-// _podNodeNameField is the Pod field the API server filters a list by bound node on.
+// _podNodeNameField 是 API server 用于按已绑定节点过滤 Pod 列表的字段。
 const _podNodeNameField = "spec.nodeName"
 
-// chargedKey names the Pods of one Workload podset bound to one node, the node named by its
-// hostname as a topology assignment names it.
+// chargedKey 标识绑定到同一节点上的单个 Workload podset 的 Pod，其中节点按 topology assignment 中指定的 hostname 命名。
 type chargedKey struct {
 	namespace string
 	workload  string
@@ -40,22 +35,17 @@ type chargedKey struct {
 	hostname  string
 }
 
-// ledgerCharges is what chargeLedgers read: the hostnames whose ledger was rebuilt, and per Workload
-// podset the Pods whose allocation that rebuilt ledger holds.
+// ledgerCharges 记录了 chargeLedgers 读取到的内容：重建了账本的节点 hostname 集合，以及每个 Workload podset 中其分配已被该重建账本收录的 Pod 数量。
 type ledgerCharges struct {
 	hostnames sets.Set[string]
 	pods      map[chargedKey]int32
 }
 
-// chargeLedgers replaces the Status of every pool node a demand can use with one rebuilt from the
-// Pods bound to that node, through the device manager's own aggregation, and counts per Workload
-// podset the Pods that rebuilt Status holds.
+// chargeLedgers 将需求可用的每个资源池节点的 Status 替换为基于绑定到该节点的 Pod 通过设备管理器自身的聚合逻辑重建的结果，并按 Workload podset 统计被该重建 Status 收录的 Pod 数量。
 //
-// Both come from one uncached list. The published Status is rebuilt by the device manager after a
-// Pod's allocation lands on the Pod, so a Pod read as charged there may not be in the Status yet;
-// counting it as charged would leave it in neither the ledger nor the inflight set.
+// 两者均来自同一份非缓存的列表读取。已发布的 Status 是在 Pod 的分配结果落盘到 Pod 之后由设备管理器异步重建的，因此列表中读到已分配的 Pod 可能尚未反映在 Status 中；若直接将其算作已入账，就会导致它既不在账本中也不在在途集合里。
 //
-// A demand naming a node needs that node only; a demand naming none can use every node of the pool.
+// 指定了节点的 demand 仅需要重建该节点；未指定节点的 demand 则可以使用资源池中的任意节点。
 func (r *NodeDevicesAdmissionReconciler) chargeLedgers(
 	ctx context.Context, pool []scopedDevices, demands []familyDemand,
 ) (ledgerCharges, error) {
@@ -103,11 +93,7 @@ func (r *NodeDevicesAdmissionReconciler) chargeLedgers(
 	return charges, nil
 }
 
-// podCharged reports whether the Pod's allocation record holds every container that requests an
-// accelerator card, so the ledger rebuilt from it carries the Pod's whole demand. A Pod partly
-// allocated is not charged: its demand is then counted whole as inflight, on top of the part the
-// ledger holds, which overstates the node's use rather than understating it. A record that cannot be
-// read is not charged either, because the rebuild skips it too.
+// podCharged 报告 Pod 的分配记录是否覆盖了所有请求加速卡的容器，从而确保由其重建的账本包含该 Pod 的完整需求。仅部分分配的 Pod 不视作已入账：此时其需求会被完整计为在途需求，叠加在账本已记录的部分之上，这会高估而非低估节点的资源占用。无法读取分配记录的 Pod 同样不视作已入账，因为重建逻辑也会跳过它。
 func podCharged(pod *core.Pod) bool {
 	allocations, err := deviceplugin.AllocatedAcceleratorsOf(pod)
 	if err != nil || len(allocations) == 0 {
@@ -125,7 +111,7 @@ func podCharged(pod *core.Pod) bool {
 	return true
 }
 
-// requestsCard reports whether the container asks for a card of any accelerator family.
+// requestsCard 报告容器是否请求了任意加速器系列的加速卡。
 func requestsCard(ctr *core.Container) bool {
 	for name, qty := range mergedContainerResources(ctr) {
 		family := nodefeature.ResourceFamilyOf(name)
@@ -140,18 +126,11 @@ func requestsCard(ctr *core.Container) bool {
 	return false
 }
 
-// inflightDemands returns the demands of the inflight Pods on the nodes whose ledger was rebuilt:
-// for each other Workload that holds its cards, the Pods its topology assignment places on such a
-// node minus the Pods of it the ledger already holds there. Each demand keeps the flavor its own
-// podset was assigned, so it is fitted on the cards its own judgment used, and the flavor's claim
-// is added to the node's scopes.
+// inflightDemands 返回账本已被重建的节点上在途 Pod 的资源需求：针对其他每个仍持有卡占用的 Workload，计算其 topology assignment 放置到该节点上的 Pod 数减去账本在该节点已收录的 Pod 数。每条需求都保留其所属 podset 被分配的 flavor，以便按原判定所用的同一组卡进行匹配，并将该 flavor 的声明添加到对应节点的作用域（scope）中。
 //
-// Only a topology assignment names the node an inflight Pod will reach. A Workload without one is
-// not counted; every queue this operator derives assigns a hostname.
+// 只有 topology assignment 会指明在途 Pod 将要落到的节点。没有 topology assignment 的 Workload 不会被计入；由本 operator 派生的所有队列都会分配 hostname。
 //
-// It returns the hostname of a node where an inflight demand's flavor resolves to no card
-// population, empty when there is none. Such a demand cannot be placed on any card, so leaving it
-// out would report its room as free.
+// 如果某个节点上某条在途需求的 flavor 解析不到任何卡群体，则返回该节点的 hostname；若不存在此类情况则返回空字符串。此类需求无法放置到任何卡上，若将其忽略就会错误地将该资源空间报告为空闲。
 func (r *NodeDevicesAdmissionReconciler) inflightDemands(
 	ctx context.Context, self *kueue.Workload, pool []scopedDevices, charges ledgerCharges,
 ) ([]familyDemand, string, error) {
@@ -205,9 +184,7 @@ func (r *NodeDevicesAdmissionReconciler) inflightDemands(
 	return inflight, unresolved, err
 }
 
-// holdsCards reports whether the Workload's cards are promised to it: it holds a quota reservation,
-// is neither evicted, finished nor deactivated, and is either admitted or answered Ready by a check
-// this controller owns. Once admitted its Pods are on their way whichever checks it went through.
+// holdsCards 报告 Workload 的加速卡是否已许诺给它：即该 Workload 持有配额预留，未被驱逐、未结束且未停用，并且已被准入或已由本控制器拥有的某个检查项回复 Ready。一旦被准入，无论此前经过了哪些检查，其 Pod 都已在创建和调度途中。
 func (r *NodeDevicesAdmissionReconciler) holdsCards(ctx context.Context, wl *kueue.Workload) (bool, error) {
 	if !kueueworkload.HasQuotaReservation(wl) || kueueworkload.IsEvicted(wl) ||
 		kueueworkload.IsFinished(wl) || !kueueworkload.IsActive(wl) {
@@ -229,10 +206,7 @@ func (r *NodeDevicesAdmissionReconciler) holdsCards(ctx context.Context, wl *kue
 	return false, nil
 }
 
-// scopeInflightFlavors adds each inflight demand's flavor to the scopes of the node it names, read
-// the way candidateDevices reads the Workload's own flavors, so collectCards stamps the cards that
-// flavor covers there. It returns the hostname of the first node where a flavor is gone or pins no
-// single accelerator key.
+// scopeInflightFlavors 将每条在途需求的 flavor 添加到其所指定节点的作用域中，读取方式与 candidateDevices 读取 Workload 自身 flavor 相同，以便 collectCards 标记该 flavor 在该节点覆盖的加速卡。若遇到首个 flavor 已不存在或无法唯一确定单一加速器键的节点，则返回该节点的 hostname。
 func (r *NodeDevicesAdmissionReconciler) scopeInflightFlavors(
 	ctx context.Context, pool []scopedDevices, inflight []familyDemand,
 ) (string, error) {
@@ -267,21 +241,16 @@ func (r *NodeDevicesAdmissionReconciler) scopeInflightFlavors(
 	return "", nil
 }
 
-// unresolvedInflightMessage explains a hold behind a Workload whose cards on the node cannot be
-// told apart, which clears once that Workload's Pods are allocated.
+// unresolvedInflightMessage 解释因先于当前 Workload 准入到该节点的另一个 Workload 其 flavor 无法解析出对应加速卡而导致的挂起，待该先序 Workload 的 Pod 完成分配后挂起即会解除。
 func unresolvedInflightMessage(node string) string {
 	return fmt.Sprintf("a Workload admitted to the node %q before this one has a flavor that resolves to no"+
 		" card population there, so the cards it will take cannot be counted; will retry once its Pods"+
 		" have been allocated", node)
 }
 
-// withUnobservedReady returns the cached Workloads, each replaced by the copy readyUnobserved holds
-// while the cached one does not show that Ready yet, sorted by namespace and name so the inflight
-// demands come out in the same order on every judgment.
+// withUnobservedReady 返回缓存中的 Workload 列表，对于缓存中尚未体现 Ready 状态的条目，将其替换为 readyUnobserved 保存的副本，并按 namespace 和 name 排序，使每次判定得到的在途需求顺序一致。
 //
-// An entry is dropped once the cache shows the Ready, shows the Workload no longer holding its
-// reservation, carries another Workload under its name, or no longer carries it at all: from then on
-// the cache answers for it.
+// 一旦缓存显示该 Workload 已变为 Ready、不再持有配额预留、同名下已换成了另一个 Workload 或已完全从缓存消失，对应条目就会被移除：此后便直接以缓存为准。
 func (r *NodeDevicesAdmissionReconciler) withUnobservedReady(cached []kueue.Workload) []*kueue.Workload {
 	out := make([]*kueue.Workload, 0, len(cached))
 	seen := sets.New[types.NamespacedName]()
@@ -313,7 +282,7 @@ func (r *NodeDevicesAdmissionReconciler) withUnobservedReady(cached []kueue.Work
 	return out
 }
 
-// showsChecks reports whether wl carries every Ready check written carries.
+// showsChecks 报告 wl 是否已携带 written 中包含的所有 Ready 检查项。
 func showsChecks(wl, written *kueue.Workload) bool {
 	for i := range written.Status.AdmissionChecks {
 		w := &written.Status.AdmissionChecks[i]
@@ -328,8 +297,7 @@ func showsChecks(wl, written *kueue.Workload) bool {
 	return true
 }
 
-// recordVerdict keeps a copy of a Workload just answered Ready, as written, until the cache shows
-// it, and forgets any earlier copy when the verdict is anything else.
+// recordVerdict 保留刚刚回复 Ready 的 Workload 的写入后副本，直到缓存中体现出该状态为止；当判定结果为其他状态时，清除此前保存的副本。
 func (r *NodeDevicesAdmissionReconciler) recordVerdict(
 	wl *kueue.Workload, written []kueue.AdmissionCheckState, state kueue.CheckState,
 ) {

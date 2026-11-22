@@ -13,10 +13,9 @@ import (
 	"gpustack.ai/gpustack/pkg/extensionapi"
 )
 
-// ModelPrefetchHandler exposes the v1 view of a v1alpha1.ModelPrefetch.
+// ModelPrefetchHandler 暴露 v1alpha1.ModelPrefetch 的 v1 视图。
 //
-// It proxies configuration changes and reads aggregated readiness from the main object.
-// No status or progress subresource is served.
+// 它代理配置变更并从主对象读取聚合就绪状态，不提供 status 或 progress 子资源。
 type ModelPrefetchHandler struct {
 	extensionapi.ObjectInfo
 	extensionapi.CurdOperations
@@ -38,7 +37,7 @@ func (h *ModelPrefetchHandler) SetupHandler(
 	return gvr, map[string]rest.Storage{}, nil
 }
 
-// modelPrefetchTable is the view's kubectl table: who is warming what, and how far it is.
+// modelPrefetchTable 是该视图的 kubectl 表格：展示谁正在预热什么及其当前进度。
 func modelPrefetchTable() (rest.TableConvertor, error) {
 	return extensionapi.NewJSONPathTemplateTableConvertor(
 		extensionapi.RenderColumn("Artifact", func(obj *worker.ModelPrefetch) string {

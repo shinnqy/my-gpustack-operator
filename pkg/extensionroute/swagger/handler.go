@@ -10,7 +10,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/httpx"
 )
 
-// Route registers Swagger UI into the given mux route.
+// Route 将 Swagger UI 注册到给定的 mux 路由中。
 func Route(r *mux.Route) {
 	p, _ := r.GetPathTemplate()
 	r.Handler(http.StripPrefix(p, index()))
@@ -29,7 +29,7 @@ func index() http.Handler {
 	})
 }
 
-// downloaded form https://github.com/swagger-api/swagger-ui/releases.
+// 下载自 https://github.com/swagger-api/swagger-ui/releases。
 //
 //go:embed ui/*
 var ui embed.FS

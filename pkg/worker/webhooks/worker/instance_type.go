@@ -18,19 +18,17 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// QueueEntranceLabelKey, on an InstanceType, records the name of the namespaced LocalQueue that
-// fronts its backing ClusterQueue (a workload's "kueue.x-k8s.io/queue-name" value). The Pod
-// webhook reverse-looks-up the InstanceType by this label to read the observed per-card VRAM
-// (Status.Detail.Memory), never trusting the user-writable LocalQueue. The Default webhook stamps
-// it with nodefeature.FormatLocalQueueName(<InstanceType name>).
+// QueueEntranceLabelKey 在 InstanceType 上记录位于其底层 ClusterQueue 前端的命名空间级
+// LocalQueue 名称（即 Workload 的 "kueue.x-k8s.io/queue-name" 值）。Pod webhook 通过该标签
+// 反向查找 InstanceType 以读取观测到的单卡显存（Status.Detail.Memory），而绝不信任用户可写的 LocalQueue。
+// Default webhook 会将其标记为 nodefeature.FormatLocalQueueName(<InstanceType name>)。
 const QueueEntranceLabelKey = "schedule." + systemname.LabelPrefix + "queue-entrance"
 
-// InstanceTypeWebhook defaults and validates a v1alpha1.InstanceType.
+// InstanceTypeWebhook 对 v1alpha1.InstanceType 执行默认值填充与校验。
 //
-// The defaulting webhook stamps only the schedule discriminator + entrance labels; the observed
-// hardware descriptor is computed by the reconciler into Status.Detail, not enriched onto the spec
-// at admission. The validating webhook requires the admin-writable inputs on create and freezes the
-// spec on update.
+// defaulting webhook 仅写入调度区分标签与入口标签；观测到的硬件描述符由 reconciler 计算并写入
+// Status.Detail，而不会在准入阶段补充到 spec 上。validating webhook 在创建时要求提供管理员可写的
+// 输入字段，并在更新时冻结 spec。
 //
 // nolint: lll
 // +k8s:webhook-gen:validating:group="worker.gpustack.ai",version="v1alpha1",resource="instancetypes",scope="Cluster"
@@ -55,14 +53,13 @@ var (
 	_ webhook.ReceiveDeletionUpdate           = (*InstanceTypeWebhook)(nil)
 )
 
-// ReceiveDeletionUpdate keeps this webhook validating updates to an InstanceType that is being
-// deleted. validateInstanceTypeSpecImmutable is a masked equality on the two specs and reads nothing
-// else, so the spec stays frozen while the reconciler drains the type's ClusterQueue rather than only
-// while the type is live.
+// ReceiveDeletionUpdate 使该 webhook 在 InstanceType 处于删除过程中时仍持续校验其更新。
+// validateInstanceTypeSpecImmutable 对新旧两个 spec 执行掩码相等性比较且不读取其他内容，
+// 从而确保在 reconciler 排空该类型的 ClusterQueue 期间（而不仅仅在存活期间）spec 保持冻结。
 //
-// One marker releases the mutating half as well, and here that refuses nothing: Default returns nil
-// on every path, and its registration is failurePolicy Fail on CREATE, so every stored InstanceType
-// has already been through it and re-deriving its labels is idempotent.
+// 同一个标记也会放行 mutating 部分，而在此处这不会导致任何拒绝：Default 在所有路径上都返回 nil，
+// 且其在 CREATE 上注册的 failurePolicy 为 Fail，因此每个已存储的 InstanceType 都已经过该处理，
+// 重新推导其标签是幂等的。
 func (r *InstanceTypeWebhook) ReceiveDeletionUpdate() {}
 
 func (r *InstanceTypeWebhook) ValidateCreate(_ context.Context, obj runtime.Object) (ctrladmission.Warnings, error) {
@@ -77,12 +74,10 @@ func (r *InstanceTypeWebhook) ValidateCreate(_ context.Context, obj runtime.Obje
 func (r *InstanceTypeWebhook) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (ctrladmission.Warnings, error) {
 	itOld, it := oldObj.(*workercore.InstanceType), newObj.(*workercore.InstanceType)
 
-	// Only immutability is enforced on update: the spec is frozen except displayName and
-	// inactive, so every input validateInstanceTypeSpec checks on create is already frozen to
-	// its stored value. Re-running those create-time checks here would add no protection and
-	// would wedge a legacy object whose stored value predates a tightened rule (e.g. a CPU-only
-	// type stored with unit CPU other than 1), blocking even a displayName/inactive edit or the
-	// operator's own inactive backfill.
+	// 更新时仅强制执行不可变性校验：除 displayName 和 inactive 外，spec 均处于冻结状态，
+	// 因此 validateInstanceTypeSpec 在创建时检查的所有输入都已冻结为其存储值。
+	// 在此处重新运行创建时校验不会增加任何保护，反而会卡住那些在规则收紧前就已存储的存量对象
+	// （例如单位 CPU 不为 1 的纯 CPU 类型），甚至阻塞对 displayName/inactive 的编辑或 operator 自身的 inactive 回填。
 	if errs := validateInstanceTypeSpecImmutable(itOld, it); len(errs) > 0 {
 		return nil, kerrors.NewInvalid(workercore.Kind("InstanceType"), itOld.Name, errs)
 	}
@@ -93,30 +88,28 @@ func (r *InstanceTypeWebhook) ValidateDelete(_ context.Context, _ runtime.Object
 	return nil, nil
 }
 
-// Default stamps the InstanceType's metadata labels so it is selectable from day one. From the
-// spec identity it derives the (acceleratable, group) feature key and, with kubernetes.io/os|arch,
-// stamps the schedule discriminators the pool's Devices and ResourceFlavors carry (pruning a stale
-// feature key left by a group/acceleratable change), plus the entrance label
-// (nodefeature.FormatLocalQueueName(name)) the Pod webhook reverse-looks-up. It writes no hardware
-// descriptor: the observed descriptor lives in Status.Detail, computed by the reconciler as
-// hardware changes, not snapshotted onto the spec here.
+// Default 为 InstanceType 打上元数据标签，使其从创建之初即可被选中。它根据 spec 标识派生
+// (acceleratable, group) 特征键，并与 kubernetes.io/os|arch 一起，打上资源池中 Devices 与
+// ResourceFlavor 所携带的调度区分标签（同时清理因 group 或 acceleratable 变更而遗留的旧特征键），
+// 此外还会添加供 Pod webhook 反向查找的入口标签（nodefeature.FormatLocalQueueName(name)）。
+// 该方法不写入硬件描述符：观测到的描述符位于 Status.Detail 中，由 reconciler 随硬件变化计算得出，
+// 而非在此处快照到 spec 上。
 func (r *InstanceTypeWebhook) Default(ctx context.Context, obj runtime.Object) error {
 	it := obj.(*workercore.InstanceType)
 
-	// Default the CPU group to the generic sentinel so a pool collapses without the admin
-	// setting it; a real CPU group only matters when awareness is on.
+	// 将 CPU 分组默认设为通用哨兵值，使资源池在管理员未配置该项时也能聚合归并；
+	// 仅当开启感知开关时，具体的 CPU 分组才有意义。
 	if it.Spec.GeneralGroup == "" {
 		it.Spec.GeneralGroup = nodefeature.GeneralGroupGeneric
 	}
-	// An accelerated type needs an accelerator group to have a pool to schedule onto; leave it
-	// for the validating webhook to reject rather than stamping degenerate labels.
+	// 加速类型需要指定 accelerator group 才能调度到对应的资源池；
+	// 此处不打上退化的标签，而是留给 validating webhook 拒绝。
 	if it.Spec.Acceleratable && it.Spec.AcceleratorGroup == "" {
 		return nil
 	}
 
-	// The pool's schedule labels from the spec identity and the awareness setting. Read the
-	// setting here (the worker process carries the local settings indexer); validation stays
-	// setting-independent.
+	// 根据 spec 标识与感知设置生成资源池的调度标签。此处读取该设置（worker 进程携带本地设置索引器）；
+	// 校验逻辑则保持与设置无关。
 	cpuAware := settings.InstanceTypeAwareCPUManufacturer.ShouldValueBool(ctx)
 	sched := nodefeature.PoolScheduleLabels(
 		it.Spec.Acceleratable, cpuAware,
@@ -124,10 +117,9 @@ func (r *InstanceTypeWebhook) Default(ctx context.Context, obj runtime.Object) e
 		it.Spec.OS, it.Spec.Arch,
 	)
 
-	// Stamp the schedule labels on the InstanceType so it is selectable by the same
-	// discriminators its Devices and ResourceFlavors carry. Drop a stale feature key left by a
-	// group/acceleratable change — its key varies, while the os/arch and the acceleratable
-	// boolean have fixed keys and are simply overwritten.
+	// 在 InstanceType 上打上调度标签，使其可通过与 Devices 和 ResourceFlavor 相同的区分标签被选中。
+	// 移除因 group 或 acceleratable 变更而遗留的旧特征键——特征键的名称会变化，
+	// 而 os/arch 以及 acceleratable 布尔值的键名固定，直接覆盖即可。
 	if it.Labels == nil {
 		it.Labels = make(map[string]string, len(sched)+1)
 	}
@@ -143,18 +135,17 @@ func (r *InstanceTypeWebhook) Default(ctx context.Context, obj runtime.Object) e
 	for k, v := range sched {
 		it.Labels[k] = v
 	}
-	// Advertise the fronting LocalQueue name so the Pod webhook reverse-looks-up this
-	// InstanceType for the observed per-card VRAM (Status.Detail.Memory).
+	// 广播前置的 LocalQueue 名称，以便 Pod webhook 反向查找该 InstanceType，
+	// 获取观测到的单卡显存（Status.Detail.Memory）。
 	it.Labels[QueueEntranceLabelKey] = nodefeature.FormatLocalQueueName(it.Name)
 
 	return nil
 }
 
-// validateInstanceTypeSpec collects the required-input errors: an accelerator group when
-// accelerated, os/arch non-empty, plus the unit-spec well-formedness checks. It reads no
-// editable setting — validation is independent of instance-type-aware-cpu-manufacturer; the
-// mutating webhook defaults an empty GeneralGroup to "generic", so GeneralGroup is never
-// required here.
+// validateInstanceTypeSpec 收集必填项错误：启用加速时的 accelerator group、非空的 os/arch，
+// 以及单元规格的格式规范检查。它不读取任何可编辑的设置——校验逻辑与
+// instance-type-aware-cpu-manufacturer 无关；mutating webhook 会将空的 GeneralGroup
+// 默认设为 "generic"，因此此处从不要求必填 GeneralGroup。
 func validateInstanceTypeSpec(it *workercore.InstanceType) field.ErrorList {
 	var errs field.ErrorList
 	if it.Spec.Acceleratable && it.Spec.AcceleratorGroup == "" {
@@ -170,11 +161,10 @@ func validateInstanceTypeSpec(it *workercore.InstanceType) field.ErrorList {
 	return append(errs, validateInstanceTypeUnitSpec(it)...)
 }
 
-// validateInstanceTypeUnitSpec enforces the unit spec: all three fields must be set and
-// well-formed — unitRAM and localStorage a positive integer with a case-sensitive "Gi" suffix.
-// The unitCPU rule branches on acceleratable: an acceleratable type accepts any unitless
-// positive integer, while a non-acceleratable (CPU-only) type accepts only exactly 1 core,
-// matching how a CPU-only request is sized (the requested CPU count is the unit count).
+// validateInstanceTypeUnitSpec 强制校验单元规格：三个字段均须设置且格式合法——unitRAM 与
+// localStorage 必须为带区分大小写 "Gi" 后缀的正整数。unitCPU 规则根据 acceleratable 分支：
+// 可加速类型接受任意无单位正整数，而非加速（纯 CPU）类型仅接受恰好为 1 核，
+// 以匹配纯 CPU 请求的计量方式（请求的 CPU 核数即单元数）。
 func validateInstanceTypeUnitSpec(it *workercore.InstanceType) field.ErrorList {
 	cpu, ram, localStg := it.Spec.UnitResources.CPU, it.Spec.UnitResources.RAM, it.Spec.LocalStorage
 
@@ -199,8 +189,8 @@ func validateInstanceTypeUnitSpec(it *workercore.InstanceType) field.ErrorList {
 	return errs
 }
 
-// extractPositiveNumberFromString returns v unchanged when it is a positive integer
-// carrying no unit suffix, and "" otherwise (including empty input).
+// extractPositiveNumberFromString 在 v 为不带单位后缀的正整数时原样返回 v，
+// 否则返回 ""（包括空输入）。
 func extractPositiveNumberFromString(v string) string {
 	n, err := strconvx.ParseInt[int32](v, 10, 32)
 	if err == nil && n > 0 {
@@ -209,9 +199,8 @@ func extractPositiveNumberFromString(v string) string {
 	return ""
 }
 
-// extractPositiveNumberFromQuantity strips the given suffix and returns the bare
-// positive integer, or "" when the suffix is absent or the remainder is not a positive
-// integer (including empty input).
+// extractPositiveNumberFromQuantity 剥离给定后缀并返回纯正整数，
+// 当后缀缺失或剩余部分不是正整数时返回 ""（包括空输入）。
 func extractPositiveNumberFromQuantity(v, suffix string) string {
 	b, ok := strings.CutSuffix(v, suffix)
 	if ok {
@@ -220,11 +209,10 @@ func extractPositiveNumberFromQuantity(v, suffix string) string {
 	return ""
 }
 
-// validateInstanceTypeSpecImmutable rejects any change to the spec after creation other than the
-// admin-editable fields: DisplayName (rename), Description (free-form annotation) and Inactive
-// (take in/out of service). The spec is fully comparable, so it masks those fields on both sides
-// and compares the rest with a single equality check — a newly added spec field is then frozen
-// automatically.
+// validateInstanceTypeSpecImmutable 拒绝对象创建后对 spec 的任何修改，除非修改的是
+// 管理员可编辑字段：DisplayName（重命名）、Description（自由文本注解）以及 Inactive
+// （启用/停用）。spec 完全可比较，因此先在两侧掩去这些字段，再用一次相等性比较校验其余部分——
+// 这样新增的 spec 字段会自动受到不可变约束保护。
 func validateInstanceTypeSpecImmutable(itOld, it *workercore.InstanceType) field.ErrorList {
 	oldSpec, newSpec := itOld.Spec, it.Spec
 	oldSpec.DisplayName, newSpec.DisplayName = "", ""

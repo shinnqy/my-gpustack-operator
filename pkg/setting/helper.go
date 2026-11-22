@@ -17,12 +17,12 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// Initializer defines the stereotype for initializing a setting's value and environment metadata.
-// declared reports whether envName was present, including when its value was empty.
+// Initializer 定义用于初始化配置项的值及其环境变量元数据的函数类型。
+// declared 表示 envName 是否存在（包括其值为空的情况）。
 type Initializer func(name string) (value, envName string, declared bool)
 
-// InitializeFromEnv searches the variable of the `GPUSTACK_${UpperSnakeCase_of_SettingName}`,
-// returns the default value if not found, and reports the variable's registration-time presence.
+// InitializeFromEnv 查找名为 `GPUSTACK_${UpperSnakeCase_of_SettingName}` 的环境变量，
+// 未找到时返回默认值，并报告该变量在注册时是否存在。
 func InitializeFromEnv(defValue ...string) Initializer {
 	return func(name string) (string, string, bool) {
 		envName := "GPUSTACK_" + stringx.UnderscoreUpper(name)
@@ -32,20 +32,20 @@ func InitializeFromEnv(defValue ...string) Initializer {
 	}
 }
 
-// Admission defines the stereotype for validating writing.
+// Admission 定义用于校验配置写入的准入函数类型。
 type Admission func(ctx context.Context, oldVal, newVal string) (err error)
 
-// ErrAdmissionSkipped is the error returned by Admission to indicate the validation is skipped.
+// ErrAdmissionSkipped 是 Admission 返回的错误，用于表示跳过此次校验。
 var ErrAdmissionSkipped = errors.New("admission skipped")
 
-// AdmitWith combines multiple Admission into one,
-// if no Admission given, it will be Allow.
+// AdmitWith 将多个 Admission 组合为一个；
+// 若未提供任何 Admission，则等效于 Allow。
 //
-// If one Admission of the given Admissions returns an error,
-// the error will be returned immediately.
+// 若其中任一 Admission 返回错误，
+// 则立即返回该错误。
 //
-// If one Admission of the given Admissions returns an ErrAdmissionSkipped,
-// the function will return true immediately.
+// 若其中任一 Admission 返回 ErrAdmissionSkipped，
+// 则函数将立即放行返回。
 func AdmitWith(admits ...Admission) Admission {
 	if len(admits) == 0 {
 		admits = []Admission{Allow()}
@@ -65,19 +65,19 @@ func AdmitWith(admits ...Admission) Admission {
 	}
 }
 
-// Allow implements the Admission stereotype,
-// which means the value can be modified.
+// Allow 实现了 Admission 类型，
+// 表示允许修改该配置值。
 func Allow() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		return nil
 	}
 }
 
-// AllowBlank implements the Admission stereotype,
-// which means the value can be modified if blank.
+// AllowBlank 实现了 Admission 类型，
+// 表示当新值为空时允许修改。
 //
-// AllowBlank always combines with other Admission,
-// if allow input anything, please use Allow instead.
+// AllowBlank 通常与其他 Admission 组合使用；
+// 若允许任意输入，请改用 Allow。
 func AllowBlank() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		if !isBlank(newVal) {
@@ -87,11 +87,11 @@ func AllowBlank() Admission {
 	}
 }
 
-// DisallowBlank implements the Admission stereotype,
-// which means the value can be modified if not blank.
+// DisallowBlank 实现了 Admission 类型，
+// 表示当新值非空时才允许修改。
 //
-// DisallowBlank always combines with other Admission,
-// if disallow input anything, please use Disallow instead.
+// DisallowBlank 通常与其他 Admission 组合使用；
+// 若禁止任何输入，请改用 Disallow。
 func DisallowBlank() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		if !isBlank(newVal) {
@@ -101,8 +101,8 @@ func DisallowBlank() Admission {
 	}
 }
 
-// AllowBool implements the Admission stereotype,
-// which means the value can be modified if it's boolean.
+// AllowBool 实现了 Admission 类型，
+// 表示当新值为布尔值时允许修改。
 func AllowBool() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		_, err := strconv.ParseBool(newVal)
@@ -110,8 +110,8 @@ func AllowBool() Admission {
 	}
 }
 
-// AllowInt64InRange implements the Admission stereotype,
-// which means the value can be modified if it's int64 and in the given range.
+// AllowInt64InRange 实现了 Admission 类型，
+// 表示当新值为 int64 且位于指定范围内时允许修改。
 func AllowInt64InRange(minVal, maxVal int64) Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		v, err := strconv.ParseInt(newVal, 10, 64)
@@ -125,8 +125,8 @@ func AllowInt64InRange(minVal, maxVal int64) Admission {
 	}
 }
 
-// AllowDurationInRange implements the Admission stereotype,
-// which means the value can be modified if it's float64 and in the given range.
+// AllowDurationInRange 实现了 Admission 类型，
+// 表示当新值为 float64 且位于指定范围内时允许修改。
 func AllowDurationInRange(minVal, maxVal time.Duration) Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		v, err := time.ParseDuration(newVal)
@@ -140,10 +140,9 @@ func AllowDurationInRange(minVal, maxVal time.Duration) Admission {
 	}
 }
 
-// AllowIPv4CIDRList implements the Admission stereotype,
-// which means the value can be modified if it's a comma-separated list of IPv4 CIDRs, blank
-// included. IPv6 prefixes are refused at the write rather than dropped at the render, so an
-// ipBlock except list never loses an entry to a silent filter.
+// AllowIPv4CIDRList 实现了 Admission 类型，
+// 表示当新值为逗号分隔的 IPv4 CIDR 列表（含空值）时允许修改。IPv6 前缀会在写入阶段
+// 被直接拒绝，而非在渲染阶段被静默丢弃，从而确保 ipBlock except 列表不会因静默过滤而丢失条目。
 func AllowIPv4CIDRList() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		for _, segment := range strings.Split(newVal, ",") {
@@ -163,10 +162,10 @@ func AllowIPv4CIDRList() Admission {
 	}
 }
 
-// AllowUrlWithSchema implements the Admission stereotype,
-// which means the value can be modified if it is a URL with specified schemas.
-// This Admission allows blank new value,
-// if not allowed, combine with DisallowBlank.
+// AllowUrlWithSchema 实现了 Admission 类型，
+// 表示当新值为具有指定协议头的 URL 时允许修改。
+// 该 Admission 允许空的新值，
+// 若不允许为空，请与 DisallowBlank 组合使用。
 func AllowUrlWithSchema(schema string, otherSchemas ...string) Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		return checkUrl(newVal, func(u url.URL) error {
@@ -184,8 +183,8 @@ func AllowUrlWithSchema(schema string, otherSchemas ...string) Admission {
 	}
 }
 
-// AllowContainerRegistry implements the Admission stereotype,
-// which means the value can be modified if it's container registry.
+// AllowContainerRegistry 实现了 Admission 类型，
+// 表示当新值为合法的容器镜像仓库地址时允许修改。
 func AllowContainerRegistry() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		_, err := conregname.NewRepository(newVal)
@@ -193,8 +192,8 @@ func AllowContainerRegistry() Admission {
 	}
 }
 
-// AllowContainerImageReference implements the Admission stereotype,
-// which means the value can be modified if it's container image reference.
+// AllowContainerImageReference 实现了 Admission 类型，
+// 表示当新值为合法的容器镜像引用时允许修改。
 func AllowContainerImageReference() Admission {
 	return func(ctx context.Context, oldVal, newVal string) error {
 		_, err := conregname.ParseReference(newVal)

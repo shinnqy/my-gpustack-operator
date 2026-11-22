@@ -4,15 +4,15 @@ import (
 	"encoding/base64"
 )
 
-// EncodeBase64 encodes the given string,
-// and then output standard format.
+// EncodeBase64 对给定字符串进行编码，
+// 然后输出标准格式。
 func EncodeBase64(src string) string {
 	bs := EncodeBase64Bytes(ToBytes(&src))
 	return FromBytes(&bs)
 }
 
-// EncodeBase64Bytes is similar to DecodeBase64,
-// but returns bytes.
+// EncodeBase64Bytes 与 DecodeBase64 类似，
+// 但返回字节切片。
 func EncodeBase64Bytes(src []byte) []byte {
 	enc := base64.RawURLEncoding
 	dst := make([]byte, enc.EncodedLen(len(src)))

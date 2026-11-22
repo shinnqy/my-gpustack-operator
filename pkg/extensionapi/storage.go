@@ -28,16 +28,15 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/gox"
 )
 
-// DryRunHandler is an interface for a handler whose OnCreate and OnUpdate pass the dry-run option on to
-// every write they make.
+// DryRunHandler 是处理器的接口，其 OnCreate 和 OnUpdate 会将 dry-run 选项传递给所执行的每次写操作。
 //
-// A dry-run create or update reaches OnCreate or OnUpdate only through a handler that supports dry
-// run: the api server behind it then runs its admission, webhooks included, and persists nothing, so
-// the dry run is refused wherever the real request is. For any other handler the dry run stops before
-// OnCreate or OnUpdate and skips that admission. It has to: a write there that drops the option
-// persists what the caller only asked to check.
+// 仅当处理器支持 dry-run 时，dry-run 创建或更新请求才会进入 OnCreate 或 OnUpdate：
+// 其后端的 API Server 随后会执行包含 Webhook 在内的准入控制且不持久化任何数据，
+// 因此在真实请求会被拒绝的场景下，dry-run 请求同样会被拒绝。对于其他处理器，
+// dry-run 会在到达 OnCreate 或 OnUpdate 之前停止并跳过该准入控制。这是必需的：
+// 若其中的写操作丢弃了该选项，就会将调用方仅请求校验的内容持久化。
 type DryRunHandler interface {
-	// SupportsDryRun reports whether OnCreate and OnUpdate pass the dry-run option on to every write.
+	// SupportsDryRun 返回 OnCreate 和 OnUpdate 是否将 dry-run 选项传递给每次写操作。
 	SupportsDryRun() bool
 }
 
@@ -47,17 +46,17 @@ func supportsDryRun(h any) bool {
 }
 
 type (
-	// CreateHandler is an interface for a creation handler.
+	// CreateHandler 是创建处理器的接口。
 	CreateHandler interface {
 		rest.Scoper
-		// New returns a new object.
+		// New 返回一个新对象。
 		New() runtime.Object
-		// OnCreate creates the object with the given options,
-		// and returns the created object.
+		// OnCreate 使用给定选项创建对象，
+		// 并返回创建后的对象。
 		OnCreate(ctx context.Context, object runtime.Object, opts ctrlcli.CreateOptions) (created runtime.Object, err error)
 	}
 
-	// CreateOperation implements the rest.Creater interface.
+	// CreateOperation 实现了 rest.Creater 接口。
 	CreateOperation struct {
 		Handler CreateHandler
 	}
@@ -65,7 +64,7 @@ type (
 
 var _ rest.Creater = (*CreateOperation)(nil)
 
-// WithCreate returns a CreateOperation for the given CreateHandler.
+// WithCreate 返回给定 CreateHandler 对应的 CreateOperation。
 func WithCreate(h CreateHandler) CreateOperation {
 	return CreateOperation{Handler: h}
 }
@@ -103,7 +102,7 @@ func (s CreateOperation) Create(
 	if dryrun.IsDryRun(options.DryRun) && !supportsDryRun(s.Handler) {
 		getter, ok := s.Handler.(rest.Getter)
 		if !ok {
-			// If the handler does not support get, we cannot check for existence.
+			// 若处理器不支持 get 操作，则无法检查对象是否存在。
 			return obj, nil
 		}
 
@@ -129,15 +128,15 @@ func (s CreateOperation) Create(
 }
 
 type (
-	// ListHandler is an interface for a listing handler.
+	// ListHandler 是列表查询处理器的接口。
 	ListHandler interface {
-		// NewList returns an empty object that can be used with the List call.
+		// NewList 返回一个可用于 List 调用的空对象。
 		NewList() runtime.Object
-		// OnList returns an object list collection for the given options.
+		// OnList 返回给定选项对应的对象列表集合。
 		OnList(ctx context.Context, opts ctrlcli.ListOptions) (list runtime.Object, err error)
 	}
 
-	// ListOperation implements the rest.Lister interface.
+	// ListOperation 实现了 rest.Lister 接口。
 	ListOperation struct {
 		WatchBookmark  WatchBookmark
 		Handler        ListHandler
@@ -147,7 +146,7 @@ type (
 
 var _ rest.Lister = (*ListOperation)(nil)
 
-// WithList returns a ListOperation for the given rest.TableConvertor and ListHandler.
+// WithList 返回给定 rest.TableConvertor 和 ListHandler 对应的 ListOperation。
 func WithList(tc rest.TableConvertor, h ListHandler) ListOperation {
 	if tc == nil {
 		tc = NewDefaultTableConvertor()
@@ -183,13 +182,13 @@ func (s ListOperation) List(
 	if listObj == nil {
 		listObj = s.Handler.NewList()
 	} else {
-		// Try to get the resource version from the list meta.
+		// 尝试从列表元数据中获取 resource version。
 		var rv string
 		lm, err := kmeta.ListAccessor(listObj)
 		if err == nil {
 			rv = lm.GetResourceVersion()
 		}
-		// Otherwise, try to get the resource version from the last list item.
+		// 否则，尝试从最后一个列表项中获取 resource version。
 		if rv == "" {
 			li, _ := kmeta.ExtractList(listObj)
 			if len(li) != 0 {
@@ -208,19 +207,19 @@ func (s ListOperation) List(
 }
 
 type (
-	// WatchHandler is an interface for a watching handler.
+	// WatchHandler 是监听处理器的接口。
 	WatchHandler interface {
-		// OnWatch returns a watch.Interface that watches the list of objects.
+		// OnWatch 返回用于监听对象列表的 watch.Interface。
 		OnWatch(ctx context.Context, opts ctrlcli.ListOptions) (watch.Interface, error)
 	}
 
-	// ListWatchHandler is an interface for a listing handler.
+	// ListWatchHandler 是列表查询处理器的接口。
 	ListWatchHandler interface {
 		ListHandler
 		WatchHandler
 	}
 
-	// ListWatchOperation implements the rest.Lister and rest.Watcher interfaces.
+	// ListWatchOperation 实现了 rest.Lister 和 rest.Watcher 接口。
 	ListWatchOperation struct {
 		ListOperation
 		Handler WatchHandler
@@ -232,7 +231,7 @@ var (
 	_ rest.Watcher = (*ListWatchOperation)(nil)
 )
 
-// WithListWatch returns a ListWatchOperation for the given rest.TableConvertor and ListWatchHandler.
+// WithListWatch 返回给定 rest.TableConvertor 和 ListWatchHandler 对应的 ListWatchOperation。
 func WithListWatch(tc rest.TableConvertor, h ListWatchHandler) ListWatchOperation {
 	return ListWatchOperation{
 		ListOperation: WithList(tc, h),
@@ -263,28 +262,28 @@ func (s ListWatchOperation) Watch(
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 由 context 取消。
 				return
 			case <-dw.StopChan():
-				// Cancel by downstream.
+				// 由下游取消。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 由上游关闭。
 					return
 				}
 
-				// Nothing to do.
+				// 无需处理。
 				if e.Object == nil {
 					c <- e
 					continue
 				}
 
-				// Record the resource revision.
+				// 记录资源版本号。
 				om, err := kmeta.Accessor(e.Object)
 				if err == nil {
-					// Ignore the event if the resource version is not updated,
-					// and the event's object is not deleted.
+					// 如果 resource version 未更新，
+					// 且事件对应的对象未被删除，则忽略该事件。
 					swp := wm.SwapResourceVersion(om.GetResourceVersion())
 					if !swp && om.GetDeletionTimestamp() == nil {
 						continue
@@ -300,14 +299,14 @@ func (s ListWatchOperation) Watch(
 }
 
 type (
-	// GetHandler is an interface for a getting handler.
+	// GetHandler 是获取处理器的接口。
 	GetHandler interface {
 		rest.Scoper
-		// OnGet returns the object with the given key and options.
+		// OnGet 返回给定键和选项对应的对象。
 		OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (object runtime.Object, err error)
 	}
 
-	// GetOperation implements the rest.Getter interface.
+	// GetOperation 实现了 rest.Getter 接口。
 	GetOperation struct {
 		Handler GetHandler
 	}
@@ -315,15 +314,15 @@ type (
 
 var _ rest.Getter = (*GetOperation)(nil)
 
-// WithGet returns a GetOperation for the given GetHandler.
+// WithGet 返回给定 GetHandler 对应的 GetOperation。
 func WithGet(h GetHandler) GetOperation {
 	return GetOperation{Handler: h}
 }
 
 type (
-	// SubResourceGetHandler is an interface for a getting handler for subresource.
+	// SubResourceGetHandler 是子资源获取处理器的接口。
 	SubResourceGetHandler interface {
-		// OnGet returns the object with the given key and options.
+		// OnGet 返回给定键和选项对应的对象。
 		OnGet(ctx context.Context, key types.NamespacedName, opts ctrlcli.GetOptions) (object runtime.Object, err error)
 	}
 
@@ -333,7 +332,7 @@ type (
 	}
 )
 
-// WithSubResourceGet returns a GetOperation for the given SubResourceGetHandler.
+// WithSubResourceGet 返回给定 SubResourceGetHandler 对应的 GetOperation。
 func WithSubResourceGet(parent rest.Scoper, h SubResourceGetHandler) GetOperation {
 	return GetOperation{
 		Handler: subResourceGetHandlerAdapter{
@@ -371,20 +370,20 @@ func (s GetOperation) Get(
 }
 
 type (
-	// UpdateHandler is an interface for an updating handler.
+	// UpdateHandler 是更新处理器的接口。
 	UpdateHandler interface {
 		GetHandler
-		// New returns a new object.
+		// New 返回一个新对象。
 		New() runtime.Object
-		// OnUpdate updates the object with the given options,
-		// and returns the updated object.
+		// OnUpdate 使用给定选项更新对象，
+		// 并返回更新后的对象。
 		OnUpdate(ctx context.Context, object, oldObject runtime.Object, opts ctrlcli.UpdateOptions) (updated runtime.Object, err error)
 	}
 
-	// BeforeUpdateFunc is a function that is called before update.
+	// BeforeUpdateFunc 是在更新前调用的函数。
 	BeforeUpdateFunc = func(ctx context.Context, object, existing runtime.Object) (runtime.Object, error)
 
-	// UpdateOperation implements the rest.Updater interface.
+	// UpdateOperation 实现了 rest.Updater 接口。
 	UpdateOperation struct {
 		Handler      UpdateHandler
 		BeforeUpdate BeforeUpdateFunc
@@ -393,7 +392,7 @@ type (
 
 var _ rest.Updater = (*UpdateOperation)(nil)
 
-// WithUpdate returns a UpdateOperation for the given UpdateHandler.
+// WithUpdate 返回给定 UpdateHandler 对应的 UpdateOperation。
 func WithUpdate(h UpdateHandler) UpdateOperation {
 	var bf BeforeUpdateFunc
 	if _, ok := h.New().(ObjectWithStatusSubResource); ok {
@@ -457,7 +456,7 @@ func (s UpdateOperation) Update(
 	if creating {
 		createHandler, ok := s.Handler.(CreateHandler)
 		if !ok {
-			// If the handler does not support get, just return an error.
+			// 若处理器不支持 get 操作，则直接返回错误。
 			return nil, false, kerrors.NewNotFound(qualifiedResourceFromContext(ctx), name)
 		}
 
@@ -518,20 +517,20 @@ func (s UpdateOperation) GetStatusSubResourceUpdater() UpdateOperation {
 }
 
 type (
-	// CreateUpdateHandler is an interface for creating and updating handler.
+	// CreateUpdateHandler 是创建和更新处理器的接口。
 	CreateUpdateHandler interface {
 		GetHandler
-		// New returns a new object.
+		// New 返回一个新对象。
 		New() runtime.Object
-		// OnCreate creates the object with the given options,
-		// and returns the created object.
+		// OnCreate 使用给定选项创建对象，
+		// 并返回创建后的对象。
 		OnCreate(ctx context.Context, object runtime.Object, opts ctrlcli.CreateOptions) (created runtime.Object, err error)
-		// OnUpdate updates the object with the given options,
-		// and returns the updated object.
+		// OnUpdate 使用给定选项更新对象，
+		// 并返回更新后的对象。
 		OnUpdate(ctx context.Context, object, oldObject runtime.Object, opts ctrlcli.UpdateOptions) (updated runtime.Object, err error)
 	}
 
-	// CreateUpdateOperation implements the rest.Creater and rest.Updater interface.
+	// CreateUpdateOperation 实现了 rest.Creater 和 rest.Updater 接口。
 	CreateUpdateOperation struct {
 		UpdateOperation
 		CreateOperation CreateOperation
@@ -543,7 +542,7 @@ var (
 	_ rest.Updater = (*CreateUpdateOperation)(nil)
 )
 
-// WithCreateUpdate returns a CreateUpdateOperation for the given CreateUpdateHandler.
+// WithCreateUpdate 返回给定 CreateUpdateHandler 对应的 CreateUpdateOperation。
 func WithCreateUpdate(h CreateUpdateHandler) CreateUpdateOperation {
 	return CreateUpdateOperation{
 		UpdateOperation: WithUpdate(h),
@@ -573,14 +572,14 @@ func (s CreateUpdateOperation) Update(
 }
 
 type (
-	// DeleteHandler is an interface for a deletion handler.
+	// DeleteHandler 是删除处理器的接口。
 	DeleteHandler = interface {
 		GetHandler
-		// OnDelete deletes the object with the given options.
+		// OnDelete 使用给定选项删除对象。
 		OnDelete(ctx context.Context, object runtime.Object, opts ctrlcli.DeleteOptions) error
 	}
 
-	// DeleteOperation implements the rest.Deleter interface.
+	// DeleteOperation 实现了 rest.Deleter 接口。
 	DeleteOperation struct {
 		Handler DeleteHandler
 	}
@@ -588,7 +587,7 @@ type (
 
 var _ rest.GracefulDeleter = (*DeleteOperation)(nil)
 
-// WithDelete returns a DeleteOperation for the given DeleteHandler.
+// WithDelete 返回给定 DeleteHandler 对应的 DeleteOperation。
 func WithDelete(h DeleteHandler) DeleteOperation {
 	return DeleteOperation{
 		Handler: h,
@@ -651,7 +650,7 @@ func (s DeleteOperation) Delete(
 	}
 	async := ptr.Deref(options.PropagationPolicy, meta.DeletePropagationBackground) == meta.DeletePropagationBackground
 	if dryrun.IsDryRun(options.DryRun) {
-		// TODO(thxCode): support delete dry run?
+		// TODO(thxCode): 是否支持删除操作的 dry-run？
 		return st, async, nil
 	}
 
@@ -662,7 +661,7 @@ func (s DeleteOperation) Delete(
 	return st, async, nil
 }
 
-// CollectionDeleteOperation implements the rest.Lister, rest.GracefulDeleter and rest.CollectionDeleter interfaces.
+// CollectionDeleteOperation 实现了 rest.Lister、rest.GracefulDeleter 和 rest.CollectionDeleter 接口。
 type CollectionDeleteOperation struct {
 	ListWatchOperation
 	DeleteOperation
@@ -674,7 +673,7 @@ var (
 	_ rest.CollectionDeleter = (*CollectionDeleteOperation)(nil)
 )
 
-// WithCollectionDelete returns a CollectionDeleteOperation for the given ListWatchHandler and DeleteHandler.
+// WithCollectionDelete 返回给定 ListWatchHandler 和 DeleteHandler 对应的 CollectionDeleteOperation。
 func WithCollectionDelete(l ListWatchOperation, d DeleteOperation) CollectionDeleteOperation {
 	return CollectionDeleteOperation{
 		ListWatchOperation: l,
@@ -737,13 +736,13 @@ func (s CollectionDeleteOperation) DeleteCollection(
 				}
 			}
 
-			// Done as reached limit.
+			// 已达到数量上限，处理完成。
 			if hasLimit {
 				close(itemsCh)
 				return nil
 			}
 
-			// Or done as no more items.
+			// 或者已无更多条目，处理完成。
 			om, err := kmeta.ListAccessor(listObj)
 			if err != nil {
 				return kerrors.NewInternalError(err)
@@ -753,7 +752,7 @@ func (s CollectionDeleteOperation) DeleteCollection(
 				return nil
 			}
 
-			// Otherwise, continue.
+			// 否则继续。
 			listOptions.Continue = om.GetContinue()
 			listOptions.ResourceVersion = ""
 			listOptions.ResourceVersionMatch = ""
@@ -796,7 +795,7 @@ func (s CollectionDeleteOperation) DeleteCollection(
 }
 
 type (
-	// CurdOperationsHandler is an interface for CURD handler.
+	// CurdOperationsHandler 是 CURD 处理器的接口。
 	CurdOperationsHandler interface {
 		CreateUpdateHandler
 		ListWatchHandler
@@ -804,8 +803,8 @@ type (
 		DeleteHandler
 	}
 
-	// CurdOperations implements the rest.Creater, rest.Lister, rest.Watcher, rest.Getter,
-	// rest.Updater, rest.GracefulDeleter and rest.CollectionDeleter interfaces.
+	// CurdOperations 实现了 rest.Creater、rest.Lister、rest.Watcher、rest.Getter、
+	// rest.Updater、rest.GracefulDeleter 和 rest.CollectionDeleter 接口。
 	CurdOperations struct {
 		CreateUpdateOperation
 		ListWatchOperation
@@ -826,9 +825,9 @@ var (
 	_ rest.CollectionDeleter = (*CurdOperations)(nil)
 )
 
-// WithCurd returns a CurdOperations for the given rest.TableConvertor and CurdOperationsHandler,
-// which implements the rest.Creater, rest.Lister, rest.Watcher, rest.Getter, rest.Updater, rest.GracefulDeleter
-// and rest.CollectionDeleter interfaces.
+// WithCurd 根据给定的 rest.TableConvertor 和 CurdOperationsHandler 返回一个 CurdOperations，
+// 其实现了 rest.Creater、rest.Lister、rest.Watcher、rest.Getter、rest.Updater、rest.GracefulDeleter
+// 和 rest.CollectionDeleter 接口。
 func WithCurd(tc rest.TableConvertor, h CurdOperationsHandler) CurdOperations {
 	cu := WithCreateUpdate(h)
 	l := WithListWatch(tc, h)
@@ -844,79 +843,79 @@ func WithCurd(tc rest.TableConvertor, h CurdOperationsHandler) CurdOperations {
 }
 
 type (
-	// CurdProxyHandler is an handler for proxy CURD handler.
+	// CurdProxyHandler 是代理 CURD 处理器的接口。
 	CurdProxyHandler[DO MetaObject, DOL MetaObjectList, UO MetaObject, UOL MetaObjectList] interface {
 		rest.Scoper
 		rest.Storage
-		// NewList returns an empty object that can be used with the List call.
+		// NewList 返回一个可用于 List 调用的空对象。
 		NewList() runtime.Object
-		// NewListForProxy returns an empty object that can be used with the List call for proxy.
+		// NewListForProxy 返回一个可用于代理 List 调用的空对象。
 		NewListForProxy() runtime.Object
-		// CastObjectTo casts the object from downstream to upstream.
+		// CastObjectTo 将对象从下游转换为上游。
 		//
-		// It is usually recommended to perform type conversion in this method,
-		// for example, `return UO(do)`.
+		// 通常建议在此方法中执行类型转换，
+		// 例如 `return UO(do)`。
 		CastObjectTo(do DO) UO
-		// CastObjectFrom casts the object from upstream to downstream.
+		// CastObjectFrom 将对象从上游转换为下游。
 		//
-		// It is usually recommended to perform type conversion in this method,
-		// for example, `return DO(uo)`.
+		// 通常建议在此方法中执行类型转换，
+		// 例如 `return DO(uo)`。
 		CastObjectFrom(ctx context.Context, uo UO) DO
 	}
 
-	// CurdProxyOnCreateBeforeAdvice is an interface for intercepting before OnCreate.
+	// CurdProxyOnCreateBeforeAdvice 是在 OnCreate 之前进行拦截的接口。
 	CurdProxyOnCreateBeforeAdvice[DO MetaObject] interface {
-		// BeforeOnCreate is called before create,
-		// to modify the creating object and options.
+		// BeforeOnCreate 在创建前调用，
+		// 用于修改待创建的对象和选项。
 		BeforeOnCreate(ctx context.Context, obj DO, opts *ctrlcli.CreateOptions) error
 	}
 
-	// CurdProxyOnListWatchBeforeAdvice is an interface for interception before OnList/OnWatch.
+	// CurdProxyOnListWatchBeforeAdvice 是在 OnList/OnWatch 之前进行拦截的接口。
 	CurdProxyOnListWatchBeforeAdvice interface {
-		// BeforeOnListWatch is called before list/watch,
-		// to modify the list/watch options.
+		// BeforeOnListWatch 在 list/watch 前调用，
+		// 用于修改 list/watch 选项。
 		BeforeOnListWatch(ctx context.Context, opts *ctrlcli.ListOptions) error
 	}
 
-	// CurdProxyOnListAfterAdvice is an interface for intercepting after OnList.
+	// CurdProxyOnListAfterAdvice 是在 OnList 之后进行拦截的接口。
 	CurdProxyOnListAfterAdvice[DOL MetaObjectList] interface {
-		// AfterOnList is called after list,
-		// to modify the list result.
+		// AfterOnList 在 list 后调用，
+		// 用于修改列表结果。
 		AfterOnList(dol DOL, opts *ctrlcli.ListOptions) (mdol DOL)
 	}
 
-	// CurdProxyOnWatchDuringAdvice is an interface for intercepting during OnWatch.
+	// CurdProxyOnWatchDuringAdvice 是在 OnWatch 期间进行拦截的接口。
 	CurdProxyOnWatchDuringAdvice[DO MetaObject] interface {
-		// DuringWatching is called during watch,
-		// to modify the receiving result.
+		// DuringWatching 在 watch 期间调用，
+		// 用于修改接收到的结果。
 		//
-		// If the return value of `send` is true,
-		// the result will be sent to the client.
+		// 如果返回值 `send` 为 true，
+		// 该结果将被发送给客户端。
 		DuringWatching(do DO, opts *ctrlcli.ListOptions) (mdo DO, send bool)
 	}
 
-	// CurdProxyOnGetBeforeAdvice is an interface for intercepting before OnGet.
+	// CurdProxyOnGetBeforeAdvice 是在 OnGet 之前进行拦截的接口。
 	CurdProxyOnGetBeforeAdvice[DO MetaObject] interface {
-		// BeforeOnGet is called before get,
-		// to modify the getting options.
+		// BeforeOnGet 在 get 前调用，
+		// 用于修改获取选项。
 		BeforeOnGet(ctx context.Context, key types.NamespacedName, opts *ctrlcli.GetOptions) error
 	}
 
-	// CurdProxyOnUpdateBeforeAdvice is an interface for intercepting before OnUpdate.
+	// CurdProxyOnUpdateBeforeAdvice 是在 OnUpdate 之前进行拦截的接口。
 	CurdProxyOnUpdateBeforeAdvice[DO MetaObject] interface {
-		// BeforeOnUpdate is called before update,
-		// to modify the updating object and options.
+		// BeforeOnUpdate 在更新前调用，
+		// 用于修改待更新的对象和选项。
 		BeforeOnUpdate(ctx context.Context, obj, oldObj DO, opts *ctrlcli.UpdateOptions) error
 	}
 
-	// CurdProxyOnDeleteBeforeAdvice is an interface for intercepting before OnDelete.
+	// CurdProxyOnDeleteBeforeAdvice 是在 OnDelete 之前进行拦截的接口。
 	CurdProxyOnDeleteBeforeAdvice[DO MetaObject] interface {
-		// BeforeOnDelete is called before delete,
-		// to modify the deleting object and options.
+		// BeforeOnDelete 在删除前调用，
+		// 用于修改待删除的对象和选项。
 		BeforeOnDelete(ctx context.Context, obj DO, opts *ctrlcli.DeleteOptions) error
 	}
 
-	// _CurdProxyHandler is a private struct that implements CurdProxyHandler.
+	// _CurdProxyHandler 是实现 CurdProxyHandler 的私有结构体。
 	_CurdProxyHandler[DO MetaObject, DOL MetaObjectList, UO MetaObject, UOL MetaObjectList] struct {
 		CurdProxyHandler[DO, DOL, UO, UOL]
 		CtrlClient   ctrlcli.WithWatch
@@ -928,7 +927,7 @@ type (
 	}
 )
 
-// WithCurdProxy returns a CurdOperations with the given CurdProxyHandler.
+// WithCurdProxy 使用给定的 CurdProxyHandler 返回一个 CurdOperations。
 func WithCurdProxy[DO MetaObject, DOL MetaObjectList, UO MetaObject, UOL MetaObjectList](
 	tc rest.TableConvertor,
 	h CurdProxyHandler[DO, DOL, UO, UOL],
@@ -971,10 +970,10 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) CastObjectFrom(ctx context.Context,
 	return do
 }
 
-// _CreateHandlerWithoutNew is an interface for a creation handler without New function.
+// _CreateHandlerWithoutNew 是不含 New 函数的创建处理器接口。
 type _CreateHandlerWithoutNew interface {
-	// OnCreate creates the object with the given options,
-	// and returns the created object.
+	// OnCreate 使用给定选项创建对象，
+	// 并返回创建后的对象。
 	OnCreate(ctx context.Context, object runtime.Object, opts ctrlcli.CreateOptions) (created runtime.Object, err error)
 }
 
@@ -983,12 +982,12 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnCreate(
 	obj runtime.Object,
 	opts ctrlcli.CreateOptions,
 ) (runtime.Object, error) {
-	// Bypass if the handler implements CreateHandler.
+	// 如果处理器实现了 CreateHandler，则绕过当前逻辑。
 	if gh, ok := h.CurdProxyHandler.(_CreateHandlerWithoutNew); ok {
 		return gh.OnCreate(ctx, obj, opts)
 	}
 
-	// Before advice.
+	// 前置拦截。
 	if bf, ok := h.CurdProxyHandler.(CurdProxyOnCreateBeforeAdvice[DO]); ok {
 		err := bf.BeforeOnCreate(ctx, obj.(DO), &opts)
 		if err != nil {
@@ -1008,12 +1007,12 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnList(
 	ctx context.Context,
 	opts ctrlcli.ListOptions,
 ) (runtime.Object, error) {
-	// Bypass if the handler implements ListHandler.
+	// 如果处理器实现了 ListHandler，则绕过当前逻辑。
 	if gh, ok := h.CurdProxyHandler.(ListHandler); ok {
 		return gh.OnList(ctx, opts)
 	}
 
-	// Before advice.
+	// 前置拦截。
 	uopts := copyListOptions(opts)
 	if bf, ok := h.CurdProxyHandler.(CurdProxyOnListWatchBeforeAdvice); ok {
 		err := bf.BeforeOnListWatch(ctx, uopts)
@@ -1043,7 +1042,7 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnList(
 		return nil, fmt.Errorf("set downstream list: %w", err)
 	}
 
-	// Set list metadata.
+	// 设置列表元数据。
 	{
 		uolm, err := kmeta.ListAccessor(uol)
 		if err != nil {
@@ -1059,7 +1058,7 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnList(
 		dolm.SetSelfLink(uolm.GetSelfLink())
 	}
 
-	// After advice.
+	// 后置拦截。
 	if af, ok := h.CurdProxyHandler.(CurdProxyOnListAfterAdvice[DOL]); ok {
 		dol = af.AfterOnList(dol.(DOL), &opts)
 	}
@@ -1071,12 +1070,12 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnWatch(
 	ctx context.Context,
 	opts ctrlcli.ListOptions,
 ) (watch.Interface, error) {
-	// Bypass if the handler implements WatchHandler.
+	// 如果处理器实现了 WatchHandler，则绕过当前逻辑。
 	if gh, ok := h.CurdProxyHandler.(WatchHandler); ok {
 		return gh.OnWatch(ctx, opts)
 	}
 
-	// Before advice.
+	// 前置拦截。
 	uopts := copyListOptions(opts)
 	if bf, ok := h.CurdProxyHandler.(CurdProxyOnListWatchBeforeAdvice); ok {
 		err := bf.BeforeOnListWatch(ctx, uopts)
@@ -1100,33 +1099,33 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnWatch(
 		for {
 			select {
 			case <-ctx.Done():
-				// Cancel by context.
+				// 由 context 取消。
 				return
 			case <-dw.StopChan():
-				// Cancel by downstream.
+				// 由下游取消。
 				return
 			case e, ok := <-uw.ResultChan():
 				if !ok {
-					// Close by upstream.
+					// 由上游关闭。
 					return
 				}
 
 				if e.Object == nil {
-					// Nothing to do.
+					// 无需处理。
 					c <- e
 					continue
 				}
 
-				// Type assert.
+				// 类型断言。
 				uo, ok := e.Object.(UO)
 				if !ok {
 					continue
 				}
 
-				// Cast.
+				// 类型转换。
 				do := h.CastObjectFrom(ctx, uo)
 
-				// During advice.
+				// 过程拦截。
 				if da, ok := h.CurdProxyHandler.(CurdProxyOnWatchDuringAdvice[DO]); ok {
 					do, ok = da.DuringWatching(do, &opts)
 					if !ok {
@@ -1164,12 +1163,12 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnGet(
 	key types.NamespacedName,
 	opts ctrlcli.GetOptions,
 ) (runtime.Object, error) {
-	// Bypass if the handler implements GetHandler.
+	// 如果处理器实现了 GetHandler，则绕过当前逻辑。
 	if gh, ok := h.CurdProxyHandler.(GetHandler); ok {
 		return gh.OnGet(ctx, key, opts)
 	}
 
-	// Before advice.
+	// 前置拦截。
 	if bf, ok := h.CurdProxyHandler.(CurdProxyOnGetBeforeAdvice[DO]); ok {
 		err := bf.BeforeOnGet(ctx, key, &opts)
 		if err != nil {
@@ -1184,10 +1183,10 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnGet(
 	return h.CastObjectFrom(ctx, uo), nil
 }
 
-// _UpdateHandlerWithoutNew is an interface for an updating handler without New function.
+// _UpdateHandlerWithoutNew 是不含 New 函数的更新处理器接口。
 type _UpdateHandlerWithoutNew interface {
-	// OnUpdate updates the object with the given options,
-	// and returns the updated object.
+	// OnUpdate 使用给定选项更新对象，
+	// 并返回更新后的对象。
 	OnUpdate(ctx context.Context, object, oldObject runtime.Object, opts ctrlcli.UpdateOptions) (updated runtime.Object, err error)
 }
 
@@ -1196,12 +1195,12 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnUpdate(
 	obj, oldObj runtime.Object,
 	opts ctrlcli.UpdateOptions,
 ) (runtime.Object, error) {
-	// Bypass if the handler implements UpdateHandler.
+	// 如果处理器实现了 UpdateHandler，则绕过当前逻辑。
 	if gh, ok := h.CurdProxyHandler.(_UpdateHandlerWithoutNew); ok {
 		return gh.OnUpdate(ctx, obj, oldObj, opts)
 	}
 
-	// Before advice.
+	// 前置拦截。
 	if bf, ok := h.CurdProxyHandler.(CurdProxyOnUpdateBeforeAdvice[DO]); ok {
 		err := bf.BeforeOnUpdate(ctx, obj.(DO), oldObj.(DO), &opts)
 		if err != nil {
@@ -1222,9 +1221,9 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnUpdate(
 	return h.CastObjectFrom(ctx, uo), nil
 }
 
-// SupportsDryRun reports true unless the handler replaces OnCreate or OnUpdate, in which case the
-// handler answers for itself: the proxy's own OnCreate and OnUpdate make one upstream write each, and
-// pass the options on to it.
+// SupportsDryRun 返回 true，除非处理器替换了 OnCreate 或 OnUpdate（此时由处理器自身决定）：
+// 代理自身的 OnCreate 和 OnUpdate 各自只执行一次上游写入，
+// 并将选项传递给上游。
 func (h _CurdProxyHandler[DO, DOL, UO, UOL]) SupportsDryRun() bool {
 	_, replacesCreate := h.CurdProxyHandler.(_CreateHandlerWithoutNew)
 	_, replacesUpdate := h.CurdProxyHandler.(_UpdateHandlerWithoutNew)
@@ -1239,12 +1238,12 @@ func (h _CurdProxyHandler[DO, DOL, UO, UOL]) OnDelete(
 	obj runtime.Object,
 	opts ctrlcli.DeleteOptions,
 ) error {
-	// Bypass if the handler implements DeleteHandler.
+	// 如果处理器实现了 DeleteHandler，则绕过当前逻辑。
 	if gh, ok := h.CurdProxyHandler.(DeleteHandler); ok {
 		return gh.OnDelete(ctx, obj, opts)
 	}
 
-	// Before advice.
+	// 前置拦截。
 	if bf, ok := h.CurdProxyHandler.(CurdProxyOnDeleteBeforeAdvice[DO]); ok {
 		err := bf.BeforeOnDelete(ctx, obj.(DO), &opts)
 		if err != nil {
@@ -1267,7 +1266,7 @@ func qualifiedKindFromContext(ctx context.Context) schema.GroupKind {
 	ri, _ := genericapirequest.RequestInfoFrom(ctx)
 	return schema.GroupKind{
 		Group: ri.APIGroup,
-		Kind:  ri.Resource, // We use the resource name as the kind name.
+		Kind:  ri.Resource, // 使用资源名称作为 Kind 名称。
 	}
 }
 

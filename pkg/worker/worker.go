@@ -55,7 +55,7 @@ type Worker struct {
 	APIServer       *genericapiserver.GenericAPIServer
 }
 
-// routingServiceReference is the system routing service the extension api services are fronted by.
+// routingServiceReference 返回前置代理各个扩展 API service 的系统路由 Service。
 func (w *Worker) routingServiceReference() apireg.ServiceReference {
 	return apireg.ServiceReference{
 		Namespace: kuberess.SystemNamespaceName,
@@ -72,22 +72,22 @@ func (w *Worker) Prepare(ctx context.Context) error {
 
 	lpCli := system.LoopbackKubeClient.Get()
 
-	// Install system namespace.
+	// 安装系统 Namespace。
 	err = kuberess.InstallSystemNamespace(ctx, lpCli)
 	if err != nil {
 		return fmt.Errorf("install system namespace: %w", err)
 	}
 
-	// Install fake system routing service if needed.
+	// 如需要，安装伪系统路由 Service。
 	if !system.LoopbackKubeInside.Get() && system.LoopbackKubeNearby.Get() {
-		// NB(thxCode): Need to enable the loopback Kubernetes APIServer's `--enable-aggregator-routing` flag also.
+		// NB(thxCode): 还需要同时启用回环 Kubernetes APIServer 的 `--enable-aggregator-routing` 标志。
 		err = kuberess.InstallFakeSystemRoutingService(ctx, lpCli, w.RoutingPort)
 		if err != nil {
 			return fmt.Errorf("install fake system routing service: %w", err)
 		}
 	}
 
-	// Initialize CRDs.
+	// 初始化 CRDs。
 	err = apis.InstallCRDs(ctx, lpCli)
 	if err != nil {
 		return fmt.Errorf("install CRDs: %w", err)
@@ -99,7 +99,7 @@ func (w *Worker) Prepare(ctx context.Context) error {
 		return fmt.Errorf("install extension API services: %w", err)
 	}
 
-	// Install webhook configurations.
+	// 安装 Webhook 配置。
 	{
 		cc := admreg.WebhookClientConfig{
 			Service: &admreg.ServiceReference{
@@ -108,16 +108,16 @@ func (w *Worker) Prepare(ctx context.Context) error {
 				Port:      ptr.To(w.RoutingPort),
 			},
 		}
-		// If we stand closed to loopback Kubernetes cluster but not inside,
-		// we can use the primary IP address to access the webhook server.
+		// 如果部署在回环 Kubernetes 集群附近而非集群内部，
+		// 可以使用主 IP 地址访问 Webhook 服务器。
 		if !system.LoopbackKubeInside.Get() && system.LoopbackKubeNearby.Get() {
-			// NB(thxCode): launch multiple instances, only one takes working.
+			// NB(thxCode): 启动多个实例时，仅有一个实例生效。
 			ep := fmt.Sprintf("https://%s:%d", system.PrimaryIP.Get(), w.RoutingPort)
 			cc = admreg.WebhookClientConfig{
 				URL: ptr.To(ep),
 			}
 		}
-		// Install webhook configurations.
+		// 安装 Webhook 配置。
 		cc.CABundle = w.RoutingCaBundle
 		err = webhooks.Install(ctx, lpCli, cc)
 		if err != nil {
@@ -125,24 +125,22 @@ func (w *Worker) Prepare(ctx context.Context) error {
 		}
 	}
 
-	// Initialize settings.
+	// 初始化设置。
 	err = settings.Initialize(ctx, lpCli)
 	if err != nil {
 		return fmt.Errorf("initialize settings: %w", err)
 	}
 
-	// Install applications.
+	// 安装应用组件。
 	err = kuberess.InstallApplications(ctx, w.Manufacturers)
 	if err != nil {
 		return fmt.Errorf("install applications: %w", err)
 	}
 
-	// Install the two custom resources the scheduling chain needs but no chart can carry:
-	// their CRDs belong to Node Feature Discovery and to Kueue, and Helm maps a whole
-	// manifest before creating anything, so a chart cannot order a CRD ahead of a custom
-	// resource that needs it. Both stay outside the --disable-applications gate — whoever
-	// deploys NFD and Kueue, the chain does not start without them — and both retry until
-	// their CRD is served.
+	// 安装调度链所需的两个自定义资源，但任何 Helm chart 都无法直接携带它们：
+	// 它们的 CRD 分别属于 Node Feature Discovery 和 Kueue，而 Helm 在创建任何资源前会先映射整个清单，因此 chart
+	// 无法保证 CRD 在依赖它的自定义资源之前创建。两者均保留在 --disable-applications 开关之外 —— 无论由谁部署
+	// NFD 和 Kueue，缺少它们调度链都无法启动 —— 且两者都会持续重试直至对应的 CRD 就绪。
 	err = kuberess.InstallCPUInfoNodeFeatureRule(ctx, w.Manufacturers)
 	if err != nil {
 		return fmt.Errorf("install cpu info node feature rule: %w", err)
@@ -177,7 +175,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		return fmt.Errorf("setup webhooks: %w", err)
 	}
 
-	// Register /metrics.
+	// 注册 /metrics。
 	mu.Handle("/metrics", legacyregistry.Handler())
 
 	// 将 Manager 检查放到存活探针。就绪探针必须能先于 Manager 启动通过。
@@ -198,7 +196,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 	}
 
-	// Register /debug.
+	// 注册 /debug。
 	{
 		runtime.SetBlockProfileRate(1)
 		mu.Handle("/debug/pprof/", httpx.LoopbackAccessHandlerFunc(pprof.Index))
@@ -209,10 +207,10 @@ func (w *Worker) Start(ctx context.Context) error {
 		mu.Handle("/debug/flags/v", httpx.LoopbackAccessHandlerFunc(routes.StringFlagPutHandler(logs.GlogSetter)))
 	}
 
-	// Register extension apis.
+	// 注册扩展 APIs。
 	mu.NotFoundHandler(extensionroutes.Index())
 
-	// Start.
+	// 启动。
 	gp := gox.GroupWithContextIn(ctx)
 	gp.Go(func(ctx context.Context) error {
 		// 聚合 API 可访问后，才注册控制器并启动 informer。
@@ -222,11 +220,11 @@ func (w *Worker) Start(ctx context.Context) error {
 			return fmt.Errorf("wait for extension API services to be ready: %w", err)
 		}
 
-		// NB(thxCode): install some resource here,
-		// don't wait for any resource, finish and go on.
+		// NB(thxCode): 在此处安装部分资源，
+		// 不等待任何资源就绪，完成后直接继续。
 		// ...
 
-		// Setup controllers.
+		// 配置控制器。
 		klog.Info("starting controller manager")
 		err = controllers.Setup(ctx, cm)
 		if err != nil {
@@ -262,18 +260,14 @@ func (w *Worker) Start(ctx context.Context) error {
 	return gp.Wait()
 }
 
-// deregisterOnTeardown removes the cluster-scoped objects of this install — every API
-// service backed by the system namespace and the webhook configurations this worker
-// registered — when the shutdown comes from the system namespace going away. Both would
-// otherwise outlive their namespaced routing service: the stale API services wedge the
-// namespace's deletion on discovery it can no longer serve, and the stale webhook
-// configurations fail admissions against a service that is gone (gpustack-operator#123).
-// The API services are matched by backing namespace rather than by the worker's own list
-// because a chart-installed one — Kueue's visibility pair — wedges the deletion the same
-// way, and a direct namespace deletion runs no chart uninstall to take it down. An ordinary
-// restart or upgrade leaves the namespace standing, so nothing is removed then — a surviving
-// replica's ensurer or the next boot keeps them served. Best effort and bounded: this must
-// never hold a shutdown up.
+// deregisterOnTeardown 在因系统 Namespace 正在被删除而触发关闭时，移除本次安装的集群作用域对象 —— 包括由该
+// 系统 Namespace 支撑的所有 API service 以及该 worker 注册的 Webhook 配置。否则这两类对象都会在带命名空间的
+// 路由 Service 消失后继续存在：陈旧的 API service 会因其已无法提供的 discovery 服务而卡住 Namespace 的删除，
+// 陈旧的 Webhook 配置则会向已不存在的 Service 发起准入调用从而导致准入失败（gpustack-operator#123）。
+// API service 按底层 Namespace 而非 worker 自身维护的列表进行匹配，因为通过 chart 安装的 APIService —— 即
+// Kueue 的 visibility 对 —— 也会以同样方式卡住删除，而直接删除 Namespace 不会触发 chart 卸载来清理它们。普通
+// 重启或升级会保留系统 Namespace，因此此时不会移除任何对象 —— 存活副本的 ensurer 或下一次启动会保持其持续提供
+// 服务。尽力而为且有超时限制：绝不能阻塞关闭流程。
 func (w *Worker) deregisterOnTeardown() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -282,11 +276,10 @@ func (w *Worker) deregisterOnTeardown() {
 	ns, err := lpCli.CoreV1().Namespaces().Get(ctx, kuberess.SystemNamespaceName, meta.GetOptions{})
 	switch {
 	case err == nil && ns.DeletionTimestamp == nil:
-		// The namespace stands: a restart or an upgrade, not a teardown.
+		// Namespace 仍然存在：属于重启或升级，而非卸载清理。
 		return
 	case err != nil && !kerrors.IsNotFound(err):
-		// A read failure cannot tell a teardown from a restart — leave the registrations
-		// rather than strip them off a living install.
+		// 读取失败时无法区分卸载清理与重启 —— 保留现有注册项，避免从存活的安装中误删配置。
 		klog.InfoS("leaving the extension API services and webhook configurations registered: cannot read the system namespace", "err", err)
 		return
 	}

@@ -11,7 +11,7 @@ import (
 	"gpustack.ai/gpustack/pkg/worker/webhooks/worker"
 )
 
-// setups is the list of all webhook handlers.
+// setups 是所有 webhook 处理器的列表。
 var setups = []webhook.Setup{
 	new(worker.InstanceWebhook),
 	new(worker.InstanceTypeWebhook),
@@ -30,32 +30,31 @@ var setups = []webhook.Setup{
 	new(worker.WorkloadWebhook),
 }
 
-// cfgGetters is the list of all webhook configuration getters.
+// cfgGetters 是所有 webhook 配置获取器的列表。
 var cfgGetters = []webhook.ConfigurationsGetter{
 	worker.GetWebhookConfigurations,
 }
 
-// configurationPrefix becomes the webhook configuration object names,
-// "<prefix>-mutation" and "<prefix>-validation". The API server runs mutating
-// webhooks serially in lexicographic order of the configuration object name,
-// so this prefix must sort before "kueue-mutating-webhook-configuration": our
-// mutating webhook folds the sliced memory request into .sliced.units and
-// Kueue's Pod webhook then hashes the container resources into a role
-// annotation, so ours must run first. "gpustack-worker" sorts before "kueue-"
-// ('g' < 'k'); a prefix at or after "kueue-" would silently reverse the order.
+// configurationPrefix 用于生成 webhook 配置对象名称，即
+// "<prefix>-mutation" 和 "<prefix>-validation"。API server 会按配置对象名称的
+// 字典序串行执行变更型 webhook，因此该前缀必须排在
+// "kueue-mutating-webhook-configuration" 之前：我们的变更型 webhook 会将
+// 切分显存请求折叠进 .sliced.units，随后 Kueue 的 Pod webhook 会将容器资源
+// 计算为哈希值写入 role 注解，因此我们的 webhook 必须先运行。"gpustack-worker"
+// 排在 "kueue-" 之前（'g' < 'k'）；若前缀等于或排在 "kueue-" 之后，执行顺序会静默反转。
 const configurationPrefix = "gpustack-worker"
 
-// Setup registers the webhook API to the given manager and HTTP mux.
+// Setup 将 webhook API 注册到指定的 manager 和 HTTP mux。
 func Setup(ctx context.Context, mgr ctrl.Manager, mux webhook.HTTPServeMux) error {
 	return webhook.ExecuteSetup(ctx, mgr, mux, setups)
 }
 
-// Install installs the webhook configurations to the Kubernetes cluster.
+// Install 将 webhook 配置安装到 Kubernetes 集群。
 func Install(ctx context.Context, cli kubernetes.Interface, cc admreg.WebhookClientConfig) error {
 	return webhook.InstallConfigurations(ctx, configurationPrefix, cli, cc, cfgGetters)
 }
 
-// Delete deletes the webhook configurations from the Kubernetes cluster.
+// Delete 从 Kubernetes 集群中删除 webhook 配置。
 func Delete(ctx context.Context, cli kubernetes.Interface) error {
 	return webhook.DeleteConfigurations(ctx, configurationPrefix, cli)
 }

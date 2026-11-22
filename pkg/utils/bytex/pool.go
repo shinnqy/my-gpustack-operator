@@ -19,9 +19,9 @@ var gp = sync.Pool{
 	},
 }
 
-// GetBytes gets a bytes buffer from the pool,
-// which can specify with a size,
-// default is 32k.
+// GetBytes 从对象池中获取一个字节缓冲区，
+// 可指定大小，
+// 默认为 32k。
 func GetBytes(size ...int) Bytes {
 	buf := *gp.Get().(*Bytes)
 
@@ -40,13 +40,13 @@ func GetBytes(size ...int) Bytes {
 	return make(Bytes, s)
 }
 
-// GetBuffer is similar to GetBytes,
-// but it returns the bytes buffer wrapped by bytes.Buffer.
+// GetBuffer 与 GetBytes 类似，
+// 但返回由 bytes.Buffer 封装的字节缓冲区。
 func GetBuffer(size ...int) BytesBuffer {
 	return bytes.NewBuffer(GetBytes(size...)[:0])
 }
 
-// Put puts the buffer(either Bytes or BytesBuffer) back to the pool.
+// Put 将缓冲区（Bytes 或 BytesBuffer）归还到对象池。
 func Put[T Bytes | BytesBuffer](buf T) {
 	switch v := any(buf).(type) {
 	case Bytes:

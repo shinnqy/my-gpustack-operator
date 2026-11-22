@@ -38,70 +38,70 @@ import (
 )
 
 type Options struct {
-	// Establish.
+	// 服务建立。
 	BindAddress net.IP
 	BindPort    int
 	CertDir     string
 
-	// Manager.
+	// Manager 配置。
 	ManagerOptions *manager.Options
 
-	// Control.
+	// 控制开关。
 	DisableAuths        bool
 	DisableApplications []string
 	CorsAllowedOrigins  []string
 
-	// Authentication.
+	// 认证。
 	AuthnTokenWebhookCacheTTL time.Duration
 	AuthnTokenRequestTimeout  time.Duration
 
-	// Authorization.
+	// 鉴权。
 	AuthzAllowCacheTTL time.Duration
 	AuthzDenyCacheTTL  time.Duration
 
-	// Audit.
+	// 审计。
 	AuditPolicyFile        string
 	AuditLogFile           string
 	AuditWebhookConfigFile string
 
-	// Device Manager.
+	// Device Manager 配置。
 	Manufacturers []string
 
-	// Model Manager.
+	// Model Manager 配置。
 	ModelManagerServiceAccount string
 }
 
 func NewOptions() *Options {
 	opts := &Options{
-		// Establish.
+		// 服务建立。
 		BindAddress: net.ParseIP("0.0.0.0"),
 		BindPort:    31443,
 
-		// Manager.
+		// Manager 配置。
 		ManagerOptions: manager.NewOptions(),
 
-		// Control.
+		// 控制开关。
 		DisableAuths:        false,
 		DisableApplications: []string{},
 		CorsAllowedOrigins:  []string{},
 
-		// Authentication.
+		// 认证。
 		AuthnTokenWebhookCacheTTL: 10 * time.Second,
 		AuthnTokenRequestTimeout:  10 * time.Second,
 
-		// Authorization.
+		// 鉴权。
 		AuthzAllowCacheTTL: 10 * time.Second,
 		AuthzDenyCacheTTL:  10 * time.Second,
 
-		// Audit.
+		// 审计。
 		AuditPolicyFile:        "",
 		AuditLogFile:           "",
 		AuditWebhookConfigFile: "",
 
-		// Device Manager.
+		// Device Manager 配置。
 		Manufacturers: nodefeature.GetKnownAcceleratableManufacturers(),
 
-		// Model Manager.
+		// Model Manager。
 		ModelManagerServiceAccount: system.ModelManagerServiceAccount.Get(),
 	}
 	opts.ManagerOptions.KubeLeaderElectionID = "worker.gpustack.ai"
@@ -110,7 +110,7 @@ func NewOptions() *Options {
 }
 
 func (o *Options) AddFlags(fs *pflag.FlagSet) {
-	// Establish.
+	// 服务监听。
 	fs.IPVar(&o.BindAddress, "bind-address", o.BindAddress,
 		"the IP address(without port) on which to serve.")
 	fs.IntVar(&o.BindPort, "secure-port", o.BindPort,
@@ -119,10 +119,10 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 		"the directory where the TLS certs are located. "+
 			"if provided, must place tls.crt and tls.key under --cert-dir.")
 
-	// Manager.
+	// Manager。
 	o.ManagerOptions.AddFlags(fs)
 
-	// Control.
+	// 控制开关。
 	fs.BoolVar(&o.DisableAuths, "disable-auths", o.DisableAuths,
 		"disable checking authentication and authorization.")
 	fs.StringSliceVar(&o.DisableApplications, "disable-applications", o.DisableApplications,
@@ -137,7 +137,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 			"and by anchoring to the end with '$' or including the ':' port separator suffix. "+
 			"examples of valid expressions are '//example.com(:|$)' and '^https://example.com(:|$)'.")
 
-	// Authentication.
+	// 身份认证。
 	fs.DurationVar(&o.AuthnTokenWebhookCacheTTL, "authentication-token-webhook-cache-ttl",
 		o.AuthnTokenWebhookCacheTTL,
 		"the duration to cache responses from the webhook token authenticator.")
@@ -145,7 +145,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 		o.AuthnTokenRequestTimeout,
 		"the duration to wait for a response from the webhook token authenticator.")
 
-	// Authorization.
+	// 权限鉴权。
 	fs.DurationVar(&o.AuthzAllowCacheTTL, "authorization-webhook-cache-authorized-ttl",
 		o.AuthzAllowCacheTTL,
 		"the duration to cache 'authorized' responses from the webhook authorizer.")
@@ -153,7 +153,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 		o.AuthzDenyCacheTTL,
 		"the duration to cache 'unauthorized' responses from the webhook authorizer.")
 
-	// Audit.
+	// 审计。
 	fs.StringVar(&o.AuditPolicyFile, "audit-policy-file", o.AuditPolicyFile,
 		"path to the file that defines the audit policy configuration.")
 	fs.StringVar(&o.AuditLogFile, "audit-log-path", o.AuditLogFile,
@@ -162,18 +162,18 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.AuditWebhookConfigFile, "audit-webhook-config-file", o.AuditWebhookConfigFile,
 		"path to a kubeconfig formatted file that defines the audit webhook configuration.")
 
-	// Device Manager.
+	// Device Manager。
 	fs.StringSliceVar(&o.Manufacturers, "manufacturer", o.Manufacturers,
 		"comma separated list of manufacturers to detect.")
 
-	// Model Manager.
+	// Model Manager。
 	fs.StringVar(&o.ModelManagerServiceAccount, "model-manager-service-account", o.ModelManagerServiceAccount,
 		"the ServiceAccount, in the system namespace, the model-manager plugin runs as; "+
 			"only it may write a NodeModelStore's status.")
 }
 
 func (o *Options) Validate(ctx context.Context) error {
-	// Establish.
+	// 服务监听。
 	if o.BindPort < 1 || o.BindPort > 65535 {
 		return errors.New("--secure-port: out of range")
 	}
@@ -189,12 +189,12 @@ func (o *Options) Validate(ctx context.Context) error {
 		}
 	}
 
-	// Manager.
+	// Manager。
 	if err := o.ManagerOptions.Validate(ctx); err != nil {
 		return err
 	}
 
-	// Control.
+	// 控制开关。
 	if len(o.DisableApplications) != 0 {
 		applicationNames := kuberess.ApplicationNames()
 		if !sets.New[string](applicationNames...).HasAll(o.DisableApplications...) {
@@ -203,7 +203,7 @@ func (o *Options) Validate(ctx context.Context) error {
 		}
 	}
 
-	// Authentication and Authorization.
+	// 认证与鉴权。
 	if !o.DisableAuths {
 		if o.AuthnTokenWebhookCacheTTL < 10*time.Second {
 			return errors.New("--authentication-token-webhook-cache-ttl: less than 10s")
@@ -219,7 +219,7 @@ func (o *Options) Validate(ctx context.Context) error {
 		}
 	}
 
-	// Audit.
+	// 审计。
 	if o.AuditPolicyFile != "" && !osx.ExistsFile(o.AuditPolicyFile) {
 		return errors.New("--audit-policy-file: no found file")
 	}
@@ -230,18 +230,18 @@ func (o *Options) Validate(ctx context.Context) error {
 		return errors.New("--audit-webhook-config-file: no found file")
 	}
 
-	// Settings. A default comes from the environment, which no admission reads.
+	// 配置项。默认值来自环境变量，不会经过准入校验。
 	if err := settings.ValidateModelStoreDefaults(); err != nil {
 		return err
 	}
 
-	// Model Manager. The status guard admits only this ServiceAccount, so a name no ServiceAccount
-	// can have would refuse every status the plugin writes.
+	// Model Manager。状态守卫仅放行该 ServiceAccount，因此任何非法 ServiceAccount 名称
+	// 都会导致插件写入的所有状态更新被拒绝。
 	if errs := validation.IsDNS1123Subdomain(o.ModelManagerServiceAccount); len(errs) != 0 {
 		return fmt.Errorf("--model-manager-service-account: %s", strings.Join(errs, "; "))
 	}
 
-	// Device Manager.
+	// Device Manager。
 	if len(o.Manufacturers) != 0 {
 		knownManufacturers := nodefeature.GetKnownAcceleratableManufacturers()
 		if !sets.New[string](knownManufacturers...).HasAll(o.Manufacturers...) {
@@ -255,7 +255,7 @@ func (o *Options) Validate(ctx context.Context) error {
 
 func newExtensionAPIServerAdmissionOptions() *genericoptions.AdmissionOptions {
 	options := genericoptions.NewAdmissionOptions()
-	// Hosting clusters may lack the policy APIs required by these plugins.
+	// 宿主集群可能缺少这些插件所需的策略 API。
 	options.DisablePlugins = []string{lifecycle.PluginName, mutating.PluginName, validating.PluginName}
 	return options
 }
@@ -339,8 +339,8 @@ func (o *Options) Complete(ctx context.Context) (*Config, error) {
 			ClientTimeout:        10 * time.Second,
 			AlwaysAllowGroups:    []string{"system:masters"},
 			AlwaysAllowPaths: []string{
-				"/mutate-*", "/validate-*", // Webhooks
-				"/livez", "/readyz", "/metrics", "/debug/*", // Measure
+				"/mutate-*", "/validate-*", // Webhook
+				"/livez", "/readyz", "/metrics", "/debug/*", // 健康检查与指标
 				"/openapi", "/openapi/*", // OpenAPI
 				"/swagger", "/swagger/*", // Swagger
 			},
@@ -354,7 +354,7 @@ func (o *Options) Complete(ctx context.Context) (*Config, error) {
 
 	admit := newExtensionAPIServerAdmissionOptions()
 
-	// Recreate the loopback Kubernetes client for server as the runtime scheme is limited from the manager.
+	// 由于 manager 的运行时 scheme 受限，为服务端重建环回 Kubernetes 客户端。
 	lpRestCfg, lpHttpCli := rest.CopyConfig(&mgrConfig.LoopbackKubeRestConfig), mgrConfig.LoopbackKubeHTTPClient
 	lpCli, err := kclientset.NewForConfigAndClient(rest.CopyConfig(lpRestCfg), lpHttpCli)
 	if err != nil {
@@ -364,29 +364,29 @@ func (o *Options) Complete(ctx context.Context) (*Config, error) {
 
 	apiSrvCfg := genericapiserver.NewRecommendedConfig(extensionapis.Codecs)
 	{
-		// Configure shared informer factory.
+		// 配置共享 Informer 工厂。
 		apiSrvCfg.SharedInformerFactory = lpInf
-		// Configure CORS allowed origins.
+		// 配置 CORS 允许的源。
 		apiSrvCfg.CorsAllowedOriginList = o.CorsAllowedOrigins
-		// Feedback Kubernetes client configuration.
+		// 回填 Kubernetes 客户端配置。
 		apiSrvCfg.LoopbackClientConfig = lpRestCfg
 		apiSrvCfg.ClientConfig = lpRestCfg
-		// Disable default metrics service.
+		// 禁用默认指标服务。
 		apiSrvCfg.EnableMetrics = false
-		// Disable default profiling service.
+		// 禁用默认性能分析服务。
 		apiSrvCfg.EnableProfiling = false
-		// Disable default index service.
+		// 禁用默认索引服务。
 		apiSrvCfg.EnableIndex = false
-		// Disable following post start hooks,
-		// because the registered apiserver can manage them.
+		// 禁用以下启动后钩子，
+		// 因为已注册的 apiserver 可以自行管理它们。
 		apiSrvCfg.DisabledPostStartHooks.Insert(
 			"priority-and-fairness-filter",
 			"max-in-flight-filter",
 			"storage-object-count-tracker-hook",
 		)
-		// Configure the effective version.
+		// 配置生效版本。
 		apiSrvCfg.EffectiveVersion = compatibility.NewEffectiveVersionFromString(version.MajorMinor(), "", "")
-		// Configure the shutdown watch termination grace period.
+		// 配置关闭期间 watch 终止宽限期。
 		apiSrvCfg.ShutdownWatchTerminationGracePeriod = 15 * time.Second
 	}
 

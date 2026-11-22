@@ -16,8 +16,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// reflectPackage reflects the given package into a APIServiceDefinition,
-// according to the given package.
+// reflectPackage 根据给定 package 将其反射为 APIServiceDefinition。
 func reflectPackage(p *types.Package) *APIServiceDefinition {
 	if p == nil {
 		return nil
@@ -27,7 +26,7 @@ func reflectPackage(p *types.Package) *APIServiceDefinition {
 		WithName("$").
 		WithValues("gen", "apireg-gen", "package", p.Path)
 
-	// Collect package markers.
+	// 收集 package 标记。
 	//
 	// +groupName=
 	// +versionName=
@@ -97,8 +96,7 @@ func reflectPackage(p *types.Package) *APIServiceDefinition {
 
 var knownScopes = sets.New(string(apiext.NamespaceScoped), string(apiext.ClusterScoped))
 
-// reflectType reflects the given type into a APIResourceDefinition,
-// according to the given type.
+// reflectType 根据给定类型将其反射为 APIResourceDefinition。
 func reflectType(t *types.Type) *APIResourceDefinition {
 	if t == nil {
 		return nil
@@ -119,7 +117,7 @@ func reflectType(t *types.Type) *APIResourceDefinition {
 		Singular: singular,
 	}
 
-	// Collect type markers.
+	// 收集类型标记。
 	//
 	// +k8s:apireg-gen:resource:scope=,categories=,shortName=,plural=,subResources=
 	tm := map[string][]string{}
@@ -181,7 +179,7 @@ const (
 	apiregGenMarker = "+k8s:apireg-gen:"
 )
 
-// collectMarkers collects markers from the given comments into a map.
+// collectMarkers 从给定注释中收集标记到 map 中。
 func collectMarkers(comments []string, into map[string][]string) {
 	for _, line := range comments {
 		line = strings.TrimSpace(line)

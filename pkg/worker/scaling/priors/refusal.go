@@ -6,65 +6,56 @@ import (
 	"strings"
 )
 
-// RefusalReason is the bounded set of reasons a resolution can be refused for.
+// RefusalReason 是解析被拒绝时有界原因枚举集合。
 //
-// THE REASONS ARE BOUNDED, so a status field or a condition message built from
-// a refusal cannot grow with the size of a catalog.
+// 原因集合是有界的，从而保证基于拒绝信息构造的 status 字段或 condition 消息不会随 catalog 规模线性膨胀。
 type RefusalReason string
 
 const (
-	// RefusalCapacityPriorUnresolved says no capacity could be derived.
+	// RefusalCapacityPriorUnresolved 表示无法推导出容量先验。
 	//
-	// IT COVERS A PROFILE THAT DOES NOT MATCH THE DEPLOYMENT, A PROFILE THAT
-	// MATCHES BUT HAS NO FEASIBLE LOAD POINT, AND A ROLE THAT NEEDS NO
-	// CAPACITY.
+	// 它涵盖 profile 与部署不匹配、profile 匹配但不存在可行负载点，以及角色不需要容量等情况。
 	RefusalCapacityPriorUnresolved RefusalReason = "CapacityPriorUnresolved"
 
-	// RefusalInsufficientLoadCoverage says the measured load curve is too
-	// sparse to carry a capacity.
+	// RefusalInsufficientLoadCoverage 表示实测负载曲线过于稀疏，不足以确定容量。
 	//
-	// IT COVERS A PROFILE WITH FEWER THAN TWO MEASURED LOAD LEVELS AND A
-	// PROFILE WITH NO EVIDENCE OF THE CAPACITY BOUNDARY.
+	// 它涵盖实测负载档位少于两个的 profile，以及缺乏容量边界依据的 profile。
 	RefusalInsufficientLoadCoverage RefusalReason = "InsufficientLoadCoverage"
 
-	// RefusalIncompatibleMetric says the profile does not measure what the
-	// role needs.
+	// RefusalIncompatibleMetric 表示 profile 未测量角色所需的指标。
 	//
-	// IT COVERS A PROFILE WHOSE THROUGHPUT NUMERATOR IS NOT THE ROLE'S
-	// NUMERATOR, A PROFILE THAT DOES NOT MEASURE THE REQUIRED LATENCY
-	// STATISTIC, AND A PROFILE WHOSE CACHE CONVENTION CANNOT BE ESTABLISHED.
+	// 它涵盖吞吐量分子与角色要求不符的 profile、未测量所需延迟统计量的 profile，以及缓存约定无法确定的 profile。
 	RefusalIncompatibleMetric RefusalReason = "IncompatibleMetric"
 )
 
-// maxRefusalDetail bounds how many keys a refusal detail may carry.
+// maxRefusalDetail 限制拒绝详情中最多可携带的键数量。
 const maxRefusalDetail = 8
 
-// RefusalError explains why no capacity prior was resolved.
+// RefusalError 说明未能解析出容量先验的原因。
 //
-// IT IS AN ERROR, so a caller that cannot use a refusal returns it unchanged
-// and a caller that can report it reads its reason.
+// 它实现了 error 接口，因此无法处理拒绝的调用方可原样向上返回，而需要上报状态的调用方可读取其 Reason。
 type RefusalError struct {
-	// Reason is the bounded reason the resolution was refused for.
+	// Reason 是解析被拒绝的有界原因。
 	Reason RefusalReason `json:"reason"`
 
-	// Message says what is missing, in one sentence.
+	// Message 用一句话说明缺失的内容。
 	Message string `json:"message"`
 
-	// Role is the role the resolution was for.
+	// Role 是本次解析所针对的角色。
 	Role string `json:"role,omitempty"`
 
-	// Shape is the shape the resolution was about, when one was found.
+	// Shape 是本次解析所涉及的规格形状（若已找到）。
 	Shape string `json:"shape,omitempty"`
 
-	// Detail carries the specific evidence that was missing.
+	// Detail 携带缺失的具体依据信息。
 	//
-	// IT IS BOUNDED, because it ends up in a status field.
+	// 其大小是有界的，因为它最终会写入 status 字段。
 	Detail map[string]string `json:"detail,omitempty"`
 }
 
-// Error returns the refusal message.
+// Error 返回拒绝说明消息。
 //
-// IT EXISTS SO A REFUSAL CAN BE RETURNED WHERE AN ERROR IS EXPECTED.
+// 实现该方法使拒绝结果可在需要 error 的位置直接返回。
 func (r *RefusalError) Error() string {
 	if r == nil {
 		return ""
@@ -75,7 +66,7 @@ func (r *RefusalError) Error() string {
 	return string(r.Reason)
 }
 
-// newRefusal builds a refusal with a bounded detail map.
+// newRefusal 构造一个带有有界详情映射表的拒绝错误。
 func newRefusal(reason RefusalReason, message string, detail map[string]string) *RefusalError {
 	refusal := &RefusalError{
 		Reason:  reason,
@@ -94,14 +85,11 @@ func newRefusal(reason RefusalReason, message string, detail map[string]string) 
 	return refusal
 }
 
-// identityMismatch lists the identity fields that differ, in a stable order.
+// identityMismatch 按稳定顺序列出存在差异的标识字段。
 //
-// THE ORDER IS FIXED, so two runs of the same comparison report the same
-// first difference.
+// 顺序是固定的，因此对同一组数据进行两次比较时会报告相同的首个差异字段。
 //
-// THE REQUEST SIDE IS THE DEPLOYMENT, and an element the deployment does not
-// state constrains nothing, because a deployment that states no quantization
-// has contradicted no measurement.
+// 请求侧代表部署，部署未声明的字段不构成约束，例如未声明量化方式的部署不会与任何测量结果产生冲突。
 func identityMismatch(want, got Identity) []string {
 	mismatched := make([]string, 0, 9)
 	appendIf := func(name string, equal bool) {
@@ -109,29 +97,21 @@ func identityMismatch(want, got Identity) []string {
 			mismatched = append(mismatched, name)
 		}
 	}
-	// THE MODEL IS COMPARED THROUGH ITS NORMALIZED FORM, because a deployment
-	// declares the model without its organization and a source declares it with
-	// one, and the same recipe is spelled several ways.
+	// 模型通过规范化形式进行比较，因为部署声明模型时可能省略组织名而数据源会携带组织名，且同一配置存在多种拼写方式。
 	appendIf("model.name", ModelNameMatches(want.Model.Name, got.Model.Name))
 	appendIf("model.revision", RevisionMatches(want.Model.Revision, got.Model.Revision))
 	appendIf("model.tokenizer", TokenizerMatches(want.Model.Tokenizer, got.Model.Tokenizer))
 	if got.Model.Quantization != "" {
 		appendIf("model.quantization", CanonicalQuantization(want.Model.Quantization) == CanonicalQuantization(got.Model.Quantization))
 	}
-	// THE ENGINE IS COMPARED BY FAMILY, because a deployment names the image it
-	// runs and a source names the image it measured, and the two images differ
-	// in a tag or a digest while the engine is the same one.
+	// 引擎按系列进行比较，因为部署指定运行时的镜像而数据源指定测量时的镜像，两者虽属同一引擎，但 tag 或摘要可能不同。
 	appendIf("engine.image", engineImageMatches(want.Engine.Image, got.Engine.Image))
-	// THE ENGINE BUILD IS COMPARED ONLY WHEN BOTH SIDES STATE ONE, because the
-	// catalog is a measurement and not a configuration, and a deployment that
-	// names no build says nothing about the build it runs.
+	// 仅当双方均声明引擎构建版本时才进行比较，因为 catalog 记录的是实测结果而非配置，未指定构建版本的部署并未对其运行的构建版本作出限制。
 	if want.Engine.Build != "" && got.Engine.Build != "" {
 		appendIf("engine.build", want.Engine.Build == got.Engine.Build)
 	}
 	appendIf("hardware.accelerator", NormalizeHardwareIdentity(want.Hardware).Accelerator == NormalizeHardwareIdentity(got.Hardware).Accelerator)
-	// THE MEMORY AND THE FORM FACTOR ARE COMPARED ONLY WHEN THE DEPLOYMENT
-	// STATES ONE, because a deployment whose instance type names no memory
-	// agrees with a measurement of any memory.
+	// 仅当部署声明了显存容量和形态规格时才进行比较，因为如果部署的 InstanceType 未指明显存大小，则可与任意显存的测量结果匹配。
 	if got.Hardware.MemoryGB > 0 {
 		appendIf("hardware.memoryGB", want.Hardware.MemoryGB == got.Hardware.MemoryGB)
 	}
@@ -141,18 +121,13 @@ func identityMismatch(want, got Identity) []string {
 	return mismatched
 }
 
-// engineImageMatches says whether two engine images belong to the same engine
-// family.
+// engineImageMatches 判断两个引擎镜像是否属于同一引擎系列。
 //
-// IT ACCEPTS THE EXACT IMAGE, because a source and a deployment that name the
-// same image agree on more than the family.
+// 若镜像完全相同则直接匹配，因为数据源与部署指定相同镜像时，其一致程度已超出引擎系列本身。
 //
-// IT ACCEPTS A SHARED FAMILY, because the tag and the digest of one engine
-// build are written many ways and a comparison of two spellings says nothing
-// about the engine behind them.
+// 若共享同一引擎系列则允许匹配，因为同一引擎构建版本的 tag 和摘要写法多样，比较两种拼写无法判断其背后的引擎。
 //
-// IT REFUSES AN IMAGE THAT NAMES NO KNOWN FAMILY, because an image this
-// operator cannot place is not one it may match against a measurement.
+// 若镜像未指明任何已知系列则拒绝匹配，因为本 operator 无法归类的镜像不应与测量结果进行匹配。
 func engineImageMatches(want, got string) bool {
 	if want == got {
 		return true
@@ -161,12 +136,11 @@ func engineImageMatches(want, got string) bool {
 	return wantFamily != "" && wantFamily == gotFamily
 }
 
-// servingConfigMismatch lists the serving configuration fields that differ.
+// servingConfigMismatch 列出存在差异的服务配置字段。
 //
-// IT COMPARES ONLY THE FIELDS THE PROFILE STATES, because the catalog is a
-// measurement and not a configuration: a profile that states no serving setting
-// constrains nothing, and a profile that states one is compared on that one
-// alone.
+// 仅比较 profile 声明的字段，因为目录是测量结果而非配置：未声明任何
+// 服务设置的 profile 不施加约束，而声明了某项设置的 profile 仅按该项
+// 进行比较。
 func servingConfigMismatch(want, got ServingConfig) []string {
 	mismatched := make([]string, 0, 6)
 	appendIf := func(name, stated, deployed string) {
@@ -185,24 +159,20 @@ func servingConfigMismatch(want, got ServingConfig) []string {
 	if conflicts := launchParameterConflicts(want, got); len(conflicts) > 0 {
 		mismatched = append(mismatched, "servingConfig.launchParameters")
 	}
-	// THE EFFECTIVE LAUNCH PARAMETERS ARE NOT COMPARED, because they say what
-	// the engine did with the launch arguments rather than what the
-	// deployment asked for.
+	// 不比较生效的启动参数，因为它们反映的是引擎对启动参数的实际处理结果，
+	// 而非部署所请求的配置。
 	return mismatched
 }
 
-// launchParameterConflicts returns the flags the deployment passes that the
-// profile records with a different value.
+// launchParameterConflicts 返回部署传入但 profile 中记录为不同值的标志。
 //
-// IT COMPARES THE FLAGS THE PROFILE RECORDS AND NOT THE WHOLE LIST, because a
-// deployment names the flags it sets and a source names the flags it ran
-// with, and the two lists differ in every flag the other one says nothing
-// about.
+// 仅比较 profile 中记录的标志而非完整列表，因为部署声明的是其设置的标志，
+// 而数据源记录的是其运行使用的标志，两者在对方未提及的所有标志上都会存在差异。
 //
-// IT READS THE EFFECTIVE DEFAULTS AS WELL, because a default the engine chose
-// for itself is the value a deployment that omits the flag runs with.
+// 同时读取生效的默认值，因为引擎自行选择的默认值即部署省略该标志时
+// 实际运行使用的值。
 //
-// IT NAMES NO VALUE, because a value the user wrote belongs to nobody else.
+// 不列出具体的值，因为用户填写的值属于其自身配置。
 func launchParameterConflicts(want, got ServingConfig) []string {
 	recorded := map[string]string{}
 	launch, err := ParseLaunchParameters(want.LaunchParameters)
@@ -233,7 +203,7 @@ func launchParameterConflicts(want, got ServingConfig) []string {
 	return conflicts
 }
 
-// topologyMismatch lists the topology fields that differ.
+// topologyMismatch 列出存在差异的拓扑字段。
 func topologyMismatch(want, got Topology) []string {
 	mismatched := make([]string, 0, 7)
 	appendIf := func(name string, equal bool) {
@@ -251,7 +221,7 @@ func topologyMismatch(want, got Topology) []string {
 	return mismatched
 }
 
-// formatMismatch renders the mismatched identity fields for a refusal detail.
+// formatMismatch 将不匹配的身份字段格式化为拒绝详情。
 func formatMismatch(mismatched []string) string {
 	if len(mismatched) == 0 {
 		return ""

@@ -5,10 +5,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstancePersistentVolumeType is the schema for worker.gpustack.ai.
+// InstancePersistentVolumeType 是 worker.gpustack.ai 的资源 schema。
 //
-// Underhood, an InstancePersistentVolumeType is mapping to a Kubernetes StorageClass,
-// and the InstancePersistentVolumeType's name is the same as the Kubernetes StorageClass's name.
+// 在底层，InstancePersistentVolumeType 对应一个 Kubernetes StorageClass，
+// 且 InstancePersistentVolumeType 的名称与该 Kubernetes StorageClass 的名称相同。
 //
 // +genclient
 // +genclient:nonNamespaced
@@ -23,163 +23,161 @@ type InstancePersistentVolumeType struct {
 
 var _ runtime.Object = (*InstancePersistentVolumeType)(nil)
 
-// InstancePersistentVolumeTypeSpec defines the desired state of InstancePersistentVolumeType.
+// InstancePersistentVolumeTypeSpec 定义 InstancePersistentVolumeType 的期望状态。
 type InstancePersistentVolumeTypeSpec struct {
-	// DisplayName is the display name of the InstancePersistentVolumeType.
+	// DisplayName 是 InstancePersistentVolumeType 的显示名称。
 	//
 	// +k8s:validation:maxLength=64
 	DisplayName string `json:"displayName,omitempty" protobuf:"bytes,1,opt,name=displayName"`
 
-	// Description is the description of the InstancePersistentVolumeType.
+	// Description 是 InstancePersistentVolumeType 的描述信息。
 	//
 	// +k8s:validation:maxLength=1024
 	Description string `json:"description,omitempty" protobuf:"bytes,2,opt,name=description"`
 
-	// InstancePersistentVolumeSource is the source of the InstancePersistentVolumeType.
+	// InstancePersistentVolumeSource 是 InstancePersistentVolumeType 的存储源配置。
 	InstancePersistentVolumeSource `json:",inline" protobuf:"bytes,3,opt,name=instancePersistentVolumeSource"`
 }
 
-// InstancePersistentVolumeSource defines the source of the InstancePersistentVolumeType.
+// InstancePersistentVolumeSource 定义 InstancePersistentVolumeType 的存储源。
 type InstancePersistentVolumeSource struct {
-	// NFS represents a volume source that is managed by an NFS server.
+	// NFS 表示由 NFS 服务器管理的卷存储源。
 	NFS *NFSInstancePersistentVolumeSource `json:"nfs,omitempty" protobuf:"bytes,1,opt,name=nfs"`
 
-	// S3 represents a volume source that is managed by an S3-compatible object storage service.
+	// S3 表示由兼容 S3 的对象存储服务管理的卷存储源。
 	S3 *S3InstancePersistentVolumeSource `json:"s3,omitempty" protobuf:"bytes,2,opt,name=s3"`
 }
 
-// NFSInstancePersistentVolumeSource defines the source of NFS.
+// NFSInstancePersistentVolumeSource 定义 NFS 存储源配置。
 type NFSInstancePersistentVolumeSource struct {
-	// Server is the hostname or IP address of the NFS server.
+	// Server 是 NFS 服务器的主机名或 IP 地址。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +required
 	Server string `json:"server" protobuf:"bytes,1,name=server"`
 
-	// Share is the path of NFS share from the server.
-	// For each InstancePersistentVolume,
-	// a corresponding subpath will be created in the NFS share.
+	// Share 是服务器上的 NFS 共享路径。
+	// 对于每个 InstancePersistentVolume，
+	// 都会在该 NFS 共享路径下创建对应的子路径。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +default="/"
 	// +k8s:validation:pattern="^(/[^/]+)+$"
 	// +k8s:validation:maxLength=1024
 	Share string `json:"share,omitempty" protobuf:"bytes,2,opt,name=share"`
 
-	// SubDirectory is the subdirectory in the NFS share for each InstancePersistentVolume.
-	// If it is blank, the subdirectory will be the same as the volume ID of the InstancePersistentVolume.
+	// SubDirectory 是 NFS 共享路径下为每个 InstancePersistentVolume 创建的子目录。
+	// 若为空，则子目录名称与 InstancePersistentVolume 的卷 ID 相同。
 	//
-	// It supports a specific string or the following template variables:
-	// - `${pvc.metadata.name}`: the name the corresponding PersistentVolumeClaim.
-	// - `${pvc.metadata.namespace}`: the namespace of the corresponding PersistentVolumeClaim.
-	// - `${pv.metadata.name}`: the name of the corresponding Kubernetes PersistentVolume.
+	// 支持指定固定字符串或以下模板变量：
+	// - `${pvc.metadata.name}`：对应 PersistentVolumeClaim 的名称。
+	// - `${pvc.metadata.namespace}`：对应 PersistentVolumeClaim 的命名空间。
+	// - `${pv.metadata.name}`：对应 Kubernetes PersistentVolume 的名称。
 	//
-	// For example, specify `${pvc.metadata.namespace}/${pvc.metadata.name}` to create a subdirectory
-	// with the namespaced name of the corresponding PersistentVolumeClaim in the NFS share
-	// for each InstancePersistentVolume.
+	// 例如，指定 `${pvc.metadata.namespace}/${pvc.metadata.name}` 可在 NFS 共享路径下
+	// 为每个 InstancePersistentVolume 创建以其对应 PersistentVolumeClaim 命名空间和名称命名的子目录。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	SubDirectory string `json:"subDirectory,omitempty" protobuf:"bytes,3,opt,name=subDirectory"`
 
-	// MountPermissions is the mounted directory permissions.
-	// If it is non-zero, perform a chmod with the specified permissions after mounted.
+	// MountPermissions 是挂载目录的权限设置。
+	// 若为非零值，将在挂载完成后使用指定权限执行 chmod。
 	MountPermissions string `json:"mountPermissions,omitempty" protobuf:"bytes,4,opt,name=mountPermissions"`
 
-	// MountOptions is the mount options for the NFS share.
+	// MountOptions 是 NFS 共享的挂载选项。
 	//
 	// +default=["hard","vers=4","rsize=1048576","wsize=1048576","noatime","nodiratime"]
 	MountOptions []string `json:"mountOptions,omitempty" protobuf:"bytes,5,opt,name=mountOptions"`
 }
 
-// S3InstancePersistentVolumeSource defines the source of S3.
+// S3InstancePersistentVolumeSource 定义 S3 存储源配置。
 type S3InstancePersistentVolumeSource struct {
-	// Endpoint is the endpoint of the S3-compatible object storage service.
+	// Endpoint 是兼容 S3 的对象存储服务端点地址。
 	//
 	// +required
 	Endpoint string `json:"endpoint" protobuf:"bytes,1,name=endpoint"`
 
-	// Region is the region of the S3-compatible object storage service.
-	// For AWS, the region is required to generate the presigned URL for the S3-compatible object storage service.
+	// Region 是兼容 S3 的对象存储服务所属区域。
+	// 对于 AWS，生成兼容 S3 对象存储服务的预签名 URL 时必须提供该区域。
 	Region string `json:"region,omitempty" protobuf:"bytes,2,opt,name=region"`
 
-	// Insecure indicates whether to use insecure connection to the S3-compatible object storage service.
-	// If it is true, the connection will not verify the TLS certificate of the S3-compatible object storage service.
+	// Insecure 表示是否使用非安全连接访问兼容 S3 的对象存储服务。
+	// 若为 true，连接时将跳过验证该对象存储服务的 TLS 证书。
 	Insecure bool `json:"insecure,omitempty" protobuf:"varint,3,opt,name=insecure"`
 
-	// AccessKey is the access key of the S3-compatible object storage service.
+	// AccessKey 是兼容 S3 的对象存储服务的访问密钥（Access Key）。
 	//
-	// Write-only input, it is required in create or update operations.
+	// 该字段为只写输入，在创建或更新操作中必填。
 	AccessKey string `json:"accessKey,omitempty" protobuf:"bytes,4,opt,name=accessKey"`
 
-	// SecretKey is the secret key of the S3-compatible object storage service.
+	// SecretKey 是兼容 S3 的对象存储服务的私钥（Secret Key）。
 	//
-	// Write-only input, it is required in create or update operations.
+	// 该字段为只写输入，在创建或更新操作中必填。
 	SecretKey string `json:"secretKey,omitempty" protobuf:"bytes,5,opt,name=secretKey"`
 
-	// Bucket is the bucket name in the S3-compatible object storage service.
-	// If it is blank, for each InstancePersistentVolume,
-	// a corresponding bucket with the same volume ID as the InstancePersistentVolume will be created in the S3-compatible object storage service.
+	// Bucket 是兼容 S3 的对象存储服务中的存储桶（Bucket）名称。
+	// 若为空，对于每个 InstancePersistentVolume，
+	// 将在兼容 S3 的对象存储服务中创建一个与该 InstancePersistentVolume 卷 ID 同名的存储桶。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	Bucket string `json:"bucket,omitempty" protobuf:"bytes,6,opt,name=bucket"`
 
-	// Prefix is the prefix in the bucket for each InstancePersistentVolume.
-	// If it is blank, the prefix will be the same as the volume ID of the InstancePersistentVolume.
+	// Prefix 是存储桶中为每个 InstancePersistentVolume 分配的前缀。
+	// 若为空，则前缀与 InstancePersistentVolume 的卷 ID 相同。
 	//
-	// It supports a specific string or the following template variables:
-	// - `${pvc.metadata.name}`: the name the corresponding PersistentVolumeClaim.
-	// - `${pvc.metadata.namespace}`: the namespace of the corresponding PersistentVolumeClaim.
-	// - `${pv.metadata.name}`: the name of the corresponding Kubernetes PersistentVolume.
+	// 支持指定固定字符串或以下模板变量：
+	// - `${pvc.metadata.name}`：对应 PersistentVolumeClaim 的名称。
+	// - `${pvc.metadata.namespace}`：对应 PersistentVolumeClaim 的命名空间。
+	// - `${pv.metadata.name}`：对应 Kubernetes PersistentVolume 的名称。
 	//
-	// For example, specify `${pvc.metadata.namespace}/${pvc.metadata.name}` to create a prefix
-	// with the namespaced name of the corresponding PersistentVolumeClaim in the bucket
-	// for each InstancePersistentVolume.
+	// 例如，指定 `${pvc.metadata.namespace}/${pvc.metadata.name}` 可在存储桶中
+	// 为每个 InstancePersistentVolume 创建以其对应 PersistentVolumeClaim 命名空间和名称组成的前缀。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	Prefix string `json:"prefix,omitempty" protobuf:"bytes,7,opt,name=prefix"`
 
-	// Mounter is the mounter for the S3-compatible object storage service.
-	// It is used to specify the mounter for [GeeseFS](https://github.com/yandex-cloud/geesefs).
+	// Mounter 是兼容 S3 的对象存储服务的挂载器。
+	// 用于为 [GeeseFS](https://github.com/yandex-cloud/geesefs) 指定挂载器。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +default="geesefs"
 	//
 	Mounter string `json:"mounter,omitempty" protobuf:"bytes,8,opt,name=mounter"`
 
-	// MountOptions is the mount options for [GeeseFS](https://github.com/yandex-cloud/geesefs).
+	// MountOptions 是 [GeeseFS](https://github.com/yandex-cloud/geesefs) 的挂载选项。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
-	// Intensive writing for large files:
-	//   disable CPU overhead, reduce freshening frequency, maximize parallelism,
-	//   and reduce part sizes to improve writing performance for large files.
+	// 大文件高并发写入场景：
+	//   关闭校验和以降低 CPU 开销、降低刷新频率、最大化并发度，
+	//   并减小分片大小以提升大文件写入性能。
 	//   ["--no-checksum","--memory-limit=4000","--max-flushers=32","--max-parallel-parts=32","--part-sizes=25"]
 	//
-	// Sequential reading for large files:
-	//   increase read-ahead size and parallelism,
-	//   and increase the memory cache limit to improve reading performance for large files.
+	// 大文件顺序读取场景：
+	//   增大预读窗口和预读并发度，
+	//   并提高内存缓存上限以提升大文件读取性能。
 	//   ["--read-ahead-large=200000"," --large-read-cutoff=10240","--read-ahead-parallel=40000","--memory-limit=8000"]
 	//
-	// Random reading for small files:
-	//   decrease read-ahead size, extend metadata cache TTL,
-	//   and increase the entry limit to improve reading performance for small files.
+	// 小文件随机读取场景：
+	//   减小预读大小、延长元数据缓存 TTL，
+	//   并提高条目上限以提升小文件读取性能。
 	//   ["--read-ahead-small=64","--small-read-cutoff=64","--read-ahead=1024","--stat-cache-ttl=300s","--entry-limit=200000"]
 	//
-	// High availability for writing:
-	//   increase the number of retries and enable fsync on close to improve data durability for writing.
+	// 写入高可用场景：
+	//   增加重试次数并在关闭文件时启用 fsync，以提高写入数据的持久性。
 	//   ["--sdk-max-retries=10","--read-retry-attempts=5","--fsync-on-close","--cache=/mnt/disk-cache]
 	//
-	// For non-Yandex S3-compatible object storage service:
+	// 非 Yandex 的兼容 S3 对象存储服务：
 	//   ["--list-type=2","--no-specials"]
 	//
 	// +default=["--no-checksum","--memory-limit=4000","--max-flushers=32","--max-parallel-parts=32","--part-sizes=25","--list-type=2","--no-specials"]
 	MountOptions []string `json:"mountOptions,omitempty" protobuf:"bytes,9,name=mountOptions"`
 }
 
-// InstancePersistentVolumeTypeList holds the list of InstancePersistentVolumeType.
+// InstancePersistentVolumeTypeList 包含 InstancePersistentVolumeType 列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstancePersistentVolumeTypeList struct {

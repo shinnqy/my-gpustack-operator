@@ -7,45 +7,41 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
-// A replica's deployed shape is read from the group total and member indexes its members carry,
-// never from the role's declared size.
+// 副本的实际部署形态根据其成员携带的组总数和成员索引读取，绝不从角色声明的大小推断。
 
-// modelDeploymentReplicaShapeState is how far a replica's members establish its shape.
+// modelDeploymentReplicaShapeState 表示副本成员对其形态的确立程度。
 type modelDeploymentReplicaShapeState int
 
 const (
-	// modelDeploymentReplicaShapeUnreadable is a shape the members do not establish: totals that
-	// disagree, seats that are duplicated, out of range or unparsable, or a multi-member group with
-	// no seat evidence.
+	// modelDeploymentReplicaShapeUnreadable 表示成员无法确立有效形态：成员声明的总数不一致、
+	// 席位索引重复、越界或无法解析，或者多成员组缺少席位索引信息。
 	modelDeploymentReplicaShapeUnreadable modelDeploymentReplicaShapeState = iota
-	// modelDeploymentReplicaShapeIncomplete is a readable shape whose members are short of the
-	// total they declare.
+	// modelDeploymentReplicaShapeIncomplete 表示形态可读取，但现有成员数量少于其声明的总数。
 	modelDeploymentReplicaShapeIncomplete
-	// modelDeploymentReplicaShapeComplete is a readable shape the replica fills.
+	// modelDeploymentReplicaShapeComplete 表示形态可读取且副本成员已全部就位。
 	modelDeploymentReplicaShapeComplete
 )
 
-// modelDeploymentReplicaShape is one replica's deployed size and how well its members establish it.
+// modelDeploymentReplicaShape 表示单个副本的实际部署规模及其成员对该形态的确立状态。
 type modelDeploymentReplicaShape struct {
-	// Total is the group size the members declare. It is zero only when the shape is unreadable.
+	// Total 是成员声明的组大小。仅当形态不可读时为 0。
 	Total int
-	// State is what the members establish.
+	// State 表示成员所确立的形态状态。
 	State modelDeploymentReplicaShapeState
-	// Reason names the contradiction or the shortfall. It is the text a hold carries, so it says
-	// which fact was read and which was expected.
+	// Reason 说明存在的冲突或成员缺口。该文本会用于阻断原因展示，因此需写明实际读取到的
+	// 信息与预期信息。
 	Reason string
 }
 
-// modelDeploymentReplicaIsWhole reports whether the members fill the total they declare.
+// modelDeploymentReplicaIsWhole 返回成员是否已填满其声明的组总数。
 func (s modelDeploymentReplicaShape) modelDeploymentReplicaIsWhole() bool {
 	return s.State == modelDeploymentReplicaShapeComplete
 }
 
-// modelDeploymentReplicaLegVerdict is the leg verdict this shape implies.
+// modelDeploymentReplicaLegVerdict 返回该形态所对应的链路判定结果。
 //
-// A replica short of its total lost members and is a fault. Members that contradict each other
-// describe nothing, which is an unknown rather than a fault: this operator has established nothing
-// about them, including that they are broken.
+// 成员数少于声明总数的副本说明存在成员缺失，属于故障。而彼此矛盾的成员无法描述有效形态，
+// 应判定为 Unknown 而非故障：本 operator 尚无法确定其任何状态，也不能断定其已损坏。
 func (s modelDeploymentReplicaShape) modelDeploymentReplicaLegVerdict() modelDeploymentLegVerdict {
 	switch s.State {
 	case modelDeploymentReplicaShapeComplete:
@@ -57,7 +53,7 @@ func (s modelDeploymentReplicaShape) modelDeploymentReplicaLegVerdict() modelDep
 	}
 }
 
-// modelDeploymentDeployedReplicaShape reads one replica's shape from its own members. It is PURE.
+// modelDeploymentDeployedReplicaShape 从单个副本自身的成员读取其形态。该函数为纯函数。
 func modelDeploymentDeployedReplicaShape(view modelDeploymentReplicaView) modelDeploymentReplicaShape {
 	if len(view.Members) == 0 {
 		return modelDeploymentReplicaShape{
@@ -87,9 +83,8 @@ func modelDeploymentDeployedReplicaShape(view modelDeploymentReplicaView) modelD
 	return modelDeploymentReplicaShape{Total: total, State: modelDeploymentReplicaShapeComplete}
 }
 
-// modelDeploymentReplicaHoldsReason says how a replica's membership stands against its deployed
-// total. An unreadable shape speaks for itself, because a count would be a claim the members do
-// not support.
+// modelDeploymentReplicaHoldsReason 说明副本的当前成员与实际部署总数之间的对应情况。
+// 不可读的形态本身已足够说明问题，因为给出成员计数反而会成为成员信息所不支持的断言。
 func modelDeploymentReplicaHoldsReason(
 	view modelDeploymentReplicaView, shape modelDeploymentReplicaShape,
 ) string {
@@ -101,11 +96,11 @@ func modelDeploymentReplicaHoldsReason(
 		strconvx.Itoa(shape.Total) + " declared members"
 }
 
-// modelDeploymentReplicaDeclaredTotal is the group size every member agrees on, or why they do not.
+// modelDeploymentReplicaDeclaredTotal 返回所有成员一致声明的组大小，或不一致的原因。
 //
-// A member declaring no total is a replica of one: that is what a Pod from before the annotation
-// existed is, and modelDeploymentPodDescription has always read it so. A member declaring one is
-// held to it, so a group mixing the two contradicts itself.
+// 未声明总数的成员视为单成员副本：在引入该 annotation 之前创建的 Pod 即如此，
+// 且 modelDeploymentPodDescription 一贯按此方式读取。已声明总数的成员必须遵守该值，
+// 因此将两者混在同一组内会产生自相矛盾。
 func modelDeploymentReplicaDeclaredTotal(members []*core.Pod) (int, string) {
 	total := 0
 	for _, member := range members {
@@ -129,12 +124,11 @@ func modelDeploymentReplicaDeclaredTotal(members []*core.Pod) (int, string) {
 	return total, ""
 }
 
-// modelDeploymentMemberDeclaredTotal reads one member's own group total, and reports false for a
-// value no replica could have been built at.
+// modelDeploymentMemberDeclaredTotal 读取单个成员自身的组总数，若值不可能用于构建副本
+// 则返回 false。
 //
-// ABSENCE IS NOT A FAILURE and reads as a replica of one; a value that is PRESENT and is not a size
-// is. One is a Pod from before the annotation existed, the other is a claim this operator cannot
-// act on.
+// 缺失该值不视为失败，而是按单成员副本读取；存在该值但不是有效规模时才视为失败。
+// 前者对应引入该 annotation 之前创建的 Pod，后者则是本 operator 无法据此执行的无效声明。
 func modelDeploymentMemberDeclaredTotal(member *core.Pod) (int, bool) {
 	raw, present := member.Annotations[kueuepodconst.GroupTotalCountAnnotation]
 	if !present {
@@ -149,12 +143,11 @@ func modelDeploymentMemberDeclaredTotal(member *core.Pod) (int, bool) {
 	return total, true
 }
 
-// modelDeploymentReplicaSeatReason reports why a replica's members cannot be told apart as seats,
-// or "" when they can.
+// modelDeploymentReplicaSeatReason 返回副本成员无法按席位区分的原因；若可区分则返回 ""。
 //
-// No seat evidence is accepted except for a provable legacy single-member replica: the render has
-// always written a seat onto every member, so a larger group with none was never produced here. A
-// seat label that is present and unparsable is a defect, not that legacy case.
+// 仅对可确认的历史遗留单成员副本接受无席位信息的情况：渲染逻辑一贯会为每个成员写入
+// 席位标签，因此不存在由本系统生成却缺少席位标签的多成员组。若存在席位标签但无法解析，
+// 则属于缺陷，而非上述历史遗留情况。
 func modelDeploymentReplicaSeatReason(members []*core.Pod, total int) string {
 	seats := make(map[int]string, len(members))
 	claimed, invalid := 0, 0
@@ -208,11 +201,10 @@ func modelDeploymentReplicaSeatReason(members []*core.Pod, total int) string {
 	return ""
 }
 
-// modelDeploymentSeatState is what a member's seat label carries: a usable seat, none at all, or a
-// claim that is not a seat.
+// modelDeploymentSeatState 表示成员席位标签所携带的状态：有效席位、完全缺失或无效席位声明。
 //
-// IT IS NOT A BOOL because absent and invalid are different facts that must not collapse. Absent
-// marks a Pod from before the label existed; invalid marks a claim this operator cannot use.
+// 不使用 bool 类型，因为“缺失”与“无效”是两种不同的事实，不能混为一谈。缺失表明
+// 该 Pod 创建于引入此标签之前；无效则表明存在本 operator 无法使用的错误声明。
 type modelDeploymentSeatState int
 
 const (
@@ -221,11 +213,11 @@ const (
 	modelDeploymentSeatInvalid
 )
 
-// modelDeploymentMemberSeat reads which seat a member claims.
+// modelDeploymentMemberSeat 读取成员所声明的席位索引。
 //
-// IT IS NOT modelDeploymentPodMemberIndex, which answers "which member does the engine call me" and
-// defaults an absent label to the leader index. That default is right there and wrong here: it would
-// make every member of a legacy replica a duplicate of the leader.
+// 它不同于 modelDeploymentPodMemberIndex，后者回答的是“引擎将该成员视作哪个索引”，
+// 并在标签缺失时默认回退到主节点索引。该默认值在彼处正确但在本处有误：若在此处使用，
+// 会使历史遗留副本中的每个成员都变成主节点的重复项。
 func modelDeploymentMemberSeat(member *core.Pod) (int, modelDeploymentSeatState) {
 	raw, present := member.Labels[modelDeploymentMemberIndexLabel]
 	if !present {
@@ -240,37 +232,36 @@ func modelDeploymentMemberSeat(member *core.Pod) (int, modelDeploymentSeatState)
 	return index, modelDeploymentSeatValid
 }
 
-// modelDeploymentReplicaExecution is who built the command line a replica is running.
+// modelDeploymentReplicaExecution 表示构建副本当前所运行命令行的主体。
 //
-// It is a question about the running Pod. The role as declared now describes the replica about to
-// be built and says nothing about the one still serving.
+// 这是一个针对运行中 Pod 的判断。当前声明的 role 描述的是即将构建的副本，
+// 与仍在提供服务的副本无关。
 type modelDeploymentReplicaExecution int
 
 const (
-	// modelDeploymentExecutionUnreadable is a replica whose command line could not be attributed,
-	// because a member carries no engine container to read.
+	// modelDeploymentExecutionUnreadable 表示无法归属命令行来源的副本，
+	// 因为其中有成员未包含可供读取的引擎容器。
 	modelDeploymentExecutionUnreadable modelDeploymentReplicaExecution = iota
-	// modelDeploymentExecutionManaged is a replica running a command line this operator built.
+	// modelDeploymentExecutionManaged 表示运行由本 operator 构建的命令行的副本。
 	modelDeploymentExecutionManaged
-	// modelDeploymentExecutionTakeover is a replica running a command line the role supplied in
-	// full, which this operator contributed no arguments, no environment and no connector to.
+	// modelDeploymentExecutionTakeover 表示运行由 role 完整提供命令行的副本，
+	// 本 operator 未向其添加任何参数、环境变量或 connector。
 	modelDeploymentExecutionTakeover
 )
 
-// modelDeploymentDeployedReplicaExecution reports who built the command line this replica is
-// running, read from its own members. It is PURE.
+// modelDeploymentDeployedReplicaExecution 根据副本自身成员报告当前所运行命令行的构建方。它是纯函数。
 //
-// The evidence is the serving-port annotation, the same one the group-forward probe relies on: the
-// render stamps it only for roles running the operator's own command line. It is not the drain
-// hook, which the Elastic realization clears from every Ray worker it renders.
+// 判断依据是服务端口 annotation，与 group-forward 探针所依赖的相同：渲染器仅为运行
+// operator 自有命令行的 role 写入该 annotation；而非 drain hook，因为 Elastic 实现会清除
+// 其渲染的每个 Ray worker 上的 drain hook。
 func modelDeploymentDeployedReplicaExecution(members []*core.Pod) (modelDeploymentReplicaExecution, string) {
 	if len(members) == 0 {
 		return modelDeploymentExecutionUnreadable,
 			"the replica holds no members, so it has no running command line to read"
 	}
 
-	// EVERY MEMBER IS ASKED. One with no engine container has not been read, and skipping it would
-	// attribute a replica from the members that happened to be legible.
+	// 必须检查每一个成员。没有引擎容器的成员视为未读取，跳过它会导致
+	// 仅凭恰好可读的成员来归属整个副本。
 	built := false
 	for _, member := range members {
 		managed, ok := modelDeploymentMemberExecution(member)
@@ -293,8 +284,8 @@ func modelDeploymentDeployedReplicaExecution(members []*core.Pod) (modelDeployme
 	return modelDeploymentExecutionTakeover, ""
 }
 
-// modelDeploymentMemberExecution reads whether this operator built one member's command line, and
-// reports false for a member carrying no engine container to read.
+// modelDeploymentMemberExecution 读取单个成员的命令行是否由本 operator 构建，
+// 若成员不包含可供读取的引擎容器则返回 false。
 func modelDeploymentMemberExecution(member *core.Pod) (managed, ok bool) {
 	if _, found := modelDeploymentDrainContainerOf(member, modelDeploymentMainContainerName); !found {
 		return false, false

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 GPUStack, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package v1 is the versioned API for gpustack.ai.
+// Package v1 是 gpustack.ai 的版本化 API。
 //
 // +k8s:openapi-gen=true
 // +k8s:openapi-model-package=ai.gpustack.v1

@@ -5,8 +5,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// ModelDeploymentMetrics is a best-effort snapshot of the deployment's serving metrics.
-// Missing measurements are listed explicitly; a measured zero remains a numeric zero.
+// ModelDeploymentMetrics 是部署服务指标的尽力而为快照。
+// 缺失的指标会明确列出；实测为零的值仍保留为数字零。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type ModelDeploymentMetrics struct {
@@ -32,7 +32,7 @@ type ModelDeploymentMetrics struct {
 
 var _ runtime.Object = (*ModelDeploymentMetrics)(nil)
 
-// ModelDeploymentMetricGauge is one compatible sum of current Pod gauges.
+// ModelDeploymentMetricGauge 是当前各 Pod 同类 gauge 指标之和。
 type ModelDeploymentMetricGauge struct {
 	Name       string    `json:"name" protobuf:"bytes,1,opt,name=name"`
 	Source     string    `json:"source" protobuf:"bytes,2,opt,name=source"`
@@ -43,8 +43,8 @@ type ModelDeploymentMetricGauge struct {
 	ObservedAt meta.Time `json:"observedAt" protobuf:"bytes,7,opt,name=observedAt"`
 }
 
-// ModelDeploymentMetricWindow is one Pod's rate or histogram mean over two scrapes.
-// Samples is the number of new events or histogram observations in that window.
+// ModelDeploymentMetricWindow 是单个 Pod 在两次采集之间的速率或直方图均值。
+// Samples 表示该时间窗口内新增事件或直方图观测值的数量。
 type ModelDeploymentMetricWindow struct {
 	Name          string    `json:"name" protobuf:"bytes,1,opt,name=name"`
 	Pod           string    `json:"pod" protobuf:"bytes,2,opt,name=pod"`
@@ -57,8 +57,8 @@ type ModelDeploymentMetricWindow struct {
 	ObservedAt    meta.Time `json:"observedAt" protobuf:"bytes,9,opt,name=observedAt"`
 }
 
-// ModelDeploymentCacheHit is a token hit ratio over two reads of the same Pod counters.
-// Its source and scope prevent local prefix hits from being mixed with external-store hits.
+// ModelDeploymentCacheHit 是对同一 Pod 计数器两次读取期间的 token 命中率。
+// 其 source 和 scope 字段用于避免将本地前缀命中与外部存储命中混为一谈。
 type ModelDeploymentCacheHit struct {
 	Pod           string    `json:"pod" protobuf:"bytes,1,opt,name=pod"`
 	Source        string    `json:"source" protobuf:"bytes,2,opt,name=source"`
@@ -72,7 +72,7 @@ type ModelDeploymentCacheHit struct {
 	ObservedAt    meta.Time `json:"observedAt" protobuf:"bytes,10,opt,name=observedAt"`
 }
 
-// ModelDeploymentMetricMissing names one source that could not contribute to the snapshot.
+// ModelDeploymentMetricMissing 列出未能为快照提供数据的一个来源。
 type ModelDeploymentMetricMissing struct {
 	Pod    string `json:"pod" protobuf:"bytes,1,opt,name=pod"`
 	Source string `json:"source" protobuf:"bytes,2,opt,name=source"`

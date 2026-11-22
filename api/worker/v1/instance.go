@@ -7,7 +7,7 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
-// Instance is the schema for worker.gpustack.ai.
+// Instance 是 worker.gpustack.ai 的结构定义。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -16,7 +16,7 @@ type Instance workercore.Instance
 
 var _ runtime.Object = (*Instance)(nil)
 
-// InstanceList holds the list of Instance.
+// InstanceList 保存 Instance 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceList struct {

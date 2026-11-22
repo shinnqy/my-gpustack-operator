@@ -20,15 +20,13 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// Install is the function type for installing an application. Its last argument reports
-// whether the caller has excluded every other process from the release for the whole call.
+// Install 是用于安装应用的函数类型。其最后一个参数表示调用方是否在整次调用期间排除了所有其他进程对该 release 的访问。
 type Install func(context.Context, *helm.Client, map[string]any, sets.Set[string], bool) error
 
-// ExecuteInstall executes the given installers concurrently, and waits for all of them to complete.
+// ExecuteInstall 并发执行给定的安装函数，并等待它们全部完成。
 //
-// exclusive declares that no other process can be acting on these releases meanwhile. It
-// travels to each installer, which is where it decides whether a release left mid-operation
-// is repairable or has to be waited out.
+// exclusive 声明在此期间没有其他进程会操作这些 release。它会传递给各个安装函数，
+// 用于在遇到停留在操作中途的 release 时决定是直接修复还是等待其完成。
 func ExecuteInstall(
 	ctx context.Context,
 	restCfg rest.Config,
@@ -48,8 +46,8 @@ func ExecuteInstall(
 		return fmt.Errorf("create helm client: %w", err)
 	}
 
-	// Append common values to globalValuesContext if not exist,
-	// which will be passed to all installers.
+	// 如果 globalValuesContext 中不存在 Env，则追加通用值，
+	// 这些值将传递给所有安装函数。
 	if _, ok := globalValuesContext["Env"]; !ok {
 		globalValuesContext["Env"] = getCommonEnv(ctx)
 	}
@@ -57,7 +55,7 @@ func ExecuteInstall(
 		globalValuesContext["ManagedLabel"] = "gpustack.ai/managed"
 	}
 
-	// Execute installers concurrently.
+	// 并发执行安装函数。
 	gp := gox.Group()
 	for i := range installs {
 		gvc := maps.Clone(globalValuesContext)

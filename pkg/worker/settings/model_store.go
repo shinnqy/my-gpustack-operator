@@ -16,26 +16,26 @@ import (
 	"gpustack.ai/gpustack/pkg/system"
 )
 
-// The watermark Settings' names. Each one's admission reads the other by name, since a reference
-// from one Setting's declaration to the other's would be an initialization cycle.
+// 水位线 Setting 的名称。两者各自的准入校验通过名称读取另一方，
+// 因为在某个 Setting 声明中直接引用另一个 Setting 会导致初始化循环依赖。
 const (
 	modelStoreHighWatermarkName = "model-store-high-watermark"
 	modelStoreLowWatermarkName  = "model-store-low-watermark"
 )
 
-// The values of ModelArtifactDeliveryMode.
+// ModelArtifactDeliveryMode 的取值。
 const (
-	// ModelArtifactDeliveryEngine has an engine download a hub artifact's resolved commit itself.
+	// ModelArtifactDeliveryEngine 表示由推理引擎自行下载 hub 制品已解析提交版本的内容。
 	ModelArtifactDeliveryEngine = "Engine"
-	// ModelArtifactDeliveryNode has the node's model-manager plugin materialize and mount it.
+	// ModelArtifactDeliveryNode 表示由节点上的 model-manager 插件物化并挂载模型制品。
 	ModelArtifactDeliveryNode = "Node"
 )
 
 var (
-	// ModelArtifactDeliveryMode is how a Hugging Face artifact's weights reach a ModelDeployment's
-	// engine. It is explicit and never inferred from whether the plugin is installed: changing it
-	// changes every Hugging Face deployment's Pods, which each roll once. The chart declares "Node"
-	// when it deploys the plugin, and the worker reasserts that declaration on every start.
+	// ModelArtifactDeliveryMode 定义 Hugging Face 制品权重到达 ModelDeployment 引擎的方式。
+	// 该配置需显式指定，绝不根据插件是否安装进行推断：修改它会变更所有 Hugging Face
+	// 部署的 Pod，导致各部署滚动更新一次。部署该插件时 Helm chart 会声明为 "Node"，
+	// worker 每次启动时也会重新声明该配置。
 	ModelArtifactDeliveryMode = settings.NewEditable(
 		"model-artifact-delivery-mode",
 		"Indicates how a Hugging Face ModelArtifact's weights reach a ModelDeployment: Engine, the engine "+
@@ -45,9 +45,9 @@ var (
 		admitDeliveryMode,
 	)
 
-	// ModelStoreHighWatermark is the cache filesystem's usage, in percent, above which the plugin
-	// removes unreferenced content. It must stay below kubelet's eviction and image collection
-	// thresholds when the cache shares kubelet's filesystem; the plugin caps it there.
+	// ModelStoreHighWatermark 是缓存文件系统的使用率阈值（百分比），超过该阈值时
+	// 插件会清理未被引用的内容。当缓存与 kubelet 共用文件系统时，该值必须低于
+	// kubelet 的驱逐阈值和镜像垃圾回收阈值；插件会在该限制处对其进行封顶。
 	ModelStoreHighWatermark = settings.NewEditable(
 		modelStoreHighWatermarkName,
 		"Indicates the node model cache's usage percent above which unreferenced models are removed, "+
@@ -57,7 +57,7 @@ var (
 		admitWatermarkAgainst(modelStoreLowWatermarkName, true),
 	)
 
-	// ModelStoreLowWatermark is the usage, in percent, a collection removes down to.
+	// ModelStoreLowWatermark 是垃圾回收执行后将缓存文件系统使用率降到的目标阈值（百分比）。
 	ModelStoreLowWatermark = settings.NewEditable(
 		modelStoreLowWatermarkName,
 		"Indicates the node model cache's usage percent a removal stops at, at least 1 and below "+
@@ -67,8 +67,8 @@ var (
 		admitWatermarkAgainst(modelStoreHighWatermarkName, false),
 	)
 
-	// ModelStorePeerSync is whether a node's plugin may pull content the other nodes' plugins
-	// hold published, instead of the hub.
+	// ModelStorePeerSync 控制节点上的插件是否允许从其他节点插件已发布的内容中拉取数据，
+	// 而非直接从 hub 拉取。
 	ModelStorePeerSync = settings.NewEditable(
 		"model-store-peer-sync",
 		"Indicates whether a node's plugin may pull a model's content from the plugins of other "+
@@ -77,8 +77,8 @@ var (
 		setting.AllowBool(),
 	)
 
-	// ModelStoreDownloadConcurrency is how many HTTP requests a node runs at once across its
-	// downloads. A large file is fetched as ranges that share this budget.
+	// ModelStoreDownloadConcurrency 指定节点在所有下载任务中同时运行的 HTTP 请求数上限。
+	// 大文件会按分片范围并发拉取，并共享此并发配额。
 	ModelStoreDownloadConcurrency = settings.NewEditable(
 		"model-store-download-concurrency",
 		"Indicates how many HTTP requests a node runs at once across its model downloads, 1 to 64.",
@@ -86,8 +86,8 @@ var (
 		setting.AllowInt64InRange(modelstore.MinDownloadConcurrency, modelstore.MaxDownloadConcurrency),
 	)
 
-	// ModelStoreDownloadBandwidth is a node's download rate limit, a quantity of bytes per second
-	// such as "200Mi"; "0" is unlimited.
+	// ModelStoreDownloadBandwidth 是节点的下载速率限制，以每秒字节数表示
+	// （例如 "200Mi"）；"0" 表示不限速。
 	ModelStoreDownloadBandwidth = settings.NewEditable(
 		"model-store-download-bandwidth",
 		"Indicates a node's model download rate limit in bytes per second, a quantity such as 200Mi; 0 is unlimited.",
@@ -99,11 +99,10 @@ var (
 	)
 )
 
-// currentValue reads another Setting's stored value by name from the Secret itself, not through the
-// Settings read cache: two edits within the cache's thirty seconds would otherwise be checked against
-// a value already replaced, and a crossed pair freezes every node's configuration. A Secret that
-// cannot be read is an error, so the admission refuses rather than skip the check. It is a variable
-// so a test can answer without an API server.
+// currentValue 按名称直接从 Secret 而非通过 Settings 读取缓存获取另一个 Setting 的存储值：
+// 否则在缓存 30 秒有效期内的两次连续修改会基于已被替换的旧值进行校验，
+// 若形成交叉错位则会冻结所有节点的配置。无法读取 Secret 时会返回 error，
+// 因此准入校验会直接拒绝而非跳过检查。将其定义为变量以便测试在没有 API server 时替换。
 var currentValue = func(ctx context.Context, name string) (string, error) {
 	sec, err := system.LoopbackKubeClient.Get().CoreV1().Secrets(setting.DelegatedSecretNamespace).
 		Get(ctx, setting.DelegatedSecretName, meta.GetOptions{})
@@ -117,9 +116,9 @@ var currentValue = func(ctx context.Context, name string) (string, error) {
 	return settings[name].DefaultValue(), nil
 }
 
-// csiDriverExists reports whether the plugin's CSIDriver object exists. It reads the API server, not
-// an informer cache, so an edit right after the plugin is installed is not refused for a CSIDriver
-// the cache has not seen yet. It is a variable so a test can answer without an API server.
+// csiDriverExists 返回插件对应的 CSIDriver 对象是否存在。该函数直接读取 API server
+// 而非 informer 缓存，以避免在刚安装完插件后因缓存尚未同步到 CSIDriver 而误拒修改。
+// 将其定义为变量以便测试在没有 API server 时替换。
 var csiDriverExists = func(ctx context.Context) (bool, error) {
 	err := system.LoopbackCtrlAPIReader.Get().Get(ctx, ctrlcli.ObjectKey{Name: modelstore.DriverName}, &storage.CSIDriver{})
 	switch {
@@ -132,8 +131,8 @@ var csiDriverExists = func(ctx context.Context) (bool, error) {
 	}
 }
 
-// admitDeliveryMode accepts Engine, and Node only while the plugin's CSIDriver exists: a delivery
-// with nothing to deliver would leave every Hugging Face deployment waiting.
+// admitDeliveryMode 允许设为 Engine，并仅在插件的 CSIDriver 存在时允许设为 Node：
+// 若缺乏实际投递方，所有 Hugging Face 部署都会一直处于等待状态。
 func admitDeliveryMode(ctx context.Context, _, newVal string) error {
 	switch newVal {
 	case ModelArtifactDeliveryEngine:
@@ -153,9 +152,8 @@ func admitDeliveryMode(ctx context.Context, _, newVal string) error {
 	}
 }
 
-// admitWatermarkAgainst keeps the high watermark above the low one: a new high must exceed the
-// current low, and a new low must stay under the current high. Lowering both therefore means
-// lowering the low one first.
+// admitWatermarkAgainst 确保高水位线始终高于低水位线：新的高水位线必须大于当前低水位线，
+// 新的低水位线必须小于当前高水位线。因此同时调低两者时需先调低低水位线。
 func admitWatermarkAgainst(other string, isHigh bool) setting.Admission {
 	return func(ctx context.Context, _, newVal string) error {
 		v, err := strconv.ParseInt(newVal, 10, 32)
@@ -169,7 +167,7 @@ func admitWatermarkAgainst(other string, isHigh bool) setting.Admission {
 		o, readable := parsePercent(raw)
 		switch {
 		case !readable:
-			// An unreadable other value is left to its own check.
+			// 若另一方的取值无法读取，则交由其自身的校验处理。
 		case isHigh && v <= o:
 			return fmt.Errorf("the high watermark %d must be above the low watermark %d", v, o)
 		case !isHigh && v >= o:
@@ -184,8 +182,8 @@ func parsePercent(raw string) (int64, bool) {
 	return v, err == nil
 }
 
-// ModelStoreLayer reads the cluster layer of a node model cache's configuration from the Settings,
-// through value: a Setting's current value at runtime, or its default at startup.
+// ModelStoreLayer 通过 value 函数从 Settings 读取节点模型缓存配置的集群层级：
+// 运行时传入 Setting 的当前值，启动时则传入其默认值。
 func ModelStoreLayer(value func(setting.Setting) string) (modelstore.Layer, error) {
 	var errs []error
 	parse32 := func(s setting.Setting) *int32 {
@@ -235,10 +233,9 @@ func ModelStoreLayer(value func(setting.Setting) string) (modelstore.Layer, erro
 	return l, errors.Join(errs...)
 }
 
-// ValidateModelStoreDefaults checks the values the node model cache's Settings take from the
-// environment, which no admission reads, so the worker refuses to start on one that would be
-// written to every node. The delivery mode's CSIDriver condition is not checked here: whether the
-// plugin exists is a runtime fact, which consumers wait on.
+// ValidateModelStoreDefaults 校验节点模型缓存的 Settings 从环境变量读取的默认值；
+// 由于这些值不经过准入校验，若其中存在将被写入所有节点的非法配置，worker 会拒绝启动。
+// 此处不检查投递模式所需的 CSIDriver 条件：插件是否存在属于运行时状态，消费方会自行等待。
 func ValidateModelStoreDefaults() error {
 	if v := ModelArtifactDeliveryMode.DefaultValue(); v != ModelArtifactDeliveryEngine && v != ModelArtifactDeliveryNode {
 		return fmt.Errorf("setting %s: want %s or %s, got %q",

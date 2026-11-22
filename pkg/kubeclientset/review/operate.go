@@ -10,47 +10,47 @@ import (
 )
 
 type (
-	// Simple holds the attributes for simply reviewing.
+	// Simple 保存用于简化权限审查的属性。
 	Simple struct {
-		// Namespace is the namespace of the action being requested.
-		// Currently, there is no distinction between no namespace and all namespaces。
+		// Namespace 是所请求操作的 Namespace。
+		// 当前未区分无 Namespace 与所有 Namespace。
 		Namespace string
-		// Group is the API Group of the Resource.
-		// "*" means all.
+		// Group 是资源的 API Group。
+		// "*" 表示全部。
 		Group string
-		// Version is the API Version of the Resource.
-		// "*" means all.
+		// Version 是资源的 API Version。
+		// "*" 表示全部。
 		Version string
-		// Resource is one of the existing resource types.
-		// "*" means all.
+		// Resource 是现有的资源类型之一。
+		// "*" 表示全部。
 		Resource string
-		// Name is the name of the resource being requested for a "get" or deleted for a "delete".
-		// "" (empty) means all.
+		// Name 是用于 "get" 请求或 "delete" 删除的资源名称。
+		// ""（空字符串）表示全部。
 		Name string
 	}
-	// Simples is the list of Simple.
+	// Simples 是 Simple 的列表。
 	Simples = []Simple
 )
 
 type CreateOption func([]string, string) ([]string, string)
 
-// WithUpdateIfExisted checks if the subject can do kubeclientset.Create
-// with kubeclientset.WithUpdateIfExisted for something.
+// WithUpdateIfExisted 检查主体是否可以使用 kubeclientset.WithUpdateIfExisted
+// 对指定资源执行 kubeclientset.Create。
 func WithUpdateIfExisted() CreateOption {
 	return func(verbs []string, subres string) ([]string, string) {
 		return append(verbs, "update"), subres
 	}
 }
 
-// WithRecreateIfDuplicated checks if the subject can do kubeclientset.Create
-// with kubeclientset.WithRecreateIfDuplicated for something.
+// WithRecreateIfDuplicated 检查主体是否可以使用 kubeclientset.WithRecreateIfDuplicated
+// 对指定资源执行 kubeclientset.Create。
 func WithRecreateIfDuplicated() CreateOption {
 	return func(verbs []string, subres string) ([]string, string) {
 		return append(verbs, "delete"), subres
 	}
 }
 
-// CanDoCreate checks if the current subject can do kubeclientset.Create for something.
+// CanDoCreate 检查当前主体是否可以对指定资源执行 kubeclientset.Create。
 func CanDoCreate(ctx context.Context,
 	cli authzcli.SelfSubjectAccessReviewInterface, reviews Simples,
 	opts ...CreateOption,
@@ -66,15 +66,15 @@ func CanDoCreate(ctx context.Context,
 
 type UpdateOption func([]string, string) ([]string, string)
 
-// WithCreateIfNotExisted checks if the subject can do kubeclientset.Update
-// with kubeclientset.WithCreateIfNotExisted for something.
+// WithCreateIfNotExisted 检查主体是否可以使用 kubeclientset.WithCreateIfNotExisted
+// 对指定资源执行 kubeclientset.Update。
 func WithCreateIfNotExisted() UpdateOption {
 	return func(verbs []string, subres string) ([]string, string) {
 		return append(verbs, "create"), subres
 	}
 }
 
-// CanDoUpdate checks if the current subject can do kubeclientset.Update for something.
+// CanDoUpdate 检查当前主体是否可以对指定资源执行 kubeclientset.Update。
 func CanDoUpdate(ctx context.Context,
 	cli authzcli.SelfSubjectAccessReviewInterface, reviews Simples,
 	opts ...UpdateOption,

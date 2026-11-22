@@ -8,17 +8,11 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
-// canonicalJSON encodes a value so that equal content always encodes to equal
-// bytes.
+// canonicalJSON 对值进行编码，确保相同内容始终编码为相同的字节序列。
 //
-// IT SORTS THE OBJECT KEYS, because the digest must not depend on the order
-// the fields happen to be declared in.
+// 它会对对象键进行排序，因为摘要不能依赖于字段声明时的偶然顺序。
 //
-// IT ENCODES WITH THE STANDARD LIBRARY, because the shared JSON package
-// switches to another encoder under the goccy build tag, and that encoder
-// writes a small exponent as 1e-07 where the standard library writes 1e-7. A
-// digest is a stored value, so its bytes must not depend on how the binary was
-// built.
+// 它使用标准库进行编码，因为共享的 JSON 包在 goccy 构建标签下会切换到另一个编码器，而该编码器会将较小指数输出为 1e-07，标准库则输出为 1e-7。摘要是需要存储的值，因此其字节内容不能依赖于二进制文件的构建方式。
 func canonicalJSON(value any) ([]byte, error) {
 	raw, err := json.Marshal(value)
 	if err != nil {
@@ -33,10 +27,9 @@ func canonicalJSON(value any) ([]byte, error) {
 	return json.Marshal(generic)
 }
 
-// Digest returns the content digest of a value.
+// Digest 返回值的内容摘要。
 //
-// THE DIGEST IS STABLE, so the same content always produces the same digest
-// and a changed catalog is visible.
+// 该摘要是稳定的，因此相同内容始终产生相同的摘要，目录发生变更时也清晰可见。
 func Digest(value any) (string, error) {
 	encoded, err := canonicalJSON(value)
 	if err != nil {
@@ -45,13 +38,13 @@ func Digest(value any) (string, error) {
 	return "sha256:" + stringx.SumBytesBySHA256(encoded), nil
 }
 
-// ProfileDigest returns the digest of a profile's content.
+// ProfileDigest 返回 profile 内容的摘要。
 func ProfileDigest(profile Profile) (string, error) {
 	profile.Digest = ""
 	return Digest(profile)
 }
 
-// CatalogDigest returns the digest of a catalog's content.
+// CatalogDigest 返回 catalog 内容的摘要。
 func CatalogDigest(catalog Catalog) (string, error) {
 	catalog.Digest = ""
 	return Digest(catalog)

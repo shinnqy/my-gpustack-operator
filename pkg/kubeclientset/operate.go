@@ -13,15 +13,13 @@ import (
 )
 
 type (
-	// MetaObject is the interface for the object with metadata.
+	// MetaObject 是带有元数据的资源对象接口。
 	MetaObject = ctrlcli.Object
 
-	// AlignWithFn is a function to compare the actual object with the expected object,
-	// and returns aligned object if the actual object is no the same with the expected object.
+	// AlignWithFn 用于比较实际对象与期望对象，并在两者不一致时返回对齐后的对象。
 	AlignWithFn[T MetaObject] func(actualCopied T) (aligned T, skip bool, err error)
 
-	// CompareWithFn is a function to compare the actual object with the expected object,
-	// and returns true if the actual object is the same with the expected object.
+	// CompareWithFn 用于比较实际对象与期望对象，若两者一致则返回 true。
 	CompareWithFn[T MetaObject] func(actualCopied T) (skip bool)
 )
 
@@ -43,32 +41,28 @@ type (
 	CreateOption[T MetaObject] func(*_CreateOptions[T])
 )
 
-// WithUpdateIfExisted with the align function to update the resource if existed.
+// WithUpdateIfExisted 配置对齐函数，以便在资源已存在时执行更新。
 //
-// WithUpdateIfExisted is conflict to WithRecreateIfDuplicated, if both provided,
-// WithUpdateIfExisted will be used.
+// WithUpdateIfExisted 与 WithRecreateIfDuplicated 互斥；若同时提供，则优先使用 WithUpdateIfExisted。
 func WithUpdateIfExisted[T MetaObject](fn AlignWithFn[T]) CreateOption[T] {
 	return func(co *_CreateOptions[T]) {
 		co.UpdateAlignFunc = fn
 	}
 }
 
-// WithRecreateIfDuplicated with the compare function to recreate the resource if different.
+// WithRecreateIfDuplicated 配置比较函数，以便在资源存在差异时重建该资源。
 //
-// WithRecreateIfDuplicated is conflict to WithUpdateIfExisted, if both provided,
-// WithUpdateIfExisted will be used.
+// WithRecreateIfDuplicated 与 WithUpdateIfExisted 互斥；若同时提供，则优先使用 WithUpdateIfExisted。
 func WithRecreateIfDuplicated[T MetaObject](fn CompareWithFn[T]) CreateOption[T] {
 	return func(co *_CreateOptions[T]) {
 		co.RecreateCompareFunc = fn
 	}
 }
 
-// Create is similar to Apply, will create the resource if it does not exist.
+// Create 类似于 Apply，在资源不存在时创建该资源。
 //
-// Create updates the resource if WithUpdateIfExisted provided,
-// or recreate the resource if WithRecreateIfDuplicated provided.
-// Select one from WithUpdateIfExisted and WithRecreateIfDuplicated, if both provided,
-// WithUpdateIfExisted will be used.
+// 若提供了 WithUpdateIfExisted，Create 会更新已有资源；若提供了 WithRecreateIfDuplicated，则会重建资源。
+// WithUpdateIfExisted 与 WithRecreateIfDuplicated 只能二选一；若同时提供，则优先使用 WithUpdateIfExisted。
 func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, opts ...CreateOption[T]) (T, error) {
 	if reflect.ValueOf(expected).IsZero() {
 		return expected, errors.New("expected is nil")
@@ -98,11 +92,11 @@ func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, 
 		}
 	}
 
-	// Create if not found or deleting.
+	// 若未找到资源或资源正在删除中，则尝试创建。
 	if err != nil || actual.GetDeletionTimestamp() != nil {
 		deleting := err == nil && actual.GetDeletionTimestamp() != nil && len(actual.GetFinalizers()) == 0
 		if deleting {
-			// NB(thxCode): sleep a while to avoid server flipping.
+			// NB(thxCode): 短暂休眠以避免服务端状态抖动。
 			time.Sleep(10 * time.Millisecond)
 		}
 		actual, err = cli.Create(ctx, expected, meta.CreateOptions{
@@ -115,10 +109,10 @@ func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, 
 					return Create(rctx, cli, expected, opts...)
 				}
 			case kerrors.IsAlreadyExists(err):
-				// Retry on already existed if:
-				// - configure align function.
-				// - configure compare function.
-				// - the resource is deleting without finalizers.
+				// 在以下情况下遇到资源已存在错误时进行重试：
+				// - 配置了对齐函数；
+				// - 配置了比较函数；
+				// - 资源正在删除且没有 finalizers。
 				if co.UpdateAlignFunc != nil || co.RecreateCompareFunc != nil || deleting {
 					if rctx, ok := nextAttempt(ctx, err); ok {
 						return Create(rctx, cli, expected, opts...)
@@ -150,10 +144,10 @@ func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, 
 			return actual, errors.New("client does not support update")
 		}
 
-		// Copy resource version for update.
+		// 复制 resourceVersion 以用于更新。
 		//
-		// And keep the original labels, annotations, finalizers, and owner references if they are not set.
-		// If you want to clean the above fields, please set them to empty in the expected object.
+		// 若期望对象中未设置 labels、annotations、finalizers 和 ownerReferences，则保留原有值。
+		// 如需清空上述字段，请在期望对象中将其显式置为空。
 		copiedOm, actualOm := copied, actual
 		copiedOm.SetResourceVersion(actualOm.GetResourceVersion())
 		if copiedOm.GetLabels() == nil {
@@ -176,12 +170,10 @@ func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, 
 			return updated, nil
 		}
 
-		// Retry if the server asked to back off, or if another writer got there first:
-		// the next pass reads the actual resource again and aligns on top of it, so a
-		// writer that lost a concurrent update converges instead of failing.
+		// 当服务端要求退避，或发生并发写入冲突时进行重试：
+		// 下一轮会重新读取实际资源并在其基础上对齐状态，使并发更新落败的一方能够收敛而非直接失败。
 		//
-		// Any one of these reasons is enough to retry, hence the disjunction: they are
-		// mutually exclusive, so requiring them together could never hold.
+		// 满足其中任一原因即可触发重试，因此使用逻辑或判断：这些条件彼此互斥，同时满足永远不可能成立。
 		if rctx, ok := retryToConverge(ctx, err); ok {
 			return Create(rctx, cli, expected, opts...)
 		}
@@ -206,9 +198,8 @@ func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, 
 			return actual, err
 		}
 
-		// Recreate, bounded like every other re-entry here: a delete that keeps being
-		// followed by a live object would otherwise recurse forever. No server error was
-		// returned on this path, so a spent budget has to be its own.
+		// 重建资源，并与其他重入路径一样受重试次数上限约束：否则删除后持续遇到存活对象会导致无限递归。
+		// 该路径没有返回服务端错误，因此耗尽重试预算时需返回其自身的错误。
 		if rctx, ok := nextAttempt(ctx, nil); ok {
 			return Create(rctx, cli, expected, opts...)
 		}
@@ -219,7 +210,7 @@ func Create[T MetaObject](ctx context.Context, cli CreateClient[T], expected T, 
 	return actual, nil
 }
 
-// CreateWithCtrlClient is similar to Create, but uses the ctrl client.
+// CreateWithCtrlClient 与 Create 类似，但使用 ctrl 客户端。
 func CreateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client, expected T, opts ...CreateOption[T]) (T, error) {
 	if reflect.ValueOf(expected).IsZero() {
 		return expected, errors.New("expected is nil")
@@ -246,11 +237,11 @@ func CreateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 		}
 	}
 
-	// Create if not found or deleting.
+	// 若未找到资源或资源正在删除中，则尝试创建。
 	if err != nil || actual.GetDeletionTimestamp() != nil {
 		deleting := err == nil && actual.GetDeletionTimestamp() != nil && len(actual.GetFinalizers()) == 0
 		if deleting {
-			// NB(thxCode): sleep a while to avoid server flipping.
+			// NB(thxCode): 短暂休眠以避免服务端状态抖动。
 			time.Sleep(10 * time.Millisecond)
 		}
 		err = cli.Create(ctx, expected, &ctrlcli.CreateOptions{
@@ -267,10 +258,10 @@ func CreateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 				return CreateWithCtrlClient[T](rctx, cli, expected, opts...)
 			}
 		case kerrors.IsAlreadyExists(err):
-			// Retry on already existed if:
-			// - configure align function.
-			// - configure compare function.
-			// - the resource is deleting without finalizers.
+			// 在以下情况下遇到资源已存在错误时进行重试：
+			// - 配置了对齐函数；
+			// - 配置了比较函数；
+			// - 资源正在删除且没有 finalizers。
 			if co.UpdateAlignFunc != nil || co.RecreateCompareFunc != nil || deleting {
 				if rctx, ok := nextAttempt(ctx, err); ok {
 					return CreateWithCtrlClient[T](rctx, cli, expected, opts...)
@@ -296,10 +287,10 @@ func CreateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 			return actual, nil
 		}
 
-		// Copy resource version for update.
+		// 复制 resourceVersion 以用于更新。
 		//
-		// And keep the original labels, annotations, finalizers, and owner references if they are not set.
-		// If you want to clean the above fields, please set them to empty in the expected object.
+		// 若期望对象中未设置 labels、annotations、finalizers 和 ownerReferences，则保留原有值。
+		// 如需清空上述字段，请在期望对象中将其显式置为空。
 		copiedOm, actualOm := copied, actual
 		copiedOm.SetResourceVersion(actualOm.GetResourceVersion())
 		if copiedOm.GetLabels() == nil {
@@ -323,8 +314,7 @@ func CreateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 			return copied, nil
 		}
 
-		// Retry if the server asked to back off, or if another writer got there first,
-		// as in Create.
+		// 当服务端要求退避或发生并发写入冲突时进行重试，逻辑与 Create 相同。
 		if rctx, ok := retryToConverge(ctx, err); ok {
 			return CreateWithCtrlClient[T](rctx, cli, expected, opts...)
 		}
@@ -344,9 +334,8 @@ func CreateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 			return actual, err
 		}
 
-		// Recreate, bounded like every other re-entry here: a delete that keeps being
-		// followed by a live object would otherwise recurse forever. No server error was
-		// returned on this path, so a spent budget has to be its own.
+		// 重建资源，并与其他重入路径一样受重试次数上限约束：否则删除后持续遇到存活对象会导致无限递归。
+		// 该路径没有返回服务端错误，因此耗尽重试预算时需返回其自身的错误。
 		if rctx, ok := nextAttempt(ctx, nil); ok {
 			return CreateWithCtrlClient[T](rctx, cli, expected, opts...)
 		}
@@ -372,26 +361,25 @@ type (
 	UpdateOption[T MetaObject] func(*_UpdateOptions[T])
 )
 
-// WithUpdateAlign with the align function to update the resource.
+// WithUpdateAlign 配置用于更新资源的对齐函数。
 func WithUpdateAlign[T MetaObject](fn AlignWithFn[T]) UpdateOption[T] {
 	return func(uo *_UpdateOptions[T]) {
 		uo.AlignFunc = fn
 	}
 }
 
-// WithCreateIfNotExisted will create the resource if it does not exist.
+// WithCreateIfNotExisted 会在资源不存在时创建该资源。
 func WithCreateIfNotExisted[T MetaObject]() UpdateOption[T] {
 	return func(uo *_UpdateOptions[T]) {
 		uo.CreateIfNotExisted = true
 	}
 }
 
-// Update will update the resource if it exists,
-// and returns the updated resource.
+// Update 在资源存在时更新该资源，并返回更新后的资源对象。
 //
-// Update returns error if the resource is not found or updating failed.
+// 若资源未找到或更新失败，Update 将返回 error。
 //
-// Update will retry if the resource is updating conflicted when AlignWithFn is provided.
+// 当提供了 AlignWithFn 且更新发生冲突时，Update 会自动重试。
 func Update[T MetaObject](ctx context.Context, cli UpdateClient[T], expected T, opts ...UpdateOption[T]) (T, error) {
 	if reflect.ValueOf(expected).IsZero() {
 		return expected, errors.New("expected is nil")
@@ -419,7 +407,7 @@ func Update[T MetaObject](ctx context.Context, cli UpdateClient[T], expected T, 
 				DryRun: uo.DryRun,
 			})
 			if err != nil && kerrors.IsAlreadyExists(err) {
-				// Retry if already existed.
+				// 若资源已存在则重试。
 				if rctx, ok := nextAttempt(ctx, err); ok {
 					return Update(rctx, cli, expected, opts...)
 				}
@@ -443,10 +431,10 @@ func Update[T MetaObject](ctx context.Context, cli UpdateClient[T], expected T, 
 		}
 	} else {
 		copied = expected.DeepCopyObject().(T)
-		// Copy resource version for update.
+		// 复制 resourceVersion 以用于更新。
 		//
-		// And keep the original labels, annotations, finalizers, and owner references if they are not set.
-		// If you want to clean the above fields, please set them to empty in the expected object.
+		// 若期望对象中未设置 labels、annotations、finalizers 和 ownerReferences，则保留原有值。
+		// 如需清空上述字段，请在期望对象中将其显式置为空。
 		copiedOm, actualOm := copied, actual
 		copiedOm.SetResourceVersion(actualOm.GetResourceVersion())
 		if copiedOm.GetLabels() == nil {
@@ -475,7 +463,7 @@ func Update[T MetaObject](ctx context.Context, cli UpdateClient[T], expected T, 
 			return actual, err
 		}
 
-		// Retry if conflicted when align function is provided.
+		// 当提供了对齐函数且更新发生冲突时进行重试。
 		if uo.AlignFunc != nil {
 			if rctx, ok := nextAttempt(ctx, err); ok {
 				return Update(rctx, cli, expected, opts...)
@@ -486,7 +474,7 @@ func Update[T MetaObject](ctx context.Context, cli UpdateClient[T], expected T, 
 	return updated, err
 }
 
-// UpdateWithCtrlClient is similar to Update, but uses the ctrl client.
+// UpdateWithCtrlClient 与 Update 类似，但使用 ctrl 客户端。
 func UpdateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client, expected T, opts ...UpdateOption[T]) (T, error) {
 	if reflect.ValueOf(expected).IsZero() {
 		return expected, errors.New("expected is nil")
@@ -512,7 +500,7 @@ func UpdateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 				FieldManager: uo.FieldManager,
 			})
 			if err != nil && kerrors.IsAlreadyExists(err) {
-				// Retry if already existed.
+				// 若资源已存在则重试。
 				if rctx, ok := nextAttempt(ctx, err); ok {
 					return UpdateWithCtrlClient[T](rctx, cli, expected, opts...)
 				}
@@ -536,10 +524,10 @@ func UpdateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 		}
 	} else {
 		copied = expected.DeepCopyObject().(T)
-		// Copy resource version for update.
+		// 复制 resourceVersion 以用于更新。
 		//
-		// And keep the original labels, annotations, finalizers, and owner references if they are not set.
-		// If you want to clean the above fields, please set them to empty in the expected object.
+		// 若期望对象中未设置 labels、annotations、finalizers 和 ownerReferences，则保留原有值。
+		// 如需清空上述字段，请在期望对象中将其显式置为空。
 		copiedOm, actualOm := copied, actual
 		copiedOm.SetResourceVersion(actualOm.GetResourceVersion())
 		if copiedOm.GetLabels() == nil {
@@ -571,7 +559,7 @@ func UpdateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 			return actual, err
 		}
 
-		// Retry if conflicted when align function is provided.
+		// 当提供了对齐函数且更新发生冲突时进行重试。
 		if uo.AlignFunc != nil {
 			if rctx, ok := nextAttempt(ctx, err); ok {
 				return UpdateWithCtrlClient[T](rctx, cli, expected, opts...)
@@ -588,9 +576,8 @@ type (
 	}
 )
 
-// isRetryError reports whether the server itself asked for another attempt. It is a pure
-// predicate: waiting belongs to nextAttempt, which is also reached from the paths that retry for
-// reasons the server never states.
+// isRetryError 报告服务端本身是否要求重试。这是一个纯判断函数：
+// 等待退避逻辑归属于 nextAttempt，其他因服务端未明确指明的原因而触发重试的路径也会经过该函数。
 func isRetryError(err error) bool {
 	if kerrors.IsTooManyRequests(err) || kerrors.IsGone(err) || kerrors.IsTimeout(err) || kerrors.IsServerTimeout(err) {
 		return true
@@ -600,33 +587,31 @@ func isRetryError(err error) bool {
 	return ok
 }
 
-// errTooManyAttempts is returned where re-entering is the operation's only way forward, so a
-// spent budget cannot be reported as the last server error — that path produced none.
+// errTooManyAttempts 用于重入是唯一推进方式但重试预算已耗尽的场景，
+// 此时无法报告最后一次服务端错误，因为该执行路径并未产生服务端错误。
 var errTooManyAttempts = errors.New("too many attempts")
 
-// retryAttemptKey carries an operation's re-entry count in its context.
+// retryAttemptKey 在 context 中记录操作的重入次数。
 type retryAttemptKey struct{}
 
 const (
-	// maxAttempts bounds how many times one operation may re-enter itself. Every operation
-	// here converges by reading the live resource again and aligning on top of it, which is a
-	// retry loop written as recursion. Unbounded, a peer writer that keeps winning makes it
-	// recurse forever: the stack grows until the process aborts, and the caller never receives
-	// an error it could report or set a condition from.
+	// maxAttempts 限制单个操作允许自身重入的最大次数。此处的每个操作都通过重新读取
+	// 实时资源并在其上对齐状态来实现收敛，相当于以递归形式编写的重试循环。若不加限制，
+	// 持续获胜的并发写入方会导致其无限递归：调用栈不断增长直至进程中止，而调用方永远
+	// 无法收到可用于上报或设置 condition 的 error。
 	maxAttempts = 8
-	// attemptBackoff is the wait before the first re-entry, doubled for each one after. A
-	// Conflict carries no server-suggested delay, so without this the next attempt is
-	// immediate and a contended object becomes a hot loop against the API server.
+	// attemptBackoff 是首次重入前的等待时间，之后每次重试按指数翻倍。Conflict 错误
+	// 不携带服务端建议的延迟，因此若无此退避，下一次尝试会立即执行，从而使发生竞争的
+	// 对象退化为针对 API Server 的热点死循环。
 	attemptBackoff = 10 * time.Millisecond
 )
 
-// nextAttempt returns the context to re-enter an operation with, after waiting out this attempt's
-// backoff, and reports whether the budget allowed one at all. A server-suggested delay wins over
-// the backoff, since the server named a figure and this only guesses one.
+// nextAttempt 在等待完本次尝试的退避时间后，返回用于重入操作的 context，并报告
+// 重试预算是否允许此次重入。若服务端给出了建议延迟，则优先采用服务端延迟，因为
+// 服务端明确指定了具体数值，而本地退避仅是估算值。
 //
-// The count rides the context because that is the only channel every operation here already
-// threads through its own recursion; the options are typed per operation, so no shared option
-// could carry it without changing all of their signatures.
+// 重入次数通过 context 传递，因为此处每个操作在自身递归过程中都已贯穿传递了
+// context；而各操作的选项类型各不相同，若不修改所有函数签名，则无法通过共享选项传递该计数。
 func nextAttempt(ctx context.Context, err error) (context.Context, bool) {
 	attempt, _ := ctx.Value(retryAttemptKey{}).(int)
 	if attempt >= maxAttempts {
@@ -647,7 +632,7 @@ func nextAttempt(ctx context.Context, err error) (context.Context, bool) {
 	return context.WithValue(ctx, retryAttemptKey{}, attempt+1), true
 }
 
-// retryTransient answers the sites that retry only because the server asked them to.
+// retryTransient 对应仅因服务端要求重试而进行重试的调用点。
 func retryTransient(ctx context.Context, err error) (context.Context, bool) {
 	if !isRetryError(err) {
 		return ctx, false
@@ -656,12 +641,10 @@ func retryTransient(ctx context.Context, err error) (context.Context, bool) {
 	return nextAttempt(ctx, err)
 }
 
-// retryToConverge answers the sites that also retry a lost write: the next pass reads the actual
-// resource again and aligns on top of it, so a writer that lost a concurrent update converges
-// instead of failing.
+// retryToConverge 对应在写入竞争失败时也会重试的调用点：下一轮会重新读取实际
+// 资源并在其上对齐状态，从而使在并发更新中失败的写入方最终收敛而非直接失败。
 //
-// Any one of these reasons is enough, hence the disjunction: they are mutually exclusive, so
-// requiring them together could never hold.
+// 这些条件满足其一即可，因此使用逻辑或：它们彼此互斥，不可能同时成立。
 func retryToConverge(ctx context.Context, err error) (context.Context, bool) {
 	if !isRetryError(err) && !kerrors.IsConflict(err) && !kerrors.IsNotAcceptable(err) {
 		return ctx, false
@@ -670,10 +653,9 @@ func retryToConverge(ctx context.Context, err error) (context.Context, bool) {
 	return nextAttempt(ctx, err)
 }
 
-// readOptions are the options for the read an operation does before it writes. The first read may
-// be served from the API server's watch cache, which is only an optimization; a re-entry may not,
-// because aligning onto the same stale object that just lost a conflict would lose again, and the
-// cache is exactly what would serve it.
+// readOptions 是操作在写入前执行读取时使用的选项。首次读取可由 API Server 的
+// watch 缓存提供（这仅是一种优化）；但重入时不可使用缓存，因为在刚刚遭遇冲突的
+// 同一份陈旧对象上继续对齐状态只会导致再次冲突，而缓存恰恰会返回这份陈旧对象。
 func readOptions(ctx context.Context) meta.GetOptions {
 	if attempt, _ := ctx.Value(retryAttemptKey{}).(int); attempt > 0 {
 		return meta.GetOptions{}

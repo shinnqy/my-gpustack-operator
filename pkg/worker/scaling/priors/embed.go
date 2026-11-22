@@ -7,26 +7,19 @@ import (
 	_ "embed"
 )
 
-// DefaultCatalogConfigMapKey is the ConfigMap data key a catalog reference
-// reads when the key is omitted.
+// DefaultCatalogConfigMapKey 是省略 key 时 catalog 引用读取的 ConfigMap data key。
 //
-// IT IS THE YAML FILE, because the catalog is written in YAML and a reader that
-// names one format reads one file.
+// 它对应 YAML 文件，因为 catalog 采用 YAML 编写，且指定单一格式的读取器只读取对应的单一文件。
 const DefaultCatalogConfigMapKey = "priors.yaml"
 
-// LegacyCatalogConfigMapKey is the ConfigMap data key a catalog was read from
-// before the catalog changed its file name.
+// LegacyCatalogConfigMapKey 是 catalog 更改文件名之前所使用的 ConfigMap data key。
 //
-// IT IS READ AS A FALLBACK, because a ConfigMap written before the change still
-// holds the catalog the operator shipped.
+// 它作为回退键读取，因为在变更前写入的 ConfigMap 中仍保存着 operator 随附的 catalog。
 const LegacyCatalogConfigMapKey = "priors.json"
 
-// embeddedCatalog is the catalog shipped with the operator.
+// embeddedCatalog 是随 operator 一同发布的 catalog。
 //
-// IT MAY HOLD NO PROFILES, because a profile only enters the catalog when a
-// source measured the evidence the resolver needs. An empty catalog refuses
-// every resolution, which is the correct behavior until a measured profile
-// is available.
+// 它可能不包含任何 profile，因为只有当数据源实测出解析器所需的依据时，profile 才会进入 catalog。空 catalog 会拒绝所有解析请求，在获得实测 profile 之前这是预期行为。
 //
 //go:embed priors.yaml
 var embeddedCatalog []byte
@@ -39,10 +32,9 @@ var loadEmbeddedOnce = sync.OnceValues(func() (*Catalog, error) {
 	return catalog, nil
 })
 
-// LoadEmbedded returns the catalog shipped with the operator.
+// LoadEmbedded 返回随 operator 一同发布的 catalog。
 //
-// IT IS PARSED AND CHECKED ONCE, so a catalog that was generated wrong fails
-// here instead of at the first resolution without re-parsing on every call.
+// 它仅在首次调用时解析和校验一次，从而使生成有误的 catalog 在此处即报错（而非延迟到首次解析时），同时避免每次调用都重复解析。
 func LoadEmbedded() (*Catalog, error) {
 	return loadEmbeddedOnce()
 }

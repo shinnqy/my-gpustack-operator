@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// FS converts fsys to a http.FileSystem implementation,
-// for use with http.FileServer and http.NewFileTransport.
-// The files provided by fsys must implement io.Seeker.
+// FS 将 fsys 转换为 http.FileSystem 实现，
+// 用于 http.FileServer 和 http.NewFileTransport。
+// fsys 提供的文件必须实现 io.Seeker。
 func FS(fsys fs.FS, opts ...*FSOption) http.FileSystem {
 	var o *FSOption
 	if len(opts) > 0 && opts[0] != nil {

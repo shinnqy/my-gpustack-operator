@@ -7,7 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// Instance is the schema for worker.gpustack.ai.
+// Instance 是 worker.gpustack.ai 的结构定义。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -22,82 +22,82 @@ type Instance struct {
 
 var _ runtime.Object = (*Instance)(nil)
 
-// InstanceSpec defines the desired state of Instance.
+// InstanceSpec 定义 Instance 的期望状态。
 type InstanceSpec struct {
-	// DisplayName is the display name of the Instance.
+	// DisplayName 是 Instance 的显示名称。
 	//
 	// +k8s:validation:maxLength=64
 	DisplayName string `json:"displayName,omitempty" protobuf:"bytes,1,opt,name=displayName"`
 
-	// Description is the description of the Instance.
+	// Description 是 Instance 的描述信息。
 	//
 	// +k8s:validation:maxLength=1024
 	Description string `json:"description,omitempty" protobuf:"bytes,2,opt,name=description"`
 
-	// Type is the name of InstanceType that provisions corresponding resources.
+	// Type 是用于供给对应资源的 InstanceType 名称。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +required
 	Type string `json:"type" protobuf:"bytes,3,name=type"`
 
-	// InstanceTemplate is the template for the Instance to run.
+	// InstanceTemplate 是用于运行 Instance 的模板。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	InstanceTemplate `json:",inline" protobuf:"bytes,4,name=instanceTemplate"`
 
-	// Volume is the volume to mount in the Instance.
+	// Volume 是要挂载到 Instance 中的卷。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	//
 	// +required
 	Volume InstanceVolume `json:"volume,omitempty" protobuf:"bytes,5,opt,name=volume"`
 
-	// SSHPublicKey is the reference to the InstanceSSHPublicKey that contains the SSH public key to access the Instance.
+	// SSHPublicKey 是对 InstanceSSHPublicKey 的引用，其中包含用于访问 Instance 的 SSH 公钥。
 	//
-	// Immutable after creation.
+	// 创建后不可变。
 	SSHPublicKey *core.LocalObjectReference `json:"sshPublicKey,omitempty" protobuf:"bytes,6,opt,name=sshPublicKey"`
 
-	// Stop indicates whether to stop the Instance after it is created.
+	// Stop 指示创建 Instance 后是否将其停止。
 	Stop bool `json:"stop,omitempty" protobuf:"varint,7,opt,name=stop"`
 
-	// NodeName pins the Instance to one Kubernetes Node, which must exist when the Instance is
-	// created. It is rendered as the backing Pod's nodeSelector on kubernetes.io/hostname, never
-	// as the Pod's own nodeName, so the scheduler and Kueue admission still mediate placement.
-	// Nothing beyond the node's existence is validated, so a node that cannot serve the referenced
-	// InstanceType leaves the Pod Pending rather than being refused. Empty means no pinning.
+	// NodeName 将 Instance 固定到指定的 Kubernetes Node，该 Node 在创建 Instance 时必须已存在。
+	// 它会被渲染为底层 Pod 在 kubernetes.io/hostname 上的 nodeSelector，而非直接设置为 Pod
+	// 自身的 nodeName，因此调度器和 Kueue 准入仍会介入放置决策。除 Node 是否存在外不做
+	// 其他校验，因此若该 Node 无法满足所引用的 InstanceType，Pod 会处于 Pending 状态而非被
+	// 拒绝。为空表示不固定节点。
 	//
-	// Immutable unless the Instance is stopped.
+	// 除非 Instance 处于停止状态，否则不可变。
 	//
 	// +k8s:validation:maxLength=253
 	NodeName string `json:"nodeName,omitempty" protobuf:"bytes,8,opt,name=nodeName"`
 }
 
-// InstanceTemplate defines the template for the Instance to run.
+// InstanceTemplate 定义用于运行 Instance 的模板。
 type InstanceTemplate struct {
-	// Image is the container image to run.
+	// Image 是要运行的容器镜像。
 	//
 	// +required
 	Image string `json:"image" protobuf:"bytes,1,name=image"`
 
-	// ImagePullPolicy is the image pull policy to use.
+	// ImagePullPolicy 是要使用的镜像拉取策略。
 	//
 	// +default="IfNotPresent"
 	// +k8s:validation:enum=["Always","IfNotPresent","Never"]
 	ImagePullPolicy core.PullPolicy `json:"imagePullPolicy,omitempty" protobuf:"bytes,2,name=imagePullPolicy"`
 
-	// Command is the command to run in the Instance,
-	// which should overwrite the default command in the container image CMD.
+	// Command 是在 Instance 中运行的命令，
+	// 将覆盖容器镜像默认的 CMD 命令。
 	//
 	// +listType=atomic
 	Command []string `json:"command,omitempty" protobuf:"bytes,3,rep,name=command"`
 
-	// Privileged indicates whether the container should run in privileged mode.
+	// Privileged 指示容器是否应以特权模式运行。
 	//
 	// +k8s:validation:default=false
 	Privileged bool `json:"privileged,omitempty" protobuf:"bytes,4,opt,name=privileged"`
 
-	// Ports is the list of ports to expose from the Instance.
+	// Ports 是从 Instance 暴露的端口列表。
 	//
 	// +patchMergeKey=port
 	// +patchStrategy=merge
@@ -106,7 +106,7 @@ type InstanceTemplate struct {
 	// +listMapKey=protocol
 	Ports []InstancePort `json:"ports,omitempty" patchStrategy:"merge" patchMergeKey:"port" protobuf:"bytes,5,rep,name=ports"`
 
-	// Env is the list of environment variables to set in the Instance.
+	// Env 是要在 Instance 中设置的环境变量列表。
 	//
 	// +patchMergeKey=name
 	// +patchStrategy=merge
@@ -114,206 +114,204 @@ type InstanceTemplate struct {
 	// +listMapKey=name
 	Env []InstanceEnvVar `json:"env,omitempty" patchStrategy:"merge" patchMergeKey:"name" protobuf:"bytes,6,rep,name=env"`
 
-	// Resources is the resource requirements for the Instance.
+	// Resources 是 Instance 的资源需求。
 	Resources *InstanceResources `json:"resources,omitempty" protobuf:"bytes,7,opt,name=resources"`
 
-	// VolumeMount is a path to mount the volume in the Instance.
+	// VolumeMount 是在 Instance 中挂载卷的路径。
 	//
 	// +default="/workspace"
 	// +k8s:validation:pattern="^(/[^/]+)+$"
 	// +k8s:validation:maxLength=1024
 	VolumeMount string `json:"volumeMount,omitempty" protobuf:"bytes,8,opt,name=volumeMount"`
 
-	// ImagePullSecret is the reference to the InstanceImagePullSecret that contains the credentials to pull the container image.
+	// ImagePullSecret 是对 InstanceImagePullSecret 的引用，其中包含拉取容器镜像所需的凭据。
 	ImagePullSecret *core.LocalObjectReference `json:"imagePullSecret,omitempty" protobuf:"bytes,9,opt,name=imagePullSecret"`
 
-	// AdditionalVolumes is the list of volumes to mount in the Instance besides its workspace,
-	// each at a path of its own. They are mounted into the Instance's main container only, which
-	// the SSH server also observes.
+	// AdditionalVolumes 是除工作区外要在 Instance 中挂载的卷列表，每个卷挂载在各自独立
+	// 的路径下。它们仅挂载到 Instance 的主容器中，SSH 服务端也会看到这些挂载。
 	//
-	// Immutable unless the Instance is stopped.
+	// 除非 Instance 处于停止状态，否则不可变。
 	//
 	// +listType=atomic
 	AdditionalVolumes []InstanceAdditionalVolume `json:"additionalVolumes,omitempty" protobuf:"bytes,10,rep,name=additionalVolumes"` // nolint: lll
 }
 
-// InstanceAdditionalVolume defines one volume to mount in the Instance besides its workspace.
-// Exactly one source must be specified.
+// InstanceAdditionalVolume 定义除工作区外要在 Instance 中挂载的单个卷。
+// 必须且只能指定一个卷源。
 type InstanceAdditionalVolume struct {
-	// MountPath is the absolute in-container path to mount the volume at. It must not duplicate
-	// another entry's path, nor the workspace's VolumeMount.
+	// MountPath 是容器内用于挂载卷的绝对路径。它不能与其他条目的路径重复，也不能与
+	// 工作区的 VolumeMount 重复。
 	//
 	// +required
 	// +k8s:validation:pattern="^(/[^/]+)+$"
 	// +k8s:validation:maxLength=1024
 	MountPath string `json:"mountPath" protobuf:"bytes,1,name=mountPath"`
 
-	// ReadOnly mounts the volume read-only.
+	// ReadOnly 以只读方式挂载卷。
 	ReadOnly bool `json:"readOnly,omitempty" protobuf:"varint,2,opt,name=readOnly"`
 
-	// SubPath mounts a relative path inside the volume rather than its root.
-	// It must not be absolute nor contain a ".." element.
+	// SubPath 挂载卷内的相对路径而非其根目录。
+	// 它不能是绝对路径，也不能包含 ".." 路径段。
 	//
 	// +k8s:validation:maxLength=1024
 	SubPath string `json:"subPath,omitempty" protobuf:"bytes,3,opt,name=subPath"`
 
-	// Persistent is the reference to the InstancePersistentVolume to mount, in the same namespace.
+	// Persistent 是同一 Namespace 下要挂载的 InstancePersistentVolume 引用。
 	Persistent *core.LocalObjectReference `json:"persistent,omitempty" protobuf:"bytes,4,opt,name=persistent"`
 
-	// ConfigMap is the reference to the ConfigMap to mount, in the same namespace.
+	// ConfigMap 是同一 Namespace 下要挂载的 ConfigMap 引用。
 	ConfigMap *core.LocalObjectReference `json:"configMap,omitempty" protobuf:"bytes,5,opt,name=configMap"`
 
-	// Secret is the reference to the Secret to mount, in the same namespace.
+	// Secret 是同一 Namespace 下要挂载的 Secret 引用。
 	Secret *core.LocalObjectReference `json:"secret,omitempty" protobuf:"bytes,6,opt,name=secret"`
 
-	// HostPath is the path on the Kubernetes Node to mount. It crosses the node boundary, so
-	// taking it requires the instance-host-path-volume-allowed Setting — at creation, and on any
-	// later change that adds or widens such a mount. One the Instance already holds is never
-	// re-judged, so the Setting going off does not strand it.
+	// HostPath 是 Kubernetes Node 上要挂载的路径。由于跨越了节点边界，使用该路径需要
+	// 开启 instance-host-path-volume-allowed Setting —— 无论是在创建时，还是在后续
+	// 新增或扩大此类挂载的变更中。Instance 已持有的挂载不会被重新校验，因此关闭该
+	// Setting 不会使其受阻。
 	HostPath *core.HostPathVolumeSource `json:"hostPath,omitempty" protobuf:"bytes,7,opt,name=hostPath"`
 
-	// Model mounts the weights of a ModelArtifact in the same namespace. It is always mounted
-	// read-only, whatever ReadOnly says, and takes no SubPath: the artifact's own path is the
-	// sub-path. Only an artifact on a PersistentVolumeClaim is accepted in this version; one on a
-	// model hub needs node delivery, which does not exist yet.
+	// Model 挂载同一 Namespace 下某个 ModelArtifact 的权重。无论 ReadOnly 如何设置，
+	// 该卷始终以只读方式挂载，且不接受 SubPath：ModelArtifact 自身的路径即为子路径。
+	// 当前版本仅支持位于 PersistentVolumeClaim 上的制品；位于模型仓库（model hub）上的
+	// 制品需要节点分发能力，目前尚未实现。
 	Model *InstanceModelVolumeSource `json:"model,omitempty" protobuf:"bytes,8,opt,name=model"`
 }
 
-// InstanceModelVolumeSource references the ModelArtifact an Instance volume mounts.
+// InstanceModelVolumeSource 引用 Instance 卷所挂载的 ModelArtifact。
 type InstanceModelVolumeSource struct {
-	// ArtifactRef names a ModelArtifact in the Instance's namespace.
+	// ArtifactRef 指定 Instance 所在 Namespace 中的 ModelArtifact 名称。
 	//
 	// +required
 	ArtifactRef core.LocalObjectReference `json:"artifactRef" protobuf:"bytes,1,name=artifactRef"`
 }
 
-// InstancePort defines the port to expose from the Instance.
+// InstancePort 定义 Instance 对外暴露的端口。
 type InstancePort struct {
-	// Port is the port number to expose on the Instance.
+	// Port 是 Instance 对外暴露的端口号。
 	Port int32 `json:"port" protobuf:"varint,1,name=port"`
 
-	// Protocol is the protocol to use for the port.
+	// Protocol 是该端口使用的协议。
 	//
 	// +k8s:validation:enum=["TCP","UDP","SCTP"]
 	// +k8s:validation:default="TCP"
 	Protocol core.Protocol `json:"protocol,omitempty" protobuf:"bytes,2,opt,name=protocol"`
 
-	// Name is the name of the port.
+	// Name 是端口的名称。
 	//
 	// +k8s:validation:maxLength=16
 	Name string `json:"name,omitempty" protobuf:"bytes,3,opt,name=name"`
 }
 
-// InstanceEnvVar defines the environment variable to set in the Instance.
+// InstanceEnvVar 定义在 Instance 中设置的环境变量。
 type InstanceEnvVar struct {
-	// Name is the name of the environment variable,
-	// each name in one Instance must be unique.
+	// Name 是环境变量的名称，
+	// 同一个 Instance 中的每个名称必须唯一。
 	Name string `json:"name" protobuf:"bytes,1,name=name"`
 
-	// Value is the value of the environment variable.
+	// Value 是环境变量的值。
 	Value string `json:"value" protobuf:"bytes,2,name=value"`
 }
 
-// InstanceResources defines the resource requirements for the Instance.
+// InstanceResources 定义 Instance 的资源需求。
 type InstanceResources struct {
-	// CPU is the CPU resource requirement for the Instance, e.g. "4", "8".
+	// CPU 是 Instance 的 CPU 资源需求，例如 "4"、"8"。
 	//
 	// +required
 	CPU resource.Quantity `json:"cpu" protobuf:"bytes,1,name=cpu"`
 
-	// RAM is the RAM resource requirement for the Instance, e.g. "40G", "16G".
+	// RAM 是 Instance 的内存资源需求，例如 "40G"、"16G"。
 	//
 	// +required
 	RAM resource.Quantity `json:"ram" protobuf:"bytes,2,name=ram"`
 
-	// LocalStorage is the local storage resource requirement for the Instance, e.g. "100G", "500G".
+	// LocalStorage 是 Instance 的本地存储资源需求，例如 "100G"、"500G"。
 	//
 	// +required
 	LocalStorage resource.Quantity `json:"localStorage" protobuf:"bytes,3,name=localStorage"`
 
-	// Accelerator is the accelerator resource requirement for the Instance, e.g. "1", "2".
+	// Accelerator 是 Instance 的加速器资源需求，例如 "1"、"2"。
 	Accelerator *resource.Quantity `json:"accelerator,omitempty" protobuf:"bytes,4,opt,name=accelerator"`
 
-	// AcceleratorSlicedMemoryPercentage is the per-accelerator VRAM budget requested on a
-	// sliced InstanceType, as a percentage in [0,100]. 0 disables slicing (the request
-	// becomes an exclusive whole-accelerator request). The Pod webhook folds it into the
-	// normalized .sliced.units; it is ignored by non-sliced requests.
+	// AcceleratorSlicedMemoryPercentage 是在切分型（sliced）InstanceType 上为每个
+	// 加速器请求的显存预算，取值范围为 [0,100] 的百分比。0 表示禁用切分（该请求
+	// 将成为独占整张加速器的请求）。Pod Webhook 会将其折算为标准化的 .sliced.units；
+	// 非切分请求会忽略该字段。
 	//
 	// +optional
 	AcceleratorSlicedMemoryPercentage int32 `json:"acceleratorSlicedMemoryPercentage,omitempty" protobuf:"varint,5,opt,name=acceleratorSlicedMemoryPercentage"` // nolint: lll
 
-	// AcceleratorSlicedCoresPercentage is the per-accelerator compute (SM) budget requested on
-	// a sliced InstanceType, as a percentage in [0,100]. It is independent of
-	// AcceleratorSlicedMemoryPercentage; when only one of the two is set the webhook
-	// copies it to the other. It is ignored by non-sliced requests.
+	// AcceleratorSlicedCoresPercentage 是在切分型（sliced）InstanceType 上为每个
+	// 加速器请求的计算单元（SM）预算，取值范围为 [0,100] 的百分比。它与
+	// AcceleratorSlicedMemoryPercentage 相互独立；当仅设置其中之一时，Webhook 会
+	// 将其值复制到另一个字段。非切分请求会忽略该字段。
 	//
 	// +optional
 	AcceleratorSlicedCoresPercentage int32 `json:"acceleratorSlicedCoresPercentage,omitempty" protobuf:"varint,6,opt,name=acceleratorSlicedCoresPercentage"` // nolint: lll
 
-	// AcceleratorPartitionedProfile is the hardware partition profile requested on a
-	// partition-offering InstanceType, e.g. "3g.40gb". A non-empty value makes this a
-	// request for one hardware partition of that shape, which is mutually exclusive with
-	// the two slice percentages above: hardware partitioning and software slicing cannot
-	// both apply to one accelerator. It is ignored by InstanceTypes offering no partition.
+	// AcceleratorPartitionedProfile 是在提供硬件分区的 InstanceType 上请求的硬件分区
+	// 规格（profile），例如 "3g.40gb"。非空值表示请求一个该规格的硬件分区，它与上述
+	// 两个切分百分比字段互斥：硬件分区与软件切分不能同时应用于同一个加速器。
+	// 不提供分区的 InstanceType 会忽略该字段。
 	//
 	// +optional
 	AcceleratorPartitionedProfile string `json:"acceleratorPartitionedProfile,omitempty" protobuf:"bytes,7,opt,name=acceleratorPartitionedProfile"` // nolint: lll
 }
 
-// InstanceVolume defines the volume to mount in the Instance,
-// which can be either ephemeral or persistent.
+// InstanceVolume 定义在 Instance 中挂载的卷，
+// 可以是临时卷（ephemeral）或持久卷（persistent）。
 type InstanceVolume struct {
-	// Ephemeral is the ephemeral volume to mount in the Instance.
+	// Ephemeral 是要在 Instance 中挂载的临时卷。
 	Ephemeral *InstanceEphemeralVolume `json:"ephemeral,omitempty" protobuf:"bytes,1,opt,name=ephemeral"`
 
-	// Persistent is the reference to the InstancePersistentVolume to mount in the Instance.
+	// Persistent 是要在 Instance 中挂载的 InstancePersistentVolume 引用。
 	Persistent *core.LocalObjectReference `json:"persistent,omitempty" protobuf:"bytes,2,opt,name=persistent"`
 }
 
-// InstanceEphemeralVolume defines the ephemeral volume to mount in the Instance.
+// InstanceEphemeralVolume 定义在 Instance 中挂载的临时卷。
 type InstanceEphemeralVolume struct {
-	// Capacity is the size limit of the volume.
+	// Capacity 是该卷的大小上限。
 	//
 	// +required
 	Capacity resource.Quantity `json:"capacity" protobuf:"bytes,1,name=capacity"`
 }
 
-// InstanceStatus defines the observed state of Instance.
+// InstanceStatus 定义 Instance 的观测状态。
 type InstanceStatus struct {
-	// Phase is the current phase of the Instance.
+	// Phase 是 Instance 当前所处的阶段。
 	Phase string `json:"phase,omitempty" protobuf:"bytes,1,name=phase"`
 
-	// PhaseMessage is the message to describe the current phase of the Instance.
+	// PhaseMessage 是描述 Instance 当前阶段的消息。
 	PhaseMessage string `json:"phaseMessage,omitempty" protobuf:"bytes,2,opt,name=phaseMessage"`
 
-	// NodeName is the name of the Kubernetes Node that the Instance is running on.
+	// NodeName 是运行该 Instance 的 Kubernetes Node 名称。
 	NodeName string `json:"nodeName,omitempty" protobuf:"bytes,3,opt,name=nodeName"`
 
-	// AccessAddresses holds the accessible addresses allocated to the Instance.
+	// AccessAddresses 保存分配给该 Instance 的可访问地址。
 	AccessAddresses []string `json:"accessAddresses,omitempty" protobuf:"bytes,4,rep,name=accessAddresses"`
 
-	// HostIPs holds the IP addresses allocated to the host.
+	// HostIPs 保存分配给宿主机的 IP 地址。
 	HostIPs []core.HostIP `json:"hostIPs,omitempty" protobuf:"bytes,5,rep,name=hostIPs"`
 
-	// PodIPs holds the IP addresses allocated to the Kubernetes Pod that related to the Instance.
+	// PodIPs 保存分配给该 Instance 关联的 Kubernetes Pod 的 IP 地址。
 	PodIPs []core.PodIP `json:"podIPs,omitempty" protobuf:"bytes,6,rep,name=podIPs"`
 
-	// Ports is the list of ports to expose from the Instance.
+	// Ports 是从该 Instance 暴露的端口列表。
 	Ports []InstanceServicePort `json:"ports,omitempty" protobuf:"bytes,7,rep,name=ports"`
 
-	// Allocations is the list of devices allocated to the Instance.
+	// Allocations 是分配给该 Instance 的设备列表。
 	Allocations []DevicesAllocationGroup `json:"allocations,omitempty" protobuf:"bytes,8,rep,name=allocations"`
 }
 
-// InstanceServicePort defines the port to expose from the container and the port to expose on the node.
+// InstanceServicePort 定义从容器暴露的端口以及在节点上暴露的端口。
 type InstanceServicePort struct {
 	InstancePort `json:",inline" protobuf:"bytes,1,name=instancePort"`
 
-	// NodePort is the port number to expose on the Kubernetes Node.
+	// NodePort 是在 Kubernetes Node 上暴露的端口号。
 	NodePort int32 `json:"nodePort,omitempty" protobuf:"varint,2,opt,name=nodePort"`
 }
 
-// InstanceList holds the list of Instance.
+// InstanceList 保存 Instance 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceList struct {

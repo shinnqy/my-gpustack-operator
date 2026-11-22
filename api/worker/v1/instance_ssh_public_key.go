@@ -5,10 +5,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InstanceSSHPublicKey is the schema for worker.gpustack.ai.
+// InstanceSSHPublicKey 是 worker.gpustack.ai 的资源 schema。
 //
-// Underhood, an InstanceSSHPublicKey is mapping to a Kubernetes Secret,
-// and the InstanceSSHPublicKey's name is the same as the Kubernetes Secret's name.
+// 在底层，InstanceSSHPublicKey 对应一个 Kubernetes Secret，
+// 且 InstanceSSHPublicKey 的名称与该 Kubernetes Secret 的名称相同。
 //
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -21,23 +21,23 @@ type InstanceSSHPublicKey struct {
 }
 
 type InstanceSSHPublicKeySpec struct {
-	// DisplayName is the display name of the InstanceSSHPublicKey.
+	// DisplayName 是 InstanceSSHPublicKey 的显示名称。
 	//
 	// +k8s:validation:maxLength=64
 	DisplayName string `json:"displayName,omitempty" protobuf:"bytes,1,opt,name=displayName"`
 
-	// Description is the description of the InstanceSSHPublicKey.
+	// Description 是 InstanceSSHPublicKey 的描述信息。
 	//
 	// +k8s:validation:maxLength=1024
 	Description string `json:"description,omitempty" protobuf:"bytes,2,opt,name=description"`
 
-	// Data is the SSH public key data.
+	// Data 是 SSH 公钥数据。
 	Data string `json:"data,omitempty" protobuf:"bytes,3,opt,name=data"`
 }
 
 var _ runtime.Object = (*InstanceSSHPublicKey)(nil)
 
-// InstanceSSHPublicKeyList holds the list of InstanceSSHPublicKey.
+// InstanceSSHPublicKeyList 保存 InstanceSSHPublicKey 的列表。
 //
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type InstanceSSHPublicKeyList struct {

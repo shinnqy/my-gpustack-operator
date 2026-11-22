@@ -19,27 +19,25 @@ const (
 	modelDeploymentElasticWithdrawnAnnotation = "modeldeployment.gpustack.ai/elastic-withdrawn"
 	elasticObservationLabel                   = "gpustack.ai/elastic-observation"
 
-	// ModelDeploymentConditionElasticResize reports whether an elastic scale stands blocked or
-	// terminally refused. It is declared beside the convergence that decides it, like every other
-	// condition whose vocabulary sits with the code that can observe it. It is False with
-	// ScaleRefused only while the durable record says the retry bound is spent, Unknown with
-	// WorldUnprovable while no record exists and the live width disagrees with the spec without
-	// proving itself, and True with NoRefusal the rest of the time: a refusal still inside its
-	// bound is not terminal and must not read as one, and an unprovable world is not a refusal.
+	// ModelDeploymentConditionElasticResize 报告弹性扩缩容是否处于阻塞或最终被拒状态。
+	// 它声明在决定该状态的收敛逻辑旁，与其他状态条件一样，其语义词表与可观测该状态的代码放在一起。
+	// 仅当持久化记录表明重试上限已耗尽时，其状态为 False 且原因为 ScaleRefused；
+	// 当无记录存在且实时宽度与 spec 不一致又无法自证时，其状态为 Unknown 且原因为 WorldUnprovable；
+	// 其余时间均为 True 且原因为 NoRefusal：仍在重试上限内的拒绝并非终态，不应被解读为终态拒绝，
+	// 而无法证明的外部世界状态也不属于拒绝。
 	ModelDeploymentConditionElasticResize kubeapistatus.ConditionType = "ElasticResize"
 
-	// modelDeploymentReasonScaleRefused is ElasticResize's False reason: the record is abandoned
-	// and its message carries the engine's own last refusal.
+	// modelDeploymentReasonScaleRefused 是 ElasticResize 为 False 时的原因：操作记录已放弃，
+	// 其消息携带引擎自身最后一次拒绝的详情。
 	modelDeploymentReasonScaleRefused = "ScaleRefused"
 
-	// modelDeploymentReasonWorldUnprovable is ElasticResize's Unknown reason: no record exists,
-	// the live width disagrees with the spec or cannot be named, and the corrective scale is
-	// blocked until a pass proves the world it would have to act on. Its message carries the
-	// desired width, the observed width and the proof that failed.
+	// modelDeploymentReasonWorldUnprovable 是 ElasticResize 为 Unknown 时的原因：无操作记录存在，
+	// 实时宽度与 spec 不一致或无法确定，纠正性扩缩容被阻塞，直到某一轮调谐能证明其将要作用的实际状态。
+	// 其消息包含期望宽度、观测宽度以及失败的证明项。
 	modelDeploymentReasonWorldUnprovable = "WorldUnprovable"
 
-	// modelDeploymentReasonNoScaleRefusal is ElasticResize's True reason: no record stands
-	// refused, whether none exists, one is in flight, or one has just completed.
+	// modelDeploymentReasonNoScaleRefusal 是 ElasticResize 为 True 时的原因：当前没有处于拒绝状态的记录，
+	// 无论是不存在记录、有操作正在进行中，还是操作刚刚完成。
 	modelDeploymentReasonNoScaleRefusal = "NoRefusal"
 )
 
@@ -54,9 +52,9 @@ func elasticOwnedBy(md *workercore.ModelDeployment, obj ctrlcli.Object) bool {
 		owner.APIVersion == workercore.GroupVersion.String() && owner.Name == md.Name && owner.UID == md.UID && obj.GetUID() != ""
 }
 
-// errElasticDeploymentChanged reports that the live deployment no longer matches the identity or
-// generation this pass captured. It is not a read failure: the spec watch requeues the deployment and
-// the next pass re-reads it, so callers that would otherwise persist a reason skip it.
+// errElasticDeploymentChanged 表示实时部署已不再匹配本轮调谐捕获的身份或 generation。
+// 它并非读取失败：spec watch 会将部署重新入队并在下一轮重新读取，
+// 因此原本会持久化错误原因的调用方应跳过持久化。
 var errElasticDeploymentChanged = errors.New("deployment identity or generation changed")
 
 func (r *ModelDeploymentReconciler) elasticLiveMembers(ctx context.Context, md *workercore.ModelDeployment) ([]core.Pod, error) {
@@ -70,10 +68,9 @@ func (r *ModelDeploymentReconciler) elasticLiveMembers(ctx context.Context, md *
 	if live.UID != md.UID || live.Generation != md.Generation || live.DeletionTimestamp != nil {
 		return nil, errElasticDeploymentChanged
 	}
-	// The list is narrowed to this deployment's identity labels so the pass does not walk the whole
-	// namespace. The labels are only a server-side prefilter: elasticOwnedBy still carries the owner
-	// UID, kind, API version and name, so a Pod a same-name recreated deployment left behind is
-	// still excluded.
+	// 列表查询通过当前部署的身份标签进行缩窄，避免遍历整个 Namespace。
+	// 这些标签仅作服务端预过滤：elasticOwnedBy 仍会校验属主的 UID、kind、API 版本和名称，
+	// 因此同名重建的部署所遗留的 Pod 依然会被排除。
 	list := new(core.PodList)
 	if err := r.APIReader.List(ctx, list,
 		ctrlcli.InNamespace(md.Namespace),
@@ -99,10 +96,10 @@ func (r *ModelDeploymentReconciler) elasticLiveMembers(ctx context.Context, md *
 	return pods, nil
 }
 
-// reconcileModelDeploymentElasticResize is the only native mutation caller.
-// The durable record precedes the request. A resumed sent record only observes.
+// reconcileModelDeploymentElasticResize 是唯一的原生变更调用方。
+// 持久化记录先于请求写入；恢复的已发送记录仅执行观测。
 func (r *ModelDeploymentReconciler) reconcileModelDeploymentElasticResize(ctx context.Context, md *workercore.ModelDeployment) error {
-	// Implement this function in chapter 25.
+	// 在第 25 章中实现此函数。
 	var result0 error
 	return result0
 }
