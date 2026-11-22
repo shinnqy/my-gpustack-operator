@@ -1,6 +1,7 @@
 package nodefeature
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -351,4 +352,178 @@ func TestConstructNodeCapacityLabels_ManualNodeManagement(t *testing.T) {
 	v, ok = managed(base(map[string]string{systemname.ManagedLabelKey: "false"}), WithManualNodeManagement(true))
 	assert.True(t, ok)
 	assert.Equal(t, "false", v, "explicit opt-out preserved under manual mode")
+}
+
+func TestFormatLocalQueueName(t *testing.T) {
+	// 即使 ClusterQueue 名很长，生成的 LocalQueue 名也固定为 31 个字符，
+	// 满足 kueue.x-k8s.io/queue-name 标签值最多 63 个字符的限制。
+	long := FormatLocalQueueName("gpustack--intel-6-143-12c-48g--nvidia-rtx-6000-ada-generation-1d-8s")
+	assert.Len(t, long, 31, "unexpected local queue name length")
+	assert.Regexp(t, "^gpustack-fnv64-[0-9a-f]{16}$", long, "unexpected local queue name shape")
+
+	// 相同的全局队列名应始终得到相同的入口名。
+	assert.Equal(t, long, FormatLocalQueueName("gpustack--intel-6-143-12c-48g--nvidia-rtx-6000-ada-generation-1d-8s"))
+
+	// 两个不同的测试队列应得到不同的入口名。
+	other := FormatLocalQueueName("gpustack--amd-25-1-1c-2g")
+	assert.NotEqual(t, long, other, "different cluster queues must not collide")
+}
+
+func TestExtractNodeFlavors(t *testing.T) {
+	// newNode 按给定标签、注解和核数创建节点。核数为零表示未上报 CPU 容量。对于非 nil 的标签表，
+	// 补上 flavor 名称和选择器使用的系统与架构。保留 nil 标签以覆盖提前返回的分支。
+	newNode := func(labels, annotations map[string]string, cpuCores int64) *core.Node {
+		if labels != nil {
+			labels[core.LabelOSStable] = "linux"
+			labels[core.LabelArchStable] = "amd64"
+		}
+		capacity := core.ResourceList{}
+		if cpuCores > 0 {
+			capacity[core.ResourceCPU] = *resource.NewQuantity(cpuCores, resource.DecimalSI)
+		}
+		return &core.Node{
+			ObjectMeta: meta.ObjectMeta{
+				Name:        "node-1",
+				Labels:      labels,
+				Annotations: annotations,
+			},
+			Status: core.NodeStatus{Capacity: capacity},
+		}
+	}
+
+	// deviceLabels 生成单一加速器型号的标签，字段与 ConstructAcceleratableNodeLabels 的输出对应。
+	deviceLabels := func(id, product, family, memory, count string) map[string]string {
+		aKey := AcceleratableFeatureLabelPrefix + "nvidia-" + id
+		return map[string]string{
+			NodeAcceleratableLabelKey:                  "true",
+			AcceleratableFeatureLabelPrefix + "nvidia": "true",
+			aKey:              "true",
+			aKey + ".product": product,
+			aKey + ".family":  family,
+			aKey + ".memory":  memory,
+			aKey + ".cores":   "0",
+			aKey + ".count":   count,
+		}
+	}
+
+	cases := []struct {
+		name string
+		node *core.Node
+		// wantCPU 非 nil 时，期望第一项为该 CPU flavor；为 nil 时，期望没有 CPU flavor。
+		wantCPU     *NodeFlavor
+		wantDevices []NodeFlavor
+		wantEmpty   bool
+	}{
+		{
+			// 节点没有标签时无法派生 flavor。
+			name:      "nil labels return no flavors",
+			node:      newNode(nil, nil, 8),
+			wantEmpty: true,
+		},
+		{
+			// 纯 CPU 节点只派生一个 flavor，使用实际型号键 amd-25-1，Acceleratable 为 false。
+			// 此例没有 cpu-name 和 cpu-family 注解，所以 Product 和 Family 为空。
+			name: "cpu-only node yields a single CPU flavor keyed by its cpu-model",
+			node: newNode(cpuModelLabels(), nil, 8),
+			wantCPU: &NodeFlavor{
+				Name:         "gpustack--amd-25-1-linux-amd64-8c",
+				GeneralKey:   "amd-25-1",
+				OS:           "linux",
+				Arch:         "amd64",
+				Count:        8,
+				Manufacturer: "amd",
+				NodeLabels: map[string]string{
+					systemname.ManagedLabelKey:                        "true",
+					core.LabelOSStable:                                "linux",
+					core.LabelArchStable:                              "amd64",
+					GeneralFeatureLabelPrefix + "amd-25-1":            "true",
+					GeneralFeatureLabelPrefix + "amd-25-1" + ".count": "8",
+				},
+			},
+		},
+		{
+			// 有加速器时同时派生 CPU 和设备 flavor。CPU 的产品和系列取自注解，设备数取自 .count。
+			// 设备 flavor 的名称包含 CPU 键和加速器键，选择器也要求节点具备同一 CPU 键。
+			name: "accelerated node yields CPU plus device flavors",
+			node: newNode(
+				mergeLabels(cpuModelLabels(), deviceLabels("tesla-t4", "Tesla-T4", "Turing", "15Gi", "2")),
+				map[string]string{
+					FeatureLabelPrefix + "cpu-name":   "AMD EPYC 7763 64-Core Processor",
+					FeatureLabelPrefix + "cpu-family": "25",
+				},
+				8,
+			),
+			wantCPU: &NodeFlavor{
+				Name:         "gpustack--amd-epyc-7763-linux-amd64-8c",
+				GeneralKey:   "amd-epyc-7763",
+				OS:           "linux",
+				Arch:         "amd64",
+				Count:        8,
+				Manufacturer: "amd",
+				Product:      "AMD EPYC 7763 64-Core Processor",
+				Family:       "25",
+				NodeLabels: map[string]string{
+					systemname.ManagedLabelKey:                             "true",
+					core.LabelOSStable:                                     "linux",
+					core.LabelArchStable:                                   "amd64",
+					GeneralFeatureLabelPrefix + "amd-epyc-7763":            "true",
+					GeneralFeatureLabelPrefix + "amd-epyc-7763" + ".count": "8",
+				},
+			},
+			wantDevices: []NodeFlavor{
+				{
+					Name:           "gpustack--amd-epyc-7763--nvidia-tesla-t4-linux-amd64-2d",
+					AcceleratorKey: "nvidia-tesla-t4",
+					GeneralKey:     "amd-epyc-7763",
+					OS:             "linux",
+					Arch:           "amd64",
+					Count:          2,
+					Acceleratable:  true,
+					Manufacturer:   "nvidia",
+					Product:        "Tesla-T4",
+					Family:         "Turing",
+					Memory:         "15Gi",
+					Cores:          "0",
+					NodeLabels: map[string]string{
+						systemname.ManagedLabelKey:                                     "true",
+						core.LabelOSStable:                                             "linux",
+						core.LabelArchStable:                                           "amd64",
+						GeneralFeatureLabelPrefix + "amd-epyc-7763":                    "true",
+						AcceleratableFeatureLabelPrefix + "nvidia-tesla-t4":            "true",
+						AcceleratableFeatureLabelPrefix + "nvidia-tesla-t4" + ".count": "2",
+					},
+				},
+			},
+		},
+		{
+			// 未上报 CPU 容量时跳过 CPU flavor。节点也没有设备标签，因此结果为空。
+			name:      "node without cpu capacity yields no flavors",
+			node:      newNode(cpuModelLabels(), nil, 0),
+			wantEmpty: true,
+		},
+	}
+
+	for _, cs := range cases {
+		t.Run(cs.name, func(t *testing.T) {
+			// 补上生产流程中由 ConstructNodeCapacityLabels 写入的通用 .count 标签，
+			// 供 ExtractNodeFlavors 读取 CPU 核数。
+			if cs.wantCPU != nil {
+				cs.node.Labels[GeneralFeatureLabelPrefix+cs.wantCPU.GeneralKey+".count"] = strconv.FormatInt(cs.wantCPU.Count, 10)
+			}
+			got := ExtractNodeFlavors(cs.node)
+			if cs.wantEmpty {
+				assert.Empty(t, got, "expected no flavors")
+				return
+			}
+			if cs.wantCPU != nil {
+				if len(got) == 0 {
+					t.Fatalf("expected a CPU flavor but got none")
+				}
+				assert.Equal(t, *cs.wantCPU, got[0], "unexpected CPU flavor")
+				assert.ElementsMatch(t, cs.wantDevices, got[1:], "unexpected device flavors")
+				return
+			}
+			assert.ElementsMatch(t, cs.wantDevices, got, "unexpected device flavors")
+		})
+	}
 }

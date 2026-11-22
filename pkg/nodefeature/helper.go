@@ -1,6 +1,7 @@
 package nodefeature
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/mapx"
 	"gpustack.ai/gpustack/pkg/utils/quantityx"
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
+	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
 const (
@@ -91,6 +93,11 @@ func applyAcceleratorLabels(labels map[string]string, group device.DevicesGroup)
 	for k := range labels {
 		labels[k] = kubemeta.SanitizeLabelValue(labels[k])
 	}
+}
+
+// ExtractAcceleratableNodeKeys 返回节点上的加速器特征键，每项的格式为“厂商-设备标识”。
+func ExtractAcceleratableNodeKeys(node *core.Node) []string {
+	return ExtractAcceleratableKeys(node.Labels)
 }
 
 // ExtractAcceleratableKeys 从标签中提取形如 ${manufacturer}-${id} 的加速器组标识。输入既可以是 Node 的标
@@ -225,6 +232,47 @@ func extractGeneralNodeKeyManufacturer(node *core.Node) string {
 	return manu
 }
 
+// CPUDetail 保存 NFD NodeFeatureRule 写入节点 feature.gpustack.ai/cpu-* 注解的原始 CPU 信息。
+// ResourceFlavor 的 cpuDetail 记录保留这些值。启用 CPU 厂商感知后，
+// InstanceType webhook 据此填写规格。
+type CPUDetail struct {
+	Manufacturer           string
+	Product                string
+	Family                 string
+	PhysicalCores          string
+	ThreadsPerPhysicalCore string
+	LogicalCores           string
+	Stepping               string
+	ClockSpeed             string
+	MaxClockSpeed          string
+	CacheLine              string
+	CacheL1I               string
+	CacheL1D               string
+	CacheL2                string
+	CacheL3                string
+}
+
+// ExtractGeneralDetail 从节点的 feature.gpustack.ai/cpu-* 注解读取 CPU 信息。
+// generalFeatureAnnotation 将缺失项和未展开的 @cpu.model.* 模板都处理为空字符串。
+func ExtractGeneralDetail(node *core.Node) CPUDetail {
+	return CPUDetail{
+		Manufacturer:           extractGeneralNodeKeyManufacturer(node),
+		Product:                generalFeatureAnnotation(node, "name"),
+		Family:                 generalFeatureAnnotation(node, "family"),
+		PhysicalCores:          generalFeatureAnnotation(node, "physical-cores"),
+		ThreadsPerPhysicalCore: generalFeatureAnnotation(node, "threads-per-core"),
+		LogicalCores:           generalFeatureAnnotation(node, "logical-cores"),
+		Stepping:               generalFeatureAnnotation(node, "stepping"),
+		ClockSpeed:             generalFeatureAnnotation(node, "hz"),
+		MaxClockSpeed:          generalFeatureAnnotation(node, "boost-freq"),
+		CacheLine:              generalFeatureAnnotation(node, "cache-line"),
+		CacheL1I:               generalFeatureAnnotation(node, "cache-l1i"),
+		CacheL1D:               generalFeatureAnnotation(node, "cache-l1d"),
+		CacheL2:                generalFeatureAnnotation(node, "cache-l2"),
+		CacheL3:                generalFeatureAnnotation(node, "cache-l3"),
+	}
+}
+
 type (
 	ConstructNodeCapacityLabelsOptions struct {
 		// ManualNodeManagement 为 true 时，管理员通过节点标签决定是否纳管。
@@ -318,10 +366,128 @@ type NodeFlavor struct {
 	NodeLabels map[string]string
 }
 
+// OwnKey 返回规模计量所用的特征键。加速器 flavor 用加速器键，CPU flavor 用通用 CPU 键，
+// .count 和 .capacity 都挂在该键下。
+func (f NodeFlavor) OwnKey() string {
+	if f.Acceleratable {
+		return f.AcceleratorKey
+	}
+	return f.GeneralKey
+}
+
+// DerivedInstanceTypeIdentity 根据 CPU 厂商感知设置计算派生规格的名称和分组。关闭时，
+// CPU 池合并为 gpustack--generic-<os>-<arch>，
+// 加速器池按加速器键 aKey 合并为 gpustack--<aKey>-<os>-<arch>。开启后，两类池都按 CPU 键 gKey 拆分，
+// 名称分别为 gpustack--<gKey>-<os>-<arch> 和 gpustack--<gKey>--<aKey>-<os>-<arch>。
+func (f NodeFlavor) DerivedInstanceTypeIdentity(aware bool) (name, generalGroup, acceleratorGroup string) {
+	generalGroup = GeneralGroupGeneric
+	if aware {
+		generalGroup = f.GeneralKey
+	}
+	if f.Acceleratable {
+		acceleratorGroup = f.AcceleratorKey
+		if aware {
+			name = fmt.Sprintf("gpustack--%s--%s-%s-%s", f.GeneralKey, f.AcceleratorKey, f.OS, f.Arch)
+		} else {
+			name = fmt.Sprintf("gpustack--%s-%s-%s", f.AcceleratorKey, f.OS, f.Arch)
+		}
+		return name, generalGroup, acceleratorGroup
+	}
+	if aware {
+		name = fmt.Sprintf("gpustack--%s-%s-%s", f.GeneralKey, f.OS, f.Arch)
+	} else {
+		name = fmt.Sprintf("gpustack--%s-%s-%s", GeneralGroupGeneric, f.OS, f.Arch)
+	}
+	return name, generalGroup, acceleratorGroup
+}
+
 // ExtractNodeFlavors 根据节点特征标签和容量构造 CPU 规格，并为每个加速器组构造相应的设备规格。
 func ExtractNodeFlavors(node *core.Node) (flavors []NodeFlavor) {
-	// 第 6 章补上此函数的实现。
-	return nil
+	if node.Labels == nil {
+		return nil
+	}
+
+	os := node.Labels[core.LabelOSStable]
+	arch := node.Labels[core.LabelArchStable]
+
+	// CPU flavor 用通用 CPU 键标识节点，以单节点核数区分规格。
+	// ConstructNodeCapacityLabels 已把向上取整的 CPU 容量写入 .count，
+	// 名称和节点选择器从同一标签取值。
+	gKey := ExtractGeneralNodeKey(node)
+	gNodeKey := GeneralFeatureLabelPrefix + gKey
+	gCountKey := gNodeKey + ".count"
+	if cpuCount, err := strconvx.Atoi[int64](node.Labels[gCountKey]); err == nil && cpuCount > 0 {
+		manufacturer, _, _ := strings.Cut(gKey, "-")
+		nodeLabels := map[string]string{
+			systemname.ManagedLabelKey: "true",
+			core.LabelOSStable:         os,
+			core.LabelArchStable:       arch,
+			gNodeKey:                   "true",
+			// 同一 flavor 只匹配核数相同的节点，保证预留的资源规格一致。
+			gCountKey: node.Labels[gCountKey],
+		}
+
+		flavors = append(flavors, NodeFlavor{
+			Name:         formatNodeFlavorName(gKey, "", os, arch, cpuCount, false),
+			GeneralKey:   gKey,
+			OS:           os,
+			Arch:         arch,
+			Count:        cpuCount,
+			Manufacturer: manufacturer,
+			// 通用键反映实际 CPU 型号，因此记录对应的产品和系列。
+			Product:    generalFeatureAnnotation(node, "name"),
+			Family:     generalFeatureAnnotation(node, "family"),
+			NodeLabels: nodeLabels,
+		})
+	}
+
+	// 每种加速器特征键产生一个设备 flavor，以该型号上报的单节点设备数区分规格。
+	for _, aKey := range ExtractAcceleratableNodeKeys(node) {
+		aNodeKey := AcceleratableFeatureLabelPrefix + aKey
+		aCountKey := aNodeKey + ".count"
+		count, err := strconvx.Atoi[int64](node.Labels[aCountKey])
+		if err != nil || count <= 0 {
+			continue
+		}
+		manufacturer, _, _ := strings.Cut(aKey, "-")
+		nodeLabels := map[string]string{
+			systemname.ManagedLabelKey: "true",
+			core.LabelOSStable:         os,
+			core.LabelArchStable:       arch,
+			// 选择器要求节点同时具备配对的 CPU 键。是否按 CPU 拆分资源池，由上层汇总时决定。
+			gNodeKey:  "true",
+			aNodeKey:  "true",
+			aCountKey: node.Labels[aCountKey],
+		}
+
+		flavors = append(flavors, NodeFlavor{
+			Name:           formatNodeFlavorName(gKey, aKey, os, arch, count, true),
+			GeneralKey:     gKey,
+			AcceleratorKey: aKey,
+			OS:             os,
+			Arch:           arch,
+			Count:          count,
+			Acceleratable:  true,
+			Manufacturer:   manufacturer,
+			Product:        node.Labels[aNodeKey+".product"],
+			Family:         node.Labels[aNodeKey+".family"],
+			Memory:         node.Labels[aNodeKey+".memory"],
+			Cores:          node.Labels[aNodeKey+".cores"],
+			NodeLabels:     nodeLabels,
+		})
+	}
+
+	return flavors
+}
+
+// formatNodeFlavorName 将 CPU 键 gKey 写入 ResourceFlavor 名。
+// 设备 flavor 还会在双连字符后写入加速器键 aKey，然后依次写入完整的系统名、架构和单节点数量。
+// CPU 核数以 c 结尾，设备数以 d 结尾。前缀 gpustack-- 及键间的双连字符可与键内部的单连字符区分。
+func formatNodeFlavorName(gKey, aKey, os, arch string, count int64, acceleratable bool) string {
+	if acceleratable {
+		return fmt.Sprintf("gpustack--%s--%s-%s-%s-%dd", gKey, aKey, os, arch, count)
+	}
+	return fmt.Sprintf("gpustack--%s-%s-%s-%dc", gKey, os, arch, count)
 }
 
 // generalFeatureAnnotation 读取 NFD NodeFeatureRule 记录的 feature.gpustack.ai/cpu-${name} 注解，各类 CPU
@@ -343,12 +509,16 @@ func generalFeatureAnnotation(node *core.Node, name string) string {
 //
 // 生成后的长度固定为 31 个字符。
 func FormatLocalQueueName(clusterQueueName string) string {
-	// 第 6 章补上此函数的实现。
-	return clusterQueueName
+	return LocalQueueNamePrefix + stringx.SumByFNV64a(clusterQueueName)
 }
 
 // LocalQueueNamePrefix 是 Operator 创建 LocalQueue 时使用的名称前缀。
 const LocalQueueNamePrefix = "gpustack-fnv64-"
+
+// GetAcceleratableCreditsResourceName 返回指定厂商在 Kueue 中计量加速器配额的资源名。
+func GetAcceleratableCreditsResourceName(manufacturer string) core.ResourceName {
+	return core.ResourceName(CreditsLabelPrefix + manufacturer)
+}
 
 // IsAcceleratableCreditsResourceName 判断资源名是否属于某个厂商的加速器配额。Kueue 将请求换算成这种单位后，
 // 在 ClusterQueue 中统一计量。

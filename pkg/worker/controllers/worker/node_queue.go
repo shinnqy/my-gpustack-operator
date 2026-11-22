@@ -1,12 +1,17 @@
 package worker
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
+	core "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -22,54 +27,37 @@ import (
 	"gpustack.ai/gpustack/pkg/kubemeta"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/systemmeta"
+	"gpustack.ai/gpustack/pkg/systemname"
 	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
 	"gpustack.ai/gpustack/pkg/utils/ctrlhandlerx"
 	"gpustack.ai/gpustack/pkg/utils/mapx"
 	"gpustack.ai/gpustack/pkg/utils/slicex"
+	"gpustack.ai/gpustack/pkg/utils/strconvx"
 	"gpustack.ai/gpustack/pkg/worker/apistatus"
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
-// NodeQueueReconciler owns the quota and admission gating of an operator-owned Kueue
-// ClusterQueue — its resource groups, the StopPolicy, and the node-devices AdmissionCheck
-// reference — driven by ClusterQueue, ResourceFlavor, and AdmissionCheck changes. The
-// InstanceTypeReconciler owns the queue's lifecycle (creation, schedule labels,
-// cohort/preemption isolation, and deletion); this reconciler
-// validates the flavor selectors against Nodes, then converges credit/CPU quota without looking
-// at the owning InstanceType:
-//   - Being deleted: drive HoldAndDrain unconditionally so Kueue evicts the admitted workloads
-//     and can then drop its own finalizer and remove the queue — Kueue never evicts on delete by
-//     itself. (This covers both an admin's direct delete and the InstanceType teardown's delete.)
-//   - Flavors present: fill the resource groups from the flavors, smallest per-node count
-//     first so Kueue packs small nodes before large ones, reference the node-devices
-//     AdmissionCheck on an accelerated derived queue and the joint-admission AdmissionCheck on
-//     every queue once each is Active, reactivate a queue
-//     that had been drained to empty (StopPolicy None), and drop the marker from the Hold this
-//     reconciler placed on a queue that had no resource groups yet, leaving its release to the
-//     InstanceTypeReconciler.
-//   - No flavors, quota still defined: gated by instance-type-drain-when-no-flavors, drive the
-//     queue to HoldAndDrain and requeue until every reservation clears, then empty the resource
-//     groups — so Kueue's reservation counters never go negative — and keep the emptied queue
-//     held until a flavor returns.
-//   - No resource groups yet, and not stopped: Hold the queue and mark the Hold as this
-//     reconciler's, whether the pool has no flavors or its flavors fail validation. A queue that
-//     declares no resource would admit every Workload.
+// NodeQueueReconciler 监听 ClusterQueue、ResourceFlavor 和 AdmissionCheck，
+// 为受管队列维护配额和准入条件。InstanceTypeReconciler 负责创建和删除队列，
+// 并设置调度标签及隔离策略。此处按标签直接查询池，核对 flavor 能选中的节点，
+// 再按 CPU 核或加速器 credits 填配额。
+//   - 删除队列时设置 HoldAndDrain，使 Kueue 驱逐已准入负载并在排空后解除 finalizer。
+//   - 池内有 flavor 时按单节点数量升序填入资源组。设备检查满足条件后挂到加速器队列，联合准入检查就绪后挂到所有队列。撤去空资源组的暂停标记，再由 InstanceTypeReconciler 按管理员意图恢复准入。
+//   - 池失去全部 flavor 时，按设置主动排空或等待预留自然释放，之后才清空配额，防止 Kueue 的预留计数变为负数。
+//   - 初次创建或校验失败的队列如果没有资源组，就先 Hold 并标记归属，避免它接纳任意资源请求。
 //
-// Reactivation fires only on a queue whose resource groups are already empty, so it never
-// contends with a drain still in progress.
+// 只有资源组已经清空时才恢复队列，不会打断正在进行的排空。
 type NodeQueueReconciler struct {
 	Client ctrlcli.Client
 }
 
 var _ ctrlreconcile.Reconciler = (*NodeQueueReconciler)(nil)
 
-// _ClusterQueueResType is the systemmeta resource type carried by the backing
-// ClusterQueue this reconciler owns.
+// _ClusterQueueResType 是 systemmeta 为规格对应的 ClusterQueue 写入的资源类别。
 const _ClusterQueueResType = "instancetypes"
 
-// IsInstanceTypeClusterQueue reports whether a ClusterQueue is one this operator backs an
-// InstanceType with, by the resource-type mark it stamps on each one it creates. The InstanceType
-// shares the ClusterQueue's name.
+// IsInstanceTypeClusterQueue 根据创建队列时写入的资源类别，判断它是否为 Operator 管理的规格队列。
+// 该队列与 InstanceType 同名。
 func IsInstanceTypeClusterQueue(cq *kueue.ClusterQueue) bool {
 	return systemmeta.MatchResource(cq, _ClusterQueueResType)
 }
@@ -95,10 +83,11 @@ type nodeQueueValidationError struct {
 
 func (e *nodeQueueValidationError) Error() string { return e.message }
 
+// IMPORTANT: 查池内 ResourceFlavor → 校验拓扑与配额守恒 → 填 Quota(credits/cpu)
 func (r *NodeQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := ctrllog.FromContext(ctx)
 
-	// Fetch.
+	// 按名字读取队列。
 	cq := new(kueue.ClusterQueue)
 	err := r.Client.Get(ctx, req.NamespacedName, cq,
 		ctrlclix.WithoutQuorum)
@@ -110,35 +99,31 @@ func (r *NodeQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	// The queue is being deleted (an admin's delete, or the InstanceType teardown). Kueue holds
-	// its own ResourceInUse finalizer until the queue is empty but never evicts admitted
-	// workloads on its own, so drive HoldAndDrain to evict them; once every reservation clears
-	// Kueue drops its finalizer and removes the queue. This drain is unconditional —
-	// instance-type-drain-when-no-flavors gates only the no-flavors auto-drain, not an explicit
-	// delete. We keep no finalizer of our own: Kueue's finalizer holds the queue alive while
-	// workloads remain, which is exactly the window this write needs.
+	// 管理员或规格清理流程请求删除队列后，Kueue 会保留 ResourceInUse finalizer 直到排空。
+	// 此处无条件设置 HoldAndDrain，促使 Kueue 驱逐已准入负载、释放预留并删除队列。
+	// instance-type-drain-when-no-flavors 只控制丢失 flavor 时的自动排空。Kueue 已有 finalizer，
+	// 无需再加一层。
 	if cq.DeletionTimestamp != nil {
 		if ptr.Deref(cq.Spec.StopPolicy, kueue.None) == kueue.HoldAndDrain {
 			return ctrl.Result{}, nil
 		}
 		cq.Spec.StopPolicy = ptr.To(kueue.HoldAndDrain)
 		if err = r.Client.Update(ctx, cq); err != nil {
-			// Every write of the queue in this reconciler requeues on a conflict. The usual cause is
-			// Kueue's status churn, which the predicate drops, so no event may follow the conflict.
+			// 所有队列写入遇到冲突时都主动重试。常见原因是 Kueue 同时更新了 status，
+			// 而此类更新会被监听过滤器忽略。
 			return objectWriteResult(logger, err, "hold and drain deleting cluster queue", _requeueAfterConflict)
 		}
 		logger.V(2).Info("holding and draining deleting cluster queue")
 		return ctrl.Result{}, nil
 	}
 
-	// The pool's ResourceFlavors, matched by the queue's schedule labels (feature key + os +
-	// arch). Admin queue names are arbitrary, so the pool is resolved by labels, not by name.
+	// 按队列的特征键、系统和架构等标签查找池内的 ResourceFlavor，这也适用于管理员自定义名称的队列。
 	lbs := nodefeature.PoolFlavorSelector(cq.Labels)
 	if len(lbs) == 0 {
 		return ctrl.Result{}, nil
 	}
-	// Scope to operator-owned flavors: a foreign ResourceFlavor that happens to share the pool's
-	// schedule labels must not pollute the queue's quota (mirrors the InstanceType webhook selector).
+	// 加上受管资源标记，避免相同调度标签的外部 ResourceFlavor 混入配额。
+	// InstanceType webhook 也使用相应的筛选条件。
 	lbs[systemmeta.ResourceTypeLabel] = _ResourceFlavorResType
 	rfList := new(kueue.ResourceFlavorList)
 	err = r.Client.List(ctx, rfList,
@@ -149,14 +134,10 @@ func (r *NodeQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// Drop ResourceFlavors Kueue is still finalizing (DeletionTimestamp set): the NodeFlavor
-	// reconciler deleted them because their nodes left the pool, but Kueue holds each one's
-	// resource-in-use finalizer until no ClusterQueue references it, and removes it only on a
-	// ClusterQueue update that drops the reference. Keeping a mid-deletion flavor in the resource
-	// groups re-holds that finalizer and deadlocks its removal, so it is treated as absent from the
-	// desired plan. NodeQueue drains the ClusterQueue before dropping a flavor Kueue may still hold
-	// quota on because removing a flavor does not itself evict or re-admit Workloads. An
-	// all-terminating pool falls through to the no-flavors drain/empty path.
+	// 正在删除的 flavor 从期望资源组中排除。Kueue 会保留它的 finalizer，
+	// 直到所有 ClusterQueue 都移除引用。若仍可能有使用该 flavor 的配额，先排空队列，
+	// 因为单独撤掉引用不会驱逐或重新准入现有负载。池内全部 flavor 都在删除时，
+	// 按无 flavor 的流程处理。
 	live := rfList.Items[:0]
 	for i := range rfList.Items {
 		if rfList.Items[i].DeletionTimestamp == nil {
@@ -171,15 +152,125 @@ func (r *NodeQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return r.drainOrEmptyClusterQueue(ctx, cq)
 }
 
-// fillClusterQueue converges the resource groups from the pool's flavors (smallest per-node
-// count first) and reactivates a queue that had been drained to empty.
+// fillClusterQueue 用池内 flavor 填充资源组，单节点数量小的在前；若队列先前已排空，按其策略恢复。
 func (r *NodeQueueReconciler) fillClusterQueue(
 	ctx context.Context, cq *kueue.ClusterQueue, rfList *kueue.ResourceFlavorList,
 ) (ctrl.Result, error) {
-	// Implement this function in chapter 06.
-	var result0 ctrl.Result
-	var result1 error
-	return result0, result1
+	logger := ctrllog.FromContext(ctx)
+	if failure := duplicateCoveredResource(cq.Spec.ResourceGroups); failure != nil {
+		return r.rejectClusterQueue(ctx, cq, failure)
+	}
+	if len(cq.Spec.ResourceGroups) > 0 && cq.Annotations[_TASQueueAnnotation] != "true" {
+		return r.rejectClusterQueue(ctx, cq, &nodeQueueValidationError{
+			reason:  "UnsupportedExistingObject",
+			message: "existing ClusterQueue has quota that was not created by the topology-aware queue controller; create fresh managed objects",
+		})
+	}
+	if failure, err := r.validateTASFlavors(ctx, cq, rfList); err != nil {
+		return ctrl.Result{}, err
+	} else if failure != nil {
+		return r.rejectClusterQueue(ctx, cq, failure)
+	}
+
+	// 先列单节点数量较小的 flavor，使 Kueue 在有多种选择时优先用小节点。
+	slices.SortStableFunc(rfList.Items, func(a, b kueue.ResourceFlavor) int {
+		if byCount := cmp.Compare(parseResourceFlavorCount(&a), parseResourceFlavorCount(&b)); byCount != 0 {
+			return byCount
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+
+	_, firstNotes := systemmeta.DescribeResource(&rfList.Items[0])
+	acceleratable := firstNotes["acceleratable"] == "true"
+	eGroups := buildResourceGroups(rfList, acceleratable, firstNotes["manufacturer"])
+
+	changed := false
+	if cq.Annotations == nil {
+		cq.Annotations = make(map[string]string)
+	}
+	if cq.Annotations[_TASQueueAnnotation] != "true" {
+		cq.Annotations[_TASQueueAnnotation] = "true"
+		changed = true
+	}
+	// 仅在设备 AdmissionCheck 已存在且为 Active 时才为加速器队列添加引用，
+	// 否则 Kueue 会把队列标记为不可用。监听该检查可以在激活时补上引用，失效或删除时撤下引用。
+	//
+	// 节点派生设置对整个集群生效。开启时，包括管理员自建规格在内的加速器队列均可启用设备检查；
+	// 关闭时继续填配额，但所有队列都跳过该设备检查。
+	//
+	// 联合准入检查一旦 Active，就应挂到所有队列，不受设备类型或派生设置限制。
+	// 多角色部署的不同 Workload 可能进入 CPU 池，也可能使用管理员自建的规格；若漏掉一个入口，
+	// 可能有一部分角色先行对外服务。不属于多角色部署的工作负载会直接通过这项检查。
+	derived := settings.InstanceTypeDerivedFromNode.ShouldValueBool(ctx)
+
+	var rules []kueue.AdmissionCheckStrategyRule
+	if acceleratable && derived && r.admissionCheckActive(ctx, _NodeDevicesAdmissionCheckName) {
+		rules = append(rules,
+			kueue.AdmissionCheckStrategyRule{Name: kueue.AdmissionCheckReference(_NodeDevicesAdmissionCheckName)})
+	}
+	if r.admissionCheckActive(ctx, _JointAdmissionCheckName) {
+		rules = append(rules,
+			kueue.AdmissionCheckStrategyRule{Name: kueue.AdmissionCheckReference(_JointAdmissionCheckName)})
+	}
+
+	var admissionChecks *kueue.AdmissionChecksStrategy
+	if len(rules) > 0 {
+		admissionChecks = &kueue.AdmissionChecksStrategy{AdmissionChecks: rules}
+	}
+	if !kubemeta.DeepEqual(cq.Spec.AdmissionChecksStrategy, admissionChecks) {
+		cq.Spec.AdmissionChecksStrategy = admissionChecks
+		changed = true
+	}
+
+	// 仅当要移除的 flavor 可能仍持有配额时才暂停并排空，驱逐旧负载后再按新方案准入。
+	// 节点加入或离开同一 profile 只改变标称配额，新增 profile 只是多一个引用，
+	// 移除已确认空闲的 flavor 也无负载要迁移；这些变更都可原地完成。
+	planChanged := !kubemeta.DeepEqual(cq.Spec.ResourceGroups, eGroups)
+	migrate := cq.Annotations[_TASQueueMigrationPhaseAnnotation] != ""
+	if !migrate && planChanged {
+		if dropped := droppedFlavorReferences(cq.Spec.ResourceGroups, eGroups); len(dropped) > 0 {
+			// Kueue 在同一次状态更新中写入 flavor 用量和 Active 条件的 observedGeneration。
+			// 若尚未观察到当前 spec，使用量可能遗漏新 flavor。等待状态追上后再判断，
+			// 避免基于旧快照误驱逐。
+			if !clusterQueueObservedAtCurrentGeneration(cq) {
+				return ctrl.Result{RequeueAfter: _TASQueueMigrationRequeueAfter}, r.setTopologyReadyConditionStatus(
+					ctx, cq, meta.ConditionUnknown, "AwaitingQueueStatus",
+					fmt.Sprintf("waiting for Kueue to report flavor usage at generation %d before dropping flavors %v",
+						cq.Generation, dropped),
+				)
+			}
+			migrate = flavorsMayBeInUse(cq, dropped)
+		}
+	}
+	if migrate {
+		return r.migrateClusterQueueResourceGroups(ctx, cq, eGroups, changed)
+	}
+
+	// 只恢复由本控制器排空的队列，即 HoldAndDrain 且配额为空。
+	// 管理员通过 Inactive 设置的 Hold 由 InstanceTypeReconciler 维护，flavor 返回时也应保留，
+	// 避免停用的规格短暂接纳工作负载。
+	if ptr.Deref(cq.Spec.StopPolicy, kueue.None) == kueue.HoldAndDrain && len(cq.Spec.ResourceGroups) == 0 {
+		cq.Spec.StopPolicy = ptr.To(kueue.None)
+		changed = true
+	}
+	// 与首批资源组和 AdmissionCheck 引用一同写入时，只移除“空队列暂停”标记。
+	// InstanceTypeReconciler 能读取 Inactive，由它决定是否解除 Hold，
+	// 避免尚无配额、尚无检查或管理员已停用的队列短暂开放。
+	if cq.Annotations[_TASQueueEmptyPlanHoldAnnotation] != "" && len(eGroups) > 0 {
+		delete(cq.Annotations, _TASQueueEmptyPlanHoldAnnotation)
+		changed = true
+	}
+	if planChanged {
+		cq.Spec.ResourceGroups = eGroups
+		changed = true
+	}
+	if changed {
+		if err := r.Client.Update(ctx, cq); err != nil {
+			return objectWriteResult(logger, err, "fill cluster queue resource groups", _requeueAfterConflict)
+		}
+		logger.V(2).Info("filled cluster queue resource groups")
+	}
+	return ctrl.Result{}, r.setTopologyReadyCondition(ctx, cq, true, "Ready", "all queue flavors are topology-aware and quota is conserved")
 }
 
 func (r *NodeQueueReconciler) migrateClusterQueueResourceGroups(
@@ -236,11 +327,9 @@ func (r *NodeQueueReconciler) migrateClusterQueueResourceGroups(
 		return ctrl.Result{RequeueAfter: _TASQueueMigrationRequeueAfter}, nil
 	}
 
-	// A queue without resource groups declares no resource, and Kueue ignores undeclared
-	// resources (quotaCheckStrategy IgnoreUndeclared), so restoring an admitting stop policy here
-	// would admit every Workload with no flavor and therefore no AdmissionCheck. The emptied queue
-	// stays held and keeps its migration annotations until a returning flavor switches it to a
-	// non-empty plan.
+	// 空资源组没有声明资源，Kueue 的 IgnoreUndeclared 策略会忽略未声明的请求；
+	// 此时解除暂停可能使任意 Workload 绕过 flavor 和准入检查。因此保持暂停及迁移注解，
+	// 待 flavor 返回并给出非空方案后恢复。
 	if len(desired) == 0 {
 		return ctrl.Result{}, r.setTopologyReadyCondition(ctx, cq, true, "Ready", "all queue flavors are topology-aware and quota is conserved")
 	}
@@ -285,9 +374,9 @@ func clusterQueueStoppedAtCurrentGeneration(cq *kueue.ClusterQueue) bool {
 		condition.Reason == kueue.ClusterQueueActiveReasonStopped
 }
 
-// clusterQueueObservedAtCurrentGeneration reports whether Kueue has written the queue status for
-// the current spec. Kueue sets the Active condition's observedGeneration in the same status write
-// as the reservation and usage counters, so the counters are current only when this holds.
+// clusterQueueObservedAtCurrentGeneration 判断 Kueue 是否已为当前 spec 写过状态。
+// Active 条件的 observedGeneration 与预留及用量计数在同次更新中写入，
+// 只有版本一致时这些计数才对应当前方案。
 func clusterQueueObservedAtCurrentGeneration(cq *kueue.ClusterQueue) bool {
 	condition := apimeta.FindStatusCondition(cq.Status.Conditions, kueue.ClusterQueueActive)
 	return condition != nil && condition.ObservedGeneration >= cq.Generation
@@ -297,14 +386,13 @@ func (r *NodeQueueReconciler) rejectClusterQueue(
 	ctx context.Context, cq *kueue.ClusterQueue, failure *nodeQueueValidationError,
 ) (ctrl.Result, error) {
 	ctrllog.FromContext(ctx).Error(failure, "reject topology-aware cluster queue")
-	// A refused plan leaves the last complete one serving; a queue that has none must not admit
-	// meanwhile.
+	// 方案校验失败时保留上一次完整的资源组；还没有资源组的队列须保持暂停。
 	if err := r.holdEmptyClusterQueue(ctx, cq); err != nil {
 		return ctrl.Result{}, err
 	}
 	result := ctrl.Result{}
-	// NodeQueue does not watch Nodes: a missing Topology or a flavor that does not yet count every
-	// pool Node heals only through a later ResourceFlavor event, so both are retried.
+	// NodeQueue 没有直接监听 Node。缺少 Topology 或 flavor 尚未覆盖全部节点时，
+	// 后续资源事件可能修复数据，所以安排重试。
 	if failure.reason == "MissingTopology" || failure.reason == "NonConservedQuota" ||
 		cq.Annotations[_TASQueueMigrationPhaseAnnotation] != "" {
 		result.RequeueAfter = 30 * time.Second
@@ -333,11 +421,163 @@ func (r *NodeQueueReconciler) setTopologyReadyConditionStatus(
 	return r.Client.Status().Patch(ctx, cq, ctrlcli.MergeFrom(before))
 }
 
-// drainOrEmptyClusterQueue handles a queue whose pool has lost all its flavors: it empties the
-// quota through the held migration, switching only once every reservation has cleared so Kueue
-// never counts negative, and leaves the emptied queue held. The drain setting decides only whether
-// remaining reservations are drained (HoldAndDrain) or waited out without holding; a queue with
-// nothing reserved is always held before it is emptied, and an already-empty queue is a no-op.
+func duplicateCoveredResource(groups []kueue.ResourceGroup) *nodeQueueValidationError {
+	seen := make(map[core.ResourceName]struct{})
+	for _, group := range groups {
+		for _, name := range group.CoveredResources {
+			if _, exists := seen[name]; exists {
+				return &nodeQueueValidationError{
+					reason:  "DuplicateCoveredResource",
+					message: fmt.Sprintf("resource %q is covered by more than one ClusterQueue resource group", name),
+				}
+			}
+			seen[name] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func (r *NodeQueueReconciler) validateTASFlavors(
+	ctx context.Context, cq *kueue.ClusterQueue, rfList *kueue.ResourceFlavorList,
+) (*nodeQueueValidationError, error) {
+	if len(rfList.Items) > _maxQueueFlavors {
+		return &nodeQueueValidationError{
+			reason:  "TooManyFlavors",
+			message: fmt.Sprintf("covered resource requires %d flavors; Kueue permits at most %d", len(rfList.Items), _maxQueueFlavors),
+		}, nil
+	}
+	selected := make(map[string]string)
+	selectedCounts := make([]int, len(rfList.Items))
+	for i := range rfList.Items {
+		rf := &rfList.Items[i]
+		profile := rf.Spec.NodeLabels[TopologyProfileLabel]
+		if profile == "" || rf.Labels[TopologyProfileLabel] != profile || rf.Spec.TopologyName == nil {
+			return &nodeQueueValidationError{
+				reason:  "MissingTopology",
+				message: fmt.Sprintf("ResourceFlavor %q is not bound to one topology profile", rf.Name),
+			}, nil
+		}
+		if expected := topologyName(profile); string(*rf.Spec.TopologyName) != expected {
+			return &nodeQueueValidationError{
+				reason: "MissingTopology",
+				message: fmt.Sprintf(
+					"ResourceFlavor %q references Topology %q instead of profile Topology %q",
+					rf.Name, *rf.Spec.TopologyName, expected,
+				),
+			}, nil
+		}
+		topology := new(kueue.Topology)
+		if err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: string(*rf.Spec.TopologyName)}, topology); err != nil {
+			if kerrors.IsNotFound(err) {
+				return &nodeQueueValidationError{
+					reason:  "MissingTopology",
+					message: fmt.Sprintf("ResourceFlavor %q references missing Topology %q", rf.Name, *rf.Spec.TopologyName),
+				}, nil
+			}
+			return nil, err
+		}
+		nodes := new(core.NodeList)
+		if err := r.Client.List(ctx, nodes, ctrlcli.MatchingLabels(rf.Spec.NodeLabels)); err != nil {
+			return nil, err
+		}
+		selectedCounts[i] = len(nodes.Items)
+		for _, node := range nodes.Items {
+			if prior, exists := selected[node.Name]; exists {
+				return &nodeQueueValidationError{
+					reason:  "OverlappingSelectors",
+					message: fmt.Sprintf("Node %q is selected by ResourceFlavors %q and %q", node.Name, prior, rf.Name),
+				}, nil
+			}
+			selected[node.Name] = rf.Name
+		}
+	}
+	for i := range rfList.Items {
+		rf := &rfList.Items[i]
+		count := parseResourceFlavorCount(rf)
+		capacity := parseResourceFlavorCapacity(rf)
+		expected := int64(selectedCounts[i]) * count
+		if count <= 0 || capacity != expected {
+			return &nodeQueueValidationError{
+				reason: "NonConservedQuota",
+				message: fmt.Sprintf(
+					"ResourceFlavor %q advertises capacity %d but %d selected Nodes contribute %d each",
+					rf.Name, capacity, selectedCounts[i], count,
+				),
+			}, nil
+		}
+	}
+
+	// NodeFlavor 会计入该池的所有受管且已带 profile 的节点，都必须被有效 flavor 的选择器覆盖。
+	// 关闭混合模式时，加速器节点不计入 CPU 池。
+	poolSelector := nodefeature.PoolFlavorSelector(cq.Labels)
+	if poolSelector == nil {
+		return nil, nil
+	}
+	cpuPool := poolSelector[nodefeature.NodeAcceleratableLabelKey] != "true"
+	if cpuPool {
+		// 纯 CPU 节点通常没有 acceleratable 标签，查询时不能要求它带有值为 false 的标签。
+		delete(poolSelector, nodefeature.NodeAcceleratableLabelKey)
+	}
+	poolSelector[systemname.ManagedLabelKey] = "true"
+	mixingAllowed := settings.InstanceTypeMixedOnNode.ShouldValueBool(ctx)
+	poolNodes := new(core.NodeList)
+	if err := r.Client.List(ctx, poolNodes, ctrlcli.MatchingLabels(poolSelector)); err != nil {
+		return nil, err
+	}
+	for i := range poolNodes.Items {
+		node := &poolNodes.Items[i]
+		if node.Labels[TopologyProfileLabel] == "" || (cpuPool && !mixingAllowed && nodeIsAccelerated(node)) {
+			continue
+		}
+		if _, exists := selected[node.Name]; !exists {
+			return &nodeQueueValidationError{
+				reason:  "NonConservedQuota",
+				message: fmt.Sprintf("Node %q belongs to the queue pool but contributes to no ResourceFlavor", node.Name),
+			}, nil
+		}
+	}
+	return nil, nil
+}
+
+// droppedFlavorReferences 找出当前资源组中存在、期望资源组中将移除的 flavor 引用。
+func droppedFlavorReferences(current, desired []kueue.ResourceGroup) []kueue.ResourceFlavorReference {
+	wanted := make(map[kueue.ResourceFlavorReference]struct{})
+	for _, group := range desired {
+		for _, flavor := range group.Flavors {
+			wanted[flavor.Name] = struct{}{}
+		}
+	}
+	var dropped []kueue.ResourceFlavorReference
+	for _, group := range current {
+		for _, flavor := range group.Flavors {
+			if _, exists := wanted[flavor.Name]; !exists {
+				dropped = append(dropped, flavor.Name)
+			}
+		}
+	}
+	return dropped
+}
+
+// flavorsMayBeInUse 检查要移除的 flavor 是否仍有预留或使用量。需要先确认状态对应当前 generation。
+// 计数中缺少某个 flavor 时，其用量未知，也按可能仍在使用处理。
+//
+// 计数可能晚于实际准入。Kueue 写完状态后仍可能给 flavor 新增预留，
+// 直接删去资源组中的引用也不会驱逐已经运行的 Workload。
+func flavorsMayBeInUse(cq *kueue.ClusterQueue, flavors []kueue.ResourceFlavorReference) bool {
+	idle := func(usage []kueue.FlavorUsage, name kueue.ResourceFlavorReference) bool {
+		i := slices.IndexFunc(usage, func(u kueue.FlavorUsage) bool { return u.Name == name })
+		return i >= 0 && !slices.ContainsFunc(usage[i].Resources, func(u kueue.ResourceUsage) bool {
+			return !u.Total.IsZero() || !u.Borrowed.IsZero()
+		})
+	}
+	return slices.ContainsFunc(flavors, func(name kueue.ResourceFlavorReference) bool {
+		return !idle(cq.Status.FlavorsReservation, name) || !idle(cq.Status.FlavorsUsage, name)
+	})
+}
+
+// drainOrEmptyClusterQueue 处理池内所有 flavor 消失的情况。
+// 已预留资源时按设置选择主动 HoldAndDrain 或等待自然释放；即使预留已归零，仍先暂停再清空配额，
+// 保证计数正确。已清空的队列维持暂停，等待容量恢复。
 func (r *NodeQueueReconciler) drainOrEmptyClusterQueue(
 	ctx context.Context, cq *kueue.ClusterQueue,
 ) (ctrl.Result, error) {
@@ -350,29 +590,23 @@ func (r *NodeQueueReconciler) drainOrEmptyClusterQueue(
 
 	drain := settings.InstanceTypeDrainWhenNoFlavors.ShouldValueBool(ctx)
 	if !drain && hasReserved(cq) {
-		// Without automatic drain, wait for reservations to clear on their own.
+		// 未启用自动排空时，等现有预留自然释放。
 		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
 	if cq.Annotations == nil {
 		cq.Annotations = make(map[string]string)
 	}
-	// Emptying the last flavor reference is the same identity-stable plan migration as a
-	// profile replacement, also when nothing is reserved: holding first closes the race in which a
-	// reservation lands between the zero check and the switch. The migration marker preserves the
-	// prior stop policy and lets a returning flavor join the in-progress plan before admission is
-	// restored.
+	// 移除最后一个 flavor 和替换 profile 一样需要原地迁移。先暂停，
+	// 防止看到零预留之后、切换方案之前又出现新预留。标记中保存原有策略，若迁移期间有 flavor 返回，
+	// 也可在恢复准入前纳入新方案。
 	return r.migrateClusterQueueResourceGroups(ctx, cq, nil, false)
 }
 
-// holdEmptyClusterQueue puts a queue that has no resource groups and is not stopped on Hold, and
-// marks the Hold so that neither reconciler releases it until fillClusterQueue drops the marker
-// with the queue's first resource groups. Such a queue
-// declares no resource, and Kueue ignores undeclared resources (quotaCheckStrategy
-// IgnoreUndeclared), so it would admit every Workload with no flavor and therefore no
-// AdmissionCheck. It is Hold, not HoldAndDrain: the queue reserves no quota to drain, and
-// HoldAndDrain would also stop the Instances of its InstanceType. A queue in the flavor migration
-// is held by the migration instead, and an admin Hold is left alone.
+// holdEmptyClusterQueue 将没有资源组且仍开放的队列设为 Hold，并标记由本控制器管理，
+// 直到 fillClusterQueue 写入首批资源组。Kueue 会忽略未声明资源，过早开放可能绕过 flavor 和准入检查。
+// 此时没有配额需要排空，所以使用 Hold，避免 HoldAndDrain 同时停掉规格的 Instance。
+// 已经在迁移或由管理员暂停的队列沿用其现有策略。
 func (r *NodeQueueReconciler) holdEmptyClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
 	if len(cq.Spec.ResourceGroups) != 0 || cq.Annotations[_TASQueueMigrationPhaseAnnotation] != "" ||
 		ptr.Deref(cq.Spec.StopPolicy, kueue.None) != kueue.None {
@@ -391,12 +625,9 @@ func (r *NodeQueueReconciler) holdEmptyClusterQueue(ctx context.Context, cq *kue
 	return nil
 }
 
-// hasReserved reports whether the ClusterQueue still holds reserved quota or
-// admitted/reserving workloads. The queue must not be emptied or deleted until Kueue has
-// finished draining; the workload counters guard against the flavor reservation snapshot
-// momentarily reading zero while eviction is still in flight. Pending workloads are
-// intentionally not counted — they hold no reservation, and gating on them would block
-// deletion forever.
+// hasReserved 检查队列是否仍有配额预留，或仍有正在预留、已准入的负载。驱逐尚未完成时，
+// 某个 flavor 的计数可能已为零，因此还要看工作负载计数。Pending 负载尚无预留，不计入排空条件，
+// 否则可能永远无法删除队列。
 func hasReserved(cq *kueue.ClusterQueue) bool {
 	if cq.Status.ReservingWorkloads != 0 || cq.Status.AdmittedWorkloads != 0 {
 		return true
@@ -409,12 +640,125 @@ func hasReserved(cq *kueue.ClusterQueue) bool {
 	})
 }
 
-// nodeQueueAdmissionCheck reports whether an AdmissionCheck is one a queue can reference: the
-// node-devices check or the joint-admission check. Either one turning Active, going inactive, or
-// being deleted changes what the queue's reference should be.
+// buildResourceGroups 汇总各 flavor 的池容量。加速器队列覆盖厂商的 credits 资源，
+// 单个 flavor 的标称配额为卡数乘每卡额度。纯 CPU 队列只覆盖 cpu，标称配额为池内总核数。
+func buildResourceGroups(rfList *kueue.ResourceFlavorList, acceleratable bool, manufacturer string) []kueue.ResourceGroup {
+	covered := []core.ResourceName{core.ResourceCPU}
+	if acceleratable {
+		covered = []core.ResourceName{nodefeature.GetAcceleratableCreditsResourceName(manufacturer)}
+	}
+
+	group := kueue.ResourceGroup{CoveredResources: covered}
+	for i := range rfList.Items {
+		rf := &rfList.Items[i]
+		capacity := parseResourceFlavorCapacity(rf)
+		if capacity <= 0 {
+			continue
+		}
+
+		nominal := *resource.NewQuantity(capacity, resource.DecimalSI)
+		if acceleratable {
+			nominal = nodefeature.AcceleratorsToCredits(nominal)
+		}
+
+		group.Flavors = append(group.Flavors, kueue.FlavorQuotas{
+			Name: kueue.ResourceFlavorReference(rf.Name),
+			Resources: []kueue.ResourceQuota{
+				{
+					Name:         covered[0],
+					NominalQuota: nominal,
+					// 空 cohort 使该队列与其他队列隔离。
+					// Kueue 不允许未加入 cohort 的队列设置借入或借出上限，因此两个字段都留空。
+				},
+			},
+		})
+	}
+	if len(group.Flavors) == 0 {
+		return nil
+	}
+	return []kueue.ResourceGroup{group}
+}
+
+// parseResourceFlavorCount 从 flavor 选择标签中读取单节点数量。带拓扑信息的名称以 profile 哈希结尾。
+func parseResourceFlavorCount(rf *kueue.ResourceFlavor) int64 {
+	prefix := nodefeature.GeneralFeatureLabelPrefix
+	if rf.Labels[nodefeature.NodeAcceleratableLabelKey] == "true" {
+		prefix = nodefeature.AcceleratableFeatureLabelPrefix
+	}
+	for key, value := range rf.Spec.NodeLabels {
+		if value != "true" || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if count, err := strconvx.Atoi[int64](rf.Spec.NodeLabels[key+_ResourceFlavorCountLabelSuffix]); err == nil && count > 0 {
+			return count
+		}
+	}
+	return 0
+}
+
+// parseNodeFlavorCount 从 flavor 名称解析单节点数量。
+// 带拓扑信息的名称可能在数量后追加 -fnv64-<hash>，因此从后往前查找数量段。
+// 已有 ResourceFlavor 对象时，队列排序优先使用 parseResourceFlavorCount 读取标签。
+func parseNodeFlavorCount(name string) int64 {
+	if profileIndex := strings.LastIndex(name, "-"+topologyProfilePrefix); profileIndex >= 0 {
+		name = name[:profileIndex]
+	}
+	segments := strings.Split(name, "-")
+	for i := len(segments) - 1; i >= 0; i-- {
+		segment := segments[i]
+		if len(segment) < 2 {
+			continue
+		}
+		switch segment[len(segment)-1] {
+		case 'c', 'd':
+			if value, err := strconvx.Atoi[int64](segment[:len(segment)-1]); err == nil {
+				return value
+			}
+		}
+	}
+	return 0
+}
+
+// parseResourceFlavorCapacity 从 flavor 自身特征键下的 .capacity 读取全池容量（节点数 × 单节点数量）。
+// 加速器 flavor 取 acceleratable. 键，CPU flavor 取 general. 键。
+// 设备 flavor 也可能带一个没有容量的 CPU 键，所以先按加速器标记选定前缀，再忽略缺失或非正的容量。
+// 找不到有效容量时返回零。
+func parseResourceFlavorCapacity(rf *kueue.ResourceFlavor) int64 {
+	prefix := nodefeature.GeneralFeatureLabelPrefix
+	if rf.Labels[nodefeature.NodeAcceleratableLabelKey] == "true" {
+		prefix = nodefeature.AcceleratableFeatureLabelPrefix
+	}
+	for k, v := range rf.Labels {
+		if v != "true" || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		if capacity, err := strconvx.Atoi[int64](rf.Labels[k+_ResourceFlavorCapacityLabelSuffix]); err == nil && capacity > 0 {
+			return capacity
+		}
+	}
+	return 0
+}
+
+// nodeQueueAdmissionCheck 识别队列可能引用的设备检查和联合准入检查。任一检查被激活、停用或删除时，
+// 队列都需要重新核对引用。
 func nodeQueueAdmissionCheck(ac *kueue.AdmissionCheck) bool {
 	return ac.Spec.ControllerName == _NodeDevicesControllerName ||
 		ac.Spec.ControllerName == _JointAdmissionControllerName
+}
+
+// admissionCheckActive 确认指定 AdmissionCheck 存在、未进入删除流程并且为 Active。
+// 引用无效检查会令整个 ClusterQueue 停止准入。
+//
+// 正在删除的检查即便仍报告 Active，也应移除引用。只有所有 ClusterQueue 都解除引用，
+// Kueue 才能移除 resource-in-use finalizer。
+func (r *NodeQueueReconciler) admissionCheckActive(ctx context.Context, name string) bool {
+	ac := new(kueue.AdmissionCheck)
+	err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: name}, ac, ctrlclix.WithoutQuorum)
+	if err != nil || ac.DeletionTimestamp != nil {
+		return false
+	}
+
+	return kubemeta.IsConditionTrue(ac.Status.Conditions, kueue.AdmissionCheckActive)
 }
 
 func (r *NodeQueueReconciler) SetupController(_ context.Context, opts controller.SetupOptions) error {
@@ -425,21 +769,15 @@ func (r *NodeQueueReconciler) SetupController(_ context.Context, opts controller
 	return ctrl.NewControllerManagedBy(opts.Manager).
 		Named("nodequeue").
 		For(
-			// Reconcile each operator-owned ClusterQueue by its own name. The reconcile is
-			// idempotent, so the operator's own writes settle without looping.
+			// 按受管 ClusterQueue 自身的名称协调。写入幂等，重复处理同一对象可以收敛。
 			&kueue.ClusterQueue{},
 			ctrlbuilder.WithPredicates(
-				// Interested in relevant ClusterQueue objects (WithPredicates ANDs, so this
-				// gates every event below).
+				// 只处理相应的受管 ClusterQueue，后续事件过滤条件同时生效。
 				ctrlpredicate.NewPredicateFuncs(func(obj ctrlcli.Object) bool {
 					return systemmeta.MatchResource(obj, _ClusterQueueResType)
 				}),
-				// Trigger reconciliation when a ClusterQueue is:
-				// - created (incl. the start-up resync).
-				// - updated if its generation (spec) changed, or its DeletionTimestamp was set
-				//   (so an explicit delete is drained).
-				// Never react to the final deletion (a gone queue has nothing to reconcile) or to
-				// status churn (reservation counters, conditions), which Kueue writes constantly.
+				// 创建（含启动首次同步）、spec 的 generation 变化或设置 DeletionTimestamp 时触发协调。
+				// 最终删除后已无对象可处理；Kueue 持续写入的计数和条件等纯状态变化也不触发本控制器。
 				ctrlpredicate.Funcs{
 					DeleteFunc: func(ctrlevent.DeleteEvent) bool { return false },
 					UpdateFunc: func(e ctrlevent.UpdateEvent) bool {
@@ -453,8 +791,7 @@ func (r *NodeQueueReconciler) SetupController(_ context.Context, opts controller
 			),
 		).
 		Watches(
-			// Re-converge the quota of every ClusterQueue a flavor feeds when the pool gains or
-			// loses flavors.
+			// flavor 加入或离开池时，为它所供给的每个队列重新计算配额。
 			&kueue.ResourceFlavor{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -462,17 +799,15 @@ func (r *NodeQueueReconciler) SetupController(_ context.Context, opts controller
 				r.enqueueNodeQueueWhenResourceFlavorChanged,
 			),
 			ctrlbuilder.WithPredicates(
-				// Trigger reconciliation when a relevant ResourceFlavor is created, updated, or
-				// deleted — any of them changes a pool's flavor set.
+				// 相关 ResourceFlavor 的创建、修改和删除都可能改变池内可用的 flavor。
 				ctrlpredicate.NewPredicateFuncs(func(obj ctrlcli.Object) bool {
 					return systemmeta.MatchResource(obj, _ResourceFlavorResType)
 				}),
 			),
 		).
 		Watches(
-			// Re-enqueue the operator-owned queues when either AdmissionCheck a queue can reference
-			// changes, so each queue acquires the reference once the check turns Active (or drops
-			// it should the check go inactive/away).
+			// 设备检查或联合准入检查的状态变化后，重新协调受管队列，激活时补上引用，
+			// 失效或删除时撤下。
 			&kueue.AdmissionCheck{},
 			ctrlhandlerx.DedupEnqueueRequestsFromMapFuncWithWindow(
 				3*time.Second,
@@ -480,8 +815,7 @@ func (r *NodeQueueReconciler) SetupController(_ context.Context, opts controller
 				r.enqueueNodeQueuesWhenAdmissionCheckChanged,
 			),
 			ctrlbuilder.WithPredicates(
-				// Trigger reconciliation when the node-devices or joint-admission AdmissionCheck is
-				// created, updated, or deleted (its Active state gates the reference).
+				// 监听两种 AdmissionCheck 的创建、更新和删除事件，以 Active 状态决定是否引用。
 				ctrlpredicate.NewPredicateFuncs(func(obj ctrlcli.Object) bool {
 					return nodeQueueAdmissionCheck(obj.(*kueue.AdmissionCheck))
 				}),
@@ -490,12 +824,9 @@ func (r *NodeQueueReconciler) SetupController(_ context.Context, opts controller
 		Complete(r)
 }
 
-// enqueueNodeQueueWhenResourceFlavorChanged enqueues every operator-owned ClusterQueue whose
-// flavor selector this changed flavor feeds. The flavor is the finest grain (it always carries
-// the CPU key), whereas a queue's pool may be collapsed and carry fewer discriminators, so a
-// MatchingLabels query keyed on the flavor's labels would miss a collapsed queue. Instead it
-// lists the operator queues and keeps those whose own poolFlavorSelector is a subset of the
-// flavor's discriminators.
+// enqueueNodeQueueWhenResourceFlavorChanged 找出使用该 flavor 的受管队列。flavor 身份最细，
+// 始终带有 CPU 键；合并池的区分标签可能更少。先列出受管队列，
+// 再检查每个队列要求的选择标签是否是该 flavor 标签的子集，以免漏掉合并池。
 func (r *NodeQueueReconciler) enqueueNodeQueueWhenResourceFlavorChanged(
 	ctx context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {
@@ -507,10 +838,8 @@ func (r *NodeQueueReconciler) enqueueNodeQueueWhenResourceFlavorChanged(
 		return nil
 	}
 
-	// Narrow to the operator-owned queues server-side via the resource-type label instead of
-	// listing every ClusterQueue. The subset match below still runs in-memory: a collapsed queue
-	// carries fewer discriminators than the flavor, so a labels-keyed query on the flavor's own
-	// labels would miss it.
+	// 先在服务端用资源类别过滤出 Operator 管理的队列，再在内存中比较选择标签。
+	// 直接带着 flavor 的全部标签查询会漏掉区分条件较少的合并池。
 	cqList := new(kueue.ClusterQueueList)
 	err := r.Client.List(ctx, cqList,
 		systemmeta.GetResourcesLabelSetOfType[ctrlcli.MatchingLabels](_ClusterQueueResType),
@@ -540,9 +869,8 @@ func (r *NodeQueueReconciler) enqueueNodeQueueWhenResourceFlavorChanged(
 	return reqs
 }
 
-// enqueueNodeQueuesWhenAdmissionCheckChanged enqueues every operator-owned ClusterQueue when
-// the node-devices or joint-admission AdmissionCheck changes, so each queue (re)acquires the
-// reference once the check turns Active (or drops it should the check go inactive/away).
+// enqueueNodeQueuesWhenAdmissionCheckChanged 在设备或联合准入检查变化时，
+// 将受管 ClusterQueue 重新入队，以便按最新可用状态增删引用。
 func (r *NodeQueueReconciler) enqueueNodeQueuesWhenAdmissionCheckChanged(
 	ctx context.Context, obj ctrlcli.Object,
 ) []ctrlreconcile.Request {

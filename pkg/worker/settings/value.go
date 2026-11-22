@@ -156,6 +156,16 @@ var (
 		setting.AllowBool(),
 	)
 
+	// InstanceTypeDerivedFromNode 控制是否从节点硬件自动派生 InstanceType 及其 ClusterQueue。
+	// 默认开启。关闭时仍会同步 ResourceFlavor，由管理员通过 InstanceType API 定义池和队列。
+	InstanceTypeDerivedFromNode = settings.NewEditable(
+		"instance-type-derived-from-node",
+		"Indicates whether the operator auto-derives the InstanceType and its backing ClusterQueue from node hardware. "+
+			"When true (default), the operator derives both; "+
+			"when false, it only aligns the ResourceFlavor and the administrator defines the ClusterQueue via the InstanceType API.",
+		setting.InitializeFromEnv("true"),
+		setting.AllowBool(),
+	)
 	// InstanceTypeDrainWhenNoFlavors 指示当资源池中的所有 ResourceFlavors 被移除后，是否会在资源组清
 	// 空之前将 ClusterQueue 排空（HoldAndDrain）。当为真时（默认状态），队列会先被排空，从而被已准入
 	// 的工作负载被移除。当为假时，运营方会等待预留资源自行清除，然后再进行排空操作，而不会进行排空。
@@ -171,6 +181,17 @@ var (
 
 	// KV 缓存。
 
+	// InstanceTypeMixedOnNode 控制同一节点能否同时贡献加速器池和纯 CPU 池。
+	// 默认计入它能够服务的所有规格。关闭后，有加速器的节点只计入加速器规格，
+	// 纯 CPU 节点只计入通用规格。
+	InstanceTypeMixedOnNode = settings.NewEditable(
+		"instance-type-mixed-on-node",
+		"Indicates whether one node may surface both a GPU and a CPU-only InstanceType. "+
+			"When true (default), a node is summarized into every type it can serve; "+
+			"when false, a node with accelerators yields only a GPU InstanceType and a CPU-only node only a general one.",
+		setting.InitializeFromEnv("true"),
+		setting.AllowBool(),
+	)
 	// NodeManagementManual 控制节点是否需要手动纳管。默认自动设置 gpustack.ai/managed=true，启用手动
 	// 模式后由管理员给节点加标签。
 	NodeManagementManual = settings.NewEditable(

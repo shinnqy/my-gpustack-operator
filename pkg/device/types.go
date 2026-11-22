@@ -140,6 +140,9 @@ type (
 	AcceleratorSlicedDetail = workercore.AcceleratorSlicedDetail
 	// AcceleratorSlicedPhysicalDetailProfile 保存设备组按硬切规格汇总的数量和大小。
 	AcceleratorSlicedPhysicalDetailProfile = workercore.AcceleratorSlicedPhysicalDetailProfile
+	// AcceleratorProfileCount 记录一种硬件分区规格的名称及实例数。
+	// 单卡 MIG 账本用它表示已分配或空闲的实例。
+	AcceleratorProfileCount = workercore.AcceleratorProfileCount
 	// AcceleratorPlacement 描述设备上连续的一段落位，单位由承载该字段的接口决定。
 	AcceleratorPlacement = workercore.AcceleratorPlacement
 	// Accelerator 保存单卡的身份、拓扑、特性和状态。

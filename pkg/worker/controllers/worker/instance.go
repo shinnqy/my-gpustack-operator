@@ -15,11 +15,10 @@ import (
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
-// InstanceReconciler reconciles v1alpha1.Instance objects to finish the following tasks:
-//   - Create/Update/Delete a Kubernetes Pod as the backing resource of the Instance based on the Instance spec.
-//   - Create a Kubernetes Service to expose the ports of the backing Pod if specified in the Instance spec. The Service
-//     belongs to the Instance rather than to the Pod, so it survives a stop and keeps its allocated node ports.
-//   - Update the Instance status based on the backing Pod status for better visibility and stability.
+// InstanceReconciler 协调 v1alpha1.Instance 的资源和状态。
+//   - 根据 Instance spec 创建、更新或删除承载实例的 Pod。
+//   - 如规格声明了端口，则为 Instance 创建 Service。Instance 拥有 Service，停止 Pod 时仍可保留已分配的节点端口。
+//   - 根据 Pod 状态更新 Instance 状态。
 type InstanceReconciler struct {
 	Client    ctrlcli.Client
 	APIReader ctrlcli.Reader
@@ -28,59 +27,54 @@ type InstanceReconciler struct {
 var _ ctrlreconcile.Reconciler = (*InstanceReconciler)(nil)
 
 const (
-	// InstancePhaseStarting is the Instance status phase reported when the
-	// backing Pod is being created or updated to match the Instance spec.
+	// InstancePhaseStarting 表示正在创建或更新 Pod，使其符合 Instance 规格。
 	InstancePhaseStarting = "Starting"
-	// InstancePhaseStopping is the Instance status phase reported when the
-	// backing Pod is being deleted to stop the Instance.
+	// InstancePhaseStopping 表示实例正在停止，正在删除其 Pod。
 	InstancePhaseStopping = "Stopping"
-	// InstancePhaseStopped is the Instance status phase reported when the
-	// backing Pod is deleted and the Instance is stopped.
+	// InstancePhaseStopped 表示 Pod 已删除，实例已停止。
 	InstancePhaseStopped = "Stopped"
-	// InstancePhaseReady is the Instance status phase reported when the
-	// backing Pod is running and ready.
+	// InstancePhaseReady 表示 Pod 已运行并就绪。
 	InstancePhaseReady = "Ready"
-	// InstancePhaseDeleting is the Instance status phase reported when the
-	// Instance is marked as deleted and the backing Pod is being deleted.
+	// InstancePhaseDeleting 表示 Instance 已进入删除流程，正在删除其 Pod。
 	InstancePhaseDeleting = "Deleting"
 )
 
+const (
+	// InstanceTypePhaseInactive 表示规格的 ClusterQueue 已因管理员停用而进入 Hold，
+	// 或已在 HoldAndDrain 下排空所有预留。
+	// 该值与 apistatus.GetSummaryOfClusterQueue 返回的 Inactive 一致。
+	InstanceTypePhaseInactive = "Inactive"
+)
+
 func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Implement this function in chapter 07.
+	// 第 7 章实现此函数。
 	var result0 ctrl.Result
 	var result1 error
 	return result0, result1
 }
 
-// additionalVolumeName is the Pod volume name of the additional volume at the given index.
+// additionalVolumeName 根据附加卷的索引生成 Pod 中的卷名。
 func additionalVolumeName(i int) string {
 	return "additional-" + strconvx.Itoa(i)
 }
 
 func (r *InstanceReconciler) SetupController(_ context.Context, opts controller.SetupOptions) error {
-	// Implement this function in chapter 07.
+	// 第 7 章实现此函数。
 	var result0 error
 	return result0
 }
 
-// PartitionProfileMemoryPercent reports the share of one card's VRAM the requested hardware
-// partition profile occupies, as a percentage in [1,100].
+// PartitionProfileMemoryPercent 返回指定硬件分区规格占单卡显存的比例，以 1 到 100 的整数百分比表示。
 //
-// It reports sizeable=false when the pool offers the profile but its observed Detail cannot size
-// it yet — the profile's per-instance memory has not been populated, or the per-card VRAM has not
-// — which is a transient state during detection or a device-manager rollout skew. The caller must
-// reject such a request as retryable rather than fall back to whole-card sizing.
+// 若池提供该规格，但探测或设备管理器滚动升级期间尚未上报每实例显存或单卡总显存，
+// 则返回 sizeable=false。调用方应提示稍后重试，避免按整卡计算。
 //
-// It reports (0, true) when the request is not a partition request at all, or when the named
-// profile is not offered. That second case is permanent, not transient, and each caller's own
-// validation rejects it with a message naming the offered profiles.
+// 请求不涉及分区，或池未提供指定的分区规格时，返回 (0, true)。后者属于规格不匹配，
+// 调用方会在校验时列出实际提供的规格。
 //
-// It sits beside getResourceRequirements rather than in the webhook package it was written for,
-// because sizing a request against an InstanceType is now done by two callers — the Instance
-// webhook, which defaults the values onto the object, and the ModelDeployment renderer, which
-// derives them at render time because its own mutating webhook defaults the card count alone. A second copy of a VRAM-anchored percentage
-// would be free to drift from this one, and the symptom of that drift is a Pod whose host CPU and
-// memory do not match the fraction of the card it holds.
+// Instance webhook 和 ModelDeployment 渲染器共用此函数，因此把它放在 getResourceRequirements 旁。
+// 前者把默认值写入 Instance，后者的 webhook 只补卡数，渲染时才换算规格。
+// 共用算法可以让 Pod 的主机 CPU 和内存与实际占用的卡份额对应。
 func PartitionProfileMemoryPercent(
 	instType *workercore.InstanceType, profile string,
 ) (pct int64, sizeable bool) {
@@ -101,10 +95,8 @@ func PartitionProfileMemoryPercent(
 	return min(max(prof.MemoryMib*100/cardVRAMMib, 1), 100), true
 }
 
-// PartitionProfile finds a partition profile in an InstanceType's observed physical-slice
-// inventory (Status.Detail), returning the aggregate (its per-instance MemoryMib and pool-wide
-// instance ceiling Count), whether the accelerator Detail has been computed at all, and whether
-// the profile was found.
+// PartitionProfile 在 Status.Detail 的物理分区清单中查找指定规格。
+// 结果包含每个实例的 MemoryMib、池内实例总上限 Count，以及是否已生成加速器详情、是否找到该规格。
 func PartitionProfile(
 	instType *workercore.InstanceType, profile string,
 ) (prof workercore.AcceleratorSlicedPhysicalDetailProfile, ready, found bool) {
@@ -117,9 +109,8 @@ func PartitionProfile(
 	return workercore.AcceleratorSlicedPhysicalDetailProfile{}, ready, false
 }
 
-// InstanceTypeCardVRAMMib parses the per-card VRAM (MiB) from an InstanceType's observed
-// Status.Detail.Memory. An empty value is the not-yet-ready state (reject as retryable rather than
-// mis-size); a non-positive or unparseable value is a hard error.
+// InstanceTypeCardVRAMMib 从 Status.Detail.Memory 解析单卡显存，单位为 MiB。空值表示尚未就绪，
+// 可以重试。非正数或无法解析的值会返回错误。
 func InstanceTypeCardVRAMMib(instType *workercore.InstanceType) (int64, error) {
 	memStr := instType.Status.Detail.Memory
 	if memStr == "" {

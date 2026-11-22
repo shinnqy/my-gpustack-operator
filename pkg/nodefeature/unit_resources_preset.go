@@ -19,21 +19,15 @@ import (
 //go:embed unit_resources_preset.yaml
 var _UnitResourcesPresetYAML []byte
 
-// _UnitResourcesPresetTable is the parsed and validated preset table. A malformed table is a
-// programming error rather than a runtime condition, so loading it panics instead of degrading
-// silently. The load happens at package initialisation, not at build time, which means the
-// validation unit tests are what actually catch a bad edit before it ships.
+// _UnitResourcesPresetTable 保存解析并校验过的预设表。格式错误属于程序配置错误，加载时会触发 panic。
+// 表在包初始化时加载，发布前需要通过校验测试发现错误。
 var _UnitResourcesPresetTable = mustLoadUnitResourcesPresets(_UnitResourcesPresetYAML)
 
-// _UnitResourcesPresetTierNames is the tier ladder, ordered smallest first. The order is the
-// monotonicity contract: a positively identified product must never be sized at or below an
-// unidentified one.
+// _UnitResourcesPresetTierNames 按从小到大的顺序列出档位。识别出的产品必须高于未识别产品的默认档位。
 var _UnitResourcesPresetTierNames = []string{"fallback", "small", "medium", "large", "xlarge"}
 
-// _UnitResourcesPresetManufacturers is the set of manufacturer keys the table may use. It is
-// spelled out from the constants instead of read from the registry knowns.go builds, because
-// package-level variables are initialized before any init function runs, so that registry is
-// still empty when the table loads. A unit test asserts the two stay in agreement.
+// _UnitResourcesPresetManufacturers 列出表中允许的厂商键。包级变量先于 init 初始化，
+// 这时 knowns.go 中的厂商表还未填充，因此直接使用厂商常量。单元测试核对两者一致。
 var _UnitResourcesPresetManufacturers = sets.New(
 	ManufacturerAMD,
 	ManufacturerAscend,
@@ -47,35 +41,31 @@ var _UnitResourcesPresetManufacturers = sets.New(
 )
 
 const (
-	// _UnitResourcesPresetFallbackTierName is the tier an unmatched product resolves to.
+	// _UnitResourcesPresetFallbackTierName 是产品未匹配时使用的档位名。
 	_UnitResourcesPresetFallbackTierName = "fallback"
 
-	// _UnitResourcesPresetRAMSuffix is the only RAM unit the InstanceType admission webhook
-	// accepts, case-sensitively.
+	// _UnitResourcesPresetRAMSuffix 是 InstanceType 准入 webhook 对 RAM 唯一接受的单位后缀，
+	// 大小写必须一致。
 	_UnitResourcesPresetRAMSuffix = "Gi"
 
-	// _UnitResourcesPresetTokenSeparators are the characters device.NormalizeName preserves
-	// between the tokens of a product slug.
+	// _UnitResourcesPresetTokenSeparators 列出 device.NormalizeName 在产品名各词之间保留的分隔符。
 	_UnitResourcesPresetTokenSeparators = "-_."
 )
 
-// _UnitResourcesPresetFallbackTier pins the value an unmatched product is stamped with: the
-// value the operator stamped before presets existed. Pinning it as data rather than convention
-// is what keeps a table edit from turning an unrecognized product into a behavior change.
+// _UnitResourcesPresetFallbackTier 固定未识别产品的默认资源量，沿用引入预设表前的值，
+// 防止修改表项时意外改变既有行为。
 var _UnitResourcesPresetFallbackTier = unitResourcesPresetTier{CPU: "4", RAM: "16Gi"}
 
-// unitResourcesPresetTier is one rung of the ladder: the per-whole-card CPU and RAM a matched
-// product is stamped with. Both are held as the strings the InstanceType carries, so the values
-// are validated by the very rules the admission webhook later applies to them.
+// unitResourcesPresetTier 表示一个档位，保存每张整卡对应的 CPU 和 RAM。
+// 两者都使用 InstanceType 中的字符串格式，加载时即可按准入 webhook 的规则校验。
 type unitResourcesPresetTier struct {
 	CPU string `json:"cpu"`
 	RAM string `json:"ram"`
 }
 
-// unitResourcesPresetEntry matches one accelerator family of one manufacturer. Prefix is a token
-// sequence, unique within its manufacturer and never a token-prefix of a sibling, so a product
-// key matches at most one entry. By refines the match for variants of the same silicon and is
-// the only ordered part of the table.
+// unitResourcesPresetEntry 对应一家厂商的一个加速器系列。Prefix 是完整词的序列，在同一厂商内唯一，
+// 也不会成为其他条目的词前缀，因此产品最多匹配一项。By 按顺序区分同一芯片的具体变体，
+// 是表中唯一依赖声明顺序的部分。
 type unitResourcesPresetEntry struct {
 	Prefix string                       `json:"prefix"`
 	Family string                       `json:"family"`
@@ -83,33 +73,42 @@ type unitResourcesPresetEntry struct {
 	By     []unitResourcesPresetVariant `json:"by,omitempty"`
 }
 
-// unitResourcesPresetVariant refines its entry when Token appears as a whole token anywhere in
-// the product key, typically a capacity discriminator such as "80gb".
+// unitResourcesPresetVariant 在产品键中出现完整的 Token 时细分档位，例如容量标识 80gb。
 type unitResourcesPresetVariant struct {
 	Token  string `json:"token"`
 	Family string `json:"family"`
 	Tier   string `json:"tier"`
 }
 
-// unitResourcesPresets is the whole table: the tier ladder, the leading marketing token
-// sequences to strip, and the prefix entries per manufacturer.
+// unitResourcesPresets 包含所有档位、需要剥离的品牌词前缀，以及按厂商组织的产品匹配项。
 type unitResourcesPresets struct {
 	Tiers    map[string]unitResourcesPresetTier    `json:"tiers"`
 	Strip    []string                              `json:"strip"`
 	Families map[string][]unitResourcesPresetEntry `json:"families"`
 }
 
-// ResolveAcceleratorFamily returns the accelerator family a raw accelerator name resolves to.
+// PresetUnitResources 根据加速器厂商和产品返回派生 InstanceType 的每卡 CPU 和 RAM。
+// 规范化后的产品名最多匹配一个前缀，随后按变体声明顺序确定档位。
+// 厂商未收录、产品未匹配或输入无法规范化时，沿用引入预设前的默认资源值。
+// 返回值满足准入 webhook 的规格规则，整个查找无需 I/O，相同输入得到相同结果。
 //
-// The name is read as a whole, because a benchmark publishes a product name and not a table key.
-// A name that already is a family is returned as it is. A name that leads with a manufacturer is
-// resolved against that manufacturer's entries. Any other name is matched against every
-// manufacturer, and a name that names two families names neither of them.
+// 调用 device.NormalizeName 时把 maxLength 设为零，避免在词中间截断名称、丢失末尾的容量标识。
+// 它仅在当前缓冲区长度恰好等于厂商名长度时去掉厂商名，
+// 多词品牌（如 Meta X、Moore Threads）要靠剥离规则处理。它也不检查词边界，因此厂商为 amd 时，
+// AMD64 Accelerator 会变为 64-accelerator。
+func PresetUnitResources(manufacturer, product string) (cpu, ram string) {
+	return _UnitResourcesPresetTable.lookup(manufacturer, product)
+}
+
+// ResolveAcceleratorFamily 将加速器原始名称解析为产品系列名。
+//
+// 基准测试通常只给出完整的产品名。名称本身是系列名时直接返回，带厂商前缀时在该厂商内查找，
+// 其余情况跨厂商匹配。结果对应多个不同系列时视为无法识别。
 func ResolveAcceleratorFamily(raw string) string {
 	return _UnitResourcesPresetTable.resolveAcceleratorFamily(raw)
 }
 
-// acceleratorFamily returns the family the table declares for a product of one manufacturer.
+// acceleratorFamily 在指定厂商的配置中查找产品对应的系列。
 func (t *unitResourcesPresets) acceleratorFamily(manufacturer, product string) string {
 	entries := t.Families[manufacturer]
 	if len(entries) == 0 {
@@ -131,8 +130,8 @@ func (t *unitResourcesPresets) acceleratorFamily(manufacturer, product string) s
 	return ""
 }
 
-// presetEntryFamily returns the family an entry resolves to for a key. The ordered variant list
-// refines the entry, and the first listed token present in the key wins.
+// presetEntryFamily 解析一个条目的系列名。如果有变体，
+// 则使用列表中第一个在产品键里完整出现的词所对应的系列。
 func presetEntryFamily(e unitResourcesPresetEntry, tokens []string) string {
 	for _, v := range e.By {
 		if slices.Contains(tokens, v.Token) {
@@ -142,21 +141,19 @@ func presetEntryFamily(e unitResourcesPresetEntry, tokens []string) string {
 	return e.Family
 }
 
-// resolveAcceleratorFamily resolves a raw accelerator name to a family of the table.
+// resolveAcceleratorFamily 将原始加速器名称解析为表中声明的系列。
 func (t *unitResourcesPresets) resolveAcceleratorFamily(raw string) string {
 	tokens := splitPresetTokens(device.NormalizeName(raw, "", 0, false))
 	if len(tokens) == 0 {
 		return ""
 	}
 
-	// A name that already is a family is its own answer, and a catalog that
-	// stores the family has to read its own value back.
+	// 名称本身已是系列名时直接返回，使保存了系列名的目录能够原样读回。
 	if name := strings.Join(tokens, "-"); t.declaresFamily(name) {
 		return name
 	}
 
-	// A name that leads with a manufacturer is resolved against that
-	// manufacturer alone, because the vendor settles what the product is.
+	// 名称带厂商前缀时，只在该厂商的条目中解析产品。
 	if _UnitResourcesPresetManufacturers.Has(tokens[0]) {
 		return t.acceleratorFamily(tokens[0], raw)
 	}
@@ -164,10 +161,9 @@ func (t *unitResourcesPresets) resolveAcceleratorFamily(raw string) string {
 	return t.resolveFamilyTokens(tokens)
 }
 
-// resolveFamilyTokens resolves a token key to the family the table declares.
+// resolveFamilyTokens 根据产品名称的词序列查找系列。
 //
-// The key may lead with words that name no vendor, so every suffix of it is tried and the
-// families that resolve have to agree.
+// 产品名前面可能有不属于任何厂商的词，因此逐个尝试后缀，并要求所有匹配结果指向同一系列。
 func (t *unitResourcesPresets) resolveFamilyTokens(tokens []string) string {
 	stripped := t.stripLeadingMarketing(tokens)
 	if family := t.matchFamily(stripped); family != "" {
@@ -186,11 +182,10 @@ func (t *unitResourcesPresets) resolveFamilyTokens(tokens []string) string {
 	return families.UnsortedList()[0]
 }
 
-// matchFamily returns the family the table declares for a token key.
+// matchFamily 返回与给定词序列匹配的系列。
 //
-// A key that names two families names neither of them, so such a key is refused. A bare product
-// name is one case of that: it is also the tail of a longer product name the table covers, and
-// "v100" names both the NVIDIA part and the Iluvatar boards that end in it.
+// 同一个名称可能指向不同系列，例如 v100 既指 NVIDIA 产品，也可能是天数智芯板卡名称的末尾。
+// 遇到这种歧义时返回空值。
 func (t *unitResourcesPresets) matchFamily(tokens []string) string {
 	families := sets.New[string]()
 	for _, entries := range t.Families {
@@ -208,7 +203,7 @@ func (t *unitResourcesPresets) matchFamily(tokens []string) string {
 	return families.UnsortedList()[0]
 }
 
-// declaresFamily reports whether the table declares a family under that name.
+// declaresFamily 检查该名称是否是表中声明的系列。
 func (t *unitResourcesPresets) declaresFamily(name string) bool {
 	for _, entries := range t.Families {
 		for _, e := range entries {
@@ -225,10 +220,42 @@ func (t *unitResourcesPresets) declaresFamily(name string) bool {
 	return false
 }
 
-// stripLeadingMarketing removes the leading marketing token sequences, repeatedly until none
-// matches. One pass is not enough: "AMD Radeon Instinct MI300X OAM" needs both "radeon" and
-// "instinct" gone before an "mi300x" prefix can match. Strip sequences are validated non-empty,
-// so the loop always terminates.
+// lookup 根据厂商和产品查找预设。只有厂商在表中有条目时才规范化产品名。
+// 加载校验保证表中厂商与可探测厂商一致。
+func (t *unitResourcesPresets) lookup(manufacturer, product string) (cpu, ram string) {
+	fallback := t.Tiers[_UnitResourcesPresetFallbackTierName]
+
+	entries := t.Families[manufacturer]
+	if len(entries) == 0 {
+		return fallback.CPU, fallback.RAM
+	}
+
+	key := device.NormalizeName(product, manufacturer, 0, false)
+	tokens := t.stripLeadingMarketing(splitPresetTokens(key))
+	if len(tokens) == 0 {
+		return fallback.CPU, fallback.RAM
+	}
+
+	for _, e := range entries {
+		if !hasTokenPrefix(tokens, splitPresetTokens(e.Prefix)) {
+			continue
+		}
+		for _, v := range e.By {
+			if slices.Contains(tokens, v.Token) {
+				tier := t.Tiers[v.Tier]
+				return tier.CPU, tier.RAM
+			}
+		}
+		tier := t.Tiers[e.Tier]
+		return tier.CPU, tier.RAM
+	}
+
+	return fallback.CPU, fallback.RAM
+}
+
+// stripLeadingMarketing 反复去掉匹配的品牌词前缀。
+// 例如 AMD Radeon Instinct MI300X OAM 要依次去掉 radeon 和 instinct，才能匹配 mi300x。
+// 加载时已确认所有剥离序列非空，每轮都能前进。
 func (t *unitResourcesPresets) stripLeadingMarketing(tokens []string) []string {
 	for stripped := true; stripped; {
 		stripped = false
@@ -245,28 +272,26 @@ func (t *unitResourcesPresets) stripLeadingMarketing(tokens []string) []string {
 	return tokens
 }
 
-// splitPresetTokens splits a normalized slug into its tokens. device.NormalizeName preserves
-// "-", "_" and "." between tokens, so Hygon's "K100_AI" and "K100-AI" tokenize identically.
+// splitPresetTokens 将规范化名称按词拆开。device.NormalizeName 会保留连字符、下划线和点，
+// 因此海光的 K100_AI 和 K100-AI 会拆出相同的词。
 func splitPresetTokens(s string) []string {
 	return strings.FieldsFunc(s, func(r rune) bool {
 		return strings.ContainsRune(_UnitResourcesPresetTokenSeparators, r)
 	})
 }
 
-// hasTokenPrefix reports whether prefix is a token-prefix of tokens. Matching whole tokens is
-// what keeps "a10" from matching "a100" during a lookup, and what keeps the table from rejecting
-// the legitimate sibling pairs "h20"/"h200" and "l4"/"l40"/"l40s" during validation.
+// hasTokenPrefix 按完整词比较前缀，避免把 a10 匹配到 a100，
+// 也允许 h20 与 h200、l4 与 l40 或 l40s 分别作为有效条目。
 func hasTokenPrefix(tokens, prefix []string) bool {
 	return len(prefix) <= len(tokens) && slices.Equal(tokens[:len(prefix)], prefix)
 }
 
-// hasTokenSuffix reports whether prefix ends with suffix. Matching whole tokens is what keeps a
-// bare "v100" from standing in for the "bi-v100" board and the "v100" part alike.
+// hasTokenSuffix 按完整词检查末尾的序列，避免用单独的 v100 指代 bi-v100 板卡和 v100 芯片这两种产品。
 func hasTokenSuffix(prefix, suffix []string) bool {
 	return len(suffix) <= len(prefix) && slices.Equal(prefix[len(prefix)-len(suffix):], suffix)
 }
 
-// mustLoadUnitResourcesPresets loads the embedded table, panicking on a malformed one.
+// mustLoadUnitResourcesPresets 加载内嵌的预设表，表格式有误时触发 panic。
 func mustLoadUnitResourcesPresets(data []byte) *unitResourcesPresets {
 	t, err := loadUnitResourcesPresets(data)
 	if err != nil {
@@ -275,8 +300,7 @@ func mustLoadUnitResourcesPresets(data []byte) *unitResourcesPresets {
 	return t
 }
 
-// loadUnitResourcesPresets strictly decodes and validates a preset table. Strict decoding is
-// what makes a misspelled field a hard error instead of a silent widening.
+// loadUnitResourcesPresets 严格解码并校验预设表，拼错字段名会立即报错。
 func loadUnitResourcesPresets(data []byte) (*unitResourcesPresets, error) {
 	t := new(unitResourcesPresets)
 	if err := yaml.UnmarshalStrict(data, t); err != nil {
@@ -288,8 +312,7 @@ func loadUnitResourcesPresets(data []byte) (*unitResourcesPresets, error) {
 	return t, nil
 }
 
-// validate rejects a table that could resolve a product to more than one tier, could depend on
-// entry order, or could stamp a value the InstanceType admission webhook would reject.
+// validate 拒绝可能让同一产品匹配多个档位、依赖条目声明顺序或产生无效 InstanceType 规格值的配置。
 func (t *unitResourcesPresets) validate() error {
 	if err := t.validateTiers(); err != nil {
 		return err
@@ -300,8 +323,7 @@ func (t *unitResourcesPresets) validate() error {
 	return t.validateFamilies()
 }
 
-// validateTiers enforces the exact tier set, the pinned fallback, the monotonic ladder, and
-// webhook-acceptable values.
+// validateTiers 校验档位集合、固定的默认值、档位递增关系，以及每个值是否符合准入规则。
 func (t *unitResourcesPresets) validateTiers() error {
 	if len(t.Tiers) != len(_UnitResourcesPresetTierNames) {
 		return fmt.Errorf("tiers: must define exactly %v, got %d", _UnitResourcesPresetTierNames, len(t.Tiers))
@@ -337,10 +359,8 @@ func (t *unitResourcesPresets) validateTiers() error {
 	return nil
 }
 
-// validateStrip enforces well-formed, non-redundant marketing sequences. Two sequences where one
-// token-prefixes the other make stripping depend on their order in the list — listed shorter-first
-// the longer one never fires, listed longer-first both do — and a result that moves with
-// declaration order is exactly what this table forbids.
+// validateStrip 检查品牌词序列的格式和冗余。如果一个序列是另一个的词前缀，
+// 先匹配短序列可能导致长序列永远匹配不到，因此拒绝依赖列表顺序的配置。
 func (t *unitResourcesPresets) validateStrip() error {
 	seen := sets.New[string]()
 	for _, s := range t.Strip {
@@ -366,9 +386,8 @@ func (t *unitResourcesPresets) validateStrip() error {
 	return nil
 }
 
-// validateFamilies enforces the per-manufacturer entry rules: a detectable manufacturer,
-// prefixes that cannot both match one key, globally unique family names, well-formed variant
-// tokens, and no entry made dead by the strip or the manufacturer trim.
+// validateFamilies 检查每个厂商是否可探测、前缀是否互斥、系列名是否全局唯一、变体词是否合法，
+// 以及剥离品牌词或厂商名后是否仍能匹配条目。
 func (t *unitResourcesPresets) validateFamilies() error {
 	families := sets.New[string]()
 
@@ -389,7 +408,7 @@ func (t *unitResourcesPresets) validateFamilies() error {
 	return nil
 }
 
-// validateFamilyEntry checks one entry and records the family names it claims.
+// validateFamilyEntry 校验一个条目，并登记它使用的系列名。
 func (t *unitResourcesPresets) validateFamilyEntry(
 	manufacturer string,
 	e unitResourcesPresetEntry,
@@ -435,7 +454,7 @@ func (t *unitResourcesPresets) validateFamilyEntry(
 	return nil
 }
 
-// claimPresetFamily records a family name as taken and checks the tier it names exists.
+// claimPresetFamily 登记系列名以防重复，并确认该系列引用的档位已存在。
 func (t *unitResourcesPresets) claimPresetFamily(at, family, tier string, families sets.Set[string]) error {
 	if family == "" {
 		return fmt.Errorf("%s.family: must not be empty", at)
@@ -450,9 +469,8 @@ func (t *unitResourcesPresets) claimPresetFamily(at, family, tier string, famili
 	return nil
 }
 
-// validatePresetPrefixesDisjoint rejects a manufacturer whose entries could both match one key.
-// This is the structural half of the one-product-one-tier guarantee: it makes "at most one entry
-// matches" a property of the table rather than of the resolver.
+// validatePresetPrefixesDisjoint 拒绝同一厂商下可能同时匹配同一产品键的前缀，
+// 使每个产品最多命中一个条目。
 func validatePresetPrefixesDisjoint(manufacturer string, entries []unitResourcesPresetEntry) error {
 	for i, outer := range entries {
 		for j, inner := range entries {
@@ -472,8 +490,8 @@ func validatePresetPrefixesDisjoint(manufacturer string, entries []unitResources
 	return nil
 }
 
-// validatePresetSequence checks a token sequence — a prefix or a strip entry. It must carry at
-// least one token, since an empty sequence is a token-prefix of every key.
+// validatePresetSequence 检查产品前缀或剥离规则的词序列。至少要有一个词，
+// 否则空序列会匹配所有产品键。
 func validatePresetSequence(s string) error {
 	for _, r := range s {
 		if isPresetTokenRune(r) || strings.ContainsRune(_UnitResourcesPresetTokenSeparators, r) {
@@ -488,7 +506,7 @@ func validatePresetSequence(s string) error {
 	return nil
 }
 
-// validatePresetToken checks a single whole-token matcher, which carries no separator.
+// validatePresetToken 检查一个完整的匹配词，词内不能含分隔符。
 func validatePresetToken(s string) error {
 	if s == "" {
 		return errors.New("must not be empty")
@@ -505,11 +523,9 @@ func isPresetTokenRune(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
 }
 
-// parsePresetUnitCPU mirrors the unit-CPU rule validateInstanceTypeUnitSpec applies to an
-// acceleratable InstanceType (pkg/worker/webhooks/worker/instance_type.go): a unitless positive
-// integer within int32. The rule is restated here rather than shared because the webhook package
-// imports this one; reusing the same primitive keeps the two domains identical, so no table can
-// load a value the webhook would then reject and leave the pool with no InstanceType at all.
+// parsePresetUnitCPU 按 validateInstanceTypeUnitSpec 的准入规则解析每卡 CPU，
+// 要求无单位、正整数且在 int32 范围内。webhook 包依赖本包，两处采用相同的数值解析约束，
+// 保证预设表生成的规格可通过准入。
 func parsePresetUnitCPU(v string) (int32, error) {
 	n, err := strconvx.ParseInt[int32](v, 10, 32)
 	if err != nil || n <= 0 {
@@ -518,8 +534,7 @@ func parsePresetUnitCPU(v string) (int32, error) {
 	return n, nil
 }
 
-// parsePresetUnitRAM mirrors the same webhook rule for RAM: a positive integer carrying a
-// case-sensitive "Gi" suffix.
+// parsePresetUnitRAM 按同一准入规则解析 RAM，要求正整数并带有大小写完全匹配的 Gi 后缀。
 func parsePresetUnitRAM(v string) (int32, error) {
 	b, ok := strings.CutSuffix(v, _UnitResourcesPresetRAMSuffix)
 	if !ok {

@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/exp/maps"
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
 	klog "k8s.io/klog/v2"
@@ -409,4 +410,19 @@ func NormalizePartitionedProfileName(raw string) string {
 		return ""
 	}
 	return fields[len(fields)-1]
+}
+
+const (
+	// CreditsPerAccelerator 定义整张卡的整数额度 B，与总单位数 D（ResourceMaxUnits）相等。
+	// 最小软切片为整卡的 1/SlicedResourceMaxSize，对应 B/SlicedResourceMaxSize，即 3125 个 credits。
+	// .sliced.units 换算为 credits 的系数 B/D 恰好为 1。各种模式都能用整数表示额度，
+	// 避免 Kueue 的 q.Value() 在处理非 CPU 资源时将不足 1 的额度向上取整为 1，造成切片借用量失真。
+	CreditsPerAccelerator = ResourceMaxUnits
+)
+
+// AcceleratorsToCredits 用整卡数乘以 B 得到整数额度。
+// ClusterQueue 的 NominalQuota 和换算后的工作负载请求据此采用相同单位。
+func AcceleratorsToCredits(accelerators resource.Quantity) resource.Quantity {
+	accelerators.Mul(CreditsPerAccelerator)
+	return accelerators
 }
