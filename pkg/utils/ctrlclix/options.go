@@ -21,20 +21,13 @@ func (v ResourceVersion) ApplyToList(opts *ctrlcli.ListOptions) {
 	opts.Raw.ResourceVersion = string(v)
 }
 
-// WithoutQuorum is a GetOption and ListOption that sets ResourceVersion to "0",
-// which means the result is served on APIServer, without waiting for the quorum of etcd to acknowledge the read.
-// This can be useful for reducing latency when stale data is acceptable.
-//
-// It only takes effect on a reader that actually reaches the APIServer — an APIReader, or a type the
-// manager excludes from its cache through Client.Cache.DisableFor. On a manager's cache-backed client
-// it is a NO-OP: that Get is served out of the informer indexer, which reads only
-// UnsafeDisableDeepCopy off the options and never sees a ResourceVersion. Passing it there buys
-// nothing, and it misleads — it tells the next reader the call trades staleness for latency, which is
-// a trade that call is not making.
+// WithoutQuorum 给 Get 或 List 指定 resourceVersion 为 "0"。请求实际到达 API 服务器时，
+// 它允许返回稍旧的视图，省去等待读取 etcd 法定多数的延迟。
+// 这适用于 APIReader 或绕过 manager 缓存的类型。由 informer 缓存响应的读取直接查本地索引，
+// 不会读取这个选项。
 const WithoutQuorum = ResourceVersion("0")
 
-// ToPatchOptions converts ctrlcli.UpdateOptions to ctrlcli.PatchOptions,
-// as they share some common fields.
+// ToPatchOptions 将更新选项中同样适用于补丁的字段传给 Patch 调用。
 func ToPatchOptions(in ctrlcli.UpdateOptions) *ctrlcli.PatchOptions {
 	return &ctrlcli.PatchOptions{
 		DryRun:          in.DryRun,
@@ -42,3 +35,6 @@ func ToPatchOptions(in ctrlcli.UpdateOptions) *ctrlcli.PatchOptions {
 		FieldValidation: in.FieldValidation,
 	}
 }
+
+// Terminated 将删除宽限期设为零，立即发起终止。终结器仍可让对象保留到清理完成。
+const Terminated = ctrlcli.GracePeriodSeconds(0)

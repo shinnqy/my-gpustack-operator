@@ -4,18 +4,19 @@ import (
 	"net/url"
 
 	core "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/modelstore"
 )
 
 const (
-	// modelDeploymentModelVolumeName and modelDeploymentModelCacheVolumeName name the weights'
-	// volumes. They share no prefix with the role's own "additional-<n>" volumes or the connector's.
+	// modelDeploymentModelVolumeName 和 modelDeploymentModelCacheVolumeName 分别标识模型权重和缓存卷，
+	// 名称与角色的 additional-<n> 卷及连接器创建的卷分开。
 	modelDeploymentModelVolumeName      = "gpustack-model"
 	modelDeploymentModelCacheVolumeName = "gpustack-model-cache"
 
-	// modelDeploymentRevisionArg pins a hub download, weights and tokenizer alike: both supported
-	// engines load the tokenizer at the same revision unless told otherwise, which is owned.
+	// modelDeploymentRevisionArg 将权重和分词器固定在同一仓库版本。两种受支持的引擎默认使用同一个 revision。
 	modelDeploymentRevisionArg = "--revision"
 
 	modelDeploymentHFHomeEnv     = "HF_HOME"
@@ -27,61 +28,79 @@ const (
 	modelDeploymentModelScopeCacheEnv  = "MODELSCOPE_CACHE"
 	modelDeploymentModelScopeDomainEnv = "MODELSCOPE_DOMAIN"
 	modelDeploymentModelScopeTokenEnv  = "MODELSCOPE_API_TOKEN"
-	// The engines' switches that route their own download through their bundled ModelScope SDK
-	// (measured, PoC-C): each engine reads only its own.
+	// 各引擎各自读取对应的开关，选择通过内置的 ModelScope SDK 下载。
 	modelDeploymentVLLMModelScopeSwitch   = "VLLM_USE_MODELSCOPE"
 	modelDeploymentSGLangModelScopeSwitch = "SGLANG_USE_MODELSCOPE"
 )
 
-// The hub kinds a hub artifact's download environment is rendered for. An engine downloads from
-// one hub, and the names it reads differ by hub.
+// 模型仓库类型决定下载时需要的环境变量。每次只从一个仓库下载。
 const (
 	modelDeploymentHubHuggingFace = "huggingFace"
 	modelDeploymentHubModelScope  = "modelscope"
 )
 
-// ModelDeploymentArtifactRender is how a deployment's weights reach its engine, resolved from the
-// ModelArtifact by the reconciler and handed to the render as values, so the render stays pure.
-//
-// A nil one is a deployment that names no artifact, which renders exactly what it rendered before
-// the field existed.
+// ModelDeploymentArtifactRender 保存协调器从 ModelArtifact 解析出的权重交付参数，渲染阶段只消费这些值。
+// 为 nil 表示部署没有指定模型制品，沿用其原有配置。
 type ModelDeploymentArtifactRender struct {
-	// Delivery is PVC, Engine, Node or Image.
+	// Delivery 指定 PVC、Engine、Node 或 Image 交付方式。
 	Delivery workercore.ModelDeploymentModelDelivery
 
-	// ArtifactName, ArtifactUID and ManifestDigest are what a node-delivered volume names, as hints
-	// the node's plugin checks against the API before it mounts anything.
+	// ArtifactName、ArtifactUID 和 ManifestDigest 写入节点交付卷。插件在挂载前用 API 对象核实这些信息。
 	ArtifactName   string
 	ArtifactUID    string
 	ManifestDigest string
 
-	// ClaimName and Path are a claim artifact's claim and the directory inside it.
+	// ClaimName 和 Path 分别表示权重所在的 PVC 名称和卷内目录。
 	ClaimName string
 	Path      string
 
-	// ImageReference is an image artifact's digest-pinned reference, rendered as a Kubernetes image
-	// volume that kubelet pulls and mounts read-only.
+	// ImageReference 用摘要固定镜像，kubelet 拉取后作为只读镜像卷挂载。
 	ImageReference string
 
-	// Repository and Revision are a hub artifact's repository and resolved commit, SecretName the
-	// Secret holding its token or "", and SizeBytes its manifest's total size.
+	// Repository 和 Revision 标识仓库及解析后的提交。SecretName 保存令牌所在 Secret 的名称，可为空。
+	// SizeBytes 是清单的总字节数。
 	Repository string
 	Revision   string
 	SecretName string
 	SizeBytes  int64
 
-	// Hub is which hub a hub artifact downloads from, one of the modelDeploymentHub kinds. The
-	// download environment's names differ by hub; a non-hub delivery renders none.
+	// Hub 标识引擎下载时要使用的模型仓库，选择对应的环境变量。其他交付方式无需仓库变量。
 	Hub string
 
-	// Endpoint, HTTPSProxy and NoProxy are the administrator's Settings, read by the reconciler.
+	// Endpoint、HTTPSProxy 和 NoProxy 来自管理员配置，由协调器读取。
 	Endpoint   string
 	HTTPSProxy string
 	NoProxy    string
 }
 
-// env returns the environment an engine download needs: the owned entries, then the defaulted
-// ones a role's own value replaces. A claim needs none, and a take-over role gets none.
+// nodeVolumeSource 生成节点 CSI 插件使用的内联卷。插件在 Pod 所在命名空间核对制品和摘要后才挂载。
+// 认证 Secret 通过 kubelet 传给插件，令牌不会进入 Pod 环境变量。
+func (a *ModelDeploymentArtifactRender) nodeVolumeSource() core.VolumeSource {
+	csi := &core.CSIVolumeSource{
+		Driver:   modelstore.DriverName,
+		ReadOnly: ptr.To(true),
+		VolumeAttributes: map[string]string{
+			modelArtifactVolumeAttrArtifact:    a.ArtifactName,
+			modelArtifactVolumeAttrArtifactUID: a.ArtifactUID,
+			modelArtifactVolumeAttrDigest:      a.ManifestDigest,
+		},
+	}
+	if a.SecretName != "" {
+		csi.NodePublishSecretRef = &core.LocalObjectReference{Name: a.SecretName}
+	}
+
+	return core.VolumeSource{CSI: csi}
+}
+
+// 控制器写入和节点插件读取的模型卷属性键。
+const (
+	modelArtifactVolumeAttrArtifact    = modelstore.VolumeAttrArtifact
+	modelArtifactVolumeAttrArtifactUID = modelstore.VolumeAttrArtifactUID
+	modelArtifactVolumeAttrDigest      = modelstore.VolumeAttrManifestDigest
+)
+
+// env 返回引擎下载需要的环境变量，区分由控制器指定的值和允许角色覆盖的默认值。
+// 通过 PVC 交付或由角色接管命令时无需注入。
 func (a *ModelDeploymentArtifactRender) env(takeOver bool, engine string) (owned, defaulted []core.EnvVar) {
 	if takeOver || a.Delivery != workercore.ModelDeploymentModelDeliveryEngine {
 		return nil, nil
@@ -91,8 +110,7 @@ func (a *ModelDeploymentArtifactRender) env(takeOver bool, engine string) (owned
 	case modelDeploymentHubModelScope:
 		owned = []core.EnvVar{
 			{Name: modelDeploymentModelScopeCacheEnv, Value: ModelDeploymentModelCachePath},
-			// The SDK takes a bare host and prefixes the scheme itself (measured in the runner's
-			// own SDK); the Setting keeps the full-URL shape the Hugging Face endpoint uses.
+			// ModelScope SDK 自行补充协议头，只接受主机名。集群设置仍采用与 Hugging Face 相同的完整 URL 形式。
 			{Name: modelDeploymentModelScopeDomainEnv, Value: endpointHost(a.Endpoint)},
 		}
 		if sw := modelScopeSwitch(engine); sw != "" {
@@ -130,9 +148,8 @@ func (a *ModelDeploymentArtifactRender) env(takeOver bool, engine string) (owned
 	return owned, defaulted
 }
 
-// modelScopeSwitch is the environment name that routes an engine's own download through its
-// bundled ModelScope SDK. An engine the table does not know reads neither switch, so none is
-// rendered for it.
+// modelScopeSwitch 返回当前引擎选择 ModelScope SDK 所需的环境变量名。
+// 引擎各自读取不同的变量，没有对应开关时返回空字符串。
 func modelScopeSwitch(engine string) string {
 	switch engine {
 	case workercore.ModelDeploymentEngineVLLM:
@@ -144,9 +161,7 @@ func modelScopeSwitch(engine string) string {
 	}
 }
 
-// endpointHost is the URL's bare host, for the one consumer that takes a host rather than a URL.
-// A value that does not parse rides as it is: the admission that passed it has already demanded a
-// schema and a host.
+// endpointHost 从完整地址中取出 SDK 要求的主机部分。配置已经过 URL 校验，异常输入仍有回退处理。
 func endpointHost(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {

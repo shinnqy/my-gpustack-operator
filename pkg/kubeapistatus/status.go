@@ -247,6 +247,17 @@ func (f path[T]) Walk(conditionsField reflect.Value, phase, phaseMessage string)
 // Decision 允许调用方自定义某一步骤的判定方式。
 type Decision[T ~string] path[T]
 
+// Make 为已有步骤设置专用的判断函数。步骤不存在或传入 nil 时保留原有规则。
+func (d Decision[T]) Make(step T, with StatusDecide) Decision[T] {
+	if with != nil {
+		if idx, exist := d.stepsIndex[step]; exist {
+			d.stepsDecide[idx] = with
+		}
+	}
+
+	return d
+}
+
 // getGeneralDecide 生成默认判定函数。它根据步骤名称选择显示文字，遇到 False 标记为中断，
 // 遇到 Unknown 标记为过渡，遇到 True 则进入下一步。
 func getGeneralDecide[T ~string](step T) StatusDecide {

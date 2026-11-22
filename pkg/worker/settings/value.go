@@ -103,6 +103,17 @@ var (
 		setting.AllowBool(),
 	)
 
+	// InstancePersistentVolumePlacement 决定创建 Pod 时是否考虑 PVC 的可挂载节点。
+	// 启用后会把已绑定 PV 的亲和性加进 Pod，并等待需要提前绑定的 PVC。关闭后只填写卷名，
+	// Kueue 的拓扑调度可能选到卷无法到达的节点。修改设置不会迁移已运行的实例。
+	InstancePersistentVolumePlacement = settings.NewEditable(
+		"instance-persistent-volume-placement",
+		"Indicates to place Instances where their persistent volumes can attach. "+
+			"Read when an Instance's Pod is created, so a change never moves a running Instance.",
+		setting.InitializeFromEnv("true"),
+		setting.AllowBool(),
+	)
+
 	// InstancePrivilegedAllowed 表示允许实例请求特权模式，从而突破容器边界，暴露节点的设备和内核接口。
 	// 当某个 Instance 在创建时或后续更改时启用特权模式时，该设置就会生效。将其关闭并不会阻止已经运行
 	// 在特权模式的 Instance 在停止或重启期间进行更新、编辑操作。
@@ -113,6 +124,14 @@ var (
 			"so disabling it never blocks an already-privileged Instance from being updated or restarted.",
 		setting.InitializeFromEnv("false"),
 		setting.AllowBool(),
+	)
+
+	// InstanceSSHServerImage 是为 Instance 创建 SSH 边车时使用的镜像。
+	InstanceSSHServerImage = settings.NewEditable(
+		"instance-ssh-server-image",
+		"Indicates the image of the SSH server, when deploying Instances.",
+		setting.InitializeFromEnv("gpustack/ssh-server:v1.4.0"),
+		setting.AllowContainerImageReference(),
 	)
 
 	// InstanceIsolationPodCIDRs 包含了集群的 Pod 地址空间，而 Instance 命名空间隔离的 NetworkPolicy

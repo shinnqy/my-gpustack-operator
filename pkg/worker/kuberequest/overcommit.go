@@ -22,6 +22,36 @@ var (
 	_CPUOvercommitBaseQuantityForAcceleratable = resource.MustParse("100m")
 )
 
+// ScaleToOvercommit 从单项资源的 limit 计算超配时的 request。调用方保留原来的 limit，
+// 并且必须传入同一资源名对应的数量，使规格控制器能用 ScaleBackOvercommit 按相同单位还原。
+//
+// 普通节点按每整核 800m 预留 CPU，加速器节点按 100m。Value() 对核心数向上取整，
+// 再用原 limit 封顶，避免 API 服务器拒绝 request 大于 limit 的 Pod。
+// 内存和临时存储按每整 Gi 预留 128Mi，1.5Gi 按 1Gi 计算，小于 1Gi 会得到零预留。其他资源直接返回原值。
+func ScaleToOvercommit(
+	resName core.ResourceName,
+	val resource.Quantity,
+	acceleratable bool,
+) resource.Quantity {
+	switch resName {
+	case core.ResourceCPU:
+		base := _CPUOvercommitBaseQuantity
+		if acceleratable {
+			base = _CPUOvercommitBaseQuantityForAcceleratable
+		}
+		req := quantityx.Multiply(base, val.Value())
+		if req.Cmp(val) > 0 {
+			return val
+		}
+		return req
+	case core.ResourceMemory:
+		return quantityx.Multiply(_RAMOvercommitBaseQuantity, val.Value()/quantityx.Gi)
+	case core.ResourceEphemeralStorage:
+		return quantityx.Multiply(_LocalStorageOvercommitBaseQuantity, val.Value()/quantityx.Gi)
+	}
+	return val
+}
+
 // ScaleBackOvercommit 把 ScaleToOvercommit 生成的 request 折算回 limit 单位。
 // InstanceTypeReconciler 在计算 CPU 资源视图时先还原 Kueue 报告的已预留总量，再从容量中扣除，
 // 使容量、剩余量和单次最大请求量的单位一致。

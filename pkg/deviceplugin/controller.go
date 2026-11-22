@@ -388,6 +388,16 @@ func AllocatedAcceleratorsOf(pod *core.Pod) (PodAllocations, error) {
 	return allocations, nil
 }
 
+// AllocatedAcceleratorGroupsOf 合并 Pod 各容器的设备分配记录，供 Instance 状态报告实际获得的设备组。
+// 没有记录或注解无法解析时返回 nil。
+func AllocatedAcceleratorGroupsOf(pod *core.Pod) []workercore.DevicesAllocationGroup {
+	allocations, err := AllocatedAcceleratorsOf(pod)
+	if err != nil {
+		return nil
+	}
+	return allocations.Aggregate().Groups
+}
+
 func allocatedStatusOf(pod *core.Pod) (allocatedStatus workercore.DevicesStatus, err error) {
 	allocations, err := AllocatedAcceleratorsOf(pod)
 	if err != nil {

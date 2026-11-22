@@ -1,9 +1,5 @@
-// Package modelstore holds a node model cache's effective configuration: the check of a
-// NodeModelStoreSpec and the layered merge that produces one.
-//
-// The worker merges and checks before it writes a node's spec, and the model-manager plugin checks
-// again before it uses one, because a hand edit of the object bypasses the worker. Both import this
-// package, so the two checks cannot drift apart.
+// Package modelstore 负责合并节点模型缓存各层配置，并校验由此生成的 NodeModelStoreSpec。
+// Worker 写入前做一次校验，model-manager 使用前再检查一次，覆盖对象被直接编辑的情况。
 package modelstore
 
 import (
@@ -20,11 +16,18 @@ import (
 	"gpustack.ai/gpustack/pkg/modelartifact"
 )
 
-// DriverName is the CSI driver the model-manager plugin registers, and the name of its CSIDriver
-// object. A consumer renders node delivery only while that object exists.
+// DriverName 是 model-manager 向 kubelet 注册的 CSI 驱动名，也是对应 CSIDriver 对象的名称。
+// 只有找到该对象时，消费方才能选择节点交付。
 const DriverName = "model.csi.gpustack.ai"
 
-// The bounds a spec's numbers must keep.
+// 消费端控制器将这些属性写入 CSI 卷，节点插件用相同的键读取模型标识、UID 和清单摘要。
+const (
+	VolumeAttrArtifact       = "artifact"
+	VolumeAttrArtifactUID    = "artifactUID"
+	VolumeAttrManifestDigest = "manifestDigest"
+)
+
+// 节点模型缓存配置中各项数值的合法边界。
 const (
 	MaxHighWatermarkPercent = 95
 	MinLowWatermarkPercent  = 1
@@ -32,8 +35,7 @@ const (
 	MaxDownloadConcurrency  = 64
 )
 
-// Layer is one source of configuration. A nil field leaves in place what the layers below it set,
-// so a narrower layer (a node pool's) overrides only the fields it names.
+// Layer 表示一层配置。nil 表示继承较低层的值，因此节点池只覆盖明确设置的字段。
 type Layer struct {
 	HighWatermarkPercent   *int32
 	LowWatermarkPercent    *int32
@@ -47,7 +49,7 @@ type Layer struct {
 	CABundleConfigMap      *string
 }
 
-// Merge overlays the layers in order, each over the ones before it, field by field.
+// Merge 按顺序逐字段叠加各层配置，后面的显式值优先。
 func Merge(layers ...Layer) workercore.NodeModelStoreSpec {
 	var spec workercore.NodeModelStoreSpec
 	for _, l := range layers {
@@ -74,10 +76,7 @@ func overlay[T any](dst, src *T) {
 	}
 }
 
-// Validate reports every rule a spec breaks, joined, or nil.
-//
-// A value that fails here is never used: the worker does not write it and the plugin does not
-// download with it, rather than fall back to a value nobody chose.
+// Validate 汇总规格违反的所有规则。校验失败时，Worker 停止写入，插件停止按此配置下载。
 func Validate(spec workercore.NodeModelStoreSpec) error {
 	var errs []error
 
@@ -100,9 +99,8 @@ func Validate(spec workercore.NodeModelStoreSpec) error {
 	if err := ValidateEndpoint(h.HuggingFaceEndpoint); err != nil {
 		errs = append(errs, fmt.Errorf("hugging face endpoint: %w", err))
 	}
-	// The ModelScope endpoint is optional: a spec an older worker wrote names none, and a
-	// ModelScope artifact on such a node waits with that named rather than being resolved
-	// against another hub. A spec that names one must name a usable one.
+	// 老版本 Worker 写入的规格可能没有 ModelScope 端点。需要 ModelScope 的模型会等待配置。
+	// 显式配置后必须通过端点校验。
 	if h.ModelScopeEndpoint != "" {
 		if err := ValidateEndpoint(h.ModelScopeEndpoint); err != nil {
 			errs = append(errs, fmt.Errorf("modelscope endpoint: %w", err))
@@ -133,15 +131,14 @@ func Validate(spec workercore.NodeModelStoreSpec) error {
 	return errors.Join(errs...)
 }
 
-// Threshold is a kubelet eviction threshold: a percentage of the filesystem, or a quantity of bytes.
+// Threshold 表示 kubelet 的驱逐阈值，可按文件系统容量的百分比或固定字节数表达。
 type Threshold struct {
 	IsPercent bool
 	Percent   float64
 	Bytes     int64
 }
 
-// ParseThreshold reads an eviction threshold the way kubelet writes one: "10%" or a quantity such
-// as "20Gi".
+// ParseThreshold 解析 kubelet 的驱逐阈值，例如 10% 或 20Gi。
 func ParseThreshold(raw string) (Threshold, error) {
 	if p, ok := strings.CutSuffix(raw, "%"); ok {
 		f, err := strconv.ParseFloat(p, 64)
@@ -158,8 +155,7 @@ func ParseThreshold(raw string) (Threshold, error) {
 	return Threshold{Bytes: q.Value()}, nil
 }
 
-// ValidateEndpoint accepts an absolute http or https URL with a host. The endpoint Setting admits
-// through it, so a value a node would refuse never reaches the Settings store by an API write.
+// ValidateEndpoint 校验端点是否为带主机名的绝对 HTTP 或 HTTPS 地址，使无效值在写入配置时就能被发现。
 func ValidateEndpoint(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -172,8 +168,7 @@ func ValidateEndpoint(raw string) error {
 	return nil
 }
 
-// ParseBandwidth reads a download bandwidth, a non-negative quantity of bytes per second such as
-// "200Mi"; "0" is unlimited.
+// ParseBandwidth 解析每秒下载的字节数，支持 200Mi 等非负整数资源量。零表示不限速。
 func ParseBandwidth(raw string) (int64, error) {
 	q, err := resource.ParseQuantity(raw)
 	if err != nil {
@@ -190,16 +185,15 @@ func ParseBandwidth(raw string) (int64, error) {
 	return v, nil
 }
 
-// DownloadsPath is the model-manager plugin's read-only path answering its running downloads, on its
-// secure port. The worker's progress subresource reads it for live progress.
+// DownloadsPath 是 model-manager 安全端口上报告活动下载的只读路径，Worker 的进度子资源从这里读取现场数据。
 const DownloadsPath = "/model/downloads"
 
-// Downloads is the answer at DownloadsPath. It names no tenant: a digest, sizes and a source.
+// Downloads 是进度接口的响应，仅列下载摘要、大小和来源。
 type Downloads struct {
 	Downloads []Download `json:"downloads"`
 }
 
-// Download is one running download on a node.
+// Download 表示节点上正在进行的一次下载。
 type Download struct {
 	Digest          string `json:"digest"`
 	DownloadedBytes int64  `json:"downloadedBytes"`
