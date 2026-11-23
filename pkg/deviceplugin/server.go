@@ -680,6 +680,7 @@ func (s *ResourceServer) Allocate(ctx context.Context, req *AllocateRequest) (*A
 		}
 		allocatedResTokensMap[resToken.Resource] = append(allocatedResTokensMap[resToken.Resource], resToken)
 	}
+	// IMPORTANT: 检查 kubelet 为单个容器选定的共享令牌。容器申请 N 张共享卡，就应在 N 张不同的物理卡上各占一份。
 	if err := s.rejectRepeatedSharedCards(len(allocatedDeviceIDs), allocatedResTokensMap); err != nil {
 		return nil, err
 	}
@@ -1276,9 +1277,29 @@ func (s *ResourceServer) rejectCrossModeCards(
 	return nil
 }
 
+// rejectRepeatedSharedCards 检查 kubelet 为单个容器选定的共享令牌。容器申请 N 张共享卡，
+// 就应在 N 张不同的物理卡上各占一份。若 kubelet 无法满足选卡建议，可能会从同一卡上取两个令牌。
+// 这会让容器拿到的卡数不足，而账本只按一张卡扣费。多张卡重复时，固定报告名称排序最前的一张。
 func (s *ResourceServer) rejectRepeatedSharedCards(requested int, cardTokens map[Resource][]ResourceToken) error {
-	// 第 9 章再检查同一张卡是否被重复选作共享卡。
-	return nil
+	if s.AllocationMode != workercore.DeviceAllocationModeShared {
+		return nil
+	}
+	var repeated []Resource
+	for res, tokens := range cardTokens {
+		if len(tokens) > 1 {
+			repeated = append(repeated, res)
+		}
+	}
+	if len(repeated) == 0 {
+		return nil
+	}
+
+	res := slices.MinFunc(repeated, func(a, b Resource) int { return cmp.Compare(a.String(), b.String()) })
+	s.Logger.Error(nil, "shared allocation with a repeated accelerator rejected",
+		"card", res.String(), "tokens", len(cardTokens[res]), "requested", requested)
+	return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+		"a shared request of %d needs %d distinct accelerators, but accelerator %s was handed %d of its tokens",
+		requested, requested, res, len(cardTokens[res]))
 }
 
 // accumulateAllocation 按令牌落在哪张卡以及容器实际申请的单位数记账，

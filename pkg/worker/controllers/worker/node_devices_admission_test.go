@@ -49,7 +49,8 @@ func devicesWithRemaining(remaining ...int32) workercore.Devices {
 func oneFlavorPool(devices []workercore.Devices) []scopedDevices {
 	pool := make([]scopedDevices, 0, len(devices))
 	for i := range devices {
-		sd := scopedDevices{devices: devices[i]}
+		// 每份 Devices 账本来自一台节点。共享请求只有在同一台节点上凑齐卡数才能通过。
+		sd := scopedDevices{devices: devices[i], hostname: fmt.Sprintf("node-%d", i)}
 		seen := sets.New[string]()
 		for gi := range devices[i].Status.Groups {
 			g := &devices[i].Status.Groups[gi]
@@ -70,10 +71,23 @@ func feasibilityOfOnePool(devices []workercore.Devices, demands []familyDemand) 
 
 func TestNodeDevicesFeasibility(t *testing.T) {
 	const (
-		whole = int32(nodefeature.ResourceMaxUnits)     // 完全空闲的一张卡。
-		half  = int32(nodefeature.ResourceMaxUnits / 2) // 单卡剩余一半的单位数。
+		whole = int32(nodefeature.ResourceMaxUnits)                                     // 完全空闲的一张卡。
+		half  = int32(nodefeature.ResourceMaxUnits / 2)                                 // 单卡剩余一半的单位数。
+		share = int32(nodefeature.ResourceMaxUnits / nodefeature.SharedResourceMaxSize) // 一位共享持有者在一张卡上占用的单位数。
 	)
 	exclusive := nodefeature.ResourceFamilyExclusive
+	sharedDemand := func(cardsPerContainer, containers int32) familyDemand {
+		return familyDemand{
+			family:      nodefeature.ResourceFamilyShared,
+			cards:       cardsPerContainer * containers,
+			sharedNeeds: []sharedNeed{{cards: cardsPerContainer, containers: containers}},
+		}
+	}
+	heldCard := func(free int32, mode workercore.DeviceAllocationMode) workercore.Devices {
+		ledger := devicesWithRemaining(free)
+		ledger.Status.Groups[0].Accelerators[0].Mode = mode
+		return ledger
+	}
 
 	cases := []struct {
 		name    string
@@ -111,6 +125,60 @@ func TestNodeDevicesFeasibility(t *testing.T) {
 			devices: []workercore.Devices{devicesWithRemaining(whole)},
 			demands: []familyDemand{{family: exclusive, cards: 1}, {family: exclusive, cards: 1}},
 			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "shared fits when a free owner slot remains on each requested card",
+			devices: []workercore.Devices{devicesWithRemaining(share, share, 0)},
+			demands: []familyDemand{sharedDemand(2, 1)},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			name:    "two shared containers of one card each share one card",
+			devices: []workercore.Devices{heldCard(2*share, workercore.DeviceAllocationModeShared)},
+			demands: []familyDemand{sharedDemand(1, 2)},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			name:    "shared holders beyond a card's free shares are held",
+			devices: []workercore.Devices{devicesWithRemaining(2 * share)},
+			demands: []familyDemand{sharedDemand(1, 3)},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "shared cannot count one card twice for the same container",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{sharedDemand(2, 1)},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "shared cannot combine two nodes for one container",
+			devices: []workercore.Devices{devicesWithRemaining(whole), devicesWithRemaining(whole)},
+			demands: []familyDemand{sharedDemand(2, 1)},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "shared needs a full share on a card",
+			devices: []workercore.Devices{devicesWithRemaining(share - 1)},
+			demands: []familyDemand{sharedDemand(1, 1)},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "shared is not placed on a card held in sliced mode",
+			devices: []workercore.Devices{heldCard(half, workercore.DeviceAllocationModeSliced)},
+			demands: []familyDemand{sharedDemand(1, 1)},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "shared and exclusive demands cannot spend the same card",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{sharedDemand(1, 1), {family: exclusive, cards: 1}},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "two shared containers can each use two cards when the freest card is picked first",
+			devices: []workercore.Devices{devicesWithRemaining(share, share, 2*share)},
+			demands: []familyDemand{sharedDemand(2, 2)},
+			want:    kueue.CheckStateReady,
 		},
 		{
 			name:    "feasibility aggregates whole cards across devices",

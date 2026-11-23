@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 
 	core "k8s.io/api/core/v1"
@@ -13,8 +15,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrladmission "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	kueuectrlconst "sigs.k8s.io/kueue/pkg/controller/constants"
 
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/nodefeature"
+	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
 	"gpustack.ai/gpustack/pkg/webhook"
 )
 
@@ -273,8 +278,87 @@ func (r *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 // 该标签表示节点的总卡数（包含已分区的卡），且只有 Pod 会经过此 webhook，因此 Kueue 在任何
 // Pod 存在之前基于 Job 模板构建的 Workload 不会被固定。
 func (r *PodWebhook) pinSharedCardCount(ctx context.Context, pod *core.Pod) error {
-	// 在第 09 章中实现此函数。
+	// IMPORTANT: 第一步：算出这个 Pod 的节点至少要有几张物理卡
+	var cards int64
+	for _, pc := range podContainers(pod) {
+		for _, base := range containerClaims(pc.ctr)[nodefeature.ResourceFamilyShared] {
+			if q, ok := containerResource(pc.ctr, base+nodefeature.SharedResourceNameSuffix); ok {
+				cards = max(cards, q.Value())
+			}
+		}
+	}
+	if cards < 2 {
+		return nil
+	}
+
+	// IMPORTANT: 第二步：查出这个 Pod 对应的“加速器组名”是什么
+	it, err := r.frontingInstanceType(ctx, pod)
+	if err != nil {
+		return err
+	}
+	if it.Spec.AcceleratorGroup == "" {
+		return fmt.Errorf("instance type %s names no accelerator group, so a shared request of %d cannot be pinned to nodes with that many cards",
+			it.Name, cards)
+	}
+	pin := core.NodeSelectorRequirement{
+		Key:      nodefeature.AcceleratableFeatureLabelPrefix + it.Spec.AcceleratorGroup + ".count",
+		Operator: core.NodeSelectorOpGt,
+		Values:   []string{strconv.FormatInt(cards-1, 10)},
+	}
+
+	// IMPORTANT: 第三步：把条件安全、幂等地写进 NodeAffinity
+	if pod.Spec.Affinity == nil {
+		pod.Spec.Affinity = &core.Affinity{}
+	}
+	if pod.Spec.Affinity.NodeAffinity == nil {
+		pod.Spec.Affinity.NodeAffinity = &core.NodeAffinity{}
+	}
+	na := pod.Spec.Affinity.NodeAffinity
+	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		na.RequiredDuringSchedulingIgnoredDuringExecution = &core.NodeSelector{}
+	}
+	required := na.RequiredDuringSchedulingIgnoredDuringExecution
+	// 各选择项之间是“或”的关系，每个选择项都要加上卡数条件。原先没有选择项时先建一个。
+	if len(required.NodeSelectorTerms) == 0 {
+		required.NodeSelectorTerms = []core.NodeSelectorTerm{{}}
+	}
+	for i := range required.NodeSelectorTerms {
+		term := &required.NodeSelectorTerms[i]
+		if !slices.ContainsFunc(term.MatchExpressions, func(e core.NodeSelectorRequirement) bool {
+			return e.Key == pin.Key && e.Operator == pin.Operator && slices.Equal(e.Values, pin.Values)
+		}) {
+			term.MatchExpressions = append(term.MatchExpressions, pin)
+		}
+	}
 	return nil
+}
+
+// frontingInstanceType 根据 Pod 的 LocalQueue 名称，查找带有对应队列入口标签的 InstanceType。
+// InstanceType 的默认化 webhook 写入此标签，因此加速器组取自 Operator 管理的规格。
+// 找不到匹配的规格或匹配到多个时，无法确定该使用哪一组设备。
+func (r *PodWebhook) frontingInstanceType(ctx context.Context, pod *core.Pod) (*workercore.InstanceType, error) {
+	lqName := pod.Labels[kueuectrlconst.QueueLabel]
+	if lqName == "" {
+		return nil, fmt.Errorf("pod has no %q label", kueuectrlconst.QueueLabel)
+	}
+
+	itList := new(workercore.InstanceTypeList)
+	sel := ctrlcli.MatchingLabels{QueueEntranceLabelKey: lqName}
+	err := r.Client.List(ctx, itList, sel)
+	if err != nil || len(itList.Items) == 0 {
+		// 控制器缓存可能尚未同步，直接向 API 服务器再查一次。
+		if err = r.APIReader.List(ctx, itList, sel, ctrlclix.WithoutQuorum); err != nil {
+			return nil, fmt.Errorf("list instance types fronting local queue %s: %w", lqName, err)
+		}
+	}
+	switch len(itList.Items) {
+	case 0:
+		return nil, fmt.Errorf("no instance type fronts local queue %s", lqName)
+	case 1:
+	default:
+		return nil, fmt.Errorf("more than one instance type fronts local queue %s", lqName)
+	}
+	return &itList.Items[0], nil
 }
 
 func (r *PodWebhook) ValidateCreate(_ context.Context, obj runtime.Object) (ctrladmission.Warnings, error) {

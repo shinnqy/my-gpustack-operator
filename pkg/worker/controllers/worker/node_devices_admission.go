@@ -715,8 +715,37 @@ func fitExclusiveDemand(cards []cardLedger, budgets []cardBudget, d familyDemand
 // 并优先选取该节点上空闲份额最多的卡。将最满的卡留到最后再消耗，可以为后续持有者
 // 保留尽量多的可用卡，这样就能让多个 Pod 共享同一节点，而不是各自独占一张卡来评估。
 func fitSharedDemand(cards []cardLedger, budgets []cardBudget, d familyDemand) (kueue.CheckState, string) {
-	// 在第 09 章实现此函数。
-	return kueue.CheckStateRetry, "shared admission is pending"
+	freeShares := func(i int) int32 {
+		if budgets[i].whole || budgets[i].slices > 0 || !cards[i].coveredBy(d) {
+			return 0
+		}
+		return cards[i].freeShares() - budgets[i].shares
+	}
+
+	for _, need := range d.sharedNeeds {
+		for range need.containers {
+			byNode := make(map[string][]int)
+			for i := range cards {
+				if freeShares(i) > 0 {
+					byNode[cards[i].hostname] = append(byNode[cards[i].hostname], i)
+				}
+			}
+			var chosen []int
+			for _, host := range slices.Sorted(maps.Keys(byNode)) {
+				if len(byNode[host]) > len(chosen) {
+					chosen = byNode[host]
+				}
+			}
+			if int32(len(chosen)) < need.cards {
+				return kueue.CheckStateRetry, demandVerdictMessage(kueue.CheckStateRetry, d)
+			}
+			slices.SortStableFunc(chosen, func(a, b int) int { return cmp.Compare(freeShares(b), freeShares(a)) })
+			for _, i := range chosen[:need.cards] {
+				budgets[i].shares++
+			}
+		}
+	}
+	return kueue.CheckStateReady, demandVerdictMessage(kueue.CheckStateReady, d)
 }
 
 // fitSlicedDemand 按切片逐个对逻辑切分请求进行准入判断。其 cards 计数即切片数量，因为
@@ -734,12 +763,20 @@ func fitSlicedDemand(cards []cardLedger, budgets []cardBudget, d familyDemand) (
 	return kueue.CheckStateRetry, "logical slice admission is pending"
 }
 
+// IMPORTANT: 算单张卡还能发几张共享门票？
 // freeShares 返回在扣除当前 Workload 的任何请求前该卡还能授予的所有权份额数：除非该卡
 // 能够服务整卡资源族且处于空闲或共享持有状态，否则返回 0；满足条件时则按剩余 units
 // 折算，每份单位对应一个份额。
 func (c cardLedger) freeShares() int32 {
-	// 在第 09 章实现此函数。
-	return 0
+	const share = nodefeature.ResourceMaxUnits / nodefeature.SharedResourceMaxSize
+	// 两个一票否决的条件：
+	// 	- 这张卡硬件上根本不能当整卡/共享卡用（例如已经被硬件切分成 MIG 分区了）
+	// 	- 这张卡正在被独占模式或逻辑切片模式占用！DevicePlugin 严格禁止同一张卡跨模式混用，所以只有完全空闲（None）或者已经在共享模式（Shared）的卡才能接纳共享容器。
+	if !c.servesFamily(nodefeature.ResourceFamilyShared) ||
+		(c.mode != workercore.DeviceAllocationModeNone && c.mode != workercore.DeviceAllocationModeShared) {
+		return 0
+	}
+	return c.remaining / share
 }
 
 // freeSliceUnits 返回在扣除当前 Workload 的任何请求前该卡还能提供给逻辑切片的 units：
