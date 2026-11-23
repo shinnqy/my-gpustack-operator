@@ -8,6 +8,7 @@ import (
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -21,6 +22,8 @@ type (
 
 	// CompareWithFn 用于比较实际对象与期望对象，若两者一致则返回 true。
 	CompareWithFn[T MetaObject] func(actualCopied T) (skip bool)
+	// PatchAlignWithFn 比较实际对象与期望对象。有差异时返回要写入的补丁内容。
+	PatchAlignWithFn[T MetaObject] func(actualCopied T) (patched []byte, skip bool, err error)
 )
 
 type (
@@ -568,6 +571,75 @@ func UpdateWithCtrlClient[T MetaObject](ctx context.Context, cli ctrlcli.Client,
 	}
 
 	return updated, err
+}
+
+type (
+	_PatchOptions[T MetaObject] struct {
+		meta.PatchOptions
+		AlignFunc PatchAlignWithFn[T]
+	}
+	PatchOption[T MetaObject] func(*_PatchOptions[T])
+)
+
+// PatchWithCtrlClient 通过 controller-runtime 的客户端执行补丁，沿用 Patch 的重试和对齐规则。
+func PatchWithCtrlClient[T MetaObject](
+	ctx context.Context,
+	cli ctrlcli.Client,
+	expected T,
+	pt types.PatchType,
+	data []byte,
+	opts ...PatchOption[T],
+) (T, error) {
+	if reflect.ValueOf(expected).IsZero() {
+		return expected, errors.New("expected is nil")
+	}
+
+	name := expected.GetName()
+	if name == "" {
+		return expected, errors.New("resource name may not be empty")
+	}
+
+	var po _PatchOptions[T]
+	for i := range opts {
+		opts[i](&po)
+	}
+
+	patched := expected.DeepCopyObject().(T)
+	err := cli.Patch(ctx, patched, ctrlcli.RawPatch(pt, data), &ctrlcli.PatchOptions{
+		DryRun:       po.DryRun,
+		FieldManager: po.FieldManager,
+		Raw:          ptr.To(po.PatchOptions),
+	})
+	if err != nil {
+		if rctx, ok := retryTransient(ctx, err); ok {
+			return PatchWithCtrlClient[T](rctx, cli, expected, pt, data, opts...)
+		}
+		if kerrors.IsConflict(err) && po.AlignFunc != nil {
+			actual := expected.DeepCopyObject().(T)
+			err = cli.Get(ctx, ctrlcli.ObjectKeyFromObject(expected), actual,
+				&ctrlcli.GetOptions{
+					Raw: ptr.To(readOptions(ctx)),
+				})
+			if err != nil {
+				if rctx, ok := retryTransient(ctx, err); ok {
+					return PatchWithCtrlClient[T](rctx, cli, expected, pt, data, opts...)
+				}
+				return actual, err
+			}
+			var skip bool
+			data, skip, err = po.AlignFunc(actual.DeepCopyObject().(T))
+			if err != nil {
+				return actual, err
+			}
+			if skip {
+				return actual, nil
+			}
+			if rctx, ok := nextAttempt(ctx, err); ok {
+				return PatchWithCtrlClient[T](rctx, cli, expected, pt, data, opts...)
+			}
+		}
+	}
+	return patched, err
 }
 
 type (

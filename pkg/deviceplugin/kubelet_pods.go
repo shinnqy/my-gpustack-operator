@@ -7,7 +7,10 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	podresources "k8s.io/kubelet/pkg/apis/podresources/v1"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"gpustack.ai/gpustack/pkg/utils/osx"
 )
@@ -49,4 +52,58 @@ func newKubeletPodLister(socket string) kubeletPodLister {
 		}
 		return resp.GetPodResources(), nil
 	}
+}
+
+// _KubeletPending 用 kubelet 自己的记录回答设备插件请求缺少的容器身份问题。kubelet 先把 Pod 纳入管理，
+// 再逐个准入，并在 Allocate 返回后才登记该容器的设备。因此调用发生时，要找的是已被 kubelet 接收、
+// 却还没拿到这类设备的容器。只看创建时间无法得知到达 kubelet 的顺序，而时间戳本身也可能相同。
+type _KubeletPending struct {
+	// pods 为 kubelet 接管的每个 Pod 保存容器状态。true 表示该容器已经持有目标资源，false 表示还没有。
+	pods map[types.NamespacedName]map[string]bool
+}
+
+// kubeletPending 查询哪些容器还在等待 resName。查询关闭或 kubelet 无法应答时返回 nil，
+// 由调用方通过本地候选推断。
+func (r *DevicesReconciler) kubeletPending(ctx context.Context, resName core.ResourceName) *_KubeletPending {
+	if r.kubeletPods == nil {
+		return nil
+	}
+	listed, err := r.kubeletPods(ctx)
+	if err != nil {
+		ctrllog.FromContext(ctx).Info("kubelet pod resources unavailable; identifying the allocating container "+
+			"by the pending-Pod heuristic", "resource", resName, "reason", err.Error())
+		return nil
+	}
+
+	return kubeletPendingFrom(listed, resName)
+}
+
+func kubeletPendingFrom(listed []*podresources.PodResources, resName core.ResourceName) *_KubeletPending {
+	pending := &_KubeletPending{pods: make(map[types.NamespacedName]map[string]bool, len(listed))}
+	for _, p := range listed {
+		ctrs := make(map[string]bool, len(p.GetContainers()))
+		for _, c := range p.GetContainers() {
+			held := false
+			for _, d := range c.GetDevices() {
+				if d.GetResourceName() == string(resName) && len(d.GetDeviceIds()) > 0 {
+					held = true
+					break
+				}
+			}
+			ctrs[c.GetName()] = held
+		}
+		pending.pods[types.NamespacedName{Namespace: p.GetNamespace(), Name: p.GetName()}] = ctrs
+	}
+	return pending
+}
+
+// waitsForDevice 检查 kubelet 是否持有该 Pod，而且该容器尚无目标设备或未被列出。
+// PodResources 可能省略不可重启的 init 容器，因此无法仅凭缺少这一行就排除它。
+func (k *_KubeletPending) waitsForDevice(pod *core.Pod, ctr *core.Container) bool {
+	ctrs, ok := k.pods[types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}]
+	if !ok {
+		return false
+	}
+	held, reported := ctrs[ctr.Name]
+	return !reported || !held
 }

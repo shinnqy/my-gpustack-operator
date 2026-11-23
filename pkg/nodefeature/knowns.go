@@ -246,6 +246,12 @@ func GetAcceleratableResourceName(manufacturer string, mode workercore.DeviceAll
 	}
 }
 
+// GetAcceleratableSlicedUnitsResourceName 返回指定厂商的逻辑切片计量键，例如 nvidia.com/gpu.sliced.units。
+// 节点补丁发布它，Kueue 用它换算 credits；设备插件用另一个 .sliced 键向容器分配令牌。
+func GetAcceleratableSlicedUnitsResourceName(manufacturer string) core.ResourceName {
+	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + SlicedUnitsResourceNameSuffix
+}
+
 // GetAcceleratableSlicedCoresPercentageResourceName 构造厂商的每卡算力百分比预算键，
 // 例如 nvidia.com/gpu.sliced.cores-percentage。该键供节点预算检查使用。
 func GetAcceleratableSlicedCoresPercentageResourceName(manufacturer string) core.ResourceName {
@@ -262,6 +268,15 @@ func GetAcceleratableSlicedMemoryPercentageResourceName(manufacturer string) cor
 // MiB）（例如 "nvidia.com/gpu.sliced.memory-mib"）。属于 Gate-2 节点级资源。
 func GetAcceleratableSlicedMemoryMibResourceName(manufacturer string) core.ResourceName {
 	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + SlicedMemoryMibResourceNameSuffix
+}
+
+// GetAcceleratablePartitionedUnitsResourceName 返回按节点发布、供 Kueue 换算 credits 的硬分区计量键，
+// 例如 nvidia.com/gpu.partitioned.units。厂商没有分区类型时返回空字符串。
+func GetAcceleratablePartitionedUnitsResourceName(manufacturer string) core.ResourceName {
+	if GetPartitionKind(manufacturer) == "" {
+		return ""
+	}
+	return _ManufacturerAcceleratableResourceNameMap[manufacturer] + PartitionedUnitsResourceNameSuffix
 }
 
 // GetAcceleratablePartitionedProfileResourceName 构造厂商的硬分区规格键。
@@ -289,6 +304,8 @@ var _SeparatorlessPartitionedProfileManufacturerSet = sets.New(ManufacturerTHead
 var (
 	// _VendorPartitionedProfileGeometryRegex 匹配无点分隔的规格，并提取计算切片数与显存容量。
 	_VendorPartitionedProfileGeometryRegex = regexp.MustCompile(`^([0-9]+)g([0-9]+)gb$`)
+	// _PublishedPartitionedProfileGeometryRegex 匹配本 operator 对外发布的、带分隔符的分区规格名。
+	_PublishedPartitionedProfileGeometryRegex = regexp.MustCompile(`^([0-9]+)g\.([0-9]+)gb$`)
 )
 
 // PublishPartitionedProfileName 将厂商规格名转换为对外发布的格式。对省略分隔点的厂商把 4g48gb 改为 4g.48gb，
@@ -304,11 +321,34 @@ func PublishPartitionedProfileName(manufacturer, profile string) string {
 	return m[1] + "g." + m[2] + "gb"
 }
 
+// VendorPartitionedProfileName 将对外发布的规格名还原成厂商库的拼法，供库存、归属标记和驱动调用使用。
+// 重复调用结果相同，其他格式、原本就带分隔符的厂商以及尚未确定厂商的输入均保留原值。
+func VendorPartitionedProfileName(manufacturer, profile string) string {
+	if !_SeparatorlessPartitionedProfileManufacturerSet.Has(manufacturer) {
+		return profile
+	}
+	m := _PublishedPartitionedProfileGeometryRegex.FindStringSubmatch(profile)
+	if m == nil {
+		return profile
+	}
+	return m[1] + "g" + m[2] + "gb"
+}
+
 // PartitionedProfileOf 从已知厂商的 <基础名>.partitioned.<技术名>-<规格> 资源键中提取规格名。
 // 它会校验基础资源名和技术名，.partitioned.units 属于额度键。
 func PartitionedProfileOf(name core.ResourceName) (string, bool) {
 	_, profile, ok := partitionedProfileOf(name)
 	return profile, ok
+}
+
+// VendorPartitionedProfileOf 判断资源键是否形如 <base>.partitioned.<kind>-<profile>，
+// 并返回厂商库使用的规格名。回到 operator 内部时须用这个拼法，才能与库存和归属标记一致。
+func VendorPartitionedProfileOf(name core.ResourceName) (string, bool) {
+	manufacturer, profile, ok := partitionedProfileOf(name)
+	if !ok {
+		return "", false
+	}
+	return VendorPartitionedProfileName(manufacturer, profile), true
 }
 
 // partitionedProfileOf 同时解析规格所属厂商和规格名，让各公开读取入口使用相同的校验规则。
@@ -410,6 +450,15 @@ func NormalizePartitionedProfileName(raw string) string {
 		return ""
 	}
 	return fields[len(fields)-1]
+}
+
+// MemoryMibToUnits 把单卡显存请求从 MiB 折算为标准单位，计算 floor(mib / cardVRAMMib × ResourceMaxUnits)。
+// 显存不能超配，因此向下取整。整卡显存非正时返回零，表示暂时无法换算。
+func MemoryMibToUnits(mib, cardVRAMMib int64) int64 {
+	if cardVRAMMib <= 0 {
+		return 0
+	}
+	return mib * ResourceMaxUnits / cardVRAMMib
 }
 
 const (

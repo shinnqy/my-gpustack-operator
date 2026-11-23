@@ -25,6 +25,7 @@ import (
 	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	kueueadmissioncheck "sigs.k8s.io/kueue/pkg/util/admissioncheck"
+	kueuetas "sigs.k8s.io/kueue/pkg/util/tas"
 	kueueworkload "sigs.k8s.io/kueue/pkg/workload"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
@@ -96,6 +97,11 @@ type sharedNeed struct {
 	containers int32
 }
 
+// IMPORTANT: 该方法把原本笼统的“总共要 3 张整卡”，拆成两条精确到节点的硬指标：
+//   - 1. host-a 上必须能找出 2 张完整空卡（node="host-a", cards=2）
+//   - 2. host-b 上必须能找出 1 张完整空卡（node="host-b", cards=1）
+//
+// =======
 // parseFamilyDemands 从 Workload 的 Pod 模板中读取加速器需求，为每个 (podset, family)
 // 生成一个关联元组；仅当分配的 flavor、单卡需求与 profile 均一致时才跨 podset 合并，
 // 因此常见的单 podset Workload 在每个资源族上恰好产出一个元组。未请求任何已知加速器的
@@ -142,7 +148,30 @@ type nodeShare struct {
 // Workload 获得准入，其拓扑解门器会将分配的节点标签复制到每个 Pod 的 nodeSelector 中。
 // 因此在执行本检查时，目标节点实际上已经确定。
 func assignedNodes(wl *kueue.Workload, podSet kueue.PodSetReference) []nodeShare {
-	// 在第 08 章中实现此函数。
+	if wl.Status.Admission == nil {
+		return nil
+	}
+	for i := range wl.Status.Admission.PodSetAssignments {
+		psa := &wl.Status.Admission.PodSetAssignments[i]
+		if psa.Name != podSet {
+			continue
+		}
+		ta := psa.TopologyAssignment
+		// 最低拓扑层级是不是主机名？
+		// 	- 如果最后一项是 hostname，说明 Kueue 已经拍板定死每个 Pod 要去哪台具体机器了！
+		// 	- 如果最后一项不是 hostname（例如 ["zone", "rack"]，只定到了“1 号机柜”，没定具体机器；或者根本没开 TAS，ta == nil）：说明目标机器还没敲定，Pod 去这个机柜里哪台机器都行。这时没法把检查收窄到某一台机器，所以直接 return nil，退回到按整个资源池（flavor）范围检查。
+		if ta == nil || !kueuetas.IsLowestLevelHostname(ta.Levels) {
+			return nil
+		}
+		var shares []nodeShare
+		for domain := range kueuetas.InternalSeqFrom(ta) {
+			if len(domain.Values) == 0 || domain.Count <= 0 {
+				continue
+			}
+			shares = append(shares, nodeShare{hostname: domain.Values[len(domain.Values)-1], count: domain.Count})
+		}
+		return shares
+	}
 	return nil
 }
 
@@ -430,6 +459,12 @@ type cardLedger struct {
 	allocatedSlices int32
 }
 
+// coveredBy 判断卡能否服务这条需求。卡必须属于 Kueue 实际分配的 flavor；读不到分配时，
+// 不能默默放宽到整个池。请求还指定了节点时，只能使用该节点上的卡。
+func (c cardLedger) coveredBy(d familyDemand) bool {
+	return c.flavors.Has(d.flavor) && (d.node == "" || c.hostname == d.node)
+}
+
 // flavorScope 表示单个已分配的 ResourceFlavor 对某个节点的覆盖声明：包含 flavor 本身，
 // 以及其 nodeLabels 固定的加速器设备键（"<manufacturer>-<id>"）。两者共同决定它覆盖
 // 节点上的哪些卡——仅凭设备键会把同型号但节点批次不同的两个 flavor 混为一谈，而仅凭
@@ -657,8 +692,18 @@ func withoutRoles(demands []familyDemand) []familyDemand {
 // 就会低于整卡容量，绝无法满足独占请求。它的 cards 计数即卡数：每份都需要一张独立的卡。
 // 当该资源族的设备集合中有足够数量的卡可满足时返回 Ready，否则返回 Retry。
 func fitExclusiveDemand(cards []cardLedger, budgets []cardBudget, d familyDemand) (kueue.CheckState, string) {
-	// 在第 08 章实现此函数。
-	return kueue.CheckStateRetry, "exclusive admission is pending"
+	var fit int32
+	for i := range cards {
+		if budgets[i].whole || budgets[i].shares > 0 || budgets[i].slices > 0 || !cards[i].coveredBy(d) ||
+			!cards[i].servesFamily(d.family) || cards[i].remaining < nodefeature.ResourceMaxUnits {
+			continue
+		}
+		budgets[i].whole = true
+		if fit++; fit >= d.cards {
+			return kueue.CheckStateReady, demandVerdictMessage(kueue.CheckStateReady, d)
+		}
+	}
+	return kueue.CheckStateRetry, demandVerdictMessage(kueue.CheckStateRetry, d)
 }
 
 // fitSharedDemand 按持有者逐个对共享请求进行准入判断。每个持有者需要在同一节点上获得
@@ -792,6 +837,9 @@ func (r *NodeDevicesAdmissionReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, nil
 	}
 
+	// IMPORTANT: 该方法把原本笼统的“总共要 3 张整卡”，拆成两条精确到节点的硬指标：
+	//   - 1. host-a 上必须能找出 2 张完整空卡（node="host-a", cards=2）
+	//   - 2. host-b 上必须能找出 1 张完整空卡（node="host-b", cards=1）
 	demands := parseFamilyDemands(wl)
 
 	// 判定结果中的角色从句用于指明涉及哪个角色，只有当 Workload 拥有多个需要区分的 podset
@@ -1157,6 +1205,27 @@ func desiredCheckStates(
 		}
 	}
 	return desired, changed
+}
+
+// demandVerdictMessage 为按数量申请的设备生成准入说明。Kueue 指定节点时说明该节点的结果，
+// 否则说明已分配 flavor 对应的资源池。
+func demandVerdictMessage(state kueue.CheckState, d familyDemand) string {
+	if d.node != "" {
+		return assignedNodeMessage(state, d)
+	}
+	return verdictMessage(state, d.podSets)
+}
+
+// assignedNodeMessage 解释受指定节点约束的准入结果。Kueue 的拓扑调度只看节点总量，
+// 看不到额度分散在哪些卡上。驱逐后若总量未变，它可能反复选择同一节点，即使另一个节点有空卡，
+// 也得等指定节点的设备释放。
+func assignedNodeMessage(state kueue.CheckState, d familyDemand) string {
+	if state == kueue.CheckStateReady {
+		return fmt.Sprintf("the node %q Kueue assigned has enough free cards to place the request%s", d.node, forRoles(d.podSets))
+	}
+	return fmt.Sprintf("no card on the node %q Kueue assigned can host the request%s;"+
+		" Kueue's topology-aware scheduling sees only the node's summed capacity and may assign the same node again,"+
+		" so this retries until that node's cards free, even while another node has room", d.node, forRoles(d.podSets))
 }
 
 func verdictMessage(state kueue.CheckState, podSets []kueue.PodSetReference) string {

@@ -58,22 +58,24 @@
 
 ## 三、文件结构与模块索引
 
-本目录的 20 个源文件按职责分为 5 个模块：
+下面按职责列出本目录的实现文件。
 
 ### 1. 节点设备账本与资源回收
 | 文件 | 作用 |
 | --- | --- |
-| `controller.go` | `DevicesReconciler`：监听本机 `Devices` 和 `Pod`，重建 `Devices.status` 账本，作为全局分配锁与变更广播中心（核心协调逻辑在第 8 章补齐） |
+| `controller.go` | `DevicesReconciler`：监听本机 `Devices` 和 `Pod`，重建 `Devices.status` 账本，为同一节点上的分配提供互斥锁，并在设备状态变化时通知插件 |
 | `terminated.go` | 判断 Pod 是否彻底终结不再重启，过滤不影响账本的 Pod 更新事件 |
-| `kubelet_pods.go` | 辅助查询本机 `kubelet` 视角的 Pod 列表用于对账 |
+| `kubelet_pods.go` | 查询本机 kubelet 已接收哪些 Pod、哪个容器仍在等待设备 |
+| `kubelet_allocations.go` | 对照 kubelet 持有的设备 ID 和 Pod 注解，出现归属冲突时阻止新分配和账本发布 |
+| `gc.go` | 对照连续多轮存活 Pod 的 UID，回收已消失 Pod 的切片工作目录 |
 | `pod_labels.go` | Chart 与控制器共用的 Pod 标签/索引常量契约，集中定义避免多处漂移 |
 | `reclaim.go` | `RunReclaimLoop`：结合账本广播与 60 秒兜底定时器，驱动有状态资源（MIG、sMLU、sGPU 等）的后台回收 |
 
-### 2. 通用 Device Plugin gRPC 服务骨架
+### 2. 通用 Device Plugin gRPC 服务
 | 文件 | 作用 |
 | --- | --- |
 | `serving.go` | 封装 Unix Socket 监听、gRPC Server 启停、定时巡检 Socket 与向 `kubelet` 自动重注册 |
-| `server.go` | `ResourceServer`：面向 `kubelet` 的通用加速器插件服务，把厂商差异委派给 `Responder`（`Start` / `ListAndWatch` 核心在第 8 章补齐） |
+| `server.go` | `ResourceServer`：面向 `kubelet` 的通用加速器插件服务，注册资源、发布设备清单、推荐候选卡，在 `Allocate` 中预留设备并写 Pod 注解，最后由厂商 `Responder` 构造容器响应 |
 | `responder.go` | 定义厂商需要实现的 `Responder` 回调接口（构造 `Allocate` 响应等） |
 | `resource.go` | 内部设备资源标识抽象（统一承载加速器、网卡端口等） |
 | `types.go` | 重新导出 `k8s.io/kubelet` Device Plugin v1beta1 API 类型别名，减少各厂商包的直接耦合 |
@@ -106,6 +108,6 @@
 
 在本仓库的渐进式学习路径中：
 - **第 5 章**：随着 `device-manager serve` 接通，本目录作为编译与启动底座整体引入；
-- **第 8 章（整卡）**：补齐 `controller.go` 账本重建与 `server.go` 插件注册/上报；
+- **第 8 章（整卡）** 已接通独占分配。Pod 请求一张卡后，kubelet 从清单选择令牌，插件记录实际卡的归属。Pod 删除后账本恢复满额。
 - **第 9～11 章（共享 / 软切 / 硬切）**：完整串联 `budget.go`、`sliced_room.go`、`inject.go`、`reclaim.go`；
 - **第 14 章（RDMA）**：补齐 `rdma_allocate.go`，完成 RDMA 端到端分配。

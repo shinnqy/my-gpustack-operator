@@ -158,6 +158,16 @@ func TestGetResourceRequirements(t *testing.T) {
 	}
 }
 
+func TestGetResourceRequirementsExclusive(t *testing.T) {
+	instType := &worker.InstanceType{Spec: workercore.InstanceTypeSpec{Acceleratable: true}}
+	instType.Status.Detail.Manufacturer = nodefeature.ManufacturerNVIDIA
+	resources := &workercore.InstanceResources{Accelerator: ptr.To(qty("2"))}
+	rr := getResourceRequirements(resources, instType, false, false, true, false)
+	want := core.ResourceList{"nvidia.com/gpu": qty("2")}
+	assertResourceList(t, want, rr.Requests, "requests")
+	assertResourceList(t, want, rr.Limits, "limits")
+}
+
 func buildInstanceClient(objs ...ctrlcli.Object) ctrlcli.Client {
 	return ctrlfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).

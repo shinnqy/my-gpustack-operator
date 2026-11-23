@@ -1239,7 +1239,7 @@ func getPortName(port workercore.InstancePort) string {
 //
 // 主容器使用通用资源和 withAccelerator，sshd 使用与它互斥的 withVisibility，按主容器的卡数申请同卡可见性。
 // 两个设备分支都要求规格支持加速器且申请卡数为正。Instance 和 ModelDeployment 共用资源参数与规格，
-// 以便后续章节在这个函数中统一补上整卡、逻辑切片和硬件分区的资源名与配额。
+// 两者都用这个函数设置主机资源、独占整卡请求和边车的设备可见性。
 func getResourceRequirements(
 	instRess *workercore.InstanceResources,
 	instType *worker.InstanceType,
@@ -1284,7 +1284,12 @@ func getResourceRequirements(
 			case instType.Status.Detail.IsLogicallySliceable() && instRess.AcceleratorSlicedMemoryPercentage > 0:
 				// 第 10 章在这里填写逻辑切片的卡数、显存和算力百分比。
 			default:
-				// 第 8 章在这里填写独占整卡的资源名和卡数。
+				// IMPORTANT: 第一次处理 GPU 资源，让 K8S 认识普通的 GPU 资源 （就是没有逻辑切分和硬切分的情况）
+				// 不支持逻辑切片的规格，或者请求的切片比例为零，都按独占整卡处理。若厂商不支持请求的硬件分区，
+				// 此处也没有对应的分区资源键，webhook 会拒绝这类请求。
+				resName := nodefeature.GetAcceleratableResourceName(manufacturer, workercore.DeviceAllocationModeExclusive)
+				rr.Limits[resName] = cardQ
+				rr.Requests[resName] = cardQ
 			}
 		case withVisibility:
 			// SSH 边车按主容器的卡数请求可见性。设备插件据此授予边车访问同一批设备的权限。切片的资源份额仍由主容器申请。

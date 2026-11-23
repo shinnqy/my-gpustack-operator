@@ -19,14 +19,19 @@ import (
 //   - Device, on Resource，是指令牌所指向物理设备的 ID。这是该包自己的词汇表，而非 kubelet 的词汇表——关于
 //     Device/Accelerator/Resource 的层级结构，可参考 pkg/device 包的文档。
 type (
-	Options                   = deviceplugin.DevicePluginOptions
-	Empty                     = deviceplugin.Empty
-	ListAndWatchResponse      = deviceplugin.ListAndWatchResponse
-	AllocateRequest           = deviceplugin.AllocateRequest
-	AllocateResponse          = deviceplugin.AllocateResponse
-	ContainerAllocateResponse = deviceplugin.ContainerAllocateResponse
-	Mount                     = deviceplugin.Mount
-	DeviceSpec                = deviceplugin.DeviceSpec
+	Options                              = deviceplugin.DevicePluginOptions
+	Empty                                = deviceplugin.Empty
+	ListAndWatchResponse                 = deviceplugin.ListAndWatchResponse
+	PreferredAllocationRequest           = deviceplugin.PreferredAllocationRequest
+	PreferredAllocationResponse          = deviceplugin.PreferredAllocationResponse
+	ContainerPreferredAllocationRequest  = deviceplugin.ContainerPreferredAllocationRequest
+	ContainerPreferredAllocationResponse = deviceplugin.ContainerPreferredAllocationResponse
+	AllocateRequest                      = deviceplugin.AllocateRequest
+	AllocateResponse                     = deviceplugin.AllocateResponse
+	ContainerAllocateRequest             = deviceplugin.ContainerAllocateRequest
+	ContainerAllocateResponse            = deviceplugin.ContainerAllocateResponse
+	Mount                                = deviceplugin.Mount
+	DeviceSpec                           = deviceplugin.DeviceSpec
 	// 服务器是每个设备插件 gRPC 服务器（其中包括 ResourceServer）向其调用者提供的生命周期契约，与
 	// kubelet API 接口无关，该服务器还实现了该接口。
 	Server interface {
