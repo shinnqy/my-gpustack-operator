@@ -2,13 +2,18 @@ package worker
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	core "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontrollerutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrlevent "sigs.k8s.io/controller-runtime/pkg/event"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlpredicate "sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -17,8 +22,18 @@ import (
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/controller"
+	"gpustack.ai/gpustack/pkg/kubeapistatus"
 	"gpustack.ai/gpustack/pkg/kubemeta"
 	"gpustack.ai/gpustack/pkg/utils/ctrlhandlerx"
+)
+
+const (
+	topologySourceConfigurationKind = "TopologySourceConfiguration"
+	topologySourceFinalizer         = "worker.gpustack.ai/topology-source"
+
+	TopologySourceConditionReady             kubeapistatus.ConditionType = "Ready"
+	TopologySourceConditionValid             kubeapistatus.ConditionType = "Valid"
+	TopologySourceConditionOwnershipConflict kubeapistatus.ConditionType = "OwnershipConflict"
 )
 
 // TopologySourceReconciler 观测设备清单并通过 NodeFeatures 发布可写标签。
@@ -30,11 +45,123 @@ type TopologySourceReconciler struct {
 
 var _ ctrlreconcile.Reconciler = (*TopologySourceReconciler)(nil)
 
+// IMPORTANT: 把外部拓扑安全引入集群
 func (r *TopologySourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// 在第 13 章中实现此函数。
-	var result0 ctrl.Result
-	var result1 error
-	return result0, result1
+	logger := ctrllog.FromContext(ctx)
+	// 取对象 + 优雅处理“正在删除”
+	source := new(workercore.TopologySource)
+	if err := r.Client.Get(ctx, req.NamespacedName, source); err != nil {
+		return ctrl.Result{}, ctrlcli.IgnoreNotFound(err)
+	}
+	if source.DeletionTimestamp != nil {
+		if !ctrlcontrollerutil.ContainsFinalizer(source, topologySourceFinalizer) {
+			return ctrl.Result{}, nil
+		}
+		if err := r.cleanupTopologySourceNodeFeatures(ctx, source); err != nil {
+			return ctrl.Result{}, err
+		}
+		ctrlcontrollerutil.RemoveFinalizer(source, topologySourceFinalizer)
+		return ctrl.Result{}, r.Client.Update(ctx, source)
+	}
+
+	// 拍下 Status 快照 + 重置本轮统计
+	before := source.DeepCopy().Status
+	source.Status.ObservedGeneration = source.Generation
+	source.Status.SourceKind = topologySourceKind(source)
+	source.Status.MutatedNodes = 0
+	source.Status.ConflictedNodes = 0
+
+	// 按来源类型路由
+	// IMPORTANT: 企业情况一、把机架映射表写在一份 YAML 里，放进 K8s 的 ConfigMap
+	if source.Spec.ConfigMap != nil {
+		if !ctrlcontrollerutil.ContainsFinalizer(source, topologySourceFinalizer) {
+			ctrlcontrollerutil.AddFinalizer(source, topologySourceFinalizer)
+			if err := r.Client.Update(ctx, source); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return r.reconcileTopologySourceConfigMap(ctx, source, before)
+	}
+	// IMPORTANT: 企业情况二、有自己的资产管理系统（CMDB / DCIM），需要 Operator 定期通过 HTTPS 接口去拉（写模式：Webhook）
+	if source.Spec.Webhook != nil {
+		if !ctrlcontrollerutil.ContainsFinalizer(source, topologySourceFinalizer) {
+			ctrlcontrollerutil.AddFinalizer(source, topologySourceFinalizer)
+			if err := r.Client.Update(ctx, source); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return r.reconcileTopologySourceWebhook(ctx, source, before)
+	}
+	// IMPORTANT: 企业情况三、已经由云厂商或运维脚本提前把标签打在 Node 上了
+	if source.Spec.NodeLabels != nil && ctrlcontrollerutil.ContainsFinalizer(source, topologySourceFinalizer) {
+		if err := r.cleanupTopologySourceNodeFeatures(ctx, source); err != nil {
+			return ctrl.Result{}, err
+		}
+		ctrlcontrollerutil.RemoveFinalizer(source, topologySourceFinalizer)
+		if err := r.Client.Update(ctx, source); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	// IMPORTANT: 企业情况四、什么信息都没提供
+	if source.Spec.NodeLabels == nil {
+		source.Status.SelectedNodes = 0
+		TopologySourceConditionReady.False(source, "PendingInventoryAdapter", "the inventory adapter is not active")
+		TopologySourceConditionValid.Unknown(source, "PendingInventoryAdapter", "the inventory adapter is not active")
+		TopologySourceConditionOwnershipConflict.False(source, "NoConflict", "the inventory adapter has not claimed Nodes")
+		return r.updateTopologySourceStatus(ctx, source, before)
+	}
+
+	selector, err := meta.LabelSelectorAsSelector(&source.Spec.NodeSelector)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	nodes := new(core.NodeList)
+	if err := r.Client.List(ctx, nodes, ctrlcli.MatchingLabelsSelector{Selector: selector}); err != nil {
+		logger.Error(err, "list selected Nodes")
+		return ctrl.Result{}, err
+	}
+	source.Status.SelectedNodes = int32(len(nodes.Items))
+	if err := validateTopologyNodeHierarchy(normalizeTopologyLevels(source.Spec.Levels), nodes.Items); err != nil {
+		TopologySourceConditionReady.False(source, "InvalidHierarchy", "selected Node labels do not form a topology tree")
+		TopologySourceConditionValid.False(source, "InvalidHierarchy", err.Error())
+		TopologySourceConditionOwnershipConflict.False(source, "ReadOnly", "nodeLabels does not claim Node labels")
+		return r.updateTopologySourceStatus(ctx, source, before)
+	}
+	TopologySourceConditionReady.True(source, "Observed", "selected Node labels are available")
+	TopologySourceConditionValid.True(source, "Observed", "selected Node labels are valid input")
+	TopologySourceConditionOwnershipConflict.False(source, "ReadOnly", "nodeLabels does not claim Node labels")
+	return r.updateTopologySourceStatus(ctx, source, before)
+}
+
+func (r *TopologySourceReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func (r *TopologySourceReconciler) updateTopologySourceStatus(
+	ctx context.Context,
+	source *workercore.TopologySource,
+	before workercore.TopologySourceStatus,
+) (ctrl.Result, error) {
+	if kubemeta.DeepEqual(before, source.Status) {
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{}, r.Client.Status().Update(ctx, source)
+}
+
+func topologySourceKind(source *workercore.TopologySource) string {
+	switch {
+	case source.Spec.NodeLabels != nil:
+		return "NodeLabels"
+	case source.Spec.ConfigMap != nil:
+		return "ConfigMap"
+	case source.Spec.Webhook != nil:
+		return "Webhook"
+	default:
+		return ""
+	}
 }
 
 func (r *TopologySourceReconciler) SetupController(_ context.Context, opts controller.SetupOptions) error {
@@ -174,4 +301,89 @@ func (r *TopologySourceReconciler) enqueueTopologySourcesWhenConfigMapChanged(
 		}
 	}
 	return reqs
+}
+
+func validateTopologySourceLabel(key, value, additionalWritePrefix string) error {
+	if !isTopologySourceStandardLabel(key) && !isTopologySourceWritableLabel(key, additionalWritePrefix) {
+		return fmt.Errorf("topology source cannot publish label %q", key)
+	}
+	if messages := validation.IsValidLabelValue(value); len(messages) > 0 || value == "" {
+		return fmt.Errorf("label %q has invalid value %q", key, value)
+	}
+	return nil
+}
+
+func isTopologySourceWritableLabel(key, additionalWritePrefix string) bool {
+	if key == TopologyProfileLabel {
+		return false
+	}
+	return strings.HasPrefix(key, "topology.gpustack.ai/") ||
+		(additionalWritePrefix != "" && strings.HasPrefix(key, additionalWritePrefix))
+}
+
+func isTopologySourceStandardLabel(key string) bool {
+	return key == core.LabelTopologyRegion || key == core.LabelTopologyZone
+}
+
+// 整份快照通过校验后才写 NodeFeature，防止把未选中的节点或互相矛盾的父子域发布出去。
+func validateTopologySnapshot(
+	source *workercore.TopologySource, snapshot workercore.TopologySourceConfiguration, selected map[string]struct{},
+) error {
+	if snapshot.APIVersion != workercore.GroupVersion.String() {
+		return fmt.Errorf("unsupported topology snapshot apiVersion %q", snapshot.APIVersion)
+	}
+	if snapshot.Kind != topologySourceConfigurationKind {
+		return fmt.Errorf("unsupported topology snapshot kind %q", snapshot.Kind)
+	}
+	if strings.TrimSpace(snapshot.Revision) == "" {
+		return fmt.Errorf("topology snapshot revision is required")
+	}
+	levelIndex := make(map[string]int, len(source.Spec.Levels))
+	for i, level := range source.Spec.Levels {
+		levelIndex[level] = i
+	}
+	parents := make(map[string]map[string]string)
+	for nodeName, labels := range snapshot.Nodes {
+		if _, found := selected[nodeName]; !found {
+			return fmt.Errorf("topology snapshot references unknown or unselected Node %q", nodeName)
+		}
+		for key, value := range labels {
+			index, declared := levelIndex[key]
+			if !declared {
+				return fmt.Errorf("topology snapshot Node %q declares undeclared level %q", nodeName, key)
+			}
+			if err := validateTopologySourceLabel(key, value, source.Spec.AdditionalWritePrefix); err != nil {
+				return fmt.Errorf("topology snapshot Node %q: %w", nodeName, err)
+			}
+			for parentIndex := 0; parentIndex < index; parentIndex++ {
+				if _, found := labels[source.Spec.Levels[parentIndex]]; !found {
+					return fmt.Errorf("topology snapshot Node %q has level %q without parent level %q", nodeName, key, source.Spec.Levels[parentIndex])
+				}
+			}
+		}
+		for i := 1; i < len(source.Spec.Levels); i++ {
+			child := source.Spec.Levels[i]
+			childValue, found := labels[child]
+			if !found {
+				continue
+			}
+			parentTuple := ""
+			for parentIndex := 0; parentIndex < i; parentIndex++ {
+				if parentIndex > 0 {
+					parentTuple += "\x00"
+				}
+				parentTuple += labels[source.Spec.Levels[parentIndex]]
+			}
+			byValue := parents[child]
+			if byValue == nil {
+				byValue = make(map[string]string)
+				parents[child] = byValue
+			}
+			if existing, exists := byValue[childValue]; exists && existing != parentTuple {
+				return fmt.Errorf("topology snapshot level %q value %q has conflicting parent tuples", child, childValue)
+			}
+			byValue[childValue] = parentTuple
+		}
+	}
+	return nil
 }

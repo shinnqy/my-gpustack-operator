@@ -1,0 +1,147 @@
+package worker
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+
+	core "k8s.io/api/core/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/utils/httpx"
+)
+
+const topologyWebhookMaxResponseBytes = 1 << 20
+
+func (r *TopologySourceReconciler) fetchTopologyWebhook(
+	ctx context.Context, source *workercore.TopologySource,
+) (workercore.TopologySourceConfiguration, error) {
+	webhook := source.Spec.Webhook
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	endpoint, err := url.Parse(webhook.URL)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.Fragment != "" {
+		return workercore.TopologySourceConfiguration{},
+			fmt.Errorf("topology webhook URL must be an absolute HTTPS URL without user information or a fragment")
+	}
+	if (webhook.BearerTokenSecretRef == nil) == (webhook.TLSClientCertificateSecretRef == nil) {
+		return workercore.TopologySourceConfiguration{}, fmt.Errorf("topology webhook requires exactly one credential reference")
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if webhook.CABundleConfigMapRef != nil {
+		ref := webhook.CABundleConfigMapRef
+		configMap := new(core.ConfigMap)
+		if err := reader.Get(ctx, ctrlcli.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, configMap); err != nil {
+			return workercore.TopologySourceConfiguration{}, fmt.Errorf("read webhook CA bundle: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(configMap.Data["ca.crt"])) {
+			return workercore.TopologySourceConfiguration{}, fmt.Errorf("webhook CA bundle is invalid")
+		}
+		tlsConfig.RootCAs = pool
+	}
+	request, err := httpx.NewGetRequestWithContext(ctx, endpoint.String())
+	if err != nil {
+		return workercore.TopologySourceConfiguration{}, fmt.Errorf("create webhook request: %w", err)
+	}
+	if webhook.BearerTokenSecretRef != nil {
+		ref := webhook.BearerTokenSecretRef
+		secret := new(core.Secret)
+		if err := reader.Get(ctx, ctrlcli.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+			return workercore.TopologySourceConfiguration{}, fmt.Errorf("read webhook bearer token: %w", err)
+		}
+		token := strings.TrimSpace(string(secret.Data["token"]))
+		if token == "" {
+			return workercore.TopologySourceConfiguration{}, fmt.Errorf("webhook bearer token is missing")
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	if webhook.TLSClientCertificateSecretRef != nil {
+		ref := webhook.TLSClientCertificateSecretRef
+		secret := new(core.Secret)
+		if err := reader.Get(ctx, ctrlcli.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+			return workercore.TopologySourceConfiguration{}, fmt.Errorf("read webhook client certificate: %w", err)
+		}
+		certificate, err := tls.X509KeyPair(secret.Data["tls.crt"], secret.Data["tls.key"])
+		if err != nil {
+			return workercore.TopologySourceConfiguration{}, fmt.Errorf("webhook client certificate is invalid")
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+	}
+	// 本轮超时由来源的请求上下文控制。只向配置的 HTTPS 端点发送凭据，重定向直接返回给调用方。
+	client := &http.Client{
+		Transport: httpx.Transport(httpx.TransportOptions().WithoutProxy().WithTLSClientConfig(tlsConfig)),
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return workercore.TopologySourceConfiguration{}, fmt.Errorf("read topology webhook: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return workercore.TopologySourceConfiguration{}, fmt.Errorf("topology webhook returned HTTP %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, topologyWebhookMaxResponseBytes+1))
+	if err != nil {
+		return workercore.TopologySourceConfiguration{}, fmt.Errorf("read topology webhook body: %w", err)
+	}
+	if len(body) > topologyWebhookMaxResponseBytes {
+		return workercore.TopologySourceConfiguration{}, fmt.Errorf("topology webhook response exceeds the size limit")
+	}
+	return decodeTopologySnapshot(body)
+}
+
+// IMPORTANT: 企业情况二、有自己的资产管理系统（CMDB / DCIM），需要 Operator 定期通过 HTTPS 接口去拉（写模式：Webhook）
+func (r *TopologySourceReconciler) reconcileTopologySourceWebhook(
+	ctx context.Context,
+	source *workercore.TopologySource,
+	before workercore.TopologySourceStatus,
+) (ctrl.Result, error) {
+	requestContext, cancel := context.WithTimeout(ctx, source.Spec.Webhook.Timeout.Duration)
+	defer cancel()
+	snapshot, err := r.fetchTopologyWebhook(requestContext, source)
+	if err != nil {
+		result, updateErr := r.markTopologySourceWebhookInvalid(ctx, source, before, err)
+		if updateErr == nil && (result.RequeueAfter == 0 || source.Spec.Webhook.PollInterval.Duration < result.RequeueAfter) {
+			result.RequeueAfter = source.Spec.Webhook.PollInterval.Duration
+		}
+		return result, updateErr
+	}
+	result, err := r.applyTopologySourceSnapshot(ctx, source, before, snapshot)
+	if err != nil {
+		return result, err
+	}
+	pollInterval := source.Spec.Webhook.PollInterval.Duration
+	if result.RequeueAfter == 0 || pollInterval < result.RequeueAfter {
+		result.RequeueAfter = pollInterval
+	}
+	return result, nil
+}
+
+func (r *TopologySourceReconciler) markTopologySourceWebhookInvalid(
+	ctx context.Context,
+	source *workercore.TopologySource,
+	before workercore.TopologySourceStatus,
+	err error,
+) (ctrl.Result, error) {
+	return r.markTopologySourceSnapshotInvalid(
+		ctx,
+		source,
+		before,
+		"WebhookReadFailed",
+		err,
+		source.Spec.Webhook.MaxStaleness.Duration,
+		"webhook snapshot",
+	)
+}

@@ -3,11 +3,14 @@ package worker
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,6 +46,7 @@ type NodeTopologyReconciler struct {
 
 var _ ctrlreconcile.Reconciler = (*NodeTopologyReconciler)(nil)
 
+// IMPORTANT: 把节点标签翻译成 Kueue Topology 与指纹
 // IMPORTANT: 给 Node 贴拓扑指纹(profile)，创建 Kueue Topology
 func (r *NodeTopologyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	node := new(core.Node)
@@ -74,10 +78,33 @@ func (r *NodeTopologyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, r.Client.Update(ctx, updated)
 }
 
-// 解析拓扑层级
+// 只有一个就绪来源选中节点时才采用它的层级，主机名始终是最后一级。
 func (r *NodeTopologyReconciler) resolveNodeTopologyLevels(ctx context.Context, node *core.Node) ([]string, error) {
-	// 第 6 章只按主机名区分节点，第 13 章再从拓扑源解析多级结构。
-	return []string{core.LabelHostname}, nil
+	sources := new(workercore.TopologySourceList)
+	if err := r.Client.List(ctx, sources); err != nil {
+		return nil, err
+	}
+	var matched []string
+	matches := 0
+	for i := range sources.Items {
+		source := &sources.Items[i]
+		if !TopologySourceConditionReady.IsTrue(source) {
+			continue
+		}
+		selector, err := meta.LabelSelectorAsSelector(&source.Spec.NodeSelector)
+		if err != nil {
+			return nil, err
+		}
+		if !selector.Matches(labels.Set(node.Labels)) {
+			continue
+		}
+		matches++
+		matched = topologyPrefix(node.Labels, normalizeTopologyLevels(source.Spec.Levels))
+	}
+	if matches != 1 {
+		matched = nil
+	}
+	return append(matched, core.LabelHostname), nil
 }
 
 func (r *NodeTopologyReconciler) ensureTopology(ctx context.Context, profile string, levels []string) error {
@@ -115,6 +142,88 @@ func topologyLevelObjects(levels []string) []kueue.TopologyLevel {
 		result[i] = kueue.TopologyLevel{NodeLabel: level}
 	}
 	return result
+}
+
+// 只使用从最上层开始连续存在的标签。缺少父域时，后面的子域不能单独参与放置。
+func topologyPrefix(nodeLabels map[string]string, levels []string) []string {
+	result := make([]string, 0, len(levels))
+	for _, level := range levels {
+		if nodeLabels[level] == "" {
+			break
+		}
+		result = append(result, level)
+	}
+	return result
+}
+
+// Topograph 的 tier-0 最靠近设备。连续的 Fabric 层若按从近到远给出，先翻转为 Kueue 使用的从粗到细顺序。
+func normalizeTopologyLevels(levels []string) []string {
+	result := slices.Clone(levels)
+	for start := 0; start < len(result); {
+		if _, found := topographFabricTier(result[start]); !found {
+			start++
+			continue
+		}
+		end := start + 1
+		for end < len(result) {
+			if _, found := topographFabricTier(result[end]); !found {
+				break
+			}
+			end++
+		}
+		first, _ := topographFabricTier(result[start])
+		last, _ := topographFabricTier(result[end-1])
+		if first < last {
+			slices.Reverse(result[start:end])
+		}
+		start = end
+	}
+	return result
+}
+
+func topographFabricTier(level string) (int, bool) {
+	if !strings.HasPrefix(level, topographFabricPrefix) {
+		return 0, false
+	}
+	tier, err := strconv.Atoi(strings.TrimPrefix(level, topographFabricPrefix))
+	return tier, err == nil
+}
+
+// 同一层的子域必须对应唯一的父域路径。节点可以缺少末尾层级，但不能跳过中间的父域。
+func validateTopologyNodeHierarchy(levels []string, nodes []core.Node) error {
+	parents := make(map[string]map[string]string)
+	for i := range nodes {
+		node := &nodes[i]
+		missingParent := false
+		for levelIndex, level := range levels {
+			value := node.Labels[level]
+			if value == "" {
+				missingParent = true
+				continue
+			}
+			if missingParent {
+				return fmt.Errorf("node %q has level %q without its parent", node.Name, level)
+			}
+			if levelIndex == 0 {
+				continue
+			}
+			parentValues := make([]string, levelIndex)
+			for parentIndex := range levelIndex {
+				parentValues[parentIndex] = node.Labels[levels[parentIndex]]
+			}
+			byValue := parents[level]
+			if byValue == nil {
+				byValue = make(map[string]string)
+				parents[level] = byValue
+			}
+			parentTuple := strings.Join(parentValues, "\x00")
+			if existing, found := byValue[value]; found && existing != parentTuple {
+				return fmt.Errorf("level %q value %q has conflicting parent tuples", level, value)
+			}
+			byValue[value] = parentTuple
+		}
+	}
+	return nil
 }
 
 func (r *NodeTopologyReconciler) enqueueAllNodes(ctx context.Context, _ ctrlcli.Object) []ctrlreconcile.Request {

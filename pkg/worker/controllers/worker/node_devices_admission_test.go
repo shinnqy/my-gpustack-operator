@@ -5,13 +5,21 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	kueueadmissioncheck "sigs.k8s.io/kueue/pkg/util/admissioncheck"
 	kueuetas "sigs.k8s.io/kueue/pkg/util/tas"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/kubeclients/kubernetes/scheme"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 )
 
@@ -512,4 +520,120 @@ func TestNodeDevicesFeasibilityPartitionedMessages(t *testing.T) {
 	assert.NotEqual(t, partitionLedgerNotReadyMessage(nil), noPartitionMsg,
 		"a pool with no partitioned card must not reuse the device-manager-rollout message")
 	assert.Contains(t, noPartitionMsg, "no partitioned card")
+}
+
+// Node 名称用于读取 Devices 账本，Kueue 的分配则使用 hostname 标签。
+// 节点 A 有一张空卡，B 有两张。一个副本申请一张卡，检查最终写回 Workload 的准入状态。
+func TestNodeDevicesAdmission_ReadsTheNodeTASAssigned(t *testing.T) {
+	const (
+		rack = "topology.gpustack.ai/rack"
+		pool = "gpu-pool"
+	)
+	nodeLevels := []string{rack, core.LabelHostname}
+	tests := []struct {
+		name    string
+		levels  []string
+		domains []kueuetas.TopologyDomainAssignment
+		want    kueue.CheckState
+	}{
+		{
+			name: "两个副本都给 A", levels: nodeLevels,
+			domains: []kueuetas.TopologyDomainAssignment{{Values: []string{"r1", "host-a"}, Count: 2}},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name: "两个副本都给 B", levels: nodeLevels,
+			domains: []kueuetas.TopologyDomainAssignment{{Values: []string{"r1", "host-b"}, Count: 2}},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			name: "A 和 B 各一个副本", levels: nodeLevels,
+			domains: []kueuetas.TopologyDomainAssignment{
+				{Values: []string{"r1", "host-a"}, Count: 1},
+				{Values: []string{"r1", "host-b"}, Count: 1},
+			},
+			want: kueue.CheckStateReady,
+		},
+		{
+			name: "分给不存在的 hostname", levels: []string{core.LabelHostname},
+			domains: []kueuetas.TopologyDomainAssignment{{Values: []string{"host-missing"}, Count: 2}},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name: "只分到机架时按已分配的 flavor 检查", levels: []string{rack},
+			domains: []kueuetas.TopologyDomainAssignment{{Values: []string{"r1"}, Count: 2}},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			name: "没有拓扑分配时按已分配的 flavor 检查",
+			want: kueue.CheckStateReady,
+		},
+	}
+	base := nodefeature.GetAcceleratableResourceName(nodefeature.ManufacturerNVIDIA, workercore.DeviceAllocationModeExclusive)
+	credits := nodefeature.GetAcceleratableCreditsResourceName(nodefeature.ManufacturerNVIDIA)
+	poolLabels := map[string]string{"acceleratable.feature.gpustack.ai/nvidia-g0": "true"}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			assignment := kueue.PodSetAssignment{
+				Name: "main", Count: ptr.To(int32(2)),
+				Flavors: map[core.ResourceName]kueue.ResourceFlavorReference{credits: pool},
+			}
+			if len(tc.levels) > 0 {
+				assignment.TopologyAssignment = kueuetas.V1Beta2From(&kueuetas.TopologyAssignment{Levels: tc.levels, Domains: tc.domains})
+			}
+			wl := &kueue.Workload{
+				ObjectMeta: meta.ObjectMeta{Namespace: "default", Name: "workers"},
+				Spec: kueue.WorkloadSpec{PodSets: []kueue.PodSet{{
+					Name: "main", Count: 2,
+					Template: core.PodTemplateSpec{Spec: core.PodSpec{Containers: []core.Container{{
+						Name: "worker", Resources: core.ResourceRequirements{Requests: core.ResourceList{base: resource.MustParse("1")}},
+					}}}},
+				}}},
+				Status: kueue.WorkloadStatus{
+					Conditions: []meta.Condition{{
+						Type: kueue.WorkloadQuotaReserved, Status: meta.ConditionTrue,
+						Reason: "QuotaReserved", Message: "quota reserved", LastTransitionTime: meta.Now(),
+					}},
+					Admission:       &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{assignment}},
+					AdmissionChecks: []kueue.AdmissionCheckState{{Name: _NodeDevicesAdmissionCheckName, State: kueue.CheckStatePending}},
+				},
+			}
+			objects := []ctrlcli.Object{
+				wl,
+				&kueue.ResourceFlavor{ObjectMeta: meta.ObjectMeta{Name: pool}, Spec: kueue.ResourceFlavorSpec{NodeLabels: poolLabels}},
+				&kueue.AdmissionCheck{ObjectMeta: meta.ObjectMeta{Name: _NodeDevicesAdmissionCheckName}, Spec: kueue.AdmissionCheckSpec{ControllerName: _NodeDevicesControllerName}},
+			}
+			for i, suffix := range []string{"a", "b"} {
+				free := []int32{nodefeature.ResourceMaxUnits}
+				if i == 1 {
+					free = append(free, nodefeature.ResourceMaxUnits)
+				}
+				devs := devicesWithRemaining(free...)
+				node := &core.Node{ObjectMeta: meta.ObjectMeta{Name: "node-" + suffix, Labels: map[string]string{
+					core.LabelHostname: "host-" + suffix, rack: "r1",
+				}}}
+				devs.ObjectMeta = meta.ObjectMeta{Name: node.Name, Labels: poolLabels}
+				for j := range devs.Spec.Groups[0].Accelerators {
+					id := node.Name + "-" + devs.Spec.Groups[0].Accelerators[j].ID
+					devs.Spec.Groups[0].Accelerators[j].ID = id
+					devs.Status.Groups[0].Accelerators[j].ID = id
+				}
+				objects = append(objects, node, &devs)
+			}
+			cli := ctrlfake.NewClientBuilder().WithScheme(scheme.Scheme).
+				WithObjects(objects...).WithStatusSubresource(wl).
+				WithIndex(&core.Pod{}, _podNodeNameField, func(obj ctrlcli.Object) []string {
+					return []string{obj.(*core.Pod).Spec.NodeName}
+				}).Build()
+			r := &NodeDevicesAdmissionReconciler{Client: cli, APIReader: cli}
+			key := ctrlcli.ObjectKeyFromObject(wl)
+			_, err := r.Reconcile(ctx, ctrlreconcile.Request{NamespacedName: key})
+			require.NoError(t, err)
+			require.NoError(t, cli.Get(ctx, key, wl))
+			check := kueueadmissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, _NodeDevicesAdmissionCheckName)
+			require.NotNil(t, check)
+			assert.Equal(t, tc.want, check.State, check.Message)
+		})
+	}
 }
