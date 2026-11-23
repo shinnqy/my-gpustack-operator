@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -310,3 +311,131 @@ type (
 		Stop()
 	}
 )
+
+// 分配器交付设备前需要确认的运行条件，以及各项检查的结果。
+type (
+	// PreflightState 表示一次设备能力检查或厂商探测的结论。三个状态分别对应可用、本次无法确认和硬件未声明这项能力。
+	PreflightState string
+
+	// PreflightDepth 表示结论的依据，依次为读取声明、检查分配器的产物、运行容器后取得实测数据。
+	PreflightDepth string
+
+	// PreflightDetection 保存一次厂商探测本身的结论。它区分“没有发现设备”和“无法探测”，便于定位驱动或挂载问题。
+	PreflightDetection struct {
+		// State 为 ok 表示已发现设备，为 not-declared 表示未发现该厂商设备，为 unavailable 表示这次无法确认。
+		State PreflightState `json:"state" yaml:"state"`
+		// Depth 记录这次探测取得的证据层级。
+		Depth PreflightDepth `json:"depth" yaml:"depth"`
+		// Accelerators 是该厂商所有设备组的加速器总数。
+		Accelerators int `json:"accelerators" yaml:"accelerators"`
+		// Detail 保留探测器对设备型号和数量的描述。
+		Detail string `json:"detail,omitempty" yaml:"detail,omitempty"`
+		// Reason 说明没有发现设备或探测失败的原因。探测成功时为空。
+		Reason string `json:"reason,omitempty" yaml:"reason,omitempty"`
+		// Host 保存宿主机厂商工具的结果。对照宿主机与容器的设备数量，可以发现设备或驱动未挂载到容器的情况。
+		Host *PreflightHostView `json:"host,omitempty" yaml:"host,omitempty"`
+	}
+
+	// PreflightHostView 保存从宿主机根目录运行厂商工具所得的信息，即使当前容器没有挂载设备也能单独查询。
+	PreflightHostView struct {
+		// Command 保存实际在宿主机执行的命令，方便复查。
+		Command string `json:"command" yaml:"command"`
+		// Accelerators 是宿主机厂商工具报告的加速器数量。
+		Accelerators int `json:"accelerators" yaml:"accelerators"`
+		// Detail 保留宿主机工具返回的原文。
+		Detail string `json:"detail,omitempty" yaml:"detail,omitempty"`
+		// Reason 说明无法访问宿主机根目录、找不到工具或命令失败等原因。取得结果时为空。
+		Reason string `json:"reason,omitempty" yaml:"reason,omitempty"`
+		// MissingMounts 仅在宿主机能看到加速器而容器探测不到时列出容器缺少的挂载。
+		MissingMounts []string `json:"missingMounts,omitempty" yaml:"missingMounts,omitempty"`
+	}
+
+	// PreflightCheck 记录一张卡的一项分配前置条件。State 供程序判断，Reason 保留现场排查所需的驱动答复。
+	PreflightCheck struct {
+		// Accelerator 标识被检查的加速器。
+		Accelerator string `json:"accelerator" yaml:"accelerator"`
+		// Capability 使用厂商对该能力的命名，例如 Ascend 的 container-share，以便对照厂商工具。
+		// 跨厂商比较时使用 Mode。
+		Capability string `json:"capability" yaml:"capability"`
+		// Mode 是该前置条件影响的分配模式。PreflightModeOf 从分配器枚举得到统一的小写名称，便于按模式比较不同厂商的结果。
+		Mode string `json:"mode" yaml:"mode"`
+		// State 记录检查结论。
+		State PreflightState `json:"state" yaml:"state"`
+		// Depth 记录实际检查到的层级。厂商未指定时，单次驱动读取按 declared 处理。
+		Depth PreflightDepth `json:"depth" yaml:"depth"`
+		// Detail 保存驱动返回的具体值，可以据此区分“能读取开关”和“开关已打开”。
+		Detail string `json:"detail,omitempty" yaml:"detail,omitempty"`
+		// Reason 说明能力读取失败或设备没有声明该能力的原因。检查成功时为空。
+		Reason string `json:"reason,omitempty" yaml:"reason,omitempty"`
+		// Command 保存探针实际执行或准备执行的完整容器命令，便于在节点上复现。
+		Command string `json:"command,omitempty" yaml:"command,omitempty"`
+		// Evidence 原样保存容器输出，实测结果可以追溯到当时的读数。
+		Evidence string `json:"evidence,omitempty" yaml:"evidence,omitempty"`
+	}
+
+	// PreflightGroup 汇总一个厂商在本轮检查中所有加速器的结果。
+	PreflightGroup struct {
+		// Manufacturer 是设备厂商名称。
+		Manufacturer string `json:"manufacturer" yaml:"manufacturer"`
+		// Timestamp 是读取前置条件的时间。驱动与硬件状态可能在检查后发生变化。
+		Timestamp time.Time `json:"timestamp" yaml:"timestamp"`
+		// Detection 保存本轮基础探测结果，即使该厂商没有其他检查项也会返回。
+		Detection PreflightDetection `json:"detection" yaml:"detection"`
+		// Checks 为每张卡的每项前置条件保存一条记录，顺序无要求。
+		Checks []PreflightCheck `json:"checks,omitempty" yaml:"checks,omitempty"`
+		// Note 解释厂商为何没有驱动检查项或整个组为何没有检查记录。只生成了分配响应也可以在这里说明。
+		Note string `json:"note,omitempty" yaml:"note,omitempty"`
+	}
+
+	// PreflightGroupList 表示一次预检中各厂商的结果。
+	PreflightGroupList = []PreflightGroup
+
+	// PreflighterOptions 配置厂商预检器。
+	PreflighterOptions struct {
+		Logger klog.Logger
+		// DryRun 要求厂商只读，连短暂开启再恢复驱动开关也要跳过。检查结果会说明哪些行为尚未验证。
+		DryRun bool
+		// HostRoot 是宿主机根目录在容器中的挂载位置。读取宿主机文件时从这个根目录拼路径。空值表示无法访问宿主机，此时应在报告中说明，
+		// 避免误读容器自己的同名文件。
+		HostRoot string
+	}
+
+	// AcceleratorPreflighter 是分配器的可选预检接口。部分厂商分配时没有驱动前置条件，可以返回说明，
+	// 随后仍能用真实分配响应检查容器注入。
+	AcceleratorPreflighter interface {
+		// PreflightAccelerator 逐卡检查当前厂商的分配条件。单卡读取失败时把原因写入该卡的结果，继续检查其他卡。
+		PreflightAccelerator(groups DevicesGroupList) PreflightGroup
+	}
+)
+
+const (
+	// PreflightStateOK 表示此项条件允许分配。分配器能在分配时开启某开关时，即使目前关闭也可得到 ok，
+	// 当前值写在 Detail。
+	PreflightStateOK PreflightState = "ok"
+	// PreflightStateUnavailable 表示本轮无法确认该项能力正常。
+	// 驱动调用失败、容器内未观察到预期效果或恢复原状态失败等情况由 Reason 区分。
+	PreflightStateUnavailable PreflightState = "unavailable"
+	// PreflightStateNotDeclared 表示这一代接口或这张卡未声明该能力，分配器可以继续处理其余能力。
+	PreflightStateNotDeclared PreflightState = "not-declared"
+)
+
+const (
+	// PreflightDepthDeclared 表示已读取驱动或宿主机配置中的声明值。
+	PreflightDepthDeclared PreflightDepth = "declared"
+	// PreflightDepthSimulated 表示已调用真实分配器并核对生成的注入配置。这个阶段不会修改硬件，
+	// 也没有通过运行容器验证效果。
+	PreflightDepthSimulated PreflightDepth = "simulated"
+	// PreflightDepthMeasured 表示已运行探针并取得观察结果。
+	PreflightDepthMeasured PreflightDepth = "measured"
+)
+
+// PreflightModeUnnamed 标记没有指定分配模式的检查，使报告能明确显示这一项。
+const PreflightModeUnnamed = "unnamed"
+
+// PreflightModeOf 把分配模式枚举转成报告使用的小写名称，使报告随枚举名称变化。
+func PreflightModeOf(mode workercore.DeviceAllocationMode) string {
+	if mode == workercore.DeviceAllocationModeNone {
+		return PreflightModeUnnamed
+	}
+	return strings.ToLower(mode.String())
+}

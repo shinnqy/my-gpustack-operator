@@ -13,6 +13,10 @@ import (
 var (
 	OperatorLibDir  = "/var/lib/gpustack/operator/lib"
 	OperatorPodsDir = "/var/lib/gpustack/operator/pods"
+
+	// OperatorPreflightDir 保存探针临时生成的挂载文件。生产分配器用 OperatorPodsDir 判断占用，
+	// 两个目录分开后，即使探针被强制终止，遗留文件也不会占用真实 Pod 的设备额度。
+	OperatorPreflightDir = "/var/lib/gpustack/operator/preflight"
 )
 
 // PodWorkDir 返回切片容器的主机工作目录，<OperatorPodsDir>/<podUID>/c-<container>`。

@@ -3,7 +3,9 @@ package worker
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
@@ -53,6 +55,79 @@ func TestDesiredAcceleratorCapacity(t *testing.T) {
 				}
 			}
 			assertResourceList(t, want, desiredAcceleratorCapacity(node, devs), "capacity")
+		})
+	}
+}
+
+func TestBuildAcceleratorCapacityPatch(t *testing.T) {
+	const (
+		units = "nvidia.com/gpu.sliced.units"
+		mib   = "nvidia.com/gpu.sliced.memory-mib"
+	)
+	mkCap := func(entries map[string]string) core.ResourceList {
+		out := core.ResourceList{}
+		for k, v := range entries {
+			out[core.ResourceName(k)] = resource.MustParse(v)
+		}
+		return out
+	}
+
+	cases := []struct {
+		name    string
+		desired core.ResourceList
+		current core.ResourceList
+		want    map[string]any // nil 表示无需修改节点容量。
+	}{
+		{
+			// Patch 中使用 Kubernetes 的标准数量字符串，6400000 会表示成 6400k。
+			name:    "set on a node without the key",
+			desired: mkCap(map[string]string{units: "6400000"}),
+			current: mkCap(map[string]string{"cpu": "8"}),
+			want:    map[string]any{units: "6400k"},
+		},
+		{
+			name:    "no change when already equal",
+			desired: mkCap(map[string]string{units: "6400000"}),
+			current: mkCap(map[string]string{units: "6400000", "cpu": "8"}),
+			want:    nil,
+		},
+		{
+			name:    "update when value differs",
+			desired: mkCap(map[string]string{units: "6400000"}),
+			current: mkCap(map[string]string{units: "3200000"}),
+			want:    map[string]any{units: "6400k"},
+		},
+		{
+			// 从期望容量消失的受管切片资源应置为 null，以移除旧键。
+			name:    "remove stale sliced keys when the model disappears",
+			desired: nil,
+			current: mkCap(map[string]string{units: "6400000", mib: "98304", "cpu": "8"}),
+			want:    map[string]any{units: nil, mib: nil},
+		},
+		{
+			// 最后一张提供某个分区 profile 的卡离开后，也应移除该 profile 的容量键。
+			name:    "remove a stale per-profile key when the last card offering it leaves",
+			desired: nil,
+			current: mkCap(map[string]string{"nvidia.com/gpu.partitioned.mig-1g.10gb": "7", "cpu": "8"}),
+			want:    map[string]any{"nvidia.com/gpu.partitioned.mig-1g.10gb": nil},
+		},
+		{
+			name:    "bare .sliced and .shared device-plugin keys are left untouched",
+			desired: nil,
+			current: mkCap(map[string]string{"nvidia.com/gpu.sliced": "2048", "nvidia.com/gpu.shared": "10", "cpu": "8"}),
+			want:    nil,
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := buildAcceleratorCapacityPatch(c.desired, c.current)
+			if c.want == nil {
+				assert.Nil(t, got)
+				return
+			}
+			assert.Equal(t, c.want, got)
 		})
 	}
 }

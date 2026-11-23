@@ -3,6 +3,7 @@ package deviceplugin
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	clienttesting "k8s.io/client-go/testing"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -41,8 +43,12 @@ func (stubResponder) GetContainerAllocateResponse(
 
 // nodeFixture 按节点名给 Pod 建索引，使 Allocate 可以从同节点的 Pod 中找到正在申请设备的容器。
 func nodeFixture(objs ...ctrlcli.Object) ctrlcli.WithWatch {
+	// 使用基础 tracker 保存含 uint64 的设备状态，避免字段管理器在测试中转换硬件计数。
+	tracker := clienttesting.NewObjectTracker(scheme.Scheme, scheme.Codecs.UniversalDecoder())
 	return ctrlfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
+		WithObjectTracker(tracker).
+		WithStatusSubresource(&workercore.Devices{}).
 		WithObjects(objs...).
 		WithIndex(&core.Pod{}, IndexingPodsByNodeName, func(obj ctrlcli.Object) []string {
 			return []string{obj.(*core.Pod).Spec.NodeName}
@@ -496,4 +502,147 @@ func TestResourceServer_Allocate_PartitionedRejectsWhenTheNodeIsFull(t *testing.
 	assert.Contains(t, err.Error(), profile)
 	_, reserved := reservedWorkload(rec, "pod-full")
 	assert.False(t, reserved, "a rejected allocation holds no reservation")
+}
+
+// twoCardDevices 构造含 dev-0 和 dev-1 的节点库存，可选在账本中记录第一张卡已被某种模式占用。
+func twoCardDevices(nodeName string, dev0Status workercore.DeviceAllocationMode) *workercore.Devices {
+	d := &workercore.Devices{
+		ObjectMeta: meta.ObjectMeta{Name: nodeName},
+		Spec: workercore.DevicesSpec{
+			Groups: []workercore.DevicesGroup{{
+				ID:           "grp-0",
+				Manufacturer: nodefeature.ManufacturerNVIDIA,
+				Accelerators: []workercore.Accelerator{
+					{ID: "dev-0", Index: 0},
+					{ID: "dev-1", Index: 1},
+				},
+			}},
+		},
+	}
+	if dev0Status != workercore.DeviceAllocationModeNone {
+		d.Status = workercore.DevicesStatus{
+			Groups: []workercore.DevicesAllocationGroup{{
+				ID:           "grp-0",
+				Manufacturer: nodefeature.ManufacturerNVIDIA,
+				Accelerators: []workercore.AcceleratorAllocation{
+					{ID: "dev-0", Index: 0, Mode: dev0Status, Remaining: 0},
+					{ID: "dev-1", Index: 1, Mode: workercore.DeviceAllocationModeNone, Remaining: nodefeature.ResourceMaxUnits},
+				},
+			}},
+		}
+	}
+	return d
+}
+
+// concurrentAllocatePod 构造等待从指定节点领取设备的 Pod，按给定模式和数量填好扩展资源。
+func concurrentAllocatePod(nodeName, name, uid string, mode workercore.DeviceAllocationMode, count int) *core.Pod {
+	resName := nodefeature.GetAcceleratableResourceName(nodefeature.ManufacturerNVIDIA, mode)
+	return &core.Pod{
+		ObjectMeta: meta.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(uid)},
+		Spec: core.PodSpec{
+			NodeName: nodeName,
+			Containers: []core.Container{{
+				Name: "main",
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{resName: *resource.NewQuantity(int64(count), resource.DecimalSI)},
+				},
+			}},
+		},
+	}
+}
+
+// waitOrDeadlock 检查并发分配是否能在指定时限内完成。
+func waitOrDeadlock(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatal("Allocate deadlocked")
+	}
+}
+
+// TestResourceServer_Allocate_Concurrent 验证同一张空闲卡同时收到整卡和共享请求时只会有一个成功，
+// 反向申请多张卡也不会死锁。
+func TestResourceServer_Allocate_Concurrent(t *testing.T) {
+	// 统计成功和因分配冲突被拒绝的请求，若出现其他错误则测试失败。
+	classifyOutcomes := func(t *testing.T, errs []error) (success, rejected int) {
+		t.Helper()
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				success++
+			case grpcstatus.Code(err) == grpccodes.FailedPrecondition:
+				rejected++
+			default:
+				t.Fatalf("unexpected Allocate error: %v", err)
+			}
+		}
+		return success, rejected
+	}
+
+	cases := []struct {
+		name       string
+		cardsInReq []string // 两个并发请求同时申请的设备 ID。
+	}{
+		{
+			name:       "one accelerator: exactly one of exclusive/shared wins",
+			cardsInReq: []string{"grp-0:dev-0:0000"},
+		},
+		{
+			name:       "two accelerators (opposite request order): exactly one of exclusive/shared wins, no deadlock",
+			cardsInReq: []string{"grp-0:dev-0:0000", "grp-0:dev-1:0000"},
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			const nodeName = "node-cc"
+			count := len(c.cardsInReq)
+
+			devs := twoCardDevices(nodeName, workercore.DeviceAllocationModeNone) // 两张卡起初均空闲。
+			exclPod := concurrentAllocatePod(nodeName, "excl", "uid-excl", workercore.DeviceAllocationModeExclusive, count)
+			sharedPod := concurrentAllocatePod(nodeName, "shared", "uid-shared", workercore.DeviceAllocationModeShared, count)
+
+			cli := nodeFixture(devs, exclPod, sharedPod)
+
+			rec := &DevicesReconciler{NodeName: nodeName, Client: cli}
+			exclServer := &ResourceServer{
+				Manufacturer: nodefeature.ManufacturerNVIDIA, AllocationMode: workercore.DeviceAllocationModeExclusive,
+				Reconciler: rec, Responder: stubResponder{},
+			}
+			sharedServer := &ResourceServer{
+				Manufacturer: nodefeature.ManufacturerNVIDIA, AllocationMode: workercore.DeviceAllocationModeShared,
+				Reconciler: rec, Responder: stubResponder{},
+			}
+
+			// 共享请求按相反顺序申请同一批卡，以验证节点分配锁能在不同申请顺序下阻止重复占用。
+			exclIDs := append([]string(nil), c.cardsInReq...)
+			sharedIDs := append([]string(nil), c.cardsInReq...)
+			for i, j := 0, len(sharedIDs)-1; i < j; i, j = i+1, j-1 {
+				sharedIDs[i], sharedIDs[j] = sharedIDs[j], sharedIDs[i]
+			}
+
+			var wg sync.WaitGroup
+			errs := make([]error, 2)
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, errs[0] = exclServer.Allocate(context.Background(),
+					&AllocateRequest{ContainerRequests: []*ContainerAllocateRequest{{DevicesIds: exclIDs}}})
+			}()
+			go func() {
+				defer wg.Done()
+				_, errs[1] = sharedServer.Allocate(context.Background(),
+					&AllocateRequest{ContainerRequests: []*ContainerAllocateRequest{{DevicesIds: sharedIDs}}})
+			}()
+			waitOrDeadlock(t, &wg, 15*time.Second)
+
+			success, rejected := classifyOutcomes(t, errs)
+			assert.Equal(t, 1, success, "exactly one Allocate must succeed")
+			assert.Equal(t, 1, rejected, "exactly one Allocate must be rejected with FailedPrecondition")
+		})
+	}
 }
