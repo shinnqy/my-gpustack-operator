@@ -76,6 +76,7 @@ func TestNodeDevicesFeasibility(t *testing.T) {
 		share = int32(nodefeature.ResourceMaxUnits / nodefeature.SharedResourceMaxSize) // 一位共享持有者在一张卡上占用的单位数。
 	)
 	exclusive := nodefeature.ResourceFamilyExclusive
+	sliced := nodefeature.ResourceFamilySliced
 	sharedDemand := func(cardsPerContainer, containers int32) familyDemand {
 		return familyDemand{
 			family:      nodefeature.ResourceFamilyShared,
@@ -179,6 +180,84 @@ func TestNodeDevicesFeasibility(t *testing.T) {
 			devices: []workercore.Devices{devicesWithRemaining(share, share, 2*share)},
 			demands: []familyDemand{sharedDemand(2, 2)},
 			want:    kueue.CheckStateReady,
+		},
+		{
+			name:    "sliced fits on partially-used cards",
+			devices: []workercore.Devices{devicesWithRemaining(half, half, half, half)},
+			demands: []familyDemand{{family: sliced, cards: 3, unitsPerCard: half}},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			name:    "sliced is held when the demand exceeds every card's remainder",
+			devices: []workercore.Devices{devicesWithRemaining(half, half)},
+			// 单个切片需要整卡的 units，各候选卡的余量都不足。
+			demands: []familyDemand{{family: sliced, cards: 1, unitsPerCard: whole}},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			// 尚未由 Pod webhook 换算的切片没有 units，会排在共享请求之后试放。即使此时预算为零，也不能再次使
+			// 用已处于共享模式的卡。
+			name:    "a card one role shares cannot also host another role's unshaped slice",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{
+				{family: nodefeature.ResourceFamilyShared, cards: 1, sharedNeeds: []sharedNeed{{cards: 1, containers: 1}}},
+				{family: sliced, cards: 1},
+			},
+			want: kueue.CheckStateRetry,
+		},
+		{
+			// 其它模式已占用的卡不能接收逻辑切片，即便它还有足够的剩余 units。
+			name:    "a slice is not placed on a card held in shared mode",
+			devices: []workercore.Devices{heldCard(whole-share, workercore.DeviceAllocationModeShared)},
+			demands: []familyDemand{{family: sliced, cards: 1, unitsPerCard: half}},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "a slice joins a card already held in sliced mode",
+			devices: []workercore.Devices{heldCard(half, workercore.DeviceAllocationModeSliced)},
+			demands: []familyDemand{{family: sliced, cards: 1, unitsPerCard: half}},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			// 每个切片都要占一个令牌。测试卡有十个切片位，即使剩余显存足够，也不能再接收第十一个。
+			name:    "slices beyond a card's slice count are held",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{{family: sliced, cards: 11, unitsPerCard: whole / 20}},
+			want:    kueue.CheckStateRetry,
+		},
+		{
+			name:    "slices up to a card's slice count share it",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{{family: sliced, cards: 10, unitsPerCard: whole / 20}},
+			want:    kueue.CheckStateReady,
+		},
+		{
+			// 优先把切片放进剩余空间最小但能容纳它的卡，以便另一角色仍可申请完整空卡。
+			name:    "a slice fills a used card before breaking into a whole one",
+			devices: []workercore.Devices{devicesWithRemaining(whole, whole*2/5)},
+			demands: []familyDemand{
+				{family: sliced, cards: 1, unitsPerCard: whole * 3 / 10},
+				{family: exclusive, cards: 1},
+			},
+			want: kueue.CheckStateReady,
+		},
+		{
+			name:    "a card one role slices cannot also serve another role exclusively",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{
+				{family: sliced, cards: 1, unitsPerCard: whole * 3 / 10},
+				{family: exclusive, cards: 1},
+			},
+			want: kueue.CheckStateRetry,
+		},
+		{
+			name:    "a card one role slices cannot also take another role's share",
+			devices: []workercore.Devices{devicesWithRemaining(whole)},
+			demands: []familyDemand{
+				{family: sliced, cards: 1, unitsPerCard: whole * 3 / 10},
+				{family: nodefeature.ResourceFamilyShared, cards: 1, sharedNeeds: []sharedNeed{{cards: 1, containers: 1}}},
+			},
+			want: kueue.CheckStateRetry,
 		},
 		{
 			name:    "feasibility aggregates whole cards across devices",

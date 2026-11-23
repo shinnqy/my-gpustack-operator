@@ -3,6 +3,8 @@ package nvidia
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	core "k8s.io/api/core/v1"
@@ -14,6 +16,7 @@ import (
 	"gpustack.ai/gpustack/pkg/deviceplugin"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/utils/gox"
+	"gpustack.ai/gpustack/pkg/utils/osx"
 )
 
 const Manufacturer = nodefeature.ManufacturerNVIDIA
@@ -244,17 +247,102 @@ func (s *server) GetContainerAllocateResponse(
 	return ctrResp, nil
 }
 
-// getSlicedContainerAllocateResponse 用于实现分片容器中的 HAMi-核心逻辑分片注入机制：包括来自容器 "
-// .sliced.cores-percentage" 的计算（SM）限制，以及来自其 ".sliced.memory-percentage" 和 "
-// .sliced.memory-mib" 的每加速器 VRAM 限制（独立维度，无统一比例），此外还包含预加载 libvgpu.so 并提供共
-// 享锁/缓存的挂载点。加速器通过 NVIDIA_VISIBLE_DEVICES 保持可见状态。HAMi-核心（通过 /etc/ld.so.preload
-// 预加载）在运行时强制执行这些限制。
+// HAMi-core 在容器内读取的固定路径。
+const (
+	ctrLdPreloadPath   = "/etc/ld.so.preload"
+	ctrVgpuLibPath     = "/usr/local/vgpu/libvgpu.so"
+	ctrVgpuLockPath    = "/tmp/vgpulock"
+	ctrVgpuCacheDir    = "/tmp/vgpu"
+	ctrVgpuSharedCache = "/tmp/vgpu/cudevshr.cache"
+	ctrDevShmPath      = "/dev/shm"
+)
+
+// 宿主机锁目录会挂入不同容器，供 HAMi-core 跨进程协调。用变量保存路径，以便单元测试改用临时目录。
+var hostVgpuLockPath = "/tmp/vgpulock"
+
+// getSlicedContainerAllocateResponse 将每卡显存 MiB 限额与 SM 百分比分别交给 HAMi-core，挂载预加载库和共享缓存，并交由节点的注入器设置设备可见性。
 func (s *server) getSlicedContainerAllocateResponse(
 	pod *core.Pod,
 	ctr *core.Container,
 	ids []string,
 	accels []deviceplugin.AllocatedAccelerator,
 ) (*deviceplugin.ContainerAllocateResponse, error) {
-	// 第 10 章补上此函数的实现。
-	return nil, fmt.Errorf("logical slice injection is pending")
+	if len(accels) == 0 {
+		return nil, fmt.Errorf("no allocated accelerator found for sliced container %q", ctr.Name)
+	}
+
+	// 建立每个容器独立的工作目录，并准备各进程共用的锁目录。
+	podWorkDir := deviceplugin.PodWorkDir(string(pod.UID), ctr.Name)
+	// 每个容器独立的工作目录（放在 Pod UID + 容器名下），用来存这个容器的共享内存缓存文件 cudevshr.cache，防止容器间数据串台，且 Pod 删除时方便统一回收。
+	vgpuCacheDir := filepath.Join(podWorkDir, "tmp/vgpu")
+	for _, dir := range []string{hostVgpuLockPath, podWorkDir, vgpuCacheDir} {
+		if err := osx.MkdirAll(dir, 0o777); err != nil {
+			return nil, fmt.Errorf("create %q: %w", dir, err)
+		}
+	}
+
+	// 算力取 .sliced.cores-percentage。每张卡的显存上限取 .sliced.memory-percentage 或
+	// .sliced.memory-mib，单位是 MiB。HAMi-core 还需要共享缓存路径。
+	coresRes := nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(Manufacturer)
+	memPctRes := nodefeature.GetAcceleratableSlicedMemoryPercentageResourceName(Manufacturer)
+	memMibRes := nodefeature.GetAcceleratableSlicedMemoryMibResourceName(Manufacturer)
+	envs := map[string]string{
+		"CUDA_DEVICE_SM_LIMIT":            strconv.Itoa(deviceplugin.SlicedCoresPercent(ctr, coresRes)),
+		"CUDA_DEVICE_MEMORY_SHARED_CACHE": ctrVgpuSharedCache,
+	}
+	for i := range accels {
+		limit, err := deviceplugin.SlicedMemoryMib(ctr, memPctRes, memMibRes, int64(accels[i].Group.Memory))
+		if err != nil {
+			return nil, fmt.Errorf("derive sliced memory limit: %w", err)
+		}
+		envs["CUDA_DEVICE_MEMORY_LIMIT_"+strconv.Itoa(i)] = strconv.FormatInt(limit, 10) + "m"
+	}
+
+	// 显存上限按位置编号。HAMi-core 根据 NVML 枚举顺序写入各卡的上限，读取时却使用 CUDA 上下文的设备序
+	// 号。CUDA_DEVICE_ORDER=PCI_BUS_ID 让这两个序号一致。默认的性能排序在混合型号节点上可能对调两张卡，
+	// 按 NVML 序号设置 CUDA_VISIBLE_DEVICES 的工作负载也依赖这个约定。保留容器显式设置的顺序。目前准入
+	// 只允许单卡切片，可见卡在两种顺序下都是 0 号。如果将来允许多卡切片，需要在准入时拒绝不兼容的顺序。
+	// 否则 FASTEST_FIRST 可能把一张共享卡的显存额度给另一张卡，挤占同卡其他容器的显存。kubelet 最后追
+	// 加容器自己的环境变量，仅靠设备插件注入无法覆盖它。
+	if !deviceplugin.ContainerEnvDeclared(ctr, "CUDA_DEVICE_ORDER") {
+		envs["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+	}
+
+	// HAMi-core 默认日志级别为 1，每次拦截调用都可能输出初始化或清理消息。容器未声明 LIBCUDA_LOG_LEVEL
+	// 时设为 0，显式设置则留给工作负载调试。
+	if !deviceplugin.ContainerEnvDeclared(ctr, "LIBCUDA_LOG_LEVEL") {
+		envs["LIBCUDA_LOG_LEVEL"] = "0"
+	}
+
+	// 容器只挂载一份 libvgpu.so，所以分到的所有 GPU 必须使用同一 CUDA 主版本。混用主版本时返回错误。
+	cudaDir := nvidiaCUDADir(accels[0].Group.RuntimeVersion)
+	for i := range accels {
+		if d := nvidiaCUDADir(accels[i].Group.RuntimeVersion); d != cudaDir {
+			return nil, fmt.Errorf("sliced container %q spans CUDA majors %s and %s; a single libvgpu cannot serve both", ctr.Name, cudaDir, d)
+		}
+	}
+	libDir := filepath.Join(deviceplugin.OperatorLibDir, "nvidia")
+	mounts := []*deviceplugin.Mount{
+		{ContainerPath: ctrVgpuLockPath, HostPath: hostVgpuLockPath, ReadOnly: false},
+		{ContainerPath: ctrLdPreloadPath, HostPath: filepath.Join(libDir, "ld.so.preload"), ReadOnly: true},
+		{ContainerPath: ctrVgpuLibPath, HostPath: filepath.Join(libDir, cudaDir, "libvgpu.so"), ReadOnly: true},
+		{ContainerPath: ctrVgpuCacheDir, HostPath: vgpuCacheDir, ReadOnly: false},
+		{ContainerPath: ctrDevShmPath, HostPath: ctrDevShmPath, ReadOnly: false},
+	}
+
+	ctrResp := &deviceplugin.ContainerAllocateResponse{
+		Envs:   envs,
+		Mounts: mounts,
+	}
+	// HAMi-core 通过预加载和环境变量取得配额。设备可见性由本节点的注入方式另行设置。
+	if err := s.resolver().Apply(s.Logger, ctrResp, pod, ids); err != nil {
+		return nil, err
+	}
+
+	return ctrResp, nil
+}
+
+// nvidiaCUDADir 根据 CUDA 主版本选择 HAMi-core 库目录。无法识别版本时使用 cuda-12。
+func nvidiaCUDADir(runtimeVersion string) string {
+	return "cuda-" + device.RuntimeMajor(runtimeVersion, "12")
 }

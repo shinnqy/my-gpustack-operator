@@ -194,3 +194,68 @@ func TestResourceServer_Allocate_SharedNeedsDistinctCards(t *testing.T) {
 		})
 	}
 }
+
+// TestResourceServer_Allocate_Sliced_RecordsUnits 用于验证容器中每个加速器对应的“.sliced.units”分
+// 配记录是否符合账本中的分配情况——即每个加速器的账本所反映的即为实际容量，节点设备准入检查会拒绝那
+// 些已承诺的单元数量超过该容量的加速器，而非单纯的注入令牌数量。
+func TestResourceServer_Allocate_Sliced_RecordsUnits(t *testing.T) {
+	const nodeName = "node-6"
+	resName := nodefeature.GetAcceleratableResourceName(nodefeature.ManufacturerNVIDIA, workercore.DeviceAllocationModeSliced)
+	unitsName := nodefeature.GetAcceleratableSlicedUnitsResourceName(nodefeature.ManufacturerNVIDIA)
+	wantUnits := int32(60 * nodefeature.ResourceMaxUnits / 100) // 60%的槽位 = 一张卡单位的60%
+
+	devs := &workercore.Devices{
+		ObjectMeta: meta.ObjectMeta{Name: nodeName},
+		Spec: workercore.DevicesSpec{
+			Groups: []workercore.DevicesGroup{{
+				ID:           "grp-0",
+				Manufacturer: nodefeature.ManufacturerNVIDIA,
+				Accelerators: []workercore.Accelerator{{
+					ID:    "dev-0",
+					Index: 0,
+				}},
+			}},
+		},
+	}
+	pod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{Name: "p", Namespace: "default"},
+		Spec: core.PodSpec{
+			NodeName: nodeName,
+			Containers: []core.Container{{
+				Name: "c",
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						resName:   resource.MustParse("1"),
+						unitsName: *resource.NewQuantity(int64(wantUnits), resource.DecimalSI),
+					},
+				},
+			}},
+		},
+	}
+
+	cli := nodeFixture(devs, pod)
+
+	s := &ResourceServer{
+		Manufacturer:   nodefeature.ManufacturerNVIDIA,
+		AllocationMode: workercore.DeviceAllocationModeSliced,
+		Reconciler:     &DevicesReconciler{NodeName: nodeName, Client: cli},
+		Responder:      stubResponder{},
+	}
+
+	_, err := s.Allocate(context.Background(), &AllocateRequest{
+		ContainerRequests: []*ContainerAllocateRequest{{
+			DevicesIds: []string{"grp-0:dev-0:0000"},
+		}},
+	})
+	require.NoError(t, err)
+
+	got := new(core.Pod)
+	require.NoError(t, cli.Get(context.Background(), ctrlcli.ObjectKeyFromObject(pod), got))
+	allocated, err := allocatedStatusOf(got)
+	require.NoError(t, err)
+	require.Len(t, allocated.Groups, 1)
+	require.Len(t, allocated.Groups[0].Accelerators, 1)
+	acc := allocated.Groups[0].Accelerators[0]
+	assert.Equal(t, workercore.DeviceAllocationModeSliced, acc.Mode)
+	assert.Equal(t, wantUnits, acc.Allocated, "real per-card committed units, not the token count")
+}

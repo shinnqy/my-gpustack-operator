@@ -1233,6 +1233,7 @@ func getPortName(port workercore.InstancePort) string {
 	return strings.ToLower(fmt.Sprintf("%s-%d", port.Protocol, port.Port))
 }
 
+// IMPORTANT: 第一关，把算力需求翻译的地方，做 GPU 默认不切分、软切分、硬切分时，第一道要处理的地方
 // getResourceRequirements 把同一规格下的容器资源需求转换为 requests 和 limits。
 // withGeneral 控制 CPU、内存和临时存储。limit 始终保留用户预算。开启 withGeneralOvercommit 时，
 // request 交给 ScaleToOvercommit 换算。加速器规格使用较小的 CPU 基数，避免 CPU 先于设备耗尽。
@@ -1282,7 +1283,19 @@ func getResourceRequirements(
 			case partProfile != "" && partCardResName != "" && partProfileResName != "":
 				// 第 11 章在这里填写硬件分区及其 profile 对应的资源。
 			case instType.Status.Detail.IsLogicallySliceable() && instRess.AcceleratorSlicedMemoryPercentage > 0:
-				// 第 10 章在这里填写逻辑切片的卡数、显存和算力百分比。
+				// 写入 .sliced 卡数和每卡的显存、算力百分比。Pod webhook 在持久化前把显存百分比折成 .sliced.units，
+				// Kueue 再用卡数和每卡 units 计算 credits。
+				slicedResName := nodefeature.GetAcceleratableResourceName(manufacturer, workercore.DeviceAllocationModeSliced)
+				memResName := nodefeature.GetAcceleratableSlicedMemoryPercentageResourceName(manufacturer)
+				coresResName := nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(manufacturer)
+				memQ := *resource.NewQuantity(int64(instRess.AcceleratorSlicedMemoryPercentage), resource.DecimalSI)
+				coresQ := *resource.NewQuantity(int64(instRess.AcceleratorSlicedCoresPercentage), resource.DecimalSI)
+				rr.Limits[slicedResName] = cardQ
+				rr.Requests[slicedResName] = cardQ
+				rr.Limits[memResName] = memQ
+				rr.Requests[memResName] = memQ
+				rr.Limits[coresResName] = coresQ
+				rr.Requests[coresResName] = coresQ
 			default:
 				// IMPORTANT: 第一次处理 GPU 资源，让 K8S 认识普通的 GPU 资源 （就是没有逻辑切分和硬切分的情况）
 				// 不支持逻辑切片的规格，或者请求的切片比例为零，都按独占整卡处理。若厂商不支持请求的硬件分区，

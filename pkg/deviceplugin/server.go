@@ -688,6 +688,7 @@ func (s *ResourceServer) Allocate(ctx context.Context, req *AllocateRequest) (*A
 	// 支持逻辑切片布局的 responder 会被调用两次，锁内选位置，锁外按已选位置生成容器响应。先统一判断一次，
 	// 保证两步使用同一套条件。
 	logicalPlacer, placesLogical := s.Responder.(LogicalSlicedResponder)
+	// IMPORTANT: NVIDIA / Ascend：没实现 PlaceLogicalSliced 和 GetLogicalSlicedResponse这两个方法，所以这里 placesLogical = false
 	placesLogical = placesLogical && s.AllocationMode == workercore.DeviceAllocationModeSliced
 
 	// 在同一把节点锁内识别容器、检查模式冲突并预留设备。两个相同请求并发到来时，

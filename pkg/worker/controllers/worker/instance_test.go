@@ -654,3 +654,22 @@ func TestInstanceReconciler_DeletingInstanceDeletesServiceAndPod(t *testing.T) {
 		})
 	}
 }
+
+func TestGetResourceRequirementsLogicalSlice(t *testing.T) {
+	instType := &worker.InstanceType{Spec: workercore.InstanceTypeSpec{Acceleratable: true}}
+	instType.Status.Detail.Manufacturer = nodefeature.ManufacturerNVIDIA
+	instType.Status.Detail.SlicedDetail.Logical.Count = 10
+	rr := getResourceRequirements(&workercore.InstanceResources{
+		Accelerator:                       ptr.To(qty("1")),
+		AcceleratorSlicedMemoryPercentage: 25,
+		AcceleratorSlicedCoresPercentage:  50,
+	}, instType, false, false, true, false)
+	// Instance 提供每卡预算，units 由 Pod 的默认化 webhook 写入。
+	want := core.ResourceList{
+		"nvidia.com/gpu.sliced":                   qty("1"),
+		"nvidia.com/gpu.sliced.memory-percentage": qty("25"),
+		"nvidia.com/gpu.sliced.cores-percentage":  qty("50"),
+	}
+	assertResourceList(t, want, rr.Requests, "requests")
+	assertResourceList(t, want, rr.Limits, "limits")
+}

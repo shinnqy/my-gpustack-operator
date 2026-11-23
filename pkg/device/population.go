@@ -22,11 +22,14 @@ func IsWholeAcceleratorCapable(status AcceleratorStatus) bool {
 	return !IsPartitioned(status)
 }
 
+// IMPORTANT: 统一“还剩几个切片槽位”的公式
 // LogicalSlotsFree 根据加速器当前已承载的切片数，报告其还能容纳多少个逻辑切片：即 LogicalSliced.Count 减去 allocatedSlices。
 // 分配一个切片既需要空闲槽位也需要空闲资源单元，两者相互独立耗尽——一张装满小切片的加速卡仍会显示大部分显存空闲。
 // 所有判断切片是否可容纳的层级都会读取此值，从而确保 DevicePlugin、准入检查、适配标签与 InstanceType 视图保持一致。
 // 非正数表示已无剩余槽位，且不支持逻辑切分的加速器恒返回非正数。
 func LogicalSlotsFree(status AcceleratorStatus, allocatedSlices int32) int32 {
-	// 在第 10 章实现此函数。
-	return 0
+	if !IsLogicallySliceable(status) {
+		return 0
+	}
+	return status.LogicalSliced.Count - allocatedSlices
 }

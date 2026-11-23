@@ -9,12 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	clienttesting "k8s.io/client-go/testing"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -169,4 +171,166 @@ func TestExclusiveDeviceLifecycle(t *testing.T) {
 	checkLedger(workercore.DeviceAllocationModeExclusive, 0)
 	require.NoError(t, client.Delete(ctx, pod))
 	checkLedger(workercore.DeviceAllocationModeNone, nodefeature.ResourceMaxUnits)
+}
+
+const testGPUUUID0 = "GPU-aaaa0000-0000-0000-0000-000000000000"
+
+// redirectLogicalSliceDirs 将逻辑切片主机路径（包括 vgpulock 目录）指向用于测试的临时目录。
+func redirectLogicalSliceDirs(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	origLib, origPods, origLock := deviceplugin.OperatorLibDir, deviceplugin.OperatorPodsDir, hostVgpuLockPath
+	deviceplugin.OperatorLibDir = filepath.Join(root, "lib")
+	deviceplugin.OperatorPodsDir = filepath.Join(root, "pods")
+	hostVgpuLockPath = filepath.Join(root, "vgpulock")
+	t.Cleanup(func() {
+		deviceplugin.OperatorLibDir = origLib
+		deviceplugin.OperatorPodsDir = origPods
+		hostVgpuLockPath = origLock
+	})
+	return root
+}
+
+// nvidiaDevices 构建了一个固定结构，该结构包含一组（runtimeVersion 控制 cuda 目录，内存控制 VRAM
+// 限制），其中包含了给定的 GPU UUIDs。
+func nvidiaDevices(runtimeVersion string, memoryMiB uint64, uuids ...string) *workercore.Devices {
+	accels := make([]workercore.Accelerator, len(uuids))
+	for i, u := range uuids {
+		accels[i] = workercore.Accelerator{ID: u, Index: uint32(i)}
+	}
+	return &workercore.Devices{
+		Spec: workercore.DevicesSpec{
+			Groups: []workercore.DevicesGroup{{
+				ID:             "a10g",
+				Manufacturer:   Manufacturer,
+				Memory:         memoryMiB,
+				RuntimeVersion: runtimeVersion,
+				Accelerators:   accels,
+			}},
+		},
+	}
+}
+
+// slicedPod构建切片容器，要求实现独立的计算与VRAM资源分配，分配器现在会读取“
+// .sliced.cores-percentage”（SM）和“.sliced.memory-percentage”（每加速器VRAM）这些指标。
+func slicedPod(uid, ctrName string, coresPercent, memPercent int64) (*core.Pod, *core.Container) {
+	coresRes := nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(Manufacturer)
+	memPctRes := nodefeature.GetAcceleratableSlicedMemoryPercentageResourceName(Manufacturer)
+	pod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{Name: ctrName + "-pod", UID: types.UID(uid)},
+		Spec: core.PodSpec{
+			Containers: []core.Container{{
+				Name: ctrName,
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						coresRes:  *resource.NewQuantity(coresPercent, resource.DecimalSI),
+						memPctRes: *resource.NewQuantity(memPercent, resource.DecimalSI),
+					},
+				},
+			}},
+		},
+	}
+	return pod, &pod.Spec.Containers[0]
+}
+
+func newSlicedServer() *server {
+	return &server{
+		ResourceServer: deviceplugin.ResourceServer{
+			Manufacturer:   Manufacturer,
+			AllocationMode: workercore.DeviceAllocationModeSliced,
+		},
+	}
+}
+
+func TestGetSlicedContainerAllocateResponse(t *testing.T) {
+	redirectLogicalSliceDirs(t)
+	s := newSlicedServer()
+	// 测试卡有 24,576 MiB 显存。算力请求为 10% SM，显存请求为 25%，两项独立。
+	devs := nvidiaDevices("12.4", 24576, testGPUUUID0)
+	pod, ctr := slicedPod("pod-uid-1", "train", 10, 25)
+	allocated := map[deviceplugin.Resource]int32{{Group: "a10g", Device: testGPUUUID0}: 1}
+
+	resp, err := s.GetContainerAllocateResponse(context.Background(), pod, ctr, devs, allocated)
+	require.NoError(t, err)
+
+	// Envs.
+	assert.Equal(t, testGPUUUID0, resp.Envs["NVIDIA_VISIBLE_DEVICES"])
+	assert.Equal(t, "10", resp.Envs["CUDA_DEVICE_SM_LIMIT"]) // .sliced.cores-percentage
+	assert.Equal(t, "/tmp/vgpu/cudevshr.cache", resp.Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"])
+	assert.Equal(t, "0", resp.Envs["LIBCUDA_LOG_LEVEL"]) // 默认降低 HAMi-core 的日志级别。CUDA 与 NVML 的设备序号需要一致，CUDA_DEVICE_MEMORY_LIMIT_<i> 才
+	// 能限制预期的卡。
+	assert.Equal(t, "PCI_BUS_ID", resp.Envs["CUDA_DEVICE_ORDER"])
+	// 向下取整后，显存限额为 24,576 × 25% = 6,144 MiB。
+	assert.Equal(t, "6144m", resp.Envs["CUDA_DEVICE_MEMORY_LIMIT_0"])
+	_, hasSecond := resp.Envs["CUDA_DEVICE_MEMORY_LIMIT_1"]
+	assert.False(t, hasSecond, "single card must not emit LIMIT_1")
+
+	// osx.MkdirAll 强制将工作目录权限设为 0777，不受 umask 影响。
+	podWorkDir := deviceplugin.PodWorkDir("pod-uid-1", "train")
+	for _, dir := range []string{hostVgpuLockPath, podWorkDir, filepath.Join(podWorkDir, "tmp/vgpu")} {
+		info, statErr := os.Stat(dir)
+		require.NoErrorf(t, statErr, "dir %s", dir)
+		assert.Equalf(t, os.FileMode(0o777), info.Mode().Perm(), "mode of %s", dir)
+	}
+
+	// Mounts.
+	libDir := filepath.Join(deviceplugin.OperatorLibDir, "nvidia")
+	byCtr := make(map[string]*deviceplugin.Mount, len(resp.Mounts))
+	for _, m := range resp.Mounts {
+		byCtr[m.ContainerPath] = m
+	}
+	cases := []struct {
+		ctrPath, hostPath string
+		readOnly          bool
+	}{
+		{ctrVgpuLockPath, hostVgpuLockPath, false},
+		{ctrLdPreloadPath, filepath.Join(libDir, "ld.so.preload"), true},
+		{ctrVgpuLibPath, filepath.Join(libDir, "cuda-12/libvgpu.so"), true},
+		{ctrVgpuCacheDir, filepath.Join(podWorkDir, "tmp/vgpu"), false},
+		{ctrDevShmPath, ctrDevShmPath, false},
+	}
+	for _, c := range cases {
+		m, ok := byCtr[c.ctrPath]
+		require.Truef(t, ok, "missing mount for %s", c.ctrPath)
+		assert.Equalf(t, c.hostPath, m.HostPath, "host path for %s", c.ctrPath)
+		assert.Equalf(t, c.readOnly, m.ReadOnly, "readOnly for %s", c.ctrPath)
+	}
+}
+
+// 没有内存维度（既无 .sliced.memory-percentage 也无 .sliced.memory-mib）的切片容器必须被拒绝，而不
+// 是默默接受整个加速器。
+func TestGetSlicedContainerAllocateResponse_NoMemoryRequest(t *testing.T) {
+	redirectLogicalSliceDirs(t)
+	s := newSlicedServer()
+	devs := nvidiaDevices("12.4", 24576, testGPUUUID0)
+	pod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{UID: types.UID("uid-x")},
+		Spec:       core.PodSpec{Containers: []core.Container{{Name: "train"}}},
+	}
+	_, err := s.GetContainerAllocateResponse(context.Background(), pod, &pod.Spec.Containers[0], devs,
+		map[deviceplugin.Resource]int32{{Group: "a10g", Device: testGPUUUID0}: 1})
+	require.Error(t, err)
+}
+
+// 声明了默认变量之一的切片容器会保留其自身值：分配器不得在其之上进行注入操作——安静的日志级别是调试
+// 的出口途径，设备顺序则决定了工作负载自身的调用方式，即 CUDA 根据此方式对卡片进行编号。
+func TestGetSlicedContainerAllocateResponse_RespectsContainerDeclaredEnv(t *testing.T) {
+	cases := []struct{ name, declared string }{
+		{"LIBCUDA_LOG_LEVEL", "3"},
+		{"CUDA_DEVICE_ORDER", "FASTEST_FIRST"},
+	}
+	for _, c := range cases {
+		redirectLogicalSliceDirs(t)
+		s := newSlicedServer()
+		devs := nvidiaDevices("12.4", 24576, testGPUUUID0)
+		pod, ctr := slicedPod("pod-uid-"+c.name, "train", 10, 25)
+		ctr.Env = []core.EnvVar{{Name: c.name, Value: c.declared}}
+		allocated := map[deviceplugin.Resource]int32{{Group: "a10g", Device: testGPUUUID0}: 1}
+
+		resp, err := s.GetContainerAllocateResponse(context.Background(), pod, ctr, devs, allocated)
+		require.NoErrorf(t, err, "declared %s", c.name)
+
+		_, injected := resp.Envs[c.name]
+		assert.Falsef(t, injected, "must not override a container-declared %s", c.name)
+	}
 }

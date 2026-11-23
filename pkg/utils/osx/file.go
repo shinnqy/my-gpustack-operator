@@ -95,6 +95,18 @@ func MkdirAll(name string, perm os.FileMode) error {
 	return os.Chmod(p, perm)
 }
 
+// WriteFile 支持 ~ 开头的家目录路径，会先创建父目录，再按指定权限写文件。
+func WriteFile(name string, data []byte, perm os.FileMode) error {
+	p := filepath.Clean(name)
+	p = InlineTilde(p)
+
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+
+	return os.WriteFile(p, data, perm)
+}
+
 // TempFile 会按照给定的模式创建一个临时文件。
 func TempFile(pattern string) string {
 	f, err := os.CreateTemp("", pattern)

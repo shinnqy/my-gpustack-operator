@@ -21,6 +21,7 @@ import (
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/utils/ctrlclix"
 	"gpustack.ai/gpustack/pkg/webhook"
+	workerctrl "gpustack.ai/gpustack/pkg/worker/controllers/worker"
 )
 
 // PodWebhook 拦截路由到 GPUStack 队列（通过 "kueue.x-k8s.io/queue-name" 标签选择）的核心 Pod，
@@ -244,6 +245,18 @@ func containerResource(ctr *core.Container, name core.ResourceName) (resource.Qu
 	return resource.Quantity{}, false
 }
 
+// setContainerResource 同时写入 Requests 和 Limits，保持扩展资源两处的数量一致。
+func setContainerResource(ctr *core.Container, name core.ResourceName, q resource.Quantity) {
+	if ctr.Resources.Requests == nil {
+		ctr.Resources.Requests = core.ResourceList{}
+	}
+	if ctr.Resources.Limits == nil {
+		ctr.Resources.Limits = core.ResourceList{}
+	}
+	ctr.Resources.Requests[name] = q
+	ctr.Resources.Limits[name] = q
+}
+
 func (r *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 	pod := obj.(*core.Pod)
 
@@ -259,7 +272,47 @@ func (r *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 
 		// 在此处折算硬件 profile 对应的 units。
 
-		_, _, _ = ctr, claims, cardVRAMMib
+		for _, base := range claims[nodefeature.ResourceFamilySliced] {
+			names := logicalResourceNamesForBase(base)
+
+			// 未声明算力百分比时，一张卡的计算预算默认为 100%。
+			if _, ok := containerResource(ctr, names.coresPct); !ok {
+				setContainerResource(ctr, names.coresPct, *resource.NewQuantity(100, resource.DecimalSI))
+			}
+
+			// 每次都从显存预算重新计算 .sliced.units，并覆盖客户端填写的值。先检查输入上限，防止整数运算溢出。
+			memPctQ, hasMemPct := containerResource(ctr, names.memPct)
+			memMibQ, hasMemMib := containerResource(ctr, names.memMib)
+			var units int64
+			switch {
+			case hasMemPct && memPctQ.Value() > 0:
+				// 同时给出百分比和 MiB 时优先取百分比。每 1% 显存对应 D/100 个单位。
+				if memPctQ.Value() > 100 {
+					return fmt.Errorf("container %q: %s must be within (0, 100]", ctr.Name, names.memPct)
+				}
+				units = memPctQ.Value() * nodefeature.ResourceMaxUnits / 100
+			case hasMemMib && memMibQ.Value() > 0:
+				if cardVRAMMib < 0 {
+					var err error
+					cardVRAMMib, err = r.cardVRAMMib(ctx, pod)
+					if err != nil {
+						return err
+					}
+				}
+				if memMibQ.Value() > cardVRAMMib {
+					return fmt.Errorf("container %q: %s must not exceed the per-card VRAM (%d MiB)",
+						ctr.Name, names.memMib, cardVRAMMib)
+				}
+				units = nodefeature.MemoryMibToUnits(memMibQ.Value(), cardVRAMMib)
+			default:
+				continue // 没有可换算的显存请求，交给校验阶段处理。
+			}
+			if units <= 0 {
+				return fmt.Errorf("container %q: cannot derive a positive %s from the requested memory",
+					ctr.Name, names.units)
+			}
+			setContainerResource(ctr, names.units, *resource.NewQuantity(units, resource.DecimalSI))
+		}
 	}
 
 	return r.pinSharedCardCount(ctx, pod)
@@ -359,6 +412,16 @@ func (r *PodWebhook) frontingInstanceType(ctx context.Context, pod *core.Pod) (*
 		return nil, fmt.Errorf("more than one instance type fronts local queue %s", lqName)
 	}
 	return &itList.Items[0], nil
+}
+
+// cardVRAMMib 从 Pod 队列对应的 InstanceType.Status.Detail 读取每卡显存，单位为 MiB。详情尚未就绪
+// 或显存值无效时返回错误，避免按错误容量换算绝对显存请求。
+func (r *PodWebhook) cardVRAMMib(ctx context.Context, pod *core.Pod) (int64, error) {
+	it, err := r.frontingInstanceType(ctx, pod)
+	if err != nil {
+		return 0, err
+	}
+	return workerctrl.InstanceTypeCardVRAMMib(it)
 }
 
 func (r *PodWebhook) ValidateCreate(_ context.Context, obj runtime.Object) (ctrladmission.Warnings, error) {

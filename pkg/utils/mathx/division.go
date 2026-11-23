@@ -10,3 +10,11 @@ func CeilDiv[I typex.Integer](a, b I) I {
 	}
 	return (a + b - 1) / b
 }
+
+// RoundDiv 将 a 除以 b 后就近取整，正数的半数向上取整。除数为零时返回零。
+func RoundDiv[I typex.Integer](a, b I) I {
+	if b == 0 {
+		return 0
+	}
+	return (a + b/2) / b
+}

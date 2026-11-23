@@ -10,6 +10,7 @@ import (
 
 	core "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -23,6 +24,7 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/controller"
 	"gpustack.ai/gpustack/pkg/device"
+	"gpustack.ai/gpustack/pkg/kubemeta"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/systemname"
 	"gpustack.ai/gpustack/pkg/utils/ctrlhandlerx"
@@ -127,8 +129,115 @@ func (r *NodeCapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // 单卡显存仍采用取整到 Gi 的有损 ".memory" 标签值，而非精确的 DevicesGroup.Memory，
 // 以保证通告的 memory-mib 与 Pod Webhook 锚点一致。对于未纳管 Node 返回 nil。
 func desiredAcceleratorCapacity(nd *core.Node, devs *workercore.Devices) core.ResourceList {
-	// 在第 10 章中实现此函数。
-	return nil
+	if !kubemeta.IsLabeled(nd, systemname.ManagedLabelKey, "true") {
+		return nil
+	}
+	groupsByKey := devicesGroupsByAcceleratableKey(devs)
+	ledgerByGroup := devicesLedgerByGroup(devs)
+	type tally struct {
+		units            int64
+		cores            int64
+		memoryPct        int64
+		memoryMib        int64
+		hasLogical       bool
+		partitionedUnits int64
+		// 每种 profile 的总数等于所有分区卡上已分配实例数与剩余可用实例数之和。
+		partitionProfiles map[string]int64
+	}
+	byManufacturer := make(map[string]*tally)
+	for _, aKey := range nodefeature.ExtractAcceleratableNodeKeys(nd) {
+		grp, ok := groupsByKey[aKey]
+		if !ok {
+			continue
+		}
+		nodeKey := nodefeature.AcceleratableFeatureLabelPrefix + aKey
+		vram := acceleratableCardMemoryMib(nd, nodeKey)
+
+		logicalCards, logicalSlices, partitionedCards := acceleratorCards(grp)
+		if logicalCards == 0 && partitionedCards == 0 {
+			// 该型号没有提供切片或分区容量。
+			continue
+		}
+
+		manufacturer, _, _ := strings.Cut(aKey, "-")
+		t := byManufacturer[manufacturer]
+		if t == nil {
+			t = &tally{}
+			byManufacturer[manufacturer] = t
+		}
+		if logicalCards > 0 {
+			t.hasLogical = true
+			t.units += logicalCards * nodefeature.ResourceMaxUnits
+			if grp.AcceleratorSlicedDetail.Logical.CoresPercentageOvercommit {
+				t.cores += logicalSlices * 100
+			} else {
+				t.cores += logicalCards * 100
+			}
+			t.memoryPct += logicalCards * 100
+			t.memoryMib += logicalCards * vram
+		}
+		if partitionedCards > 0 {
+			// 一张分区卡也计一整张卡的 units。逻辑切片和硬件分区使用同一计量尺度，分别汇总各自能使用的卡。
+			t.partitionedUnits += partitionedCards * nodefeature.ResourceMaxUnits
+			for name, count := range partitionInstancesByProfile(grp, ledgerByGroup[aKey]) {
+				if t.partitionProfiles == nil {
+					t.partitionProfiles = make(map[string]int64)
+				}
+				t.partitionProfiles[name] += count
+			}
+		}
+	}
+	if len(byManufacturer) == 0 {
+		return nil
+	}
+	out := make(core.ResourceList, len(byManufacturer)*6)
+	for manufacturer, t := range byManufacturer {
+		if t.hasLogical && poolAdvertised(nd, manufacturer, workercore.DeviceAllocationModeSliced) {
+			out[nodefeature.GetAcceleratableSlicedUnitsResourceName(manufacturer)] = *resource.NewQuantity(t.units, resource.DecimalSI)
+			out[nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(manufacturer)] = *resource.NewQuantity(t.cores, resource.DecimalSI)
+			out[nodefeature.GetAcceleratableSlicedMemoryPercentageResourceName(manufacturer)] = *resource.NewQuantity(t.memoryPct, resource.DecimalSI)
+			out[nodefeature.GetAcceleratableSlicedMemoryMibResourceName(manufacturer)] = *resource.NewQuantity(t.memoryMib, resource.DecimalSI)
+		}
+		if t.partitionedUnits == 0 || !poolAdvertised(nd, manufacturer, workercore.DeviceAllocationModePartitioned) {
+			continue
+		}
+		out[nodefeature.GetAcceleratablePartitionedUnitsResourceName(manufacturer)] = *resource.NewQuantity(t.partitionedUnits, resource.DecimalSI)
+		// 节点提供的每种 profile 单独发布资源键。最后一张支持该 profile 的卡移除后，后续补丁会清除旧键。
+		for name, count := range t.partitionProfiles {
+			resName := nodefeature.GetAcceleratablePartitionedProfileResourceName(manufacturer, name)
+			if resName == "" {
+				continue
+			}
+			out[resName] = *resource.NewQuantity(count, resource.DecimalSI)
+		}
+	}
+	return out
+}
+
+// poolAdvertised 检查设备插件是否还在节点上公布该资源族的原始令牌池。池容量为正时才发布相应的计量
+// 资源。
+func poolAdvertised(nd *core.Node, manufacturer string, mode workercore.DeviceAllocationMode) bool {
+	resName := nodefeature.GetAcceleratableResourceName(manufacturer, mode)
+	if resName == "" {
+		return false
+	}
+	pool := nd.Status.Capacity[resName]
+	return pool.Sign() > 0
+}
+
+// devicesGroupsByAcceleratableKey 用“厂商-设备组 ID”索引节点上的 Devices 组。ConstructGroupID 会移
+// 除厂商前缀，同节点上不同厂商的裸 ID 可能重复，因此查每卡切分数据时必须使用完整键。尚无设备账本时
+// 返回 nil。
+func devicesGroupsByAcceleratableKey(devs *workercore.Devices) map[string]*workercore.DevicesGroup {
+	if devs == nil {
+		return nil
+	}
+	out := make(map[string]*workercore.DevicesGroup, len(devs.Spec.Groups))
+	for i := range devs.Spec.Groups {
+		g := &devs.Spec.Groups[i]
+		out[g.Manufacturer+"-"+g.ID] = g
+	}
+	return out
 }
 
 // acceleratorCards 将 Devices 组中的卡划分为两个永不重叠的集合：logical 统计提供软件切片的卡数，
@@ -211,6 +320,16 @@ func devicesLedgerByGroup(devs *workercore.Devices) map[string]map[string]*worke
 		out[grp.Manufacturer+"-"+grp.ID] = accs
 	}
 	return out
+}
+
+// acceleratableCardMemoryMib 将该型号 .memory 标签的 Kubernetes 容量值换算成每卡 MiB。标签缺失或不
+// 可解析时返回 0，该型号不会贡献可用的 MiB 额度。
+func acceleratableCardMemoryMib(nd *core.Node, nodeKey string) int64 {
+	q, err := resource.ParseQuantity(nd.Labels[nodeKey+".memory"])
+	if err != nil {
+		return 0
+	}
+	return q.Value() / (1 << 20) // 将字节换算为 MiB。
 }
 
 // ownedCapacitySuffixes 是 NodeCapacityReconciler 通过 Patch Node 管理的固定计数键后缀。

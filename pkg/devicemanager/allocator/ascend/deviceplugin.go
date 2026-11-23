@@ -1,9 +1,13 @@
 package ascend
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	core "k8s.io/api/core/v1"
@@ -16,7 +20,9 @@ import (
 	"gpustack.ai/gpustack/pkg/deviceplugin"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/utils/gox"
+	"gpustack.ai/gpustack/pkg/utils/osx"
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
+	"gpustack.ai/gpustack/pkg/utils/stringx"
 )
 
 const Manufacturer = nodefeature.ManufacturerAscend
@@ -299,20 +305,186 @@ func visibleDevices(accels []deviceplugin.AllocatedAccelerator) (string, error) 
 	return strings.Join(indexes, ","), nil
 }
 
-// getSlicedContainerAllocateResponse 用于实现 sliced 容器中的 vcann-rt 逻辑切片注入机制：每个容器都有一个
-// npu_info.config 文件，其中包含了根据容器 ".sliced.units" 请求所确定的计算/内存配额，以及预加载
-// libvruntime.so 并暴露配置的挂载点。真正的驱动程序 libdcmi/HAL 在运行时进行绑定。此功能仅负责分配配额和
-// 库挂载。
-//
-// vcann-rt 的 npu_info.config 配置模型对应一个物理 NPU，因此分片后的 Ascend 容器对应一个加速器，而
-// ASCEND_VISIBLE_DEVICES 则用于标识那个加速器。
+// vcann-rt 在容器内读取的固定路径。
+const (
+	ctrLdPreloadPath = "/etc/ld.so.preload"
+	ctrVruntimePath  = "/opt/enpu/vcann-rt/lib/libvruntime.so"
+	ctrMonitorPath   = "/opt/enpu/vcann-rt/tools/enpu-monitor"
+	ctrConfigPath    = "/etc/enpu/vcann-rt/npu_info.config"
+	ctrDevShmPath    = "/dev/shm"
+
+	// vcann-rt 的调度策略取值为 1（固定份额）、2（弹性，默认）或 3（尽力而为）。
+	vcannSchedulingPolicy = 2
+)
+
+// getSlicedContainerAllocateResponse 将每卡显存和 AI Core 预算写入容器自己的 npu_info.config，挂载 vcann-rt 并设置 ASCEND_VISIBLE_DEVICES。vcann-rt 的一份配置只对应一张物理 NPU。
 func (s *server) getSlicedContainerAllocateResponse(
 	pod *core.Pod,
 	ctr *core.Container,
 	accels []deviceplugin.AllocatedAccelerator,
 ) (*deviceplugin.ContainerAllocateResponse, error) {
-	// 第 10 章补上此函数的实现。
-	var result0 *deviceplugin.ContainerAllocateResponse
-	var result1 error
-	return result0, result1
+	if len(accels) == 0 {
+		return nil, fmt.Errorf("no allocated accelerator found for sliced container %q", ctr.Name)
+	}
+	// 一份 npu_info.config 只描述一张物理 NPU。分配多张时拒绝请求，避免只限制第一张却把其余 NPU 一并暴
+	// 露给容器。
+	if len(accels) > 1 {
+		return nil, fmt.Errorf("sliced container %q allocated %d accelerators, but vcann-rt logical slicing is single-NPU", ctr.Name, len(accels))
+	}
+
+	// 下面为唯一分配到的 NPU 构造配置。
+	//
+	// 容器运行时解析可见设备号，vcann-rt 配额文件使用物理编号。A5 上两个编号可能不同，见 visibleIndex。
+	// 950 上以物理编号写此配置尚待真机确认，厂商未提供该代 vcann-rt 供核对。
+	group, accel := accels[0].Group, accels[0].Accel
+	npuID, err := physicalIndex(accel)
+	if err != nil {
+		return nil, err
+	}
+	visible, err := visibleIndex(group, accel)
+	if err != nil {
+		return nil, err
+	}
+
+	// AI Core 算力百分比与显存 MiB 分别计算。
+	coresPct := deviceplugin.SlicedCoresPercent(ctr,
+		nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(Manufacturer))
+	memMib, err := deviceplugin.SlicedMemoryMib(ctr,
+		nodefeature.GetAcceleratableSlicedMemoryPercentageResourceName(Manufacturer),
+		nodefeature.GetAcceleratableSlicedMemoryMibResourceName(Manufacturer),
+		int64(group.Memory))
+	if err != nil {
+		return nil, fmt.Errorf("derive sliced memory limit: %w", err)
+	}
+
+	// 接下来会修改宿主驱动的共享开关，先完成请求和配额校验。
+	if err = s.ensureShareEnabled(accel); err != nil {
+		return nil, err
+	}
+
+	podWorkDir := deviceplugin.PodWorkDir(string(pod.UID), ctr.Name)
+	if err = osx.MkdirAll(podWorkDir, 0o777); err != nil {
+		return nil, fmt.Errorf("create pod work dir %q: %w", podWorkDir, err)
+	}
+
+	configHostPath := filepath.Join(podWorkDir, "etc/enpu/vcann-rt/npu_info.config")
+	vnpuID := lowestFreeVNPUID(deviceplugin.OperatorPodsDir, npuID, configHostPath)
+	cfg := renderNPUInfoConfig(npuID, vnpuID, coresPct, memMib, accel.ID)
+	if err = osx.WriteFile(configHostPath, stringx.ToBytes(&cfg), 0o644); err != nil {
+		return nil, fmt.Errorf("write npu_info.config %q: %w", configHostPath, err)
+	}
+
+	cannDir := ascendCANNDir(group.RuntimeVersion, group.Family)
+	libDir := filepath.Join(deviceplugin.OperatorLibDir, "ascend")
+	mounts := []*deviceplugin.Mount{
+		{ContainerPath: ctrLdPreloadPath, HostPath: filepath.Join(libDir, "ld.so.preload"), ReadOnly: true},
+		{ContainerPath: ctrVruntimePath, HostPath: filepath.Join(libDir, cannDir, "lib/libvruntime.so"), ReadOnly: true},
+		{ContainerPath: ctrMonitorPath, HostPath: filepath.Join(libDir, cannDir, "tools/enpu-monitor"), ReadOnly: true},
+		{ContainerPath: ctrConfigPath, HostPath: configHostPath, ReadOnly: true},
+		{ContainerPath: ctrDevShmPath, HostPath: ctrDevShmPath, ReadOnly: false},
+	}
+
+	// 可见性环境变量只写入这张 NPU 的运行时编号。
+	envs := map[string]string{
+		"ASCEND_VISIBLE_DEVICES": strconvx.FormatUint(visible, 10),
+	}
+
+	// vcann-rt 的 ENPU_LOG_LEVEL 默认为 3，拦截调用会输出详细信息。仅在容器没有显式声明时设为 1，保留
+	// 调试入口。
+	if !deviceplugin.ContainerEnvDeclared(ctr, "ENPU_LOG_LEVEL") {
+		envs["ENPU_LOG_LEVEL"] = "1"
+	}
+
+	// 默认让 npu-smi info 显示切片额度。项目的 vcann-rt 补丁通过 ENPU_DSMI_HOOK 启用 dsmi_get_hbm_info
+	// 拦截。容器显式声明的值优先，包括设为关闭。ContainerEnvDeclared 看不到 envFrom 的值，若要退出此默
+	// 认行为，须在容器 Env 中声明。
+	if !deviceplugin.ContainerEnvDeclared(ctr, "ENPU_DSMI_HOOK") {
+		envs["ENPU_DSMI_HOOK"] = "1"
+	}
+
+	return &deviceplugin.ContainerAllocateResponse{
+		Envs:   envs,
+		Mounts: mounts,
+	}, nil
+}
+
+// lowestFreeVNPUID 扫描同一物理 NPU 上其他容器的配置，选取最小的空闲虚拟 NPU 编号。重启或重试时，
+// 如果当前容器已有属于该物理卡的有效配置，就沿用原编号。
+func lowestFreeVNPUID(podsDir string, npuId uint32, selfConfigPath string) int {
+	if phy, virt, ok := parseNPUInfoConfig(selfConfigPath); ok && phy == int(npuId) {
+		return virt
+	}
+
+	used := make(map[int]bool)
+	matches, _ := filepath.Glob(filepath.Join(podsDir, "*", "*", "etc/enpu/vcann-rt/npu_info.config"))
+	for _, f := range matches {
+		if f == selfConfigPath {
+			continue
+		}
+		if phy, virt, ok := parseNPUInfoConfig(f); ok && phy == int(npuId) {
+			used[virt] = true
+		}
+	}
+	for i := 0; ; i++ {
+		if !used[i] {
+			return i
+		}
+	}
+}
+
+// renderNPUInfoConfig 生成 vcann-rt 读取的 npu_info.config。
+//
+// physical-npu-id 是驱动的物理设备编号。探测漏掉某张卡时，Operator 的逻辑序号可能已和它错开。
+// aicore-quota 取 .sliced.cores-percentage，是计算预算百分比。
+// memory-quota 是从 .sliced.memory-percentage 或 .sliced.memory-mib 推导的每卡显存 MiB。
+// shm-id 将设备 ID 中的空格换成连字符，生成 vcann-rt 需要的 VDie-ID 格式。
+// scheduling-policy 固定为弹性策略 2。
+func renderNPUInfoConfig(npuId uint32, vnpuId, aicoreQuota int, memoryQuotaMib int64, acceleratorID string) string {
+	shmID := strings.ReplaceAll(acceleratorID, " ", "-")
+	var b strings.Builder
+	_, _ = fmt.Fprintf(&b, "physical-npu-id=%d\n", npuId)
+	_, _ = fmt.Fprintf(&b, "virtual-npu-id=%d\n", vnpuId)
+	_, _ = fmt.Fprintf(&b, "aicore-quota=%d\n", aicoreQuota)
+	_, _ = fmt.Fprintf(&b, "memory-quota=%d\n", memoryQuotaMib)
+	_, _ = fmt.Fprintf(&b, "shm-id=%s\n", shmID)
+	_, _ = fmt.Fprintf(&b, "scheduling-policy=%d\n", vcannSchedulingPolicy)
+	return b.String()
+}
+
+// parseNPUInfoConfig 从 vcann-rt 配置中读取 physical-npu-id 和 virtual-npu-id。
+func parseNPUInfoConfig(path string) (npuId, vnpuId int, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer func() { _ = f.Close() }()
+
+	phy, vnpu := -1, -1
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		key, val, found := strings.Cut(scanner.Text(), "=")
+		if !found {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(val))
+		if err != nil {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "physical-npu-id":
+			phy = n
+		case "virtual-npu-id":
+			vnpu = n
+		}
+	}
+	if phy < 0 || vnpu < 0 {
+		return 0, 0, false
+	}
+	return phy, vnpu, true
+}
+
+// ascendCANNDir 按 CANN 主版本和小写型号族选择 vcann-rt 的库目录，例如 cann-8-910b。未知版本的默认
+// 主版本为 8。
+func ascendCANNDir(runtimeVersion, family string) string {
+	return "cann-" + device.RuntimeMajor(runtimeVersion, "8") + "-" + strings.ToLower(family)
 }

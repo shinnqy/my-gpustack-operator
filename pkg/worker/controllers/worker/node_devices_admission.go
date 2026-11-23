@@ -759,8 +759,30 @@ func fitSharedDemand(cards []cardLedger, budgets []cardBudget, d familyDemand) (
 // 卡的空闲槽位数等于其上限减去账本中已记录的切片、本 Workload 以及 inflight 请求在此
 // 分配的切片后的余量，因此即使显存仍有大量剩余，装满小切片上限的卡也不会再接纳新切片。
 func fitSlicedDemand(cards []cardLedger, budgets []cardBudget, d familyDemand) (kueue.CheckState, string) {
-	// 在第 10 章实现此函数。
-	return kueue.CheckStateRetry, "logical slice admission is pending"
+	freeUnits := func(i int) int32 {
+		c := &cards[i]
+		free := c.freeSliceUnits()
+		if free < 0 || budgets[i].whole || budgets[i].shares > 0 || !c.coveredBy(d) ||
+			budgets[i].slices >= c.freeSlots() {
+			return -1
+		}
+		return free - budgets[i].units
+	}
+
+	for range d.cards {
+		best, bestFree := -1, int32(0)
+		for i := range cards {
+			if free := freeUnits(i); free >= d.unitsPerCard && (best < 0 || free < bestFree) {
+				best, bestFree = i, free
+			}
+		}
+		if best < 0 {
+			return kueue.CheckStateRetry, demandVerdictMessage(kueue.CheckStateRetry, d)
+		}
+		budgets[best].units += d.unitsPerCard
+		budgets[best].slices++
+	}
+	return kueue.CheckStateReady, demandVerdictMessage(kueue.CheckStateReady, d)
 }
 
 // IMPORTANT: 算单张卡还能发几张共享门票？

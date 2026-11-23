@@ -3,6 +3,8 @@ package amd
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	core "k8s.io/api/core/v1"
@@ -14,6 +16,7 @@ import (
 	"gpustack.ai/gpustack/pkg/deviceplugin"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/utils/gox"
+	"gpustack.ai/gpustack/pkg/utils/osx"
 )
 
 const Manufacturer = nodefeature.ManufacturerAMD
@@ -99,6 +102,22 @@ func newServer(logger klog.Logger, mode workercore.DeviceAllocationMode) devicep
 
 	return s
 }
+
+// AMD ROCm 拦截库在容器内使用的挂载路径。
+//
+// ctrVrocmLibPath 应与 pack/gpustack-operator/rootfs/etc/gpustack/lib/amd/ld.so.preload 中的路径一
+// 致。这个文件覆盖容器的预加载配置，动态加载器按其中的路径查库。观察工具与拦截库安装在同一目录。
+const (
+	ctrLdPreloadPath  = "/etc/ld.so.preload"
+	ctrVrocmLibPath   = "/usr/local/vrocm/libvrocm.so"
+	ctrVrocmMonPath   = "/usr/local/vrocm/rocm-monitor"
+	ctrVrocmCheckPath = "/usr/local/vrocm/rocm-cumask-check"
+	ctrLedgerDir      = "/var/run/vrocm"
+	ctrLedgerPath     = ctrLedgerDir + "/ledger"
+)
+
+// readTopologyFn 在 Linux 读取实际 HSA 拓扑，单元测试可以独立验证其上层的整数分配算法。
+var readTopologyFn = readTopology
 
 // 从 AMD 设备插件中读取的 Device-node 路径，相关功能位于 rocm/k8s-device-plugin 的
 // internal/pkg/plugin/plugin.go 文件中。
@@ -235,6 +254,19 @@ func appendCardDevices(
 // none”则属于。
 const runtimeVisibleDevicesNone = "none"
 
+// rocrVisibleDevices 将探测器记录的 GPU-<serial> UUID 写成 ROCR_VISIBLE_DEVICES，ROCr 用这些 ID 匹
+// 配 agent。
+//
+// ROCr 先应用可见列表，然后为设备编号。HSA_CU_MASK 的 GPU_list 和 VROCM_DEVICE_MEMORY_LIMIT_<i> 都
+// 使用这一顺序。三个值必须来自同一份有序列表，否则掩码和显存额度可能作用到另一张卡。
+func rocrVisibleDevices(accels []deviceplugin.AllocatedAccelerator) string {
+	ids := make([]string, 0, len(accels))
+	for i := range accels {
+		ids = append(ids, accels[i].Accel.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
 func (s *server) GetContainerAllocateResponse(
 	_ context.Context,
 	_ *core.Pod,
@@ -265,6 +297,141 @@ func (s *server) GetContainerAllocateResponse(
 	// 注入加速器自身的设备节点，因此授权不依赖于容器运行时是否已安装，以便进行任何解释。
 	if err := appendDeviceNodes(ctrResp, accels); err != nil {
 		return nil, err
+	}
+
+	return ctrResp, nil
+}
+
+// PlaceLogicalSliced 根据每卡的算力预算，在节点已有分配旁为容器放置 CU 窗口。
+//
+// 该方法在设备插件的节点级分配锁内执行。HSA 拓扑按卡缓存，窗口计算只做整数运算。释放锁之前先把选好
+// 的窗口记入预留，以便下一个并发分配看到它。
+func (s *server) PlaceLogicalSliced(
+	_ context.Context,
+	_ *core.Pod,
+	ctr *core.Container,
+	devs *workercore.Devices,
+	allocated map[deviceplugin.Resource]int32,
+	occupied deviceplugin.Placements,
+) (deviceplugin.Placements, error) {
+	accels := deviceplugin.AllocatedAccelerators(devs, allocated)
+	if len(accels) == 0 {
+		return nil, fmt.Errorf("no allocated accelerator found for sliced container %q", ctr.Name)
+	}
+
+	coresRes := nodefeature.GetAcceleratableSlicedCoresPercentageResourceName(Manufacturer)
+	coresPct := deviceplugin.SlicedCoresPercent(ctr, coresRes)
+
+	placed := make(deviceplugin.Placements, len(accels))
+	for i := range accels {
+		accel := accels[i].Accel
+		if accel.ID == "" {
+			// 设备可见性依赖这张卡的唯一 ID。缺少 ID 时拒绝分配，避免容器意外看见其它卡。
+			return nil, fmt.Errorf("card at index %d reports no unique id, so it cannot be sliced", accel.Index)
+		}
+		res := deviceplugin.Resource{Group: accels[i].Group.ID, Device: accel.ID}
+		topo, err := readTopologyFn(accel.Topology.PciBusID, accel.ID)
+		if err != nil {
+			return nil, fmt.Errorf("read topology of card %s: %w", accel.ID, err)
+		}
+		length, err := WindowCUs(topo, coresPct)
+		if err != nil {
+			return nil, fmt.Errorf("derive the compute window of card %s: %w", accel.ID, err)
+		}
+		// 请求与硬件步长不对齐时，向下取整并记录实际分配比例。Kueue 按申请值计费，而较多着色器引擎可能让实
+		// 际比例低几个百分点。
+		if delivered := length * 100 / topo.CU; delivered != coresPct {
+			s.Logger.Info("compute request aligned down to the card's allocation atom",
+				"card", accel.ID, "requested", coresPct, "delivered", delivered,
+				"atomCUs", topo.Quantum(), "cardCUs", topo.CU)
+		}
+		placed[res] = []workercore.AcceleratorPlacement{
+			PackWindow(topo, length, occupied[res]),
+		}
+	}
+	return placed, nil
+}
+
+// GetLogicalSlicedResponse 将显存配额、ROCr 初始化时读取的 CU 掩码，以及预加载库和跨进程账本目录写
+// 入分配响应。
+//
+// 使用锁内已经记入预留的窗口，容器的掩码必须和节点账本里的位置一致。
+func (s *server) GetLogicalSlicedResponse(
+	_ context.Context,
+	pod *core.Pod,
+	ctr *core.Container,
+	devs *workercore.Devices,
+	allocated map[deviceplugin.Resource]int32,
+	placements deviceplugin.Placements,
+) (*deviceplugin.ContainerAllocateResponse, error) {
+	accels := deviceplugin.AllocatedAccelerators(devs, allocated)
+	if len(accels) == 0 {
+		return nil, fmt.Errorf("no allocated accelerator found for sliced container %q", ctr.Name)
+	}
+
+	// 软切分容器和整卡容器使用相同的设备节点，切片的额外约束来自显存配额和计算窗口。
+	ctrResp := &deviceplugin.ContainerAllocateResponse{}
+	if err := appendDeviceNodes(ctrResp, accels); err != nil {
+		return nil, err
+	}
+
+	// 账本按容器建立。它以 ROCR_VISIBLE_DEVICES 中的位置索引卡，不同容器各自的 0 号设备可能属于不同物
+	// 理卡。目录放在 Pod 工作目录下，回收 Pod 时一起删除。拦截库自行创建账本文件，目录允许不同 UID 的
+	// 工作负载写入。
+	ledgerDir := filepath.Join(deviceplugin.PodWorkDir(string(pod.UID), ctr.Name), "run/vrocm")
+	if err := osx.MkdirAll(ledgerDir, 0o777); err != nil {
+		return nil, fmt.Errorf("create %q: %w", ledgerDir, err)
+	}
+
+	memPctRes := nodefeature.GetAcceleratableSlicedMemoryPercentageResourceName(Manufacturer)
+	memMibRes := nodefeature.GetAcceleratableSlicedMemoryMibResourceName(Manufacturer)
+
+	envs := map[string]string{
+		// ROCr 根据 ROCR_VISIBLE_DEVICES 筛选并排列可见设备。实测无法解析其中一个设备 ID 时，它会静默返回
+		// 零个 GPU agent。这里从注入设备节点时使用的同一份列表生成环境变量。
+		"AMD_VISIBLE_DEVICES":  runtimeVisibleDevicesNone,
+		"ROCR_VISIBLE_DEVICES": rocrVisibleDevices(accels),
+		"VROCM_LEDGER_PATH":    ctrLedgerPath,
+	}
+
+	masks := make([]string, 0, len(accels))
+	for i := range accels {
+		accel := accels[i].Accel
+
+		// ROCm 拦截库读取不带单位后缀的 MiB 整数。NVIDIA 的 HAMi-core 则使用带 m 后缀的字符串。
+		memMib, err := deviceplugin.SlicedMemoryMib(ctr, memPctRes, memMibRes, int64(accels[i].Group.Memory))
+		if err != nil {
+			return nil, fmt.Errorf("derive sliced memory limit: %w", err)
+		}
+		envs["VROCM_DEVICE_MEMORY_LIMIT_"+strconv.Itoa(i)] = strconv.FormatInt(memMib, 10)
+
+		res := deviceplugin.Resource{Group: accels[i].Group.ID, Device: accel.ID}
+		window, ok := placements[res]
+		if !ok || len(window) == 0 {
+			return nil, fmt.Errorf("no compute window was placed for card %s", accel.ID)
+		}
+		// GPU_list 取这张卡在可见列表中的十进制下标 i。写入物理序号会选错卡，填入 UUID 则会让 ROCr 静默丢
+		// 弃整个掩码。
+		masks = append(masks, Mask(i, window[0]))
+	}
+	// 每张卡生成一个 GPU_list:CU_list 片段，ROCr 要求用分号连接各片段。
+	envs["HSA_CU_MASK"] = strings.Join(masks, ";")
+
+	// 日志级别 1 会记录拒绝和错误。显式注入该值可将日志行为固定在本次分配中，容器自行声明
+	// LIBVROCM_LOG_LEVEL 时保留其值。
+	if !deviceplugin.ContainerEnvDeclared(ctr, "LIBVROCM_LOG_LEVEL") {
+		envs["LIBVROCM_LOG_LEVEL"] = "1"
+	}
+
+	libDir := filepath.Join(deviceplugin.OperatorLibDir, "amd")
+	ctrResp.Envs = envs
+	// IMPORTANT: 挂载 so 文件等
+	ctrResp.Mounts = []*deviceplugin.Mount{
+		{ContainerPath: ctrLdPreloadPath, HostPath: filepath.Join(libDir, "ld.so.preload"), ReadOnly: true},
+		{ContainerPath: ctrVrocmLibPath, HostPath: filepath.Join(libDir, "libvrocm.so"), ReadOnly: true},
+		{ContainerPath: ctrVrocmMonPath, HostPath: filepath.Join(libDir, "rocm-monitor"), ReadOnly: true},
+		{ContainerPath: ctrVrocmCheckPath, HostPath: filepath.Join(libDir, "rocm-cumask-check"), ReadOnly: true},
+		{ContainerPath: ctrLedgerDir, HostPath: ledgerDir, ReadOnly: false},
 	}
 
 	return ctrResp, nil
