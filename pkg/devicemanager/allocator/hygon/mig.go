@@ -6,15 +6,22 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/deviceplugin"
 	"gpustack.ai/gpustack/pkg/utils/json"
+	"gpustack.ai/gpustack/pkg/utils/osx"
 )
 
 // migMarkerName 是每个容器/每个加速器的所有权记录的基础名称。它采用“磁盘格式”：早期版本所创建的记录仍存在
 // 于真实节点上，若对其进行重命名，则会导致重试、采用和回收过程无法处理已分配的资源。
 const migMarkerName = "hygon-mig.json"
+
+// _MigInstanceIDPrefix 是厂商工具显示实例以及运行时选择实例时使用的前缀。
+const _MigInstanceIDPrefix = "MIG-"
 
 // migConfigDir 是厂商自己的实时实例注册表。驱动程序在每个计算实例创建后，会在此处写入一个文件，该文件就是
 // 容器用于使用该实例的绑定对象——因此它既是驱动程序识别分区身份的依据，也是分配给工作负载的工件。它是一个
@@ -87,6 +94,13 @@ type migDriver interface {
 	ListInstances() ([]migLiveInstance, error)
 }
 
+// migCard 同时保存上层账本使用的 UUID 和访问 Multi-Instance 库所需的 PCI 地址。该库不能按设备 UUID
+// 查卡，二者都要从探测记录带入。
+type migCard struct {
+	UUID     string
+	PciBusID string
+}
+
 // migCardLocks 会对加速器分区中的每一次修改进行序列化处理，因此两个并发分配操作无法同时选择相同的空闲位置，
 // 且回收扫描操作也无法在分配过程仍在进行时销毁实例。
 //
@@ -146,6 +160,16 @@ type migMarkerEntry struct {
 	marker migMarker
 }
 
+// migMarkerFileName 用物理卡的 UUID 命名记录；即便一个容器涉及多张卡，也能逐卡跟踪所有权。
+func migMarkerFileName(cardUUID string) string {
+	return strings.TrimSuffix(migMarkerName, ".json") + "-" + cardUUID + ".json"
+}
+
+// migMarkerPath 在给定的 Pod 工作根目录下拼出当前容器与卡的标记路径。
+func migMarkerPath(podsDir, podUID, container, cardUUID string) string {
+	return filepath.Join(podsDir, podUID, "c-"+container, migMarkerFileName(cardUUID))
+}
+
 // parseMigMarker 会读取记录失败关闭状态：缺失、格式错误或不完整均为错误，因此重新绑定和回收路径永远不会误
 // 读活跃分区。原始规格 ID 不会检查其存在性，因为 0 是合法的厂商 ID。
 //
@@ -171,6 +195,24 @@ func parseMigMarker(path string) (migMarker, error) {
 		)
 	}
 	return m, nil
+}
+
+// writeMigMarker 持久化写入记录，避免并发扫描读到半份文件，并使完整记录能在异常关机后恢复。
+//
+// 标记由设备插件自己读取。只有写入者需要访问这个文件，容器和厂商库都不读取它。
+func writeMigMarker(path string, m migMarker) error {
+	dir := filepath.Dir(path)
+	if err := osx.MkdirAll(dir, 0o777); err != nil {
+		return fmt.Errorf("create marker dir %q: %w", dir, err)
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal marker: %w", err)
+	}
+	if err := osx.DurableWrite(path, data, 0o600); err != nil {
+		return fmt.Errorf("write marker %q: %w", path, err)
+	}
+	return nil
 }
 
 // scanMigMarkers 会解析 podsDir 下的每个分区记录。无法解析的记录会被作为损坏路径处理，而不会导致扫描失败，
@@ -217,4 +259,227 @@ func cardFromMigMarkerPath(path string) (string, bool) {
 		return "", false
 	}
 	return card, true
+}
+
+// migOwnedGiIDsOnCard 收集这张卡上已被容器认领的 GI 编号。
+func migOwnedGiIDsOnCard(entries []migMarkerEntry, cardUUID string) map[uint32]bool {
+	owned := make(map[uint32]bool)
+	for i := range entries {
+		if entries[i].marker.Card == cardUUID {
+			owned[entries[i].marker.GiID] = true
+		}
+	}
+	return owned
+}
+
+// migOwnershipUnknownOnCard 判断损坏文件是否可能属于当前卡。文件名指向当前卡，或文件名无法识别卡时，
+// 归属均不能确定。
+//
+// 归属不明时停止接管已有实例，避免将已有容器的分区交给第二个容器。
+func migOwnershipUnknownOnCard(corrupt []string, cardUUID string) bool {
+	for _, path := range corrupt {
+		card, ok := cardFromMigMarkerPath(path)
+		if !ok || card == cardUUID {
+			return true
+		}
+	}
+	return false
+}
+
+// pickMigPlacement 从驱动报告的合法位置中，选择起点最低且无重叠的位置。
+//
+// 总从低位放置可以使布局可复现，并尽量为较大的规格留下连续空间。
+func pickMigPlacement(possible, occupied []migPlacement) (migPlacement, bool) {
+	candidates := slices.Clone(possible)
+	slices.SortFunc(candidates, func(a, b migPlacement) int { return int(a.Start - b.Start) })
+	for _, slot := range candidates {
+		if !migPlacementOverlapsAny(slot, occupied) {
+			return slot, true
+		}
+	}
+	return migPlacement{}, false
+}
+
+// migPlacementOverlapsAny 判断候选区间是否与已占用区间有交集。
+func migPlacementOverlapsAny(slot migPlacement, occupied []migPlacement) bool {
+	for _, o := range occupied {
+		if slot.Start < o.Start+o.Length && o.Start < slot.Start+slot.Length {
+			return true
+		}
+	}
+	return false
+}
+
+// findLiveMigInstance 从实时枚举结果查找指定 GI 编号。
+func findLiveMigInstance(state migCardState, giID uint32) (migInstance, bool) {
+	for i := range state.Live {
+		if state.Live[i].GiID == giID {
+			return state.Live[i], true
+		}
+	}
+	return migInstance{}, false
+}
+
+// adoptUnboundMigInstance 查找符合目标规格且未被容器认领的实时实例。
+//
+// 创建完成后写标记失败，或进程在两步之间退出，都可能留下无主实例。接管同一厂商 profile ID 的实例可避
+// 免重启后不断积累分区。几何不匹配的实例不能交付给该申请。
+func adoptUnboundMigInstance(state migCardState, owned map[uint32]bool) (migInstance, bool) {
+	candidates := slices.Clone(state.Live)
+	slices.SortFunc(candidates, func(a, b migInstance) int { return int(a.Placement.Start - b.Placement.Start) })
+	for _, inst := range candidates {
+		if inst.ProfileID == state.ProfileID && !owned[inst.GiID] {
+			return inst, true
+		}
+	}
+	return migInstance{}, false
+}
+
+// migReserveOutcome 记录本次预留做了什么，决定失败时能撤销哪些状态。
+type migReserveOutcome int
+
+const (
+	// migRebound 表示沿用该容器自己的记录，本次没有创建实例或新增认领。
+	migRebound migReserveOutcome = iota
+	// migAdopted 表示为既有的无主实例写了标记，回滚时仅撤销这份认领。
+	migAdopted
+	// migCreated 表示实例由本次调用创建，回滚时负责销毁。
+	migCreated
+)
+
+// reserveMigInstance 对一张卡完成预留和登记，调用方持有该卡的锁。
+//
+// 先尝试复用当前容器已持有的分区，然后尝试接管同规格的无主实例。都不适用时，在最低空闲位置新建 GI 并
+// 创建覆盖该 GI 的 CI。
+//
+// 在同一临界区内写所有权标记。若写入失败，撤销本调用刚创建的分区。
+//
+// 仅在 err 为 nil 时使用返回的 outcome。预留失败已经撤销本次部分变更，调用方不能再按错误路径返回的枚
+// 举值做二次回滚。
+func reserveMigInstance(
+	drv migDriver, podsDir, podUID, container string, card migCard, profile string,
+) (inst migInstance, outcome migReserveOutcome, err error) {
+	cardUUID := card.UUID
+	self := migMarkerPath(podsDir, podUID, container, cardUUID)
+
+	if m, perr := parseMigMarker(self); perr == nil {
+		if m.Profile != profile {
+			return migInstance{}, migRebound, fmt.Errorf(
+				"marker %q mismatches request (profile=%s): fail closed", self, profile,
+			)
+		}
+		state, serr := drv.CardState(card.PciBusID, profile)
+		if serr != nil {
+			return migInstance{}, migRebound, fmt.Errorf("read card %s state: %w", cardUUID, serr)
+		}
+		live, ok := findLiveMigInstance(state, m.GiID)
+		if !ok {
+			return migInstance{}, migRebound, fmt.Errorf(
+				"marker %q references missing gpu instance %d on card %s: fail closed", self, m.GiID, cardUUID,
+			)
+		}
+		// GI 编号可以被复用。此厂商每次创建分区都会生成新的 UUID，因此重新绑定时须比较实时 UUID 和记录中的
+		// UUID。
+		if live.UUID != m.MigUUID {
+			return migInstance{}, migRebound, fmt.Errorf(
+				"marker %q gpu instance %d uuid %q no longer matches live uuid %q (id reused): fail closed",
+				self, m.GiID, m.MigUUID, live.UUID,
+			)
+		}
+		return m.instance(), migRebound, nil
+	} else if !os.IsNotExist(perr) {
+		return migInstance{}, migRebound, fmt.Errorf("read self marker %q: %w", self, perr)
+	}
+
+	state, err := drv.CardState(card.PciBusID, profile)
+	if err != nil {
+		return migInstance{}, migCreated, fmt.Errorf("read card %s state: %w", cardUUID, err)
+	}
+
+	entries, corrupt := scanMigMarkers(podsDir)
+	owned := migOwnedGiIDsOnCard(entries, cardUUID)
+
+	reused, adopt := migInstance{}, false
+	if !migOwnershipUnknownOnCard(corrupt, cardUUID) {
+		reused, adopt = adoptUnboundMigInstance(state, owned)
+	}
+
+	if adopt {
+		inst, outcome = reused, migAdopted
+	} else {
+		occupied := make([]migPlacement, 0, len(state.Live))
+		for i := range state.Live {
+			occupied = append(occupied, state.Live[i].Placement)
+		}
+		slot, ok := pickMigPlacement(state.Possible, occupied)
+		if !ok {
+			return migInstance{}, migCreated, fmt.Errorf(
+				"card %s has no free placement for profile %s", cardUUID, profile,
+			)
+		}
+		inst, err = drv.CreateInstance(card.PciBusID, profile, slot)
+		if err != nil {
+			return migInstance{}, migCreated, fmt.Errorf(
+				"create %s instance on card %s: %w", profile, cardUUID, err,
+			)
+		}
+		outcome = migCreated
+	}
+
+	m := migMarker{
+		PodUID: podUID, Container: container, Card: cardUUID, PciBusID: card.PciBusID, Profile: profile,
+		ProfileID: inst.ProfileID, GiID: inst.GiID, CiID: inst.CiID, MigUUID: inst.UUID,
+		ConfPath: inst.ConfPath, Start: inst.Placement.Start, Length: inst.Placement.Length,
+	}
+	if werr := writeMigMarker(self, m); werr != nil {
+		if outcome == migCreated {
+			// 写标记失败时撤销本次创建。进程真正崩溃而遗留的实例则由后续回收处理。
+			_ = drv.DestroyInstance(card.PciBusID, inst)
+		}
+		return migInstance{}, outcome, werr
+	}
+	return inst, outcome, nil
+}
+
+// migAccelerator 同时保存所属设备组和探测记录，前者用于上报资源键，后者用于构造容器设备节点。
+type migAccelerator struct {
+	groupID string
+	accel   *workercore.Accelerator
+}
+
+// migAllocatedAccelerator 查找具有给定身份且属于本次分配的加速器。
+func migAllocatedAccelerator(
+	devs *workercore.Devices, allocated map[deviceplugin.Resource]int32, cardUUID string,
+) (migAccelerator, bool) {
+	accelerators := deviceplugin.AllocatedAccelerators(devs, allocated)
+	for i := range accelerators {
+		if accelerators[i].Accel.ID == cardUUID {
+			return migAccelerator{
+				groupID: accelerators[i].Group.ID,
+				accel:   accelerators[i].Accel,
+			}, true
+		}
+	}
+	return migAccelerator{}, false
+}
+
+// migAllocatedCards 为每张已分配的卡同时返回 UUID 和 PCI 地址。
+//
+// 卡缺少 PCI 地址时返回错误。厂商库无法定位这张卡，静默跳过会让容器拿到的设备数少于已分配的设备数。
+func migAllocatedCards(
+	devs *workercore.Devices, allocated map[deviceplugin.Resource]int32,
+) ([]migCard, error) {
+	accelerators := deviceplugin.AllocatedAccelerators(devs, allocated)
+	cards := make([]migCard, 0, len(accelerators))
+	for i := range accelerators {
+		accel := accelerators[i].Accel
+		if accel.Topology.PciBusID == "" {
+			return nil, fmt.Errorf(
+				"card %s: no recorded pci address to reach it through the multi-instance library: fail closed",
+				accel.ID,
+			)
+		}
+		cards = append(cards, migCard{UUID: accel.ID, PciBusID: accel.Topology.PciBusID})
+	}
+	return cards, nil
 }

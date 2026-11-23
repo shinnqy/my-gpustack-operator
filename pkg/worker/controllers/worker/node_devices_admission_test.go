@@ -317,3 +317,199 @@ func TestExclusiveDemandUsesAssignedNode(t *testing.T) {
 		assert.Equal(t, tc.want, got, tc.host)
 	}
 }
+
+// physicalCard 用于描述一个分区化的卡片，作为可行性测试用的实例：包括其分配模式、剩余的标量单元数量、
+// RemainingProfiles 账本（profile → 空闲实例数量），以及其能力是否包含缓存的 Placements（账本准备信
+// 号）。
+type physicalCard struct {
+	id                string
+	mode              workercore.DeviceAllocationMode
+	remaining         int32
+	remainingProfiles map[string]int32
+	placementsCached  bool
+}
+
+// physicalDevices 为每张测试卡同时构建 Spec 中的能力记录和 Status 中的分配记录。两者使用相同设备 ID，
+// 后者包含模式、剩余 units 和 RemainingProfiles，与 collectCards 的关联方式一致。
+func physicalDevices(cards ...physicalCard) workercore.Devices {
+	return physicalDevicesOf("nvidia", cards...)
+}
+
+// physicalDevicesOf 为指定厂商生成与 physicalDevices 相同形状的账本。单卡按厂商自己的规格名称存储余
+// 量，因此测试必须保留厂商身份，才能验证公布的资源名是否正确转换。
+func physicalDevicesOf(manufacturer string, cards ...physicalCard) workercore.Devices {
+	specAccels := make([]workercore.Accelerator, len(cards))
+	statusAccels := make([]workercore.AcceleratorAllocation, len(cards))
+	for i, c := range cards {
+		prof := workercore.AcceleratorPhysicalSlicedProfile{Name: "cap", Count: 7}
+		if c.placementsCached {
+			prof.Placements = []workercore.AcceleratorPlacement{{Start: 0, Length: 1}}
+		}
+		specAccels[i] = workercore.Accelerator{
+			ID: c.id, Index: uint32(i),
+			Status: workercore.AcceleratorStatus{
+				PhysicalSliced: workercore.AcceleratorPhysicalSliced{
+					Profiles: []workercore.AcceleratorPhysicalSlicedProfile{prof},
+					Count:    prof.Count,
+				},
+			},
+		}
+		rem := make([]workercore.AcceleratorProfileCount, 0, len(c.remainingProfiles))
+		for name, cnt := range c.remainingProfiles {
+			rem = append(rem, workercore.AcceleratorProfileCount{Name: name, Count: cnt})
+		}
+		statusAccels[i] = workercore.AcceleratorAllocation{
+			ID: c.id, Index: uint32(i), Mode: c.mode, Remaining: c.remaining, RemainingProfiles: rem,
+		}
+	}
+	return workercore.Devices{
+		Spec: workercore.DevicesSpec{
+			Groups: []workercore.DevicesGroup{{ID: "g0", Manufacturer: manufacturer, Accelerators: specAccels}},
+		},
+		Status: workercore.DevicesStatus{
+			Groups: []workercore.DevicesAllocationGroup{{ID: "g0", Manufacturer: manufacturer, Accelerators: statusAccels}},
+		},
+	}
+}
+
+func TestNodeDevicesFeasibilityPartitioned(t *testing.T) {
+	none := workercore.DeviceAllocationModeNone
+	partitioned := workercore.DeviceAllocationModePartitioned
+	exclusive := workercore.DeviceAllocationModeExclusive
+
+	cases := []struct {
+		name    string
+		devices []workercore.Devices
+		profile string
+		cards   int32
+		want    kueue.CheckState
+	}{
+		{
+			name: "enough cards with a free placement is ready",
+			// 每个实例有1个免费放置空间，因此这两个实例必须来自不同的卡。在第一个实例有剩余空间的情况下，适配过
+			// 程在检查第二个实例之前就完成了——这种情况的遍历操作并未实际执行。
+			devices: []workercore.Devices{physicalDevices(
+				physicalCard{id: "g0", mode: none, remainingProfiles: map[string]int32{"1g.10gb": 1}, placementsCached: true},
+				physicalCard{id: "g1", mode: partitioned, remainingProfiles: map[string]int32{"1g.10gb": 1}, placementsCached: true},
+			)},
+			profile: "1g.10gb", cards: 2, want: kueue.CheckStateReady,
+		},
+		{
+			name: "profile full everywhere retries (not reject)",
+			devices: []workercore.Devices{physicalDevices(
+				physicalCard{id: "g0", mode: partitioned, remainingProfiles: map[string]int32{"1g.10gb": 0}, placementsCached: true},
+			)},
+			profile: "1g.10gb", cards: 1, want: kueue.CheckStateRetry,
+		},
+		{
+			name: "no placements cached is ledger-not-ready retry",
+			devices: []workercore.Devices{physicalDevices(
+				physicalCard{id: "g0", mode: none, remainingProfiles: map[string]int32{}, placementsCached: false},
+			)},
+			profile: "1g.10gb", cards: 1, want: kueue.CheckStateRetry,
+		},
+		{
+			name: "exclusive-held partitioned card is not a candidate",
+			devices: []workercore.Devices{physicalDevices(
+				physicalCard{id: "g0", mode: exclusive, remainingProfiles: map[string]int32{"1g.10gb": 7}, placementsCached: true},
+			)},
+			profile: "1g.10gb", cards: 1, want: kueue.CheckStateRetry,
+		},
+		{
+			name: "short by one card retries",
+			devices: []workercore.Devices{physicalDevices(
+				physicalCard{id: "g0", mode: none, remainingProfiles: map[string]int32{"1g.10gb": 1}, placementsCached: true},
+			)},
+			profile: "1g.10gb", cards: 2, want: kueue.CheckStateRetry,
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, _ := feasibilityOfOnePool(c.devices, []familyDemand{
+				{family: nodefeature.ResourceFamilyPartitioned, cards: c.cards, profile: c.profile},
+			})
+			assert.Equal(t, c.want, got)
+		})
+	}
+}
+
+// TestNodeDevicesFeasibilityPartitionedVendorSpelledLedger 在可行性检查阶段将 profile 名称的边界标记
+// 出来。需求名称即作为已发布资源的键来命名该 profile，而卡片的 per-profile 账本则以制造商自己的库名
+// 称作为键——若严格比对两者，则没有匹配项，可理解为完整的卡片；若对已发布的 profile 进行任何请求，在
+// 有空间的池中会永远处于重试状态。最终判定仍使用已发布的名称，因为那是用户所指定的名称。
+func TestNodeDevicesFeasibilityPartitionedVendorSpelledLedger(t *testing.T) {
+	roomyCard := []workercore.Devices{physicalDevicesOf(nodefeature.ManufacturerTHead, physicalCard{
+		id: "p0", mode: workercore.DeviceAllocationModeNone,
+		remainingProfiles: map[string]int32{"4g48gb": 2}, placementsCached: true,
+	})}
+
+	got, msg := feasibilityOfOnePool(roomyCard, []familyDemand{
+		{family: nodefeature.ResourceFamilyPartitioned, cards: 1, profile: "4g.48gb"},
+	})
+	assert.Equal(t, kueue.CheckStateReady, got, "a published profile name against a vendor-spelled ledger")
+	assert.Contains(t, msg, `"4g.48gb"`, "the verdict quotes the name the user wrote")
+
+	// 转换过程会将一种拼写转换为另一种，但并不会让所有名称都匹配。
+	got, _ = feasibilityOfOnePool(roomyCard, []familyDemand{
+		{family: nodefeature.ResourceFamilyPartitioned, cards: 1, profile: "8g.96gb"},
+	})
+	assert.Equal(t, kueue.CheckStateRetry, got, "a profile the card does not offer")
+}
+
+// TestNodeDevicesFeasibilityPartitionedCountsPlacements 说明：实例中的分区需求计数基于实例而非卡：一
+// 张卡拥有多个空闲分区，该卡对应的多个复制品属于剩余分区，这与 RemainingProfiles 的报告内容以及
+// placement-authoritative Allocate 的功能一致。如果按每张卡统计一个实例，那么在有空间容纳所有复制品
+// 的节点上，每个复制品都将被永久拒绝在重试阶段中运行。
+func TestNodeDevicesFeasibilityPartitionedCountsPlacements(t *testing.T) {
+	oneRoomyCard := []workercore.Devices{physicalDevices(physicalCard{
+		id: "g0", mode: workercore.DeviceAllocationModeNone,
+		remainingProfiles: map[string]int32{"1g.10gb": 3}, placementsCached: true,
+	})}
+
+	for _, want := range []struct {
+		instances int32
+		state     kueue.CheckState
+	}{
+		{instances: 1, state: kueue.CheckStateReady},
+		{instances: 3, state: kueue.CheckStateReady},
+		{instances: 4, state: kueue.CheckStateRetry},
+	} {
+		got, _ := feasibilityOfOnePool(oneRoomyCard, []familyDemand{
+			{family: nodefeature.ResourceFamilyPartitioned, cards: want.instances, profile: "1g.10gb"},
+		})
+		assert.Equal(t, want.state, got, "%d instances against one card with 3 free placements", want.instances)
+	}
+
+	// 一个工作负载的两次分区需求不得出现在相同的放置区间中。
+	got, _ := feasibilityOfOnePool(oneRoomyCard, []familyDemand{
+		{family: nodefeature.ResourceFamilyPartitioned, cards: 2, profile: "1g.10gb"},
+		{family: nodefeature.ResourceFamilyPartitioned, cards: 2, profile: "1g.10gb", unitsPerCard: 1},
+	})
+	assert.Equal(t, kueue.CheckStateRetry, got, "4 instances across two demands exceed the 3 free placements")
+}
+
+// TestNodeDevicesFeasibilityPartitionedMessages 标记了“账本未准备”状态所承载的消息与真正的“配置已满”
+// 状态不同，因此运维人员能够区分升级窗口与实际冲突情况，且完全没有分区机制的池也不会重复利用资源。
+func TestNodeDevicesFeasibilityPartitionedMessages(t *testing.T) {
+	notReady := []workercore.Devices{physicalDevices(
+		physicalCard{id: "g0", mode: workercore.DeviceAllocationModeNone, placementsCached: false},
+	)}
+	full := []workercore.Devices{physicalDevices(
+		physicalCard{id: "g0", mode: workercore.DeviceAllocationModePartitioned, remainingProfiles: map[string]int32{"1g.10gb": 0}, placementsCached: true},
+	)}
+	// 完全没有分区卡的池，与发布窗口是不同的概念，必须包含其专属说明。
+	noPartition := []workercore.Devices{devicesWithRemaining(int32(nodefeature.ResourceMaxUnits))}
+
+	demand := []familyDemand{{family: nodefeature.ResourceFamilyPartitioned, cards: 1, profile: "1g.10gb"}}
+	_, notReadyMsg := feasibilityOfOnePool(notReady, demand)
+	_, fullMsg := feasibilityOfOnePool(full, demand)
+	_, noPartitionMsg := feasibilityOfOnePool(noPartition, demand)
+
+	assert.Equal(t, partitionLedgerNotReadyMessage(nil), notReadyMsg)
+	assert.NotEqual(t, notReadyMsg, fullMsg, "ledger-not-ready and profile-full messages must differ")
+	assert.NotEqual(t, partitionLedgerNotReadyMessage(nil), noPartitionMsg,
+		"a pool with no partitioned card must not reuse the device-manager-rollout message")
+	assert.Contains(t, noPartitionMsg, "no partitioned card")
+}

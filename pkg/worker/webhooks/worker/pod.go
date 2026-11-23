@@ -270,7 +270,22 @@ func (r *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 		ctr := pc.ctr
 		claims := containerClaims(ctr)
 
-		// 在此处折算硬件 profile 对应的 units。
+		// 根据分区规格的显存折算每卡配额，与绝对 MiB 形式的软切请求使用同一计量尺度。硬切分只填写自己的资源
+		// 键。
+		for _, base := range claims[nodefeature.ResourceFamilyPartitioned] {
+			// 找出容器点名的 profile
+			profiles := containerPartitionProfiles(ctr, base)
+			if len(profiles) != 1 {
+				// 合法请求必须恰好指定一种规格。没有指定或指定多种时交给校验阶段处理。
+				continue
+			}
+			units, err := r.partitionContainerUnits(ctx, pod, ctr, base, profiles[0])
+			if err != nil {
+				return err
+			}
+			names := partitionResourceNamesForBase(base)
+			setContainerResource(ctr, names.units, *resource.NewQuantity(units, resource.DecimalSI))
+		}
 
 		for _, base := range claims[nodefeature.ResourceFamilySliced] {
 			names := logicalResourceNamesForBase(base)
@@ -422,6 +437,43 @@ func (r *PodWebhook) cardVRAMMib(ctx context.Context, pod *core.Pod) (int64, err
 		return 0, err
 	}
 	return workerctrl.InstanceTypeCardVRAMMib(it)
+}
+
+// partitionContainerUnits 从队列对应的 InstanceType 读取已观测到的规格和单卡显存，再计算每个分区的
+// .partitioned.units。详情尚未就绪时提示重试；资源池未提供所选规格时指出具体的容器和规格。
+//
+// 按每个分区的显存占整卡显存的比例计费。96 GiB 卡上的 48 GiB 分区占 800,000 units，96 GiB 分区占
+// 1,600,000 units。相同显存的 .sliced.memory-mib 请求也得到相同的配额。
+func (r *PodWebhook) partitionContainerUnits(
+	ctx context.Context, pod *core.Pod, ctr *core.Container, base core.ResourceName, profile string,
+) (int64, error) {
+	it, err := r.frontingInstanceType(ctx, pod)
+	if err != nil {
+		return 0, err
+	}
+	prof, ready, found := workerctrl.PartitionProfile(it, profile)
+	if !found {
+		if !ready {
+			return 0, fmt.Errorf("instance type %s is not ready yet (accelerator detail not computed); retry", it.Name)
+		}
+		return 0, fmt.Errorf("container %q: partition profile %q is not offered by the target pool (instance type %s)",
+			ctr.Name, profile, it.Name)
+	}
+	// 探测或滚动更新期间，规格名称可能先于 MemoryMib 出现。将缺失的显存视为暂未就绪，请求可以重试。
+	if prof.MemoryMib <= 0 {
+		return 0, fmt.Errorf("instance type %s is not ready yet (partition profile %q has no memory detail); retry",
+			it.Name, profile)
+	}
+	cardVRAMMib, err := workerctrl.InstanceTypeCardVRAMMib(it)
+	if err != nil {
+		return 0, err
+	}
+	units := nodefeature.MemoryMibToUnits(prof.MemoryMib, cardVRAMMib)
+	if units <= 0 {
+		return 0, fmt.Errorf("container %q: cannot derive a positive %s from partition profile %q",
+			ctr.Name, partitionResourceNamesForBase(base).units, profile)
+	}
+	return units, nil
 }
 
 func (r *PodWebhook) ValidateCreate(_ context.Context, obj runtime.Object) (ctrladmission.Warnings, error) {

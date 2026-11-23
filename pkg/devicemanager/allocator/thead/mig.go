@@ -1,21 +1,26 @@
 package thead
 
 import (
+	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	core "k8s.io/api/core/v1"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/deviceplugin"
 	"gpustack.ai/gpustack/pkg/utils/json"
+	"gpustack.ai/gpustack/pkg/utils/osx"
 )
 
 // markerName 是写入 Pod 工作目录下的、每个容器/每个加速器分区所有权标记。它是重启后保留的记录，能够摧毁原
@@ -163,6 +168,18 @@ type markerEntry struct {
 	marker migMarker
 }
 
+// markerFileName 用物理卡的 UUID 组成 thead-mig-<GPU UUID>.json。容器涉及多张卡时，每张卡有独立的所
+// 有权标记，并由自己的锁保护。
+func markerFileName(cardUUID string) string {
+	return strings.TrimSuffix(markerName, ".json") + "-" + cardUUID + ".json"
+}
+
+// markerPath 以传入的 Pod 工作根目录、Pod UID、容器名和设备 UUID 定位标记，分配和回收因此可以在同一
+// 目录树中查找记录。
+func markerPath(podsDir, podUID, container, cardUUID string) string {
+	return filepath.Join(podsDir, podUID, "c-"+container, markerFileName(cardUUID))
+}
+
 // parseMarker 会读取标记失败关闭机制：缺失、格式错误或不完整的记录会引发错误，因此自标记的重复使用和回收
 // 不会默默地错误读取到正在使用的分区。原始规格中的 ID 不会检查其存在性，因为 0 是合法的厂商 ID。
 //
@@ -194,6 +211,25 @@ func parseMarker(path string) (migMarker, error) {
 		)
 	}
 	return m, nil
+}
+
+// writeMarker 持久写入标记，避免并发扫描读到半份记录，并使已完成的写入能经受异常关机。
+//
+// 每个容器的工作目录也用于其他厂商运行时文件，因此允许容器镜像自行选择的用户访问。所有权标记只由设备
+// 插件读取，文件仅授予写入者读写权限。
+func writeMarker(path string, m migMarker) error {
+	dir := filepath.Dir(path)
+	if err := osx.MkdirAll(dir, 0o777); err != nil {
+		return fmt.Errorf("create marker dir %q: %w", dir, err)
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal marker: %w", err)
+	}
+	if err := osx.DurableWrite(path, data, 0o600); err != nil {
+		return fmt.Errorf("write marker %q: %w", path, err)
+	}
+	return nil
 }
 
 // scanMarkers 会解析 podsDir 下的每个分区标记。无法解析的标记会被作为损坏的路径收集，而不会导致整个扫描失
@@ -303,6 +339,42 @@ func ownershipUnknownOnCard(corrupt []string, cardUUID string) bool {
 	return false
 }
 
+// adoptUnboundInstance 查找这张卡上没有标记认领且厂商原始 profile ID 与请求一致的存活分区，可用于接
+// 管以前遗留的实例。
+//
+// 用厂商原始 profile ID 区分配置。即使算力切片数与显存区间长度一致，媒体或图形等变体仍可能属于不同规
+// 格，不能仅凭大小接管。
+//
+// 若实例身份为空，说明 GI 尚无可寻址的 CI，例如进程在两次创建之间退出。留给回收器处理，不将它作为可
+// 交付分区。
+func adoptUnboundInstance(state migCardState, owned map[uint32]bool, computeSlices, memorySlices int32) (migInstance, bool) {
+	for i := range state.Live {
+		inst := state.Live[i]
+		if inst.UUID == "" || owned[inst.GiID] {
+			continue
+		}
+		if inst.ProfileID == state.ProfileID &&
+			inst.ComputeSlices == computeSlices && inst.Placement.Length == memorySlices {
+			return inst, true
+		}
+	}
+	return migInstance{}, false
+}
+
+// pickPlacement 在合法且未占用的区间里选择 Start 最小的一个，卡已满时返回 false。同卡创建由卡锁串行
+// 执行。
+func pickPlacement(possible, occupied []migPlacement) (migPlacement, bool) {
+	sorted := make([]migPlacement, len(possible))
+	copy(sorted, possible)
+	slices.SortFunc(sorted, func(a, b migPlacement) int { return cmp.Compare(a.Start, b.Start) })
+	for _, slot := range sorted {
+		if !placementOverlapsAny(slot, occupied) {
+			return slot, true
+		}
+	}
+	return migPlacement{}, false
+}
+
 // placementOverlapsAny 报告该槽位区间是否与任何已占用的区间相交。两个半开区间 [a, a+m) 和 [b, b+n) 若满足
 // a < b+n 且 b < a+m，则会发生重叠。
 func placementOverlapsAny(slot migPlacement, occupied []migPlacement) bool {
@@ -315,10 +387,178 @@ func placementOverlapsAny(slot migPlacement, occupied []migPlacement) bool {
 	return false
 }
 
+// findLiveInstance 在该卡的实时状态中查找指定 GI 编号。
+func findLiveInstance(state migCardState, giID uint32) (migInstance, bool) {
+	for i := range state.Live {
+		if state.Live[i].GiID == giID {
+			return state.Live[i], true
+		}
+	}
+	return migInstance{}, false
+}
+
+// migReserveOutcome 区分本次调用做了哪些操作，以便失败时只撤销本次变更。
+// - migCreated 表示本次创建了 GI、CI 并写入标记，回滚时销毁它们并清除标记。
+// - migBound 表示接管了一个已存在的无主分区。回滚只删除新写的标记，使分区再次可供接管。
+// - migRebound 表示沿用自身标记完成重试。分区和标记属于以前已成功的分配，回滚时均保留。
+type migReserveOutcome int
+
+const (
+	migCreated migReserveOutcome = iota
+	migBound
+	migRebound
+)
+
+// reserveMigInstance 在卡锁内为当前容器分配分区，依次检查以下三种来源。
+//
+// - 先核对当前容器自己的标记、物理卡、规格和驱动中的实例身份，使 kubelet 重试时能返回同一分区。
+// - 没有自身标记时，尝试接管厂商原始规格相同的无主分区。
+// - 否则在最低空闲位置新建 GPU 实例和计算实例。
+//
+// 在卡锁内持久化标记。写入失败时撤销刚创建的实例，成功时返回本次实际执行的预留类型供外层回滚。
+//
+// 驱动无法完整读取当前状态时返回错误。若把读取失败视作空卡，可能将一个仍被占用的区间分配两次。
+//
+// 仅在 err 为 nil 时解释 outcome。失败路径已经撤销本次部分变更，不能再依据返回的枚举值做二次回滚。
+func reserveMigInstance(
+	drv migDriver, podsDir, podUID, container, cardUUID, profile string, computeSlices, memorySlices int32,
+) (inst migInstance, outcome migReserveOutcome, err error) {
+	self := markerPath(podsDir, podUID, container, cardUUID)
+	if m, perr := parseMarker(self); perr == nil {
+		if m.Profile != profile {
+			return migInstance{}, migRebound, fmt.Errorf(
+				"marker %q mismatches request (profile=%s): fail closed", self, profile,
+			)
+		}
+		state, serr := drv.CardState(cardUUID, profile, computeSlices, memorySlices)
+		if serr != nil {
+			return migInstance{}, migRebound, fmt.Errorf("read card %s state: %w", cardUUID, serr)
+		}
+		liveInst, ok := findLiveInstance(state, m.GiID)
+		if !ok {
+			return migInstance{}, migRebound, fmt.Errorf(
+				"marker %q references missing gpu instance %d on card %s: fail closed", self, m.GiID, cardUUID,
+			)
+		}
+		// GI 的数字 ID 可以被复用，重新绑定前还要确认驱动报告的实例身份与标记一致。
+		if liveInst.UUID != m.MigUUID {
+			return migInstance{}, migRebound, fmt.Errorf(
+				"marker %q gpu instance %d uuid %q no longer matches live uuid %q (id reused): fail closed",
+				self, m.GiID, m.MigUUID, liveInst.UUID,
+			)
+		}
+		return m.instance(), migRebound, nil
+	} else if !os.IsNotExist(perr) {
+		return migInstance{}, migRebound, fmt.Errorf("read self marker %q: %w", self, perr)
+	}
+
+	state, err := drv.CardState(cardUUID, profile, computeSlices, memorySlices)
+	if err != nil {
+		return migInstance{}, migCreated, fmt.Errorf("read card %s state: %w", cardUUID, err)
+	}
+
+	entries, corrupt := scanMarkers(podsDir)
+	owned := ownedGiIDsOnCard(entries, cardUUID)
+
+	reused, adopt := migInstance{}, false
+	if !ownershipUnknownOnCard(corrupt, cardUUID) {
+		reused, adopt = adoptUnboundInstance(state, owned, computeSlices, memorySlices)
+	}
+
+	if adopt {
+		inst = reused
+		outcome = migBound
+	} else {
+		occupied := make([]migPlacement, 0, len(state.Live))
+		for i := range state.Live {
+			occupied = append(occupied, state.Live[i].Placement)
+		}
+		slot, ok := pickPlacement(state.Possible, occupied)
+		if !ok {
+			return migInstance{}, migCreated, fmt.Errorf(
+				"card %s has no free placement for profile %s", cardUUID, profile,
+			)
+		}
+		inst, err = drv.CreateInstance(cardUUID, profile, computeSlices, memorySlices, slot)
+		if err != nil {
+			return migInstance{}, migCreated, fmt.Errorf("create %s instance on card %s: %w", profile, cardUUID, err)
+		}
+		outcome = migCreated
+	}
+
+	m := migMarker{
+		PodUID: podUID, Container: container, Card: cardUUID, Profile: profile, ProfileID: inst.ProfileID,
+		GiID: inst.GiID, CiID: inst.CiID, MigUUID: inst.UUID,
+		ComputeSlices: inst.ComputeSlices, Start: inst.Placement.Start, Length: inst.Placement.Length,
+	}
+	if werr := writeMarker(self, m); werr != nil {
+		if outcome == migCreated {
+			// 标记写入失败时撤销本次新建的实例。接管的实例早已存在，应继续保留；两步间崩溃遗留的实例由回收器处理。
+			_ = drv.DestroyInstance(cardUUID, inst)
+		}
+		return migInstance{}, outcome, werr
+	}
+	return inst, outcome, nil
+}
+
+// profileGeometry 从 devs.Spec 中该卡探测到的目标规格读取计算和显存切片数，找不到卡或规格时返回
+// false。
+func profileGeometry(devs *workercore.Devices, cardUUID, profile string) (computeSlices, memorySlices int32, ok bool) {
+	for i := range devs.Spec.Groups {
+		grp := &devs.Spec.Groups[i]
+		for j := range grp.Accelerators {
+			acc := &grp.Accelerators[j]
+			if acc.ID != cardUUID {
+				continue
+			}
+			for k := range acc.Status.PhysicalSliced.Profiles {
+				p := &acc.Status.PhysicalSliced.Profiles[k]
+				if p.Name == profile {
+					return p.ComputeSlices, p.MemorySlices, true
+				}
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// allocatedAccelerators 按 devs 的顺序列出本次分配的设备 UUID，使主容器和共用分区的容器按相同顺序组
+// 装设备列表。
+func allocatedAccelerators(devs *workercore.Devices, allocated map[deviceplugin.Resource]int32) []string {
+	cards := make([]string, 0, len(allocated))
+	for i := range devs.Spec.Groups {
+		grp := &devs.Spec.Groups[i]
+		for j := range grp.Accelerators {
+			res := deviceplugin.Resource{
+				Group:  grp.ID,
+				Device: grp.Accelerators[j].ID,
+			}
+			if _, ok := allocated[res]; ok {
+				cards = append(cards, grp.Accelerators[j].ID)
+			}
+		}
+	}
+	return cards
+}
+
+// resourceForAccelerator 把设备 UUID 转换成账本以设备组和设备组成的 Resource 键。
+func resourceForAccelerator(devs *workercore.Devices, cardUUID string) deviceplugin.Resource {
+	for i := range devs.Spec.Groups {
+		grp := &devs.Spec.Groups[i]
+		for j := range grp.Accelerators {
+			if grp.Accelerators[j].ID == cardUUID {
+				return deviceplugin.Resource{Group: grp.ID, Device: cardUUID}
+			}
+		}
+	}
+	return deviceplugin.Resource{Device: cardUUID}
+}
+
 // hostDevDir 和 hostProcDriverDir 是厂商设备节点的根目录，也是驱动程序 procfs 能力树的根目录。它们是变量
 // 而非常量，因此测试中可以将其指向临时目录，而无需读取主机自身的/dev 和/proc 目录。
 var (
-	hostDevDir = "/dev"
+	hostDevDir        = "/dev"
+	hostProcDriverDir = "/proc/driver"
 )
 
 // 以下节点集合来自厂商的容器隔离文档，该文档中的示例正好包含了这里所描述的五个分区的容器要素——两个共享控
@@ -343,6 +583,13 @@ const (
 	// devCardPrefix 用于指定加速器自身的设备节点，该节点以 CARD ORDINAL——即加速器索引——作为后缀，而不
 	// 会使用该节点所携带的内核次要编号作为后缀。
 	devCardPrefix = "alixpu_ppu"
+	// devCapDir 和 devCapPrefix 用于根据驱动在 procfs 中公布的次设备号拼出能力设备路径。
+	devCapDir    = "alixpu-caps"
+	devCapPrefix = "alixpu-cap"
+	// procDriverName 是驱动在 procfs 下保存能力文件的目录名。
+	procDriverName = "alixpu"
+	// procCapMinorField 是 access 文件中给出能力节点次设备号的字段名。
+	procCapMinorField = "DeviceFileMinor:"
 )
 
 // sharedControlNodePaths 返回厂商的共享控制节点，每个容器需要一个。
@@ -356,6 +603,53 @@ func sharedControlNodePaths() []string {
 // cardNodePath 返回由给定卡片序号指定的设备节点。
 func cardNodePath(ordinal uint32) string {
 	return filepath.Join(hostDevDir, devCardPrefix+strconv.FormatUint(uint64(ordinal), 10))
+}
+
+// capNodePath 返回与指定次设备号对应的能力设备路径。
+func capNodePath(minor uint32) string {
+	return filepath.Join(hostDevDir, devCapDir, devCapPrefix+strconv.FormatUint(uint64(minor), 10))
+}
+
+// cardCapDir 返回该卡分区 access 文件所在的 procfs 目录。目录与卡设备节点使用同一数字序号，避免把一
+// 张卡的设备与另一张卡的能力文件混用。数字后缀也会排除驱动级的配置和监控目录。
+func cardCapDir(ordinal uint32) string {
+	return filepath.Join(hostProcDriverDir, procDriverName, "capabilities",
+		"ppu"+strconv.FormatUint(uint64(ordinal), 10), "mig")
+}
+
+// giAccessPath 指向该卡上指定 GI 的 procfs access 文件。
+func giAccessPath(ordinal, giID uint32) string {
+	return filepath.Join(cardCapDir(ordinal), "gi"+strconv.FormatUint(uint64(giID), 10), "access")
+}
+
+// ciAccessPath 指向指定 GI 内部 CI 的 procfs access 文件。
+func ciAccessPath(ordinal, giID, ciID uint32) string {
+	return filepath.Join(cardCapDir(ordinal),
+		"gi"+strconv.FormatUint(uint64(giID), 10), "ci"+strconv.FormatUint(uint64(ciID), 10), "access")
+}
+
+// readCapMinor 从 procfs access 文件读取能力节点的次设备号。文件不可读或没有该字段时返回错误。
+//
+// 次设备号在分配时读取。它不是按卡连续编号，也不能从 GI/CI 编号推出。厂商示例中一个 GI 的能力编号为
+// 256，另一个为 1280，其首个 CI 为 1281。创建或删除分区会重新分配编号，缓存探测时的值可能将容器指向
+// 其他人的分区。
+func readCapMinor(path string) (uint32, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read capability file: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), procCapMinorField)
+		if !ok {
+			continue
+		}
+		minor, perr := strconv.ParseUint(strings.TrimSpace(rest), 10, 32)
+		if perr != nil {
+			return 0, fmt.Errorf("capability file %q: parse %s %w", path, procCapMinorField, perr)
+		}
+		return uint32(minor), nil
+	}
+	return 0, fmt.Errorf("capability file %q carries no %s field", path, procCapMinorField)
 }
 
 // deviceNodeMinor 表示路径下字符设备的次要版本号。它是一个包变量，因此测试中可以忽略其在无根目录的临时目
@@ -459,4 +753,150 @@ func requireCardNode(devs *workercore.Devices, cardUUID string) (uint32, *device
 		}
 	}
 	return 0, nil, fmt.Errorf("card %s: absent from the device record: fail closed", cardUUID)
+}
+
+// partitionDeviceSpecs 生成访问单个分区所需的卡设备节点及其 GI、CI 对应的能力设备节点。节点编号按驱
+// 动实际报告的值解析。
+//
+// 所有这些设备都必需。该厂商没有额外的容器运行时钩子可以补齐设备，少给节点会导致分区不可用，错给节点
+// 则会暴露其他分区。
+//
+// 调用方在预留前已经将卡节点的内核次设备号与探测记录核对。直接沿用验证过的节点及卡序号，保证 procfs
+// 能力目录与实际设备一致。
+func partitionDeviceSpecs(
+	ordinal uint32,
+	card *deviceplugin.DeviceSpec,
+	inst migInstance,
+) ([]*deviceplugin.DeviceSpec, error) {
+	specs := []*deviceplugin.DeviceSpec{card}
+	for _, access := range []string{
+		giAccessPath(ordinal, inst.GiID),
+		ciAccessPath(ordinal, inst.GiID, inst.CiID),
+	} {
+		minor, merr := readCapMinor(access)
+		if merr != nil {
+			return nil, merr
+		}
+		spec, derr := requireNumberedDeviceNode(capNodePath(minor), minor)
+		if derr != nil {
+			return nil, derr
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
+// ActuatePhysicalSliced 在每张分到的卡上按规格创建或复用分区，并把实际区间和分区身份返回给节点账本。
+// 容器响应携带访问这些分区所需的设备节点。
+//
+// 容器内全部访问权限由这份设备列表决定。任何必需节点无法构造都应拒绝分配，并按各卡的预留结果只撤销本
+// 次变更。
+//
+// 这是 PhysicalSlicedResponder 的分区执行方法，完整接口的编译期断言位于可见性响应文件中。
+func (s *server) ActuatePhysicalSliced(
+	_ context.Context,
+	pod *core.Pod,
+	ctr *core.Container,
+	devs *workercore.Devices,
+	allocated map[deviceplugin.Resource]int32,
+	profile string,
+) (*deviceplugin.PhysicalSlicedAllocation, error) {
+	if s.mig == nil {
+		return nil, fmt.Errorf("mig actuator not configured")
+	}
+
+	cards := allocatedAccelerators(devs, allocated)
+	if len(cards) == 0 {
+		return nil, fmt.Errorf("no allocated card for physical-slice container %q", ctr.Name)
+	}
+
+	// 在预留之前先验证所有卡都会用到的共享控制节点，缺少这些节点时可以在创建任何分区之前返回错误。
+	sharedPaths := sharedControlNodePaths()
+	devices := make([]*deviceplugin.DeviceSpec, 0, len(sharedPaths)+3*len(cards))
+	for _, path := range sharedPaths {
+		spec, err := requireDeviceNode(path)
+		if err != nil {
+			return nil, err
+		}
+		devices = append(devices, spec)
+	}
+
+	placements := make(map[deviceplugin.Resource][]workercore.AcceleratorPlacement, len(cards))
+	ids := make(map[deviceplugin.Resource]string, len(cards))
+	// results 保存每张卡的实际分配结果。回滚时重新取得对应卡锁，避免与同卡的其他分配或回收竞争。
+	type cardResult struct {
+		card    string
+		inst    migInstance
+		outcome migReserveOutcome
+	}
+	var results []cardResult
+	rollback := func() {
+		for i := range results {
+			r := results[i]
+			unlock := lockCard(r.card)
+			switch r.outcome {
+			case migCreated:
+				_ = s.mig.DestroyInstance(r.card, r.inst)
+				_ = os.Remove(markerPath(deviceplugin.OperatorPodsDir, string(pod.UID), ctr.Name, r.card))
+			case migBound:
+				// 该实例在本次接管前已经存在。删除本次写入的标记即可恢复无主状态，后续由回收器按条件处理。
+				_ = os.Remove(markerPath(deviceplugin.OperatorPodsDir, string(pod.UID), ctr.Name, r.card))
+			case migRebound:
+				// 以前的分配仍拥有这个分区及其标记。
+			}
+			unlock()
+		}
+	}
+
+	for _, cardUUID := range cards {
+		computeSlices, memorySlices, ok := profileGeometry(devs, cardUUID, profile)
+		if !ok {
+			rollback()
+			return nil, fmt.Errorf("card %s has no physical-slice profile %q", cardUUID, profile)
+		}
+		// 先确定卡序号和卡节点确实对应探测到的同一物理卡，再执行预留。若不能验证就返回错误，避免在一张卡上创
+		// 建分区、却把另一张卡的设备节点和能力目录交给容器。
+		ordinal, cardNode, aerr := requireCardNode(devs, cardUUID)
+		if aerr != nil {
+			s.Logger.Info("refusing a partition on a card whose device node cannot be shown to address it; "+
+				"the node named by the card's accelerator index must carry the minor number the detector "+
+				"recorded for that card",
+				"card", cardUUID, "profile", profile, "container", ctr.Name, "reason", aerr.Error())
+			rollback()
+			return nil, aerr
+		}
+
+		unlock := lockCard(cardUUID)
+		inst, outcome, err := reserveMigInstance(
+			s.mig, deviceplugin.OperatorPodsDir, string(pod.UID), ctr.Name, cardUUID, profile, computeSlices, memorySlices,
+		)
+		unlock()
+		if err != nil {
+			rollback()
+			return nil, err
+		}
+		results = append(results, cardResult{card: cardUUID, inst: inst, outcome: outcome})
+
+		specs, derr := partitionDeviceSpecs(ordinal, cardNode, inst)
+		if derr != nil {
+			rollback()
+			return nil, fmt.Errorf("card %s partition device nodes: %w", cardUUID, derr)
+		}
+		devices = append(devices, specs...)
+
+		res := resourceForAccelerator(devs, cardUUID)
+		placements[res] = []workercore.AcceleratorPlacement{
+			{Start: inst.Placement.Start, Length: inst.Placement.Length},
+		}
+		// 虽然容器最终按设备节点而非标识字符串寻址，仍在分配时记录分区身份，供状态读取和故障定位。
+		ids[res] = inst.UUID
+	}
+
+	return &deviceplugin.PhysicalSlicedAllocation{
+		Profile:    profile,
+		Placements: placements,
+		IDs:        ids,
+		Response:   &deviceplugin.ContainerAllocateResponse{Devices: devices},
+		Rollback:   rollback,
+	}, nil
 }

@@ -673,3 +673,19 @@ func TestGetResourceRequirementsLogicalSlice(t *testing.T) {
 	assertResourceList(t, want, rr.Requests, "requests")
 	assertResourceList(t, want, rr.Limits, "limits")
 }
+
+func TestGetResourceRequirementsPartitioned(t *testing.T) {
+	instType := &worker.InstanceType{Spec: workercore.InstanceTypeSpec{Acceleratable: true}}
+	instType.Status.Detail.Manufacturer = nodefeature.ManufacturerNVIDIA
+	rr := getResourceRequirements(&workercore.InstanceResources{
+		Accelerator:                   ptr.To(qty("1")),
+		AcceleratorPartitionedProfile: "3g.40gb",
+	}, instType, false, false, true, false)
+	// Instance 声明一份分区和一种规格。显存折算由 Pod 的默认化 webhook 完成。
+	want := core.ResourceList{
+		"nvidia.com/gpu.partitioned":             qty("1"),
+		"nvidia.com/gpu.partitioned.mig-3g.40gb": qty("1"),
+	}
+	assertResourceList(t, want, rr.Requests, "requests")
+	assertResourceList(t, want, rr.Limits, "limits")
+}

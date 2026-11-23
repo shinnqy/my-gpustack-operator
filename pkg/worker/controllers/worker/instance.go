@@ -1280,8 +1280,15 @@ func getResourceRequirements(
 		switch {
 		case withAccelerator:
 			switch {
+			// partCardResName（.partitioned）是总令牌：告诉 K8s 调度器和 Device Plugin，“我要领一张开启了硬件分区模式的卡”。Device Plugin 监听的就是这个令牌来触发分配。
 			case partProfile != "" && partCardResName != "" && partProfileResName != "":
-				// 第 11 章在这里填写硬件分区及其 profile 对应的资源。
+				// 一个硬件分区请求在一张物理卡上领取一个指定规格的实例。准入会把卡数限定为 1，因此分区令牌和规格键都
+				// 写 1。Pod webhook 按该规格的显存计算 .partitioned.units。
+				one := *resource.NewQuantity(1, resource.DecimalSI)
+				rr.Limits[partCardResName] = one
+				rr.Requests[partCardResName] = one
+				rr.Limits[partProfileResName] = one
+				rr.Requests[partProfileResName] = one
 			case instType.Status.Detail.IsLogicallySliceable() && instRess.AcceleratorSlicedMemoryPercentage > 0:
 				// 写入 .sliced 卡数和每卡的显存、算力百分比。Pod webhook 在持久化前把显存百分比折成 .sliced.units，
 				// Kueue 再用卡数和每卡 units 计算 credits。

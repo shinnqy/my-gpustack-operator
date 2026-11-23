@@ -829,8 +829,67 @@ func (c cardLedger) freeSlots() int32 {
 // 时序偏差），都会分别给出不同的 Retry 消息（与“profile 暂时已满”区分开），以便运维
 // 人员分辨这三种情况。绝不返回 Reject。
 func fitPartitionDemand(cards []cardLedger, budgets []cardBudget, d familyDemand) (kueue.CheckState, string) {
-	// 在第 11 章实现此函数。
-	return kueue.CheckStateRetry, "partition admission is pending"
+	var partitionCards, ledgerReady, fit int32
+	for i := range cards {
+		c := &cards[i]
+		if !c.coveredBy(d) || !c.servesFamily(nodefeature.ResourceFamilyPartitioned) {
+			continue
+		}
+		partitionCards++
+		if partitionProfilesHavePlacements(c.capability.PhysicalSliced.Profiles) {
+			ledgerReady++
+		}
+		if c.mode != workercore.DeviceAllocationModeNone && c.mode != workercore.DeviceAllocationModePartitioned {
+			continue // 该卡已被整卡独占或共享请求占用。
+		}
+		// 每个实例占一个放置名额。不同规格在一张卡上的合法区间可能重叠，所以本轮对每个已试放的分区都扣减一个
+		// 名额，具体区间在 Allocate 时确定。需求中记录的是资源键公布的规格名，查单卡账本时要换成该厂商使用的
+		// 拼写。
+		vendorProfile := nodefeature.VendorPartitionedProfileName(c.manufacturer, d.profile)
+		free := remainingProfileCount(c.remainingProfiles, vendorProfile) - budgets[i].placements
+		if free <= 0 {
+			continue
+		}
+		take := min(free, d.cards-fit)
+		budgets[i].placements += take
+		if fit += take; fit >= d.cards {
+			if d.node != "" {
+				return kueue.CheckStateReady, assignedNodeMessage(kueue.CheckStateReady, d)
+			}
+			return kueue.CheckStateReady, partitionVerdictMessage(kueue.CheckStateReady, d.profile, d.podSets)
+		}
+	}
+	switch {
+	case partitionCards == 0:
+		return kueue.CheckStateRetry, partitionNoCardsMessage(d.profile, d.podSets)
+	case ledgerReady == 0:
+		return kueue.CheckStateRetry, partitionLedgerNotReadyMessage(d.podSets)
+	case d.node != "":
+		return kueue.CheckStateRetry, assignedNodeMessage(kueue.CheckStateRetry, d)
+	}
+	return kueue.CheckStateRetry, partitionVerdictMessage(kueue.CheckStateRetry, d.profile, d.podSets)
+}
+
+// partitionProfilesHavePlacements 检查是否已有任一规格公布合法区间。它用于判断设备管理器是否已经提供
+// 分区放置数据。
+func partitionProfilesHavePlacements(profiles []workercore.AcceleratorPhysicalSlicedProfile) bool {
+	for i := range profiles {
+		if len(profiles[i].Placements) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// remainingProfileCount 在卡的 RemainingProfiles 状态中查找还能创建多少个指定规格的实例。入参须用厂
+// 商拼写，缺少条目时返回 0。
+func remainingProfileCount(profiles []workercore.AcceleratorProfileCount, profile string) int32 {
+	for i := range profiles {
+		if profiles[i].Name == profile {
+			return profiles[i].Count
+		}
+	}
+	return 0
 }
 
 // NodeDevicesAdmissionReconciler 是面向 _NodeDevicesControllerName 的外部 Kueue
@@ -1309,6 +1368,32 @@ func forRoles(podSets []kueue.PodSetReference) string {
 		return " for role " + names[0]
 	}
 	return " for roles " + strings.Join(names, ", ")
+}
+
+// partitionLedgerNotReadyMessage 用于区分两种需要等待的情况：设备管理器还未报告合法区间，或已报告但
+// 目前没有空位。
+//
+// 可用区间按当前角色获分配的 flavor 查询。消息指出该角色，避免把一个角色等待设备上报的情况描述成整个
+// 资源池故障。
+func partitionLedgerNotReadyMessage(podSets []kueue.PodSetReference) string {
+	return "the partition placement ledger is not ready on the assigned flavor pool" +
+		forRoles(podSets) + " (device manager rolling out); will retry"
+}
+
+func partitionVerdictMessage(state kueue.CheckState, profile string, podSets []kueue.PodSetReference) string {
+	if state == kueue.CheckStateReady {
+		return fmt.Sprintf("the assigned flavor pool has enough partitioned cards with a free %q placement%s",
+			profile, forRoles(podSets))
+	}
+	return fmt.Sprintf("no partitioned card in the assigned flavor pool currently has a free %q placement%s; will retry as capacity frees",
+		profile, forRoles(podSets))
+}
+
+// partitionNoCardsMessage 表示当前角色获分配的 flavor 中根本没有启用硬件分区的卡。这种情况需要资源池
+// 提供分区卡。 若池内有分区卡但区间尚未上报，使用 partitionLedgerNotReadyMessage。
+func partitionNoCardsMessage(profile string, podSets []kueue.PodSetReference) string {
+	return fmt.Sprintf("the assigned flavor pool has no partitioned card for profile %q%s; partition a card in this pool (will retry)",
+		profile, forRoles(podSets))
 }
 
 func (r *NodeDevicesAdmissionReconciler) SetupController(_ context.Context, opts controller.SetupOptions) error {

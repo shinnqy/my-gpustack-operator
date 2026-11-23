@@ -173,7 +173,10 @@ func TestExclusiveDeviceLifecycle(t *testing.T) {
 	checkLedger(workercore.DeviceAllocationModeNone, nodefeature.ResourceMaxUnits)
 }
 
-const testGPUUUID0 = "GPU-aaaa0000-0000-0000-0000-000000000000"
+const (
+	testGPUUUID0 = "GPU-aaaa0000-0000-0000-0000-000000000000"
+	testGPUUUID1 = "GPU-bbbb1111-1111-1111-1111-111111111111"
+)
 
 // redirectLogicalSliceDirs 将逻辑切片主机路径（包括 vgpulock 目录）指向用于测试的临时目录。
 func redirectLogicalSliceDirs(t *testing.T) string {
@@ -333,4 +336,111 @@ func TestGetSlicedContainerAllocateResponse_RespectsContainerDeclaredEnv(t *test
 		_, injected := resp.Envs[c.name]
 		assert.Falsef(t, injected, "must not override a container-declared %s", c.name)
 	}
+}
+
+// 同一份 3g.40gb 分配应在容器响应、Pod 注解、设备账本和所有权标记中指向同一分区。
+// 测试替换集群客户端和 NVML 驱动，使用正式的 Allocate、账本重建及回收入口。
+func TestPartitionedAllocationLifecycle(t *testing.T) {
+	const node = "node-mig"
+	const profile = "3g.40gb"
+	const owner = "main"
+	redirectLogicalSliceDirs(t)
+
+	devs := migDevices(profile, 3, 4, testGPUUUID0)
+	devs.Name = node
+	group := &devs.Spec.Groups[0]
+	group.Memory = 81920
+	physical := &group.Accelerators[0].Status.PhysicalSliced
+	physical.Count = 2
+	physical.Profiles[0].Count = 2
+	physical.Profiles[0].MemoryMib = 40960
+	physical.Profiles[0].Placements = []workercore.AcceleratorPlacement{{Start: 0, Length: 4}, {Start: 4, Length: 4}}
+
+	resources := core.ResourceList{
+		"nvidia.com/gpu.partitioned":             resource.MustParse("1"),
+		"nvidia.com/gpu.partitioned.mig-3g.40gb": resource.MustParse("1"),
+		"nvidia.com/gpu.partitioned.units":       resource.MustParse("800000"),
+	}
+	pod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{Name: "partition-a", Namespace: "default", UID: "uid-mig"},
+		Spec: core.PodSpec{NodeName: node, Containers: []core.Container{{
+			Name: owner, Resources: core.ResourceRequirements{Requests: resources, Limits: resources.DeepCopy()},
+		}}},
+	}
+	tracker := clienttesting.NewObjectTracker(scheme.Scheme, scheme.Codecs.UniversalDecoder())
+	cli := ctrlfake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjectTracker(tracker).
+		WithStatusSubresource(devs).WithObjects(devs, pod).
+		WithIndex(&core.Pod{}, deviceplugin.IndexingPodsByNodeName, func(obj ctrlcli.Object) []string {
+			return []string{obj.(*core.Pod).Spec.NodeName}
+		}).Build()
+	drv := newFakeMigDriver()
+	drv.possible[testGPUUUID0] = []migPlacement{{Start: 0, Length: 4}, {Start: 4, Length: 4}}
+
+	allocate := func() string {
+		t.Helper()
+		// 每次使用一个新设备插件，第二次调用只能凭 Pod 注解、磁盘标记和驱动状态恢复分配。
+		s := &server{
+			ResourceServer: deviceplugin.ResourceServer{
+				Manufacturer: Manufacturer, AllocationMode: workercore.DeviceAllocationModePartitioned,
+				Reconciler: &deviceplugin.DevicesReconciler{NodeName: node, Client: cli},
+			},
+			mig: drv,
+		}
+		s.Responder = s
+		response, err := s.Allocate(t.Context(), &deviceplugin.AllocateRequest{
+			ContainerRequests: []*deviceplugin.ContainerAllocateRequest{{DevicesIds: []string{"h100:" + testGPUUUID0 + ":0000"}}},
+		})
+		require.NoError(t, err)
+		require.Len(t, response.ContainerResponses, 1)
+		return response.ContainerResponses[0].Envs["NVIDIA_VISIBLE_DEVICES"]
+	}
+
+	visible := allocate()
+	path := markerPath(string(pod.UID), owner, testGPUUUID0)
+	marker, err := parseMarker(path)
+	require.NoError(t, err)
+	require.NotEmpty(t, visible)
+	require.Equal(t, marker.MigUUID, visible)
+	require.Equal(t, profile, marker.Profile)
+	require.NoError(t, cli.Get(t.Context(), ctrlcli.ObjectKeyFromObject(pod), pod))
+	allocations, err := deviceplugin.AllocatedAcceleratorsOf(pod)
+	require.NoError(t, err)
+	require.Len(t, allocations[owner].Devices.Groups, 1)
+	cards := allocations[owner].Devices.Groups[0].Accelerators
+	require.Len(t, cards, 1)
+	require.Equal(t, visible, cards[0].AllocatedPhysicalID)
+	require.Equal(t, int32(800000), cards[0].Allocated)
+	require.Equal(t, []workercore.AcceleratorPlacement{{Start: marker.Start, Length: marker.Length}}, cards[0].AllocatedPhysicalPlacements)
+	require.Equal(t, visible, allocate())
+	require.Equal(t, 1, drv.createCalls)
+
+	rec := &deviceplugin.DevicesReconciler{NodeName: node, Client: cli}
+	checkRoom := func(want int32) {
+		t.Helper()
+		key := ctrlcli.ObjectKeyFromObject(devs)
+		_, err := rec.Reconcile(t.Context(), ctrl.Request{NamespacedName: key})
+		require.NoError(t, err)
+		require.NoError(t, cli.Get(t.Context(), key, devs))
+		require.Len(t, devs.Status.Groups, 1)
+		require.Len(t, devs.Status.Groups[0].Accelerators, 1)
+		require.Equal(t, []workercore.AcceleratorProfileCount{{Name: profile, Count: want}},
+			devs.Status.Groups[0].Accelerators[0].RemainingProfiles)
+	}
+	checkRoom(1)
+	r := newReclaimer(drv, deviceplugin.OperatorPodsDir, ctrl.Log, liveClaimsFrom(t.Context(), rec))
+	for range reclaimMaxMisses {
+		r.reconcile([]string{string(pod.UID)})
+	}
+	require.Empty(t, drv.destroyed)
+
+	require.NoError(t, cli.Delete(t.Context(), pod))
+	for range reclaimMaxMisses - 1 {
+		r.reconcile(nil)
+	}
+	require.Empty(t, drv.destroyed)
+	r.reconcile(nil)
+	require.Equal(t, []migInstance{marker.instance()}, drv.destroyed)
+	_, err = os.Stat(path)
+	require.True(t, os.IsNotExist(err))
+	checkRoom(2)
 }
