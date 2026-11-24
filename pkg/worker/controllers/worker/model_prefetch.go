@@ -10,6 +10,7 @@ import (
 	core "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
@@ -83,6 +84,55 @@ type prefetchProgress struct {
 	// lapsed 统计副本处于 Ready 但已超过保留 TTL 的目标节点数量：这些副本不再计为就绪，其固定标记（pin）
 	// 已被释放，且不会有预热 Pod 重新预热它们。
 	lapsed int32
+}
+
+// prefetchTargetNodes 返回排好序的目标节点名。可以显式指定节点标签或 InstanceType。未指定放置条件时，
+// 从当前命名空间引用此制品的部署推导 InstanceType。
+func prefetchTargetNodes(
+	pf *workercore.ModelPrefetch, nodes []core.Node, deps []workercore.ModelDeployment,
+	pools InstanceTypeFlavorNames,
+) ([]string, error) {
+	placement := pf.Spec.Placement
+	if placement != nil && len(placement.InstanceTypes) > 0 && placement.NodeSelector != nil {
+		return nil, ErrPrefetchPlacementAmbiguous
+	}
+	typeNames := prefetchPlacementTypeNames(pf, deps)
+	if placement != nil && placement.NodeSelector != nil {
+		sel, err := meta.LabelSelectorAsSelector(placement.NodeSelector)
+		if err != nil {
+			return nil, err
+		}
+		var out []string
+		for i := range nodes {
+			if sel.Matches(labels.Set(nodes[i].Labels)) {
+				out = append(out, nodes[i].Name)
+			}
+		}
+		sort.Strings(out)
+
+		return out, nil
+	}
+
+	// 先通过 InstanceType 对应的调度标签解析出资源池的 ResourceFlavor，再检查节点是否属于这些池。
+	// Flavor 名含拓扑和数量信息，不能用 InstanceType 对象名代替。
+	wanted := map[string]bool{}
+	for _, name := range typeNames {
+		for _, flavorName := range pools[name] {
+			wanted[flavorName] = true
+		}
+	}
+	var out []string
+	for i := range nodes {
+		for flavorName := range wanted {
+			if matchNodeFlavor(&nodes[i], flavorName) != nil {
+				out = append(out, nodes[i].Name)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+
+	return out, nil
 }
 
 // prefetchPlacementTypeNames 返回预取的 placement 所选择的 InstanceType 名称，或该 Namespace 下的
@@ -290,10 +340,7 @@ func PrefetchTargetNodes(
 	pf *workercore.ModelPrefetch, nodes []core.Node, deps []workercore.ModelDeployment,
 	pools InstanceTypeFlavorNames,
 ) ([]string, error) {
-	// 在第 18 章中实现此函数。
-	var result0 []string
-	var result1 error
-	return result0, result1
+	return prefetchTargetNodes(pf, nodes, deps, pools)
 }
 
 // Webhook 共用的 placement 拒绝错误：同时设置两种选择方式会产生歧义，而 schema 因两者均非必填而无法校验。

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"maps"
+	"sort"
 	"time"
 
 	core "k8s.io/api/core/v1"
@@ -39,10 +40,20 @@ const (
 // selectModelStore 将存储列表筛选为 selector 匹配该节点的存储，并按名称排序：第一项即为该节点的生效
 // 存储，切片长度即为重叠数。
 func selectModelStore(stores []workercore.ModelStore, node *core.Node) ([]*workercore.ModelStore, error) {
-	// 在第 16 章中实现此函数。
-	var result0 []*workercore.ModelStore
-	var result1 error
-	return result0, result1
+	nodeLabels := labels.Set(node.Labels)
+	var matched []*workercore.ModelStore
+	for i := range stores {
+		sel, err := meta.LabelSelectorAsSelector(&stores[i].Spec.NodeSelector)
+		if err != nil {
+			return nil, err
+		}
+		if sel.Matches(nodeLabels) {
+			matched = append(matched, &stores[i])
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool { return matched[i].Name < matched[j].Name })
+
+	return matched, nil
 }
 
 // modelStoreLayer 将存储的策略读取为一个合并层。存储未填写的字段保持为 nil，从而让下层配置继续生效——

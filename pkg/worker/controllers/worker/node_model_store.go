@@ -180,8 +180,20 @@ func csiNodeListsModelDriver(csiNode *storage.CSINode) bool {
 
 // syncRegistrationLabel 使调度标签与 kubelet 的插件注册状态保持同步。
 func (r *NodeModelStoreReconciler) syncRegistrationLabel(ctx context.Context, nd *core.Node, registered bool) error {
-	// 在第 16 章中实现此函数。
-	return nil
+	value := nd.Labels[ModelManagerRegisteredLabel]
+	if registered && value == "true" || !registered && value == "" {
+		return nil
+	}
+	before := nd.DeepCopy()
+	if registered {
+		if nd.Labels == nil {
+			nd.Labels = map[string]string{}
+		}
+		nd.Labels[ModelManagerRegisteredLabel] = "true"
+	} else {
+		delete(nd.Labels, ModelManagerRegisteredLabel)
+	}
+	return r.Client.Patch(ctx, nd, ctrlcli.MergeFrom(before))
 }
 
 // effectiveSpec 将配置层级合并为节点的 spec 并执行校验。基础层是集群的 Settings，从本控制器 watch 的 Settings 存储中读取，而非通过 Settings 包的读缓存读取，以便变更能随自身事件立即触达每个节点；资源池层是选择器匹配该节点的按字母序排在第一位的 ModelStore，仅覆盖其显式声明的字段。胜出者的名称会一并写入 spec，而选择器重叠则属于 ModelStore 自身 status 处理的范畴，不作为 spec 错误。

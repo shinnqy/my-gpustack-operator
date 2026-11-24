@@ -366,8 +366,68 @@ func (r *ModelArtifactReconciler) resolveHubSource(
 	ctx context.Context, ma *workercore.ModelArtifact, hub modelArtifactHub, source *workercore.ModelArtifactHubSource,
 	token string, now time.Time,
 ) time.Duration {
-	// 在第 16 章中实现此函数。
-	return modelArtifactUnavailableRetry
+	resolution, err := hub.Resolve(ctx, source.Repository, source.Revision, token, modelartifact.Filter{
+		Allow: ma.Spec.AllowPatterns, Ignore: ma.Spec.IgnorePatterns,
+	})
+	if err != nil {
+		reason := modelartifact.ReasonOf(err)
+		// 首次无法访问 Hub 时先记录故障并重试。只有连续未收到答复、确认间隔已过且用户明确指定 expectedDigest，
+		// 才采用该摘要作为身份。Hub 明确返回内容或拒绝访问时，应按它的实际答复处理。
+		if reason == modelartifact.ReasonSourceUnavailable && ma.Spec.ExpectedDigest != "" &&
+			ModelArtifactConditionDegraded.IsTrue(ma) && ModelArtifactConditionDegraded.GetReason(ma) == reason {
+			if wait := modelArtifactConditionSince(ma, ModelArtifactConditionDegraded).Add(modelArtifactConfirmDelay).Sub(now); wait > 0 {
+				return wait
+			}
+			ma.Status.Resolved = &workercore.ModelArtifactResolved{
+				ManifestDigest: ma.Spec.ExpectedDigest,
+				DigestSource:   workercore.ModelArtifactDigestSourceExpected,
+				ResolvedTime:   meta.NewTime(r.now()),
+			}
+			ModelArtifactConditionResolved.True(ma, modelArtifactReasonResolved,
+				fmt.Sprintf("resolved to the expected digest %s without the hub; the hub is not contacted again", ma.Spec.ExpectedDigest))
+			ModelArtifactConditionDegraded.False(ma, modelArtifactReasonHealthy, "")
+
+			return r.revalidateInterval(ctx)
+		}
+		ModelArtifactConditionResolved.False(ma, reason, err.Error())
+		ModelArtifactConditionDegraded.True(ma, reason, err.Error())
+		if reason == modelartifact.ReasonSourceUnavailable {
+			// 从本轮确认的中断时刻开始计时。更早的其他错误留下的状态时间不计入这次离线确认。
+			ModelArtifactConditionDegraded.LastTransitionTime(ma, now.UTC().Format(time.RFC3339))
+			return modelArtifactUnavailableRetry
+		}
+		return modelArtifactRefusedRetry
+	}
+
+	// expectedDigest 是用户对本次清单的断言。Hub 返回的清单不匹配时，保留期望和实际两个摘要，便于核查。
+	if anchor := ma.Spec.ExpectedDigest; anchor != "" && resolution.Manifest.Digest != anchor {
+		err = &modelartifact.SourceError{
+			Reason: modelartifact.ReasonDigestMismatch,
+			Message: fmt.Sprintf("the artifact expects %s, the hub resolved %s@%s to %s",
+				anchor, source.Repository, source.Revision, resolution.Manifest.Digest),
+		}
+		ModelArtifactConditionResolved.False(ma, modelartifact.ReasonDigestMismatch, err.Error())
+		ModelArtifactConditionDegraded.True(ma, modelartifact.ReasonDigestMismatch, err.Error())
+
+		return modelArtifactRefusedRetry
+	}
+
+	resolvedAt := meta.NewTime(r.now())
+	ma.Status.Resolved = &workercore.ModelArtifactResolved{
+		Revision:          resolution.Commit,
+		ManifestDigest:    resolution.Manifest.Digest,
+		DigestSource:      workercore.ModelArtifactDigestSourceHub,
+		FileCount:         resolution.Manifest.FileCount,
+		SizeBytes:         resolution.Manifest.SizeBytes,
+		ResolvedTime:      resolvedAt,
+		LastValidatedTime: &resolvedAt,
+	}
+	ModelArtifactConditionResolved.True(ma, modelArtifactReasonResolved,
+		fmt.Sprintf("%s@%s resolved to commit %s", source.Repository, source.Revision, resolution.Commit))
+	ModelArtifactConditionDegraded.False(ma, modelArtifactReasonHealthy, "")
+	r.warnOnRejectedToken(ctx, ma, source, hub, token)
+
+	return r.revalidateInterval(ctx)
 }
 
 // revalidateHubSource 检查对已解析 commit 的访问权限，并报告下一次请求来源的时间间隔。
