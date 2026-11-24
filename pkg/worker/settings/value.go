@@ -377,6 +377,18 @@ var (
 
 	// 模型预取。
 
+	// ModelPrefetchWarmupImage 是 ModelPrefetch 在每个目标节点上运行预热 Pod 时使用的镜像。
+	// 该 Pod 仅挂载制品卷、逐文件读回校验后即退出，因此镜像只需包含 shell、find 和 sha256sum，
+	// 不运行模型也不链接任何加速器运行时。将其作为可配置项而非写死常量，是因为唯一必须保证的
+	// 是节点能拉取到该镜像，这取决于集群自身的镜像仓库配置（离线环境可指向私有镜像源）。
+	// 默认值是一个轻量的基础镜像，与预热路径验证时使用的形态一致。
+	ModelPrefetchWarmupImage = settings.NewEditable(
+		"model-prefetch-warmup-image",
+		"Indicates the image a ModelPrefetch's warm-up Pod runs on each target node.",
+		setting.InitializeFromEnv("gpustack/mirrored-python:3.12-alpine"),
+		setting.AllowContainerImageReference(),
+	)
+
 	// 工作负载的配置项。
 
 	// WorkloadFitAffinity 表示 Workload webhook 是否会将操作员队列中的切片或共享请求固定到那些符合适

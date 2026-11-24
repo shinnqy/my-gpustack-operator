@@ -82,9 +82,36 @@ func (p *Puller) FetchFile(ctx context.Context, digest string, file download.Fil
 }
 
 // FetchManifest 从已发布目标目录树的 peer 拉取清单，重组为规范清单并绑定校验摘要后返回。
+// 对于没有 Hub 来源、仅锚定摘要的制品，调用方会优先调用此方法；若无可用来源，则直接返回明确的无源错误。
 func (p *Puller) FetchManifest(ctx context.Context, digest string) (modelartifact.Manifest, error) {
-	// 在第 18 章中实现此函数。
-	return modelartifact.Manifest{}, fmt.Errorf("peer manifest is pending")
+	treeHex, ok := HexOf(digest)
+	if !ok {
+		return modelartifact.Manifest{}, fmt.Errorf("digest %q is not a manifest digest", digest)
+	}
+	sources, err := p.Discover(ctx, digest)
+	if err != nil {
+		return modelartifact.Manifest{}, err
+	}
+	var lastErr error
+	for _, src := range sources {
+		if p.sitsOut(src) {
+			continue
+		}
+		manifest, err := p.fetchListing(ctx, src, treeHex)
+		if err == nil {
+			return manifest, nil
+		}
+		if ctx.Err() != nil {
+			return modelartifact.Manifest{}, context.Cause(ctx)
+		}
+		p.setAside(src)
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no candidate was usable")
+	}
+
+	return modelartifact.Manifest{}, fmt.Errorf("no node holds %s: %w", digest, lastErr)
 }
 
 // fetchFrom 从单个来源拉取完整文件：先重组清单并核对目录树根摘要，确认无误后再按序拉取分片、

@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	core "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,12 +28,17 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/controller"
 	"gpustack.ai/gpustack/pkg/kubemeta"
+	"gpustack.ai/gpustack/pkg/modelstore"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/setting"
 	"gpustack.ai/gpustack/pkg/systemmeta"
 	"gpustack.ai/gpustack/pkg/utils/mapx"
+	"gpustack.ai/gpustack/pkg/utils/stringx"
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
+
+// modelPrefetchPodsPerPass 限制单轮对账最多创建的预热 Pod 数量，避免针对大节点池预取时向 API Server 突发大量写入。
+const modelPrefetchPodsPerPass = 8
 
 // ModelPrefetch 状态的各 Condition。
 const (
@@ -69,10 +77,113 @@ func (r *ModelPrefetchReconciler) now() time.Time {
 }
 
 func (r *ModelPrefetchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// 在第 18 章中实现此函数。
-	var result0 ctrl.Result
-	var result1 error
-	return result0, result1
+	logger := ctrllog.FromContext(ctx)
+
+	pf := new(workercore.ModelPrefetch)
+	switch err := r.Client.Get(ctx, req.NamespacedName, pf); {
+	case kerrors.IsNotFound(err):
+		// 已删除的预取对象不在列表中，因此需通过并集重算释放它的 pin；此处执行可覆盖删除的恰好是最后一个预取对象的场景。
+		return ctrl.Result{}, r.recomputePinned(ctx)
+	case err != nil:
+		return ctrl.Result{}, err
+	}
+
+	if pf.DeletionTimestamp != nil {
+		// 预热 Pod 会随 OwnerReference 自动级联清理；pin 则通过并集重算移除，重算时不会再计入当前预取对象。
+		return ctrl.Result{}, r.recomputePinned(ctx)
+	}
+
+	// 先计算目标节点集合：它在制品解析完成之前即可得出，且 status 中的 desiredNodes 取自该集合大小。
+	nodes := new(core.NodeList)
+	if err := r.Client.List(ctx, nodes); err != nil {
+		return ctrl.Result{}, err
+	}
+	deps := new(workercore.ModelDeploymentList)
+	if err := r.Client.List(ctx, deps, ctrlcli.InNamespace(pf.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+	pools, err := ResolveInstanceTypeFlavorNames(ctx, r.Client, pf, deps.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	targets, err := prefetchTargetNodes(pf, nodes.Items, deps.Items, pools)
+	if err != nil {
+		// 无法解析的选择器本应被 API Server 的校验规则拒绝；此处将其记录为异常状态并等待下一次变更。
+		logger.Error(err, "the prefetch's placement does not parse")
+		before := pf.Status.DeepCopy()
+		r.writeStatus(pf, prefetchProgress{}, err, false)
+		return ctrl.Result{}, r.commitStatus(ctx, pf, before)
+	}
+
+	artifact := new(workercore.ModelArtifact)
+	artifactErr := r.Client.Get(ctx,
+		ctrlcli.ObjectKey{Namespace: pf.Namespace, Name: pf.Spec.ArtifactRef.Name}, artifact)
+	artifactMissing := kerrors.IsNotFound(artifactErr)
+	if artifactErr != nil && !artifactMissing {
+		return ctrl.Result{}, artifactErr
+	}
+	digest := ""
+	if artifactErr == nil && artifact.Status.Resolved != nil {
+		digest = artifact.Status.Resolved.ManifestDigest
+	}
+	artifactReady := digest != ""
+
+	// 分发事实来自各目标节点针对该摘要的上报条目，通过与制品节点视图共享的存储聚合函数读取。
+	stores := new(workercore.NodeModelStoreList)
+	if err := r.Client.List(ctx, stores); err != nil {
+		return ctrl.Result{}, err
+	}
+	entries := modelstore.NodeEntries(stores.Items, digest)
+
+	progress := prefetchProgress{desired: int32(len(targets))}
+	expired := map[string]bool{}
+	for _, node := range targets {
+		switch entry, ok := entries[node]; {
+		case !ok || entry.State == workercore.NodeModelStoreModelStateDownloading:
+			progress.downloading++
+		case entry.State == workercore.NodeModelStoreModelStateFailed:
+			progress.failed++
+		default: // 状态为 Ready，除非该节点副本已超过保留 TTL。
+			if r.ttlExpired(pf, entry) {
+				expired[node] = true
+				progress.lapsed++
+				continue
+			}
+			progress.ready = append(progress.ready, node)
+		}
+	}
+
+	// 仅当制品已完成解析后才创建预热 Pod：在此之前所有目标节点都在等待解析结果，无需创建 Pod。
+	var requeue ctrl.Result
+	if artifactReady {
+		image, err := r.warmupImage(ctx)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		requeue, err = r.deliver(ctx, pf, artifact, digest, image, targets, progress.ready, entries, expired)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	before := pf.Status.DeepCopy()
+	r.writeStatus(pf, progress, err, artifactMissing)
+	if err := r.commitStatus(ctx, pf, before); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 每轮对账结束后整体重算 pin，确保已过期、重新定向或已删除的预取对象不会遗留 pin，
+	// 同时也不会误删其他活跃预取对象仍需保留的 pin。
+	if err := r.recomputePinned(ctx); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if pf.Spec.Retention.TTLAfterLastUse != nil {
+		// 节点上报的 TTL 过期粒度为小时级；按小时重新入队即可准确执行过期策略。
+		return requeueOr(requeue, ctrl.Result{RequeueAfter: time.Hour}), nil
+	}
+
+	return requeueOr(requeue, ctrl.Result{}), nil
 }
 
 // prefetchProgress 是单轮对账中读取到的分发进度，是生成状态（status）的原始数据。
@@ -174,6 +285,225 @@ func deploymentInstanceTypes(deps []workercore.ModelDeployment, artifactName str
 	return out
 }
 
+// deliver 按受控批次为每个目标节点维持一个运行中的预热 Pod，并清理离开目标集合或已完成工作的 Pod。
+// 替代 Pod 会使用新的生成名创建，因此即便被删除的旧 Pod 仍在终止宽限期内，新旧尝试也可短时共存。
+//
+// 节点自身的条目状态决定了已结束 Pod 删除后的后续动作。状态仍为 Downloading 或尚无条目的节点需要重新创建
+// 预热 Pod；状态已为 Ready 或 Failed 的节点表示已经收敛——清理已结束的 Pod 且不再重建，避免确定性失败的
+// 物化以事件速率不断重试，也避免 Pod 成功后状态上报延迟引发无意义的重复读回。
+func (r *ModelPrefetchReconciler) deliver(ctx context.Context, pf *workercore.ModelPrefetch,
+	artifact *workercore.ModelArtifact, digest, image string, targets, ready []string,
+	entries map[string]workercore.NodeModelStoreModel, expired map[string]bool,
+) (ctrl.Result, error) {
+	want := map[string]bool{}
+	for _, node := range targets {
+		want[node] = true
+	}
+
+	readySet := map[string]bool{}
+	for _, node := range ready {
+		readySet[node] = true
+	}
+	failed := map[string]bool{}
+	waiting := map[string]bool{}
+	for _, node := range targets {
+		if expired[node] {
+			continue
+		}
+		entry, ok := entries[node]
+		switch {
+		case !ok || entry.State == workercore.NodeModelStoreModelStateDownloading:
+			waiting[node] = true
+		case entry.State == workercore.NodeModelStoreModelStateFailed:
+			failed[node] = true
+		}
+	}
+
+	pods := new(core.PodList)
+	if err := r.Client.List(ctx, pods, ctrlcli.InNamespace(pf.Namespace),
+		ctrlcli.MatchingLabels{"worker.gpustack.ai/model-prefetch": pf.Name}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	created := 0
+	requeue := ctrl.Result{}
+	removed := map[string]bool{}
+	for _, pod := range pods.Items {
+		_, onTarget := want[pod.Spec.NodeName]
+		// 若 Pod 挂载的摘要与制品当前解析结果不一致，立即视为陈旧并清理，避免节点一直占用旧权重。
+		stale := podWarmDigest(&pod) != digest
+		done := pod.Status.Phase == core.PodSucceeded || pod.Status.Phase == core.PodFailed
+		settled := readySet[pod.Spec.NodeName] || failed[pod.Spec.NodeName] || expired[pod.Spec.NodeName]
+		// 已收敛节点上的已结束 Pod 已完成使命；仍处于等待节点上的已结束 Pod 属于失败尝试，需清理后在旁重建替代尝试。
+		if !onTarget || stale || (done && (settled || waiting[pod.Spec.NodeName])) {
+			if err := r.Client.Delete(ctx, &pod); ctrlcli.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, err
+			}
+			removed[pod.Name] = true
+		}
+	}
+
+	// 被删除的 Pod 会在终止宽限期内保持 Terminating，因此以本轮列表扣除刚删除对象后的结果判断节点是否已有存活尝试。
+	// 基于列表而非 Pod 名称判断，可避免正在终止的失效尝试把替代 Pod 阻塞到下一轮对账。
+	live := map[string]bool{}
+	for i := range pods.Items {
+		if !removed[pods.Items[i].Name] {
+			live[pods.Items[i].Spec.NodeName] = true
+		}
+	}
+
+	for _, node := range targets {
+		if !waiting[node] || live[node] {
+			continue
+		}
+		if created >= modelPrefetchPodsPerPass {
+			// 超出单轮上限的其余节点留待下一轮继续创建。
+			requeue = ctrl.Result{RequeueAfter: 5 * time.Second}
+
+			return requeue, nil
+		}
+		pod := warmupPod(pf, artifact, image, node, digest)
+		kubemeta.ControlOn(pod, pf, workercore.SchemeGroupVersion.WithKind("ModelPrefetch"))
+		if err := r.Client.Create(ctx, pod); err != nil {
+			return ctrl.Result{}, err
+		}
+		created++
+	}
+
+	return requeue, nil
+}
+
+// bindingAllowsPinned 返回绑定对象生效的 allowPinned 值，nil 视为默认的 false。
+func bindingAllowsPinned(binding *workercore.ModelStoreBinding) bool {
+	return binding.Spec.AllowPinned != nil && *binding.Spec.AllowPinned
+}
+
+// recomputePinned 将每个节点的 spec.pinned 重写为全部存活预取对象所要求固定摘要的并集：
+// 只要分发已就绪且未超过保留 TTL，摘要就会固定在该节点上，多个 Namespace 同时固定同一摘要时共同保留。
+// 本控制器是该字段的唯一写入方，因此整表替换而非局部合并，确保从期望集合消失的 pin 在本轮结束后立即清除。
+func (r *ModelPrefetchReconciler) recomputePinned(ctx context.Context) error {
+	pfs := new(workercore.ModelPrefetchList)
+	if err := r.Client.List(ctx, pfs); err != nil {
+		return err
+	}
+	nodes := new(core.NodeList)
+	if err := r.Client.List(ctx, nodes); err != nil {
+		return err
+	}
+	stores := new(workercore.NodeModelStoreList)
+	if err := r.Client.List(ctx, stores); err != nil {
+		return err
+	}
+	// depsByNS 将推导型 placement 的展开范围限制在预取对象所属 Namespace 内，避免其他 Namespace 同名制品扩大目标集。
+	deps := new(workercore.ModelDeploymentList)
+	if err := r.Client.List(ctx, deps); err != nil {
+		return err
+	}
+	depsByNS := map[string][]workercore.ModelDeployment{}
+	for i := range deps.Items {
+		ns := deps.Items[i].Namespace
+		depsByNS[ns] = append(depsByNS[ns], deps.Items[i])
+	}
+
+	// 一次性列出所有绑定与制品并建索引，避免按预取对象逐条 Get 产生 2P 次请求往返。
+	bindings := new(workercore.ModelStoreBindingList)
+	if err := r.Client.List(ctx, bindings); err != nil {
+		return err
+	}
+	bindingByKey := map[string]*workercore.ModelStoreBinding{}
+	for i := range bindings.Items {
+		b := &bindings.Items[i]
+		bindingByKey[b.Namespace+"/"+b.Name] = b
+	}
+	artifacts := new(workercore.ModelArtifactList)
+	if err := r.Client.List(ctx, artifacts); err != nil {
+		return err
+	}
+	artifactByKey := map[string]*workercore.ModelArtifact{}
+	for i := range artifacts.Items {
+		a := &artifacts.Items[i]
+		artifactByKey[a.Namespace+"/"+a.Name] = a
+	}
+
+	// desired[node] 记录所有保留策略仍生效的预取对象要求在该节点上固定的摘要集合。
+	desired := map[string]map[string]bool{}
+	for i := range pfs.Items {
+		pf := &pfs.Items[i]
+		if pf.DeletionTimestamp != nil || !pf.Spec.Retention.Pinned {
+			continue
+		}
+		binding := bindingByKey[pf.Namespace+"/"+pf.Spec.BindingRef.Name]
+		if binding == nil {
+			continue // 授权已删除，不能再依据它维持固定状态。
+		}
+		if !bindingAllowsPinned(binding) {
+			continue
+		}
+
+		artifact := artifactByKey[pf.Namespace+"/"+pf.Spec.ArtifactRef.Name]
+		if artifact == nil || artifact.Status.Resolved == nil {
+			continue
+		}
+		digest := artifact.Status.Resolved.ManifestDigest
+		if digest == "" {
+			continue
+		}
+		pools, err := ResolveInstanceTypeFlavorNames(ctx, r.Client, pf, depsByNS[pf.Namespace])
+		if err != nil {
+			return err
+		}
+		targets, err := prefetchTargetNodes(pf, nodes.Items, depsByNS[pf.Namespace], pools)
+		if err != nil {
+			continue // placement 配置无效，错误由该预取对象自身的状态体现。
+		}
+		entries := modelstore.NodeEntries(stores.Items, digest)
+		for _, node := range targets {
+			entry, ok := entries[node]
+			entryReady := ok && entry.State == workercore.NodeModelStoreModelStateReady && !r.ttlExpired(pf, entry)
+			if !entryReady {
+				continue
+			}
+			if desired[node] == nil {
+				desired[node] = map[string]bool{}
+			}
+			desired[node][digest] = true
+		}
+	}
+
+	for i := range stores.Items {
+		nms := &stores.Items[i]
+		want := desired[nms.Name]
+		if want == nil && len(nms.Spec.Pinned) == 0 {
+			continue
+		}
+		fresh := make([]string, 0, len(want))
+		for digest := range want {
+			fresh = append(fresh, digest)
+		}
+		sort.Strings(fresh)
+		if slices.Equal(nms.Spec.Pinned, fresh) {
+			continue
+		}
+		updated := nms.DeepCopy()
+		updated.Spec.Pinned = fresh
+		if err := r.Client.Update(ctx, updated); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ttlExpired 判断节点对该内容的最近使用时间是否已超过保留 TTL。从未上报过使用时间的节点不视为过期。
+func (r *ModelPrefetchReconciler) ttlExpired(pf *workercore.ModelPrefetch, entry workercore.NodeModelStoreModel) bool {
+	ttl := pf.Spec.Retention.TTLAfterLastUse
+	if ttl == nil || entry.LastUsedTime == nil {
+		return false
+	}
+
+	return r.now().Sub(entry.LastUsedTime.Time) > ttl.Duration
+}
+
 // writeStatus 根据进度填充状态。Available 要求 readyNodes 达到 MinReady（0 表示全部目标节点）；Degraded
 // 在有目标节点放弃分发时置位——或当预取指定的制品消失时置位，从而终止分发而非一直拉取。Lapsed 表示
 // 低于 MinReady 的缺口是由保留 TTL 导致的：仅当过期副本本身足以解释该缺口时才变为 True，以确保预热中
@@ -267,6 +597,16 @@ func (r *ModelPrefetchReconciler) writeStatus(
 		[]gpustack.Condition{progressing, available, degraded, lapsed}, r.now())
 }
 
+func (r *ModelPrefetchReconciler) commitStatus(
+	ctx context.Context, pf *workercore.ModelPrefetch, before *workercore.ModelPrefetchStatus,
+) error {
+	if kubemeta.DeepEqual(before, &pf.Status) {
+		return nil
+	}
+
+	return r.Client.Status().Update(ctx, pf)
+}
+
 // requiredNodes 返回满足预取所需的就绪节点数：即 MinReady，当其保持默认值 0 时为全部目标节点数。
 func requiredNodes(pf *workercore.ModelPrefetch, desired int32) int32 {
 	if pf.Spec.MinReady == 0 || pf.Spec.MinReady > desired {
@@ -274,6 +614,117 @@ func requiredNodes(pf *workercore.ModelPrefetch, desired int32) int32 {
 	}
 
 	return pf.Spec.MinReady
+}
+
+// warmupImage 按照配置控制器读取层级的方式读取预热镜像配置：优先从委托 Secret 读取，未设置时回退到内置默认值。
+func (r *ModelPrefetchReconciler) warmupImage(ctx context.Context) (string, error) {
+	sec := new(core.Secret)
+	key := ctrlcli.ObjectKey{Namespace: setting.DelegatedSecretNamespace, Name: setting.DelegatedSecretName}
+	if err := r.Client.Get(ctx, key, sec); ctrlcli.IgnoreNotFound(err) != nil {
+		return "", err
+	}
+	if v, ok := sec.Data[settings.ModelPrefetchWarmupImage.Name()]; ok {
+		return string(v), nil
+	}
+
+	return settings.ModelPrefetchWarmupImage.DefaultValue(), nil
+}
+
+// warmupPod 将分发操作渲染为预热 Pod：挂载制品卷、绑定目标节点、无特权配置、读回目录树后退出。
+// 它不带 queue-name 标签，因此 Kueue 与本 operator 的 Pod webhook 均不干预它。
+// 每次尝试使用新的生成名，确保替代 Pod 与仍在终止中的旧 Pod 不会重名冲突。
+func warmupPod(pf *workercore.ModelPrefetch, artifact *workercore.ModelArtifact, image, nodeName, digest string) *core.Pod {
+	return &core.Pod{
+		ObjectMeta: meta.ObjectMeta{
+			GenerateName: prefetchPodName(pf.Name, nodeName) + "-",
+			Namespace:    pf.Namespace,
+			Labels: map[string]string{
+				"worker.gpustack.ai/model-prefetch":        pf.Name,
+				"worker.gpustack.ai/model-prefetch-digest": warmDigestLabel(digest),
+			},
+		},
+		Spec: core.PodSpec{
+			NodeName:                      nodeName,
+			RestartPolicy:                 core.RestartPolicyNever,
+			TerminationGracePeriodSeconds: ptr.To[int64](10),
+			// 卡住的挂载或挂起的读回必须有终点：超时会使 Pod 失败，下一轮对账再根据条目状态决定是否重试。
+			ActiveDeadlineSeconds: ptr.To[int64](2 * 60 * 60),
+			SecurityContext: &core.PodSecurityContext{
+				RunAsNonRoot:   ptr.To(true),
+				RunAsUser:      ptr.To[int64](65534),
+				SeccompProfile: &core.SeccompProfile{Type: core.SeccompProfileTypeRuntimeDefault},
+			},
+			Containers: []core.Container{{
+				Name:    "warmup",
+				Image:   image,
+				Command: []string{"sh", "-c", "cd /model && find . -type f | sort | xargs -r sha256sum"},
+				SecurityContext: &core.SecurityContext{
+					AllowPrivilegeEscalation: ptr.To(false),
+					Capabilities:             &core.Capabilities{Drop: []core.Capability{"ALL"}},
+				},
+				VolumeMounts: []core.VolumeMount{{Name: "model", MountPath: "/model", ReadOnly: true}},
+			}},
+			Volumes: []core.Volume{{
+				Name: "model",
+				VolumeSource: core.VolumeSource{
+					CSI: &core.CSIVolumeSource{
+						Driver:   modelstore.DriverName,
+						ReadOnly: ptr.To(true),
+						VolumeAttributes: map[string]string{
+							modelstore.VolumeAttrArtifact:       artifact.Name,
+							modelstore.VolumeAttrArtifactUID:    string(artifact.UID),
+							modelstore.VolumeAttrManifestDigest: digest,
+						},
+					},
+				},
+			}},
+		},
+	}
+}
+
+// podWarmDigest 读取 Pod 预热卷中声明的摘要；若 Pod 缺少该属性或未声明对应卷则返回空字符串。
+func podWarmDigest(pod *core.Pod) string {
+	for _, v := range pod.Spec.Volumes {
+		if v.CSI != nil && v.CSI.Driver == modelstore.DriverName {
+			return v.CSI.VolumeAttributes[modelstore.VolumeAttrManifestDigest]
+		}
+	}
+
+	return ""
+}
+
+// warmDigestLabel 将摘要折叠为 API Server 可接受的标签值：标签值上限为 63 个字符而完整摘要含 64 位十六进制，
+// 因此此处取前 32 位作为可读标识；权威的摘要匹配仍以保存完整值的 CSI 卷属性为准。
+func warmDigestLabel(digest string) string {
+	hexPart := strings.TrimPrefix(digest, "sha256:")
+	if len(hexPart) > 32 {
+		hexPart = hexPart[:32]
+	}
+
+	return hexPart
+}
+
+// prefetchPodName 构造预热 Pod 的 generateName 前缀，由预取名与节点名拼接而成。
+// 长度合法时保留可读拼接；超长时以两者哈希值收尾，既避免超长前缀引发校验失败，又防止两台节点名截断后发生碰撞。
+// 247 的上限为 API Server 追加的连字符和 5 位随机后缀预留空间（253 - 1 - 5）。
+func prefetchPodName(pf, node string) string {
+	name := pf + "-warmup-" + node
+	if len(name) <= 247 {
+		return name
+	}
+	tag := stringx.SumBySHA256(pf + "/" + node)[:8]
+	room := 247 - len(tag) - 1
+	base := (pf + "-warmup-" + node)[:room]
+
+	return base + "-" + tag
+}
+
+func requeueOr(chosen, fallback ctrl.Result) ctrl.Result {
+	if chosen.RequeueAfter > 0 || chosen.Requeue {
+		return chosen
+	}
+
+	return fallback
 }
 
 // InstanceTypeFlavorNames 按 InstanceType 名称保存该类型资源池所选择的 ResourceFlavor 名称。若某个类型

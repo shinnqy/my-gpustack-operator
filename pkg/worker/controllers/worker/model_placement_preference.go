@@ -1,14 +1,18 @@
 package worker
 
 import (
+	"cmp"
 	"context"
 	"slices"
 
 	core "k8s.io/api/core/v1"
+	storage "k8s.io/api/storage/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
+	gpustack "gpustack.ai/gpustack/api/v1"
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
@@ -25,6 +29,13 @@ const (
 	// nodeModelStoreConditionReady 是插件在正常服务其所在节点期间保持为 True 的状态条件名称。
 	nodeModelStoreConditionReady = "Ready"
 )
+
+// modelPlacementCandidate 表示持有已就绪可供挂载摘要的候选节点。
+type modelPlacementCandidate struct {
+	node     string
+	hostname string
+	model    workercore.NodeModelStoreModel
+}
 
 // placementPreference 为挂载这些权重的 Pod 返回节点放置偏好：当使用节点交付摘要且已就绪可
 // 挂载时，返回持有该摘要的节点；当使用镜像制品时，返回 kubelet 上报持有该镜像的节点；对于
@@ -115,8 +126,108 @@ func modelPlacementImagePreference(ctx context.Context, cli ctrlcli.Reader, refe
 // 偏好项中的值为节点的 kubernetes.io/hostname 标签而非节点名称：TAS 按该标签索引节点，且部分云厂商会将其
 // 设为与 Node 名称不同的值。
 func modelPlacementPreference(ctx context.Context, cli ctrlcli.Reader, digest string) *core.PreferredSchedulingTerm {
-	// 在第 18 章中实现此函数。
-	return nil
+	logger := ctrllog.FromContext(ctx)
+
+	stores := new(workercore.NodeModelStoreList)
+	if err := cli.List(ctx, stores); err != nil {
+		logger.Error(err, "list node model stores for a placement preference; none is added")
+		return nil
+	}
+
+	var candidates []modelPlacementCandidate
+	for i := range stores.Items {
+		nms := &stores.Items[i]
+		if !nodeModelStoreReady(nms) {
+			continue
+		}
+		j := slices.IndexFunc(nms.Status.Models, func(m workercore.NodeModelStoreModel) bool {
+			return m.Digest == digest && m.State == workercore.NodeModelStoreModelStateReady
+		})
+		if j < 0 {
+			continue
+		}
+
+		csiNode := new(storage.CSINode)
+		if err := cli.Get(ctx, ctrlcli.ObjectKey{Name: nms.Name}, csiNode); err != nil {
+			if ctrlcli.IgnoreNotFound(err) != nil {
+				logger.Error(err, "read a CSINode for a placement preference; the node is left out", "node", nms.Name)
+			}
+			continue
+		}
+		if !csiNodeListsModelDriver(csiNode) {
+			continue
+		}
+
+		node := new(core.Node)
+		if err := cli.Get(ctx, ctrlcli.ObjectKey{Name: nms.Name}, node); err != nil {
+			if ctrlcli.IgnoreNotFound(err) != nil {
+				logger.Error(err, "read a Node for a placement preference; the node is left out", "node", nms.Name)
+			}
+			continue
+		}
+		hostname := node.Labels[core.LabelHostname]
+		if hostname == "" {
+			continue
+		}
+
+		candidates = append(candidates, modelPlacementCandidate{node: nms.Name, hostname: hostname, model: nms.Status.Models[j]})
+	}
+
+	hostnames := modelPlacementHostnames(candidates)
+	if len(hostnames) == 0 {
+		return nil
+	}
+
+	return &core.PreferredSchedulingTerm{
+		Weight: modelPlacementPreferenceWeight,
+		Preference: core.NodeSelectorTerm{MatchExpressions: []core.NodeSelectorRequirement{
+			{Key: core.LabelHostname, Operator: core.NodeSelectorOpIn, Values: hostnames},
+		}},
+	}
+}
+
+// modelPlacementHostnames 对候选节点排序并返回前 modelPlacementMaxNodes 个节点的主机名：
+// 优先选择当前已有 Pod 正在挂载该摘要的节点，其次按最近使用时间降序，最后按节点名称升序。
+// 正在服务该摘要的节点最有可能位于消费方其他副本所在的资源池内，截断时应优先保留。
+// 排序结果仅依赖候选集合本身，从而确保基于同一快照构建的同一副本成员携带完全一致的节点列表。
+func modelPlacementHostnames(candidates []modelPlacementCandidate) []string {
+	sorted := slices.Clone(candidates)
+	slices.SortFunc(sorted, func(a, b modelPlacementCandidate) int {
+		if a.model.Referenced != b.model.Referenced {
+			if a.model.Referenced {
+				return -1
+			}
+			return 1
+		}
+		if c := cmp.Compare(lastUsedUnix(b.model), lastUsedUnix(a.model)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.node, b.node)
+	})
+	if len(sorted) > modelPlacementMaxNodes {
+		sorted = sorted[:modelPlacementMaxNodes]
+	}
+
+	hostnames := make([]string, 0, len(sorted))
+	for i := range sorted {
+		hostnames = append(hostnames, sorted[i].hostname)
+	}
+
+	return hostnames
+}
+
+func lastUsedUnix(m workercore.NodeModelStoreModel) int64 {
+	if m.LastUsedTime == nil {
+		return 0
+	}
+
+	return m.LastUsedTime.Unix()
+}
+
+func nodeModelStoreReady(nms *workercore.NodeModelStore) bool {
+	return slices.ContainsFunc(nms.Status.Conditions, func(c gpustack.Condition) bool {
+		return c.Type == nodeModelStoreConditionReady && c.Status == meta.ConditionTrue
+	})
 }
 
 // injectModelPlacementPreference 将 term 追加到 Pod 的首选节点亲和性（preferred node affinity）中，并保留
