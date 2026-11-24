@@ -1,7 +1,5 @@
-// Package rdma 拥有 RDMA 设备插件服务器：这四种分配模式系列使得节点的 RDMA 接口可分配。它就是厂商打包形式
-// 所描述的精简版 device.Allocator——它构建这些服务器，赋予它们统一的生命周期，并针对 kubelet 的套接字启动
-// 每个服务器。这些服务器本身以及它们生成的每个响应都存储在 pkg/deviceplugin 中，同时也在它们读取的协调器
-// 清单中。
+// Package rdma 管理节点的 RDMA 设备插件。整端点、共享端点和 SR-IOV VF 分别使用独立的
+// kubelet 资源名和套接字，服务器实现位于 pkg/deviceplugin。
 package rdma
 
 // IMPORTANT: 为什么单独拆出来，不归到 nvidia/ 或 ascend/ 下面？

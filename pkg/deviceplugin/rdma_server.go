@@ -55,7 +55,7 @@ func NewRDMAServer(
 
 // rdmaFamilyName 是套接字基础名称的第一个组成部分，也是通知器的厂商标签。它用于标识 RDMA 资源家族，而目前
 // 没有厂商使用这一名称——因为加速器套接字的第一个组成部分总是厂商名称，这与检测器报告的情况一致。因此，
-// RDMA 套接字无法与厂商服务器产生冲突，且四个 RDMA 套接字在模式组件上各不相同。
+// RDMA 套接字无法与厂商服务器产生冲突，整端点、共享端点和 VF 三种模式各有自己的套接字。
 const rdmaFamilyName = "rdma"
 
 // servingOptions 定义了此服务器所提供的内容：响应 gRPC 调用的插件，即此服务器本身。其注册的资源。以及基于
@@ -136,9 +136,8 @@ func (s *rdmaServer) ListAndWatch(_ *Empty, srv grpc.ServerStreamingServer[ListA
 	}
 }
 
-// getListAndWatchResponse 根据节点的接口清单构建该服务器的广告内容。这是该清单的纯函数操作——协调器仅用于
-// 读取该对象，除此之外不执行其他操作——因此过程中任何地方的分配状态都不会改变响应结果，这使得两个共享资源
-// 池能够同时提供相同的 HCAs，而不会相互干扰。
+// getListAndWatchResponse 根据当前接口清单发布各端点的 token 和 NUMA 提示。链路明确失败时，
+// token 保留原 ID，健康状态改为 Unhealthy，供 kubelet 停止向新容器分配。
 func (s *rdmaServer) getListAndWatchResponse(ctx context.Context) (*ListAndWatchResponse, error) {
 	devs, err := s.Reconciler.getDevices(ctx)
 	if err != nil {

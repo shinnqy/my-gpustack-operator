@@ -1,24 +1,42 @@
 package nodefeature
 
 import (
+	"sort"
+	"strings"
+
 	core "k8s.io/api/core/v1"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/device"
+	"gpustack.ai/gpustack/pkg/kubemeta"
 )
 
 const (
-	// RDMAFeatureLabelPrefix 用于作为该文件所写入的每一个标签的前缀，也是使该集合可以移除的关键：如果
-	// 某个遍历过程不再报告这些键中的任何一个，就需要删除过时的键。而使用这个前缀是识别哪些键属于我们
-	// 的唯一方式。
+	// RDMAFeatureLabelPrefix 是这组标签的共同前缀。
+	// 探测器用它识别本轮已消失、需要从 NodeFeature 撤下的旧标签。
 	RDMAFeatureLabelPrefix = FeatureLabelPrefix + "rdma."
+
+	// NodeRDMACapableLabelKey 表示至少一个端点的链路没有被判为故障。
+	// 工作负载可用自己的节点选择器或亲和性要求它。每个端点的绑定和链路状态保存在 Devices 中。
+	NodeRDMACapableLabelKey = RDMAFeatureLabelPrefix + "capable"
+
+	// NodeRDMADistanceLabelKey 保存节点上任意加速器与可用 RDMA 端点之间最短的总线距离。
+	// 它供观察使用，具体容器拿到的设备由 kubelet 分配结果决定。
+	NodeRDMADistanceLabelKey = RDMAFeatureLabelPrefix + "distance"
+
+	// NodeRDMANumaLabelKey 保存可用 RDMA 端点所在的 NUMA 节点集合。用下划线分隔各值，
+	// 例如 0_1。逗号会被标签清理器去掉，直接拼接会让两个节点看起来像同一个编号。
+	NodeRDMANumaLabelKey = RDMAFeatureLabelPrefix + "numa"
+
+	// rdmaNumaSeparator 用合法的标签字符分隔 NUMA 节点编号。
+	rdmaNumaSeparator = "_"
 )
 
 // rdmaResourceNameBase 是 RDMA 资源键的基础：即运营商自己的设备前缀，该前缀下所有该运营商所发布的节点级资
 // 源都归属于此，此外还包含品牌名称。它不包含制造商信息，因为网络接口属于节点，而非供应商。
 const rdmaResourceNameBase = VisibilityResourceNamePrefix + "rdma"
 
-// RDMAEndpointPoolSize 表示共享家族中一个 RDMA 端点所 advertised 的并发持有者数量。
+// RDMAEndpointPoolSize 表示共享家族中一个 RDMA 端点向 kubelet 上报的并发持有者数量。
 //
 // 该图来自被替代的生态系统，而非在此处编造：操作员通常会安装的共享 RDMA 设备插件在厂商自己的部署指南中设
 // 定为 63 作为默认配置，因此基于该插件编写的工作负载在此处没有更严格的限制。64 是指下一个 2 的幂次数值，
@@ -61,22 +79,111 @@ func GetRDMAResourceName(mode workercore.DeviceAllocationMode) core.ResourceName
 	}
 }
 
-// ConstructRDMANodeLabels 根据一次检测过程的参数集构建 RDMA 功能标签。
+// ConstructRDMANodeLabels 根据一次节点探测生成 RDMA 能力、NUMA 和距离标签。
+// 有明确链路状态时优先使用它，failed 的端点不参与聚合，unverified 仍可贡献能力标签。
+// 没有链路记录时再看 RDMA 绑定标志。
 //
-// 当连接检查未显示连接中断时，某个端点被视为具备 RDMA 能力。只有在未达成任何判断结果时，才会退化为仅检查
-// 设备是否绑定状态。因此，`failed` 是保留 NodeRDMACapableLabelKey 的状态，而 `unverified` 则会发出该状态—
-// —包括探测器为无法读取的树状结构所记录的未验证记录，这些记录中不包含任何绑定设备。若保留该状态，则“此端
-// 口的状态无法被读取”会变为“此节点没有 RDMA”。
-//
-// 这种聚合是存在性的：当至少有一个端点具备能力时，标签才会被发出，而不是所有端点都具备能力时。因此，一个
-// 拥有损坏的网卡而旁边有正常网卡的节点，仍然可以保留该网卡，并仍能处理 RDMA 工作负载。哪个端点损坏了，会
-// 在 `Devices` 中，按接口和虚拟功能进行区分。节点标签无法体现这一点。
-//
-// 对于没有此类接口的节点，它返回的是一个空映射，而非 nil。调用方移除过时的键正是导致这种缺失生效的原因——
-// 标签在它们被写入的对象上是可叠加的，因此不再被报告的键仍然存在。
+// 只要有一个可用端点，节点便可保留能力标签。端点的具体差异留在 Devices 中。全部端点都不再可用时返回空映射，
+// 由上报器撤下旧的 RDMA 标签。
 func ConstructRDMANodeLabels(
 	groups device.DevicesGroupList, interfaces []device.Interface,
 ) map[string]string {
-	// 第 14 章补上此函数的实现。
-	return nil
+	capable := rdmaEndpoints(interfaces)
+
+	labels := map[string]string{}
+	if len(capable) == 0 {
+		return labels
+	}
+	labels[NodeRDMACapableLabelKey] = "true"
+
+	// NUMA 标签必须完整表示整个集合。清理后的值若会改变，例如超过 63 个字符而被截断，就略过这个标签。
+	// 逐端点的亲和信息仍保存在 Devices 中。
+	if numa := rdmaNumaNodes(capable); numa != "" && kubemeta.SanitizeLabelValue(numa) == numa {
+		labels[NodeRDMANumaLabelKey] = numa
+	}
+	// 距离描述的是一对设备。节点只有 RDMA 网卡却没有加速器时，只发布能从网卡本身得到的标签。
+	if distance, ok := closestAcceleratorDistance(groups, capable); ok {
+		labels[NodeRDMADistanceLabelKey] = distance.String()
+	}
+
+	for k := range labels {
+		labels[k] = kubemeta.SanitizeLabelValue(labels[k])
+	}
+	return labels
+}
+
+// rdmaEndpoints 收集用于节点标签聚合的接口和虚拟功能。SR-IOV 的 VF 在库存中位于 PF 的条目下，
+// 需逐一处理。VF 与 PF 处于同一 PCI 桥路径，NUMA 则优先用 VF 自己的读数，
+// VF 未报告时沿用 PF 的值。
+func rdmaEndpoints(interfaces []device.Interface) []device.Interface {
+	endpoints := make([]device.Interface, 0, len(interfaces))
+	for i := range interfaces {
+		iface := interfaces[i]
+		if rdmaUsable(iface.RDMA, iface.Link) {
+			endpoints = append(endpoints, iface)
+		}
+
+		for j := range iface.VirtualFunctions {
+			vf := &iface.VirtualFunctions[j]
+			if !rdmaUsable(vf.RDMA, vf.Link) {
+				continue
+			}
+			endpoint := iface
+			// 这里已经得到一个独立端点，清空子列表可以避免随后再次遍历同一批 VF。
+			endpoint.VirtualFunctions = nil
+			if vf.NumaAffinity != "" {
+				endpoint.NumaAffinity = vf.NumaAffinity
+			}
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+
+	return endpoints
+}
+
+// rdmaUsable 先看链路结论，只有明确失败才从节点标签聚合中排除。若探测器看到了 RDMA 目录却无法读取，
+// unverified 仍能反映这一情况。完全没有链路记录时，才使用 RDMA 绑定标志。
+func rdmaUsable(rdma bool, link *workercore.DeviceInterfaceLink) bool {
+	if link != nil {
+		return link.State != workercore.DeviceInterfaceLinkStateFailed
+	}
+	return rdma
+}
+
+// rdmaNumaNodes 收集非空 NUMA 节点编号，去重后按字符串排序并用下划线连接，
+// 使同一批硬件在各轮探测中产生稳定的标签值。
+func rdmaNumaNodes(capable []device.Interface) string {
+	seen := make(map[string]bool, len(capable))
+	nodes := make([]string, 0, len(capable))
+	for i := range capable {
+		numa := capable[i].NumaAffinity
+		// 空值表示内核没有给出亲和信息，跳过它才能保留“未知”和实际编号 0 的区别。
+		if numa == "" || seen[numa] {
+			continue
+		}
+		seen[numa] = true
+		nodes = append(nodes, numa)
+	}
+	sort.Strings(nodes)
+	return strings.Join(nodes, rdmaNumaSeparator)
+}
+
+// closestAcceleratorDistance 遍历本节点所有加速器与可用端点的组合，
+// 返回最短总线距离及是否存在可比较的设备对。这个结果描述整台节点，不能用来推断某次分配选择了哪块网卡。
+func closestAcceleratorDistance(
+	groups device.DevicesGroupList, capable []device.Interface,
+) (device.TopologyDistance, bool) {
+	closest, found := device.TopologyDistanceUnknown, false
+	for gi := range groups {
+		for ai := range groups[gi].Accelerators {
+			topology := groups[gi].Accelerators[ai].Topology
+			for ii := range capable {
+				found = true
+				if d := device.BusDistance(topology, capable[ii]); d < closest {
+					closest = d
+				}
+			}
+		}
+	}
+	return closest, found
 }

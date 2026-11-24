@@ -28,7 +28,7 @@
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  pkg/devicemanager/allocator/   （厂商适配层 / 按厂商动态启停总控）         │
-│  - allocator.go：监听 Detector 发现的厂商，动态启停对应厂商插件 + RDMA 插件  │
+│  - allocator.go：按探测结果启停厂商插件，Linux 节点单独启动 RDMA 插件        │
 │  - nvidia/ ascend/ amd/ ...：按模式组装插件，实现各自 Responder 注入与硬件动作│
 └───────────────────┬───────────────────────────────────────┬─────────────┘
                     │ 复用通用服务、账本、注入策略、回收循环      │ 调用厂商驱动做 MIG/共享开关等
@@ -100,7 +100,8 @@
 | --- | --- |
 | `rdma_server.go` | `rdmaServer`：复用 `serving.go` 面向 `kubelet` 提供 `ListAndWatch`，按模式发布节点级 RDMA 资源 |
 | `rdma_endpoint.go` | 从 `Devices.spec.interfaces`（含 PF 与 SR-IOV VF）实时推导可分配的 RDMA 端点及健康状态 |
-| `rdma_allocate.go` | 响应 `kubelet` 的 RDMA `Allocate` 请求（具体实现在第 14 章补齐） |
+| `rdma_allocate.go` | 从当前 `Devices.spec.interfaces` 解析 kubelet 选中的 token，按端点去重，返回设备和 `NCCL_IB_HCA` |
+| `rdma_devices.go` | 从 Linux sysfs 查找与 RDMA 设备名对应的 `/dev/infiniband/uverbsN` |
 
 ---
 
@@ -110,4 +111,4 @@
 - **第 5 章**：随着 `device-manager serve` 接通，本目录作为编译与启动底座整体引入；
 - **第 8 章（整卡）** 已接通独占分配。Pod 请求一张卡后，kubelet 从清单选择令牌，插件记录实际卡的归属。Pod 删除后账本恢复满额。
 - **第 9～11 章（共享 / 软切 / 硬切）**：完整串联 `budget.go`、`sliced_room.go`、`inject.go`、`reclaim.go`；
-- **第 14 章（RDMA）**：补齐 `rdma_allocate.go`，完成 RDMA 端到端分配。
+- **第 14 章（RDMA）** 已接通端点分配。ListAndWatch 将失败链路标记为 `Unhealthy`。Allocate 复核授予的端点是否仍属于当前模式，只交付这些端点对应的设备，并在宿主机存在时附带一次 `rdma_cm`。
