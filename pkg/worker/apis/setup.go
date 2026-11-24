@@ -47,6 +47,11 @@ func DeleteServicesBackedBy(ctx context.Context, cli kubernetes.Interface, names
 	return api.DeleteServicesBackedBy(ctx, cli, namespace)
 }
 
+// IsServicesReady 对 Worker 所需的各个 APIService 各检查一次，返回遇到的第一个未就绪或无法读取的服务。
+func IsServicesReady(ctx context.Context, cli kubernetes.Interface) error {
+	return api.IsServicesReady(ctx, cli, apiSvcGetters)
+}
+
 // WaitForServicesReady 等待 API 服务就绪。
 func WaitForServicesReady(ctx context.Context, cli kubernetes.Interface) error {
 	return api.WaitForServicesReady(ctx, cli, apiSvcGetters)

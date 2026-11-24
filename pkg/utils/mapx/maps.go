@@ -120,3 +120,18 @@ func EqualWithStringPrefix[V comparable, M ~map[string]V](a, b M, prefix string,
 	}
 	return true
 }
+
+// Slice 遍历映射，对每个键值对调用 f，将结果收集到切片。映射为空时返回 nil。
+func Slice[K comparable, V, Y any, M ~map[K]V](m M, f func(K, V) Y) []Y {
+	if len(m) == 0 {
+		return nil
+	}
+	ret := make([]Y, 0, len(m))
+	for k, v := range m {
+		ret = append(ret, f(k, v))
+	}
+	if len(ret) == 0 {
+		return nil
+	}
+	return ret
+}

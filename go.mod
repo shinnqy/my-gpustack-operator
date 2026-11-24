@@ -80,6 +80,7 @@ require (
 	k8s.io/kube-openapi v0.0.0-20260618221249-bc653b64f974
 	k8s.io/kubectl v0.36.5
 	k8s.io/kubelet v0.36.5
+	k8s.io/streaming v0.36.5
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/kueue v0.18.11
@@ -219,7 +220,6 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	k8s.io/dynamic-resource-allocation v0.36.2 // indirect
 	k8s.io/kms v0.36.5 // indirect
-	k8s.io/streaming v0.36.5 // indirect
 	oras.land/oras-go/v2 v2.6.1 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0 // indirect
 	sigs.k8s.io/jobset v0.12.0 // indirect
