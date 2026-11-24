@@ -336,6 +336,12 @@ func (m *ModelScope) firstRootFile(ctx context.Context, repository, commit, toke
 	return first, nil
 }
 
+// FileURL 返回仓库在指定 commit 下某个文件的下载地址。Hub 对小文件直接返回字节内容，
+// 对 LFS 文件则重定向到支持字节范围请求的带签名内容寻址 CDN 路径。
+func (m *ModelScope) FileURL(repository, commit, path string) string {
+	return m.fileURL(repository, commit, path)
+}
+
 func (m *ModelScope) fileURL(repository, commit, path string) string {
 	return m.apiURL("models", repository, "repo") +
 		"?Revision=" + url.QueryEscape(commit) + "&FilePath=" + url.QueryEscape(path)

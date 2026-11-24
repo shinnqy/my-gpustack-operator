@@ -2,7 +2,34 @@ package stringx
 
 import (
 	"encoding/base64"
+	"strings"
 )
+
+// DecodeBase64 解码给定字符串，支持带填充或不带填充的格式。
+func DecodeBase64(str string) (string, error) {
+	// 统一为标准编码格式。
+	str = strings.ReplaceAll(str, "-", "+")
+	str = strings.ReplaceAll(str, "_", "/")
+
+	// 统一为无填充格式。
+	str = strings.TrimRight(str, "=")
+
+	bs, err := DecodeBase64Bytes(ToBytes(&str))
+	if err != nil {
+		return "", err
+	}
+
+	return FromBytes(&bs), nil
+}
+
+// DecodeBase64Bytes 解码给定字节切片。
+func DecodeBase64Bytes(src []byte) ([]byte, error) {
+	enc := base64.RawStdEncoding
+	dst := make([]byte, enc.DecodedLen(len(src)))
+	n, err := enc.Decode(dst, src)
+
+	return dst[:n], err
+}
 
 // EncodeBase64 对给定字符串进行编码，
 // 然后输出标准格式。

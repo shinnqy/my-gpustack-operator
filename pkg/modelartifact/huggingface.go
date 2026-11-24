@@ -103,6 +103,11 @@ func (h *HuggingFace) ListManifest(ctx context.Context, repository, commit, toke
 	return manifest, nil
 }
 
+// FileURL 返回仓库在指定 commit 下某个文件的下载地址。Hub 会重定向到支持字节范围请求的内容主机。
+func (h *HuggingFace) FileURL(repository, commit, path string) string {
+	return h.resolveURL(repository, commit, path)
+}
+
 // huggingFaceTreeEntry 是目录树列表中的一个条目。
 type huggingFaceTreeEntry struct {
 	Type string `json:"type"`
