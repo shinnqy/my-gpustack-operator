@@ -233,6 +233,7 @@ func (r *ModelDeploymentReconciler) convergeModelDeployment(
 ) (ctrl.Result, error) {
 	logger := ctrllog.FromContext(ctx)
 
+	// IMPORTANT: 检查有没有配共享 KV Cache 池
 	// 优先解析，但其判定结果刻意不作为下方收敛逻辑的前置门控。当 Binding 缺失或短暂不可用时（例如
 	// 存储主节点重启会使所有 Binding 在数十秒内处于非 Ready 状态），现有副本仍应继续提供服务，仅通过
 	// condition 上报状态即可。若在此处拒绝收敛，会把存储的常规升级演变为其上所有部署的服务中断。
@@ -249,6 +250,7 @@ func (r *ModelDeploymentReconciler) convergeModelDeployment(
 		return objectWriteResult(logger, err, "claim kv cache pool binding", ctrl.Result{})
 	}
 
+	// IMPORTANT: 检查有没有配共享 KV Cache 池
 	// 每轮调谐仅解析一次，而非按角色分别解析：端点与传输方式属于整个池及其后端。返回 nil 表示
 	// 当前尚无可用连接目标，此时渲染副本时不配置连接器，而不会配置残缺的连接器。
 	connection, err := r.resolveModelDeploymentConnection(ctx, domain)
@@ -2029,6 +2031,7 @@ func (r *ModelDeploymentReconciler) renderModelDeploymentPods(
 	return r.renderModelDeploymentRolePods(ctx, md, connection, interfaceProtocols, weights)
 }
 
+// 组装输入参数
 func (r *ModelDeploymentReconciler) renderModelDeploymentRolePods(
 	ctx context.Context, md *workercore.ModelDeployment,
 	connection *ModelDeploymentConnectorInput, interfaceProtocols []string, weights *modelArtifactWeights,
@@ -2158,11 +2161,13 @@ func (r *ModelDeploymentReconciler) renderModelDeploymentRolePods(
 			}
 		}
 
+		// IMPORTANT: 生产控制器调用 model deployment 的入口
 		template, err := renderModelDeploymentPodTemplate(ctx, in)
 		if err != nil {
 			return nil, err
 		}
 
+		// 再按 replicas × size 批量“复印 + 盖钢印”
 		size := modelDeploymentRoleSize(role)
 		rolePods := make(map[int][]*core.Pod, role.Replicas)
 		for ordinal := range int(role.Replicas) {

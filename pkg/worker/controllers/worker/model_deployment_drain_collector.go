@@ -809,3 +809,32 @@ func modelDeploymentDrainParallelismUnreadable(
 
 	return "", false
 }
+
+// IMPORTANT: SGLang 分离模式识别
+//
+// modelDeploymentDrainSGLangDisaggregationMode 负责分离判定中的 SGLang 一侧，直接从命令行读取，
+// 而不经过面向 vLLM 的负载均衡形态表。
+//
+// 负载均衡表仅根据 vLLM 的数据并行标志判定形态，因此跨节点启动的 SGLang 成员会被推导为 Internal
+// 并通过常规检查。SGLang 改为在命令行上自行声明形态：该参数可取 null、prefill 或 decode，而
+// prefill 或 decode 成员正是协议不能仅凭自身指标直接退场的形态。此处直接读取 Pod 自身命令行，
+// 因此即使对应 role 已从 spec 删除依然有效。
+func modelDeploymentDrainSGLangDisaggregationMode(command []string) string {
+	for i, token := range command {
+		value := ""
+		switch {
+		case token == "--disaggregation-mode" && i+1 < len(command):
+			value = command[i+1]
+		case strings.HasPrefix(token, "--disaggregation-mode="):
+			value = strings.TrimPrefix(token, "--disaggregation-mode=")
+		default:
+			continue
+		}
+
+		if value == "prefill" || value == "decode" {
+			return value
+		}
+	}
+
+	return ""
+}

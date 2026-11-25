@@ -9,6 +9,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -49,4 +50,31 @@ type modelDeploymentDrainAnswer struct {
 type modelDeploymentDrainReader interface {
 	// Drain 报告该成员当前仍在途的工作量。按设计它是逐成员进行的：组级聚合值只能代表组，绝不能用来证明单个成员为零。
 	Drain(ctx context.Context, target modelDeploymentDrainTarget) (modelDeploymentDrainAnswer, error)
+}
+
+// IMPORTANT: 是给 r.drainReader 加的“防空指针 + 安全拦截”默认替身（设计模式里叫 Null Object 模式）
+//
+// unwiredDrainReader 是在真实采集器接入前使用的默认生产读取器。它会点名引擎并拒绝作答，
+// 使此期间的状态信息明确指出哪款引擎尚未接入度量，而不是误报队列为空。
+type unwiredDrainReader struct{}
+
+// Drain 返回 Unsupported，且永不返回 error：未接线属于已知状态而非故障，若返回 error 会使
+// 所有调用方将其当作可重试故障不断重试。
+func (unwiredDrainReader) Drain(
+	_ context.Context, target modelDeploymentDrainTarget,
+) (modelDeploymentDrainAnswer, error) {
+	return modelDeploymentDrainAnswer{
+		State:  modelDeploymentDrainUnsupported,
+		Reason: fmt.Sprintf("no engine in-flight collector is wired for %s yet", target.Engine),
+	}, nil
+}
+
+// modelDeploymentDrainReaderOf 解析本轮调谐使用的读取器。字段为 nil 时采用生产默认实现，
+// 即上方的拒绝型读取器。
+func (r *ModelDeploymentReconciler) modelDeploymentDrainReaderOf() modelDeploymentDrainReader {
+	if r.drainReader == nil {
+		return unwiredDrainReader{}
+	}
+
+	return r.drainReader
 }

@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	core "k8s.io/api/core/v1"
@@ -41,6 +43,7 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	kubeapistatus "gpustack.ai/gpustack/pkg/kubeapistatus"
 	"gpustack.ai/gpustack/pkg/kubemeta"
+	"gpustack.ai/gpustack/pkg/utils/strconvx"
 )
 
 // 协议的预算时间已固化。每个阶段会在全局截止时间与从 phaseStartedAt 起算的
@@ -72,6 +75,17 @@ const (
 	// modelDeploymentRetirementOverallBudget 限定整个退场操作的总体时限。
 	modelDeploymentRetirementOverallBudget = 300 * time.Second
 )
+
+// modelDeploymentRetirementRetryAnnotation 是重试已中止预留的显式指令。它是显式指令而非定时器：
+// 中止状态在收到再次请求之前始终保持终止，从而避免无法排空的副本在每次调谐时被反复删除。
+//
+// 注解值格式为 roleName:replicaOrdinal:opaqueRetryToken。token 按契约保持不透明：跨部署无法
+// 证明其来源，因此不解析出处，只要出现新字符串即视为新的重试请求。
+const modelDeploymentRetirementRetryAnnotation = "modeldeployment.gpustack.ai/retirement-retry"
+
+// modelDeploymentRetirementEncodeWithdrawn 是 encoder 副本在等待 Draining 窗口耗尽期间携带的原因文案。
+const modelDeploymentRetirementEncodeWithdrawn = "the target runs the Encode role, which exports no " +
+	"in-flight queue this protocol can read; it is withdrawn from discovery and leaving on the window"
 
 // modelDeploymentRetirementPlan 表示单轮调谐对当前唯一在途预留所评估出的结果。
 //
@@ -133,9 +147,135 @@ func (p modelDeploymentRetirementPlan) names(role string, ordinal int) bool {
 func (r *ModelDeploymentReconciler) planModelDeploymentRetirement(
 	ctx context.Context, md *workercore.ModelDeployment, pods []core.Pod,
 ) *modelDeploymentRetirementPlan {
-	// 在第 19 章中实现此函数。
-	var result0 *modelDeploymentRetirementPlan
-	return result0
+	reservation := md.Status.Retirement
+	if reservation == nil {
+		return &modelDeploymentRetirementPlan{DeletesAllowed: true}
+	}
+
+	plan := &modelDeploymentRetirementPlan{
+		Reservation:    reservation.DeepCopy(),
+		DeletesAllowed: true,
+		InFlight:       true,
+	}
+	plan.Target, plan.held = modelDeploymentRetirementTarget(reservation, pods)
+
+	// 已完成的操作直接清理，且这是本轮对其执行的唯一动作。
+	// 不会把预留作为墓碑留在对象上，因为滞留的预留会持续拒绝健康谓词并占住空槽位。
+	if reservation.State == workercore.ModelDeploymentRetirementStateCompleted {
+		plan.Clear = true
+		plan.InFlight = false
+
+		return plan
+	}
+
+	// 进入 Deleting 及之后阶段，目标缺失意味着删除已经落地而非异常丢失。这些阶段本身就在等待目标
+	// 消失，若把目标缺失当成外部终止，就会中止刚刚完成的操作并错误记录一次并未发生的保留。
+	if reservation.State != workercore.ModelDeploymentRetirementStateAdmitted &&
+		reservation.State != workercore.ModelDeploymentRetirementStateDisqualified &&
+		reservation.State != workercore.ModelDeploymentRetirementStateWithdrawing &&
+		reservation.State != workercore.ModelDeploymentRetirementStateDraining &&
+		reservation.State != workercore.ModelDeploymentRetirementStateAborted {
+		// 从 Deleting 起保持 Hold。操作已提交删除并依赖待删分组继续受本协议管辖，整个 settle 期间
+		// 其他路径不得介入——尤其是常规收敛逻辑在同一轮也能看到这些 Pod，若放开 Hold，多余副本清理
+		// 规则会把目标连同其他不再声明的副本一起收走。退场按成员推进删除，而常规收敛按副本决策，两者
+		// 正好在此阶段冲突。
+		plan.Hold = true
+		// 透传调用方 context：已取消的调谐未读取服务端状态，绝不能改用新的 background context
+		// 继续推进删除后的观测。
+		r.advanceModelDeploymentRetirementPastDeletion(ctx, md, plan)
+
+		return plan
+	}
+
+	// 目标已经消失，或已进入非删除途径唯一可能的终态（被 kubelet 驱逐或引擎自行退出，终态 Pod
+	// 不会再运行）。此时已无流量可撤出、无队列可排空，继续持有只会让中止操作挂在一个已死的 Pod 上。
+	// 因此记录实际原因并释放目标，交由常规终态 Pod 路径完成后续清理。
+	//
+	// 终态沿用 Aborted 并通过 reason 说明原因（冻结状态集中没有单独枚举），同时解除 Hold，
+	// 因为已无法保留的目标不应继续被持有。
+	if plan.held.Len() == 0 || modelDeploymentRetirementTargetTerminal(plan) {
+		plan.Reservation.State = workercore.ModelDeploymentRetirementStateAborted
+		plan.Reservation.Reason = "the target was terminated outside this operator; " +
+			"nothing could be retained"
+		plan.Hold = false
+		plan.InFlight = false
+
+		return plan
+	}
+
+	// 从此处开始操作持有目标。在提交删除之前的所有状态（含 Aborted）均保持 Hold：中止操作的本意
+	// 就是刻意保留容量，若后续缩容把被保留的副本直接删掉，保留语义便不复存在。
+	plan.Hold = true
+
+	// 若 spec 重新声明了该 ordinal 且同 UID 成员均健康，则收编而非继续退场。处于 Aborted 状态时
+	// 扩容再次包含该 ordinal 意味着副本仍被需要，取消操作并交由常规收敛保留现有 Pod 即可。
+	// 同 ordinal 上出现不同 UID 属于新分组，已在上方按外部终止处理，不会错误收编替代副本。
+	if adopted, retry := r.adoptsModelDeploymentRetirement(ctx, md, plan, pods); adopted {
+		plan.Clear = true
+		plan.Hold = false
+		plan.InFlight = false
+
+		return plan
+	} else if retry {
+		plan.InFlight = true
+
+		return plan
+	}
+
+	// 重试指令是显式操作，必须在进入状态机之前先消费，使从 Aborted 发起的重试回到 Admitted，
+	// 而不是直接重跑先前中止的那一步。
+	if r.consumeModelDeploymentRetry(ctx, md, plan) {
+		// 消费逻辑会按固定顺序先写状态再清注解，本轮直接返回并在下一轮重新进入，使顺序可观测而非假设。
+		plan.InFlight = true
+
+		return plan
+	}
+
+	switch reservation.State {
+	case workercore.ModelDeploymentRetirementStateAborted:
+		// 中止状态在收到新意图前保持终态，防止无法排空的副本在每次调谐时反复触发删除。
+		plan.InFlight = false
+
+	case workercore.ModelDeploymentRetirementStateAdmitted:
+		r.advanceModelDeploymentRetirementToDisqualified(ctx, md, plan)
+
+	case workercore.ModelDeploymentRetirementStateDisqualified:
+		r.advanceModelDeploymentRetirementToWithdrawing(ctx, md, plan)
+
+	case workercore.ModelDeploymentRetirementStateWithdrawing:
+		r.advanceModelDeploymentRetirementToDraining(ctx, md, plan)
+
+	case workercore.ModelDeploymentRetirementStateDraining:
+		r.advanceModelDeploymentRetirementToDeleting(ctx, md, plan)
+
+	case workercore.ModelDeploymentRetirementStateDeleting:
+		r.advanceModelDeploymentRetirementToSettling(ctx, md, plan)
+
+	case workercore.ModelDeploymentRetirementStateSettling:
+		r.advanceModelDeploymentRetirementToCompleted(ctx, md, plan)
+	}
+
+	return plan
+}
+
+// advanceModelDeploymentRetirementPastDeletion 驱动 Deleting 及之后的状态，这些状态以目标消失为前提。
+//
+// 进入时 Hold 已经生效，确保删除进行期间协议外部的路径不会插手该目标。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementPastDeletion(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	if err := ctx.Err(); err != nil {
+		plan.Clear = false
+		plan.Reservation.Reason = fmt.Sprintf("the pass was cancelled, so the release is not observed: %v", err)
+
+		return
+	}
+	switch plan.Reservation.State {
+	case workercore.ModelDeploymentRetirementStateDeleting:
+		r.advanceModelDeploymentRetirementToSettling(ctx, md, plan)
+	case workercore.ModelDeploymentRetirementStateSettling:
+		r.advanceModelDeploymentRetirementToCompleted(ctx, md, plan)
+	}
 }
 
 // commitModelDeploymentRetirement 发出操作对应的删除请求，它是此控制器中唯一凭协议自身权限
@@ -289,6 +429,302 @@ func (r *ModelDeploymentReconciler) writeModelDeploymentRetirement(
 	return nil
 }
 
+// modelDeploymentRetirementTarget 按 UID 将预留解析为当前存活的目标副本。
+//
+// 必须按 UID 而非仅按 (role, ordinal) 解析：操作期间该槽位可能被滚动更新或人工重建填充，
+// 若仅按 ordinal 查找就会误指替代副本并将其删除。UID 唯一标识单个对象，已被替换的目标在此解析为空，
+// 进而按外部终止处理而不会静默转移目标。
+func modelDeploymentRetirementTarget(
+	reservation *workercore.ModelDeploymentRetirementStatus, pods []core.Pod,
+) (modelDeploymentReplicaView, sets.Set[types.UID]) {
+	claimed := sets.New[string](reservation.TargetMemberUIDs...)
+	held := sets.New[types.UID]()
+
+	view := modelDeploymentReplicaView{Role: reservation.RoleName, Ordinal: int(reservation.ReplicaOrdinal)}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil || !claimed.Has(string(pod.UID)) {
+			continue
+		}
+
+		// UID 集合是权威依据，同时从标签填充视图以便协议判断槽位与完整性；即使成员标签与预留不一致，
+		// 只要 UID 命中依然会被持有保护。
+		if ordinal, ok := modelDeploymentPodOrdinal(pod); ok {
+			view.Seated = true
+			view.Ordinal = ordinal
+		}
+		view.Members = append(view.Members, pod)
+		held.Insert(pod.UID)
+	}
+
+	return view, held
+}
+
+// advanceModelDeploymentRetirementToDisqualified 将操作从 Admitted 推进到 Disqualified，等待目标离开端点选择集。
+//
+// 此处只观测资格标签是否已移除，而不直接修改标签：常规收敛中的健康谓词 NoPlannedRetirement 分支
+// 会对被预留副本自动摘除该标签，避免同一标签键出现两个写入方。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementToDisqualified(
+	_ context.Context, _ *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	// 不在此处重写阶段开始时间，因为目标仍携带资格标签时会多次轮询 Admitted，重写会不断重置预算。
+	now := r.modelDeploymentNow()
+	if modelDeploymentRetirementBudgetSpent(plan.Reservation, modelDeploymentRetirementWithdrawalBudget, now) {
+		r.abortModelDeploymentRetirement(plan, now,
+			"the withdrawal budget was exhausted before the target left selection")
+
+		return
+	}
+
+	for _, member := range plan.Target.Members {
+		if member.Labels[modelDeploymentLabelKeyEndpointEligible] == modelDeploymentEndpointEligibleValue {
+			plan.Reservation.Reason = "the target is still in endpoint selection"
+
+			return
+		}
+	}
+
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateDisqualified
+	plan.Reservation.Reason = "the target has left endpoint selection"
+}
+
+// advanceModelDeploymentRetirementToWithdrawing 将操作从 Disqualified 推进到 Withdrawing，
+// 等待路由器的实际服务观测确认目标不再承接流量。
+//
+// Withdrawing 与 Disqualified 共享同一摘除阶段预算，沿用既有 phaseStartedAt。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementToWithdrawing(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	now := r.modelDeploymentNow()
+	if modelDeploymentRetirementBudgetSpent(plan.Reservation, modelDeploymentRetirementWithdrawalBudget, now) {
+		r.abortModelDeploymentRetirement(plan, now,
+			"the withdrawal budget was exhausted before the target stopped serving")
+
+		return
+	}
+
+	residual, held := r.observeModelDeploymentRetirementResidual(ctx, md, plan.held)
+	if held {
+		plan.Reservation.Reason = residual
+
+		return
+	}
+
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateWithdrawing
+	plan.Reservation.Reason = "the target is out of selection and nothing serves it"
+}
+
+// advanceModelDeploymentRetirementToDraining 将操作推进到 Draining，所有成员保持运行并开始读取引擎队列。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementToDraining(
+	_ context.Context, _ *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	now := r.modelDeploymentNow()
+	plan.Reservation.PhaseStartedAt = meta.NewTime(now)
+
+	if modelDeploymentRetirementBudgetSpent(plan.Reservation, modelDeploymentRetirementDrainBudget, now) {
+		r.abortModelDeploymentRetirement(plan, now,
+			"the drain budget was exhausted before the target left deletion")
+
+		return
+	}
+
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateDraining
+	plan.Reservation.Reason = "reading the target's in-flight queues with every member retained"
+}
+
+// advanceModelDeploymentRetirementToDeleting 读取各成员队列，确认全部空闲后提交删除。
+// 这是协议唯一授权删除目标的入口。
+//
+// encoder 副本不依据语言模型队列指标判定（编码器不导出此类队列），而是等待完整的 Draining 窗口后进入删除；
+// 窗口耗尽后仍走同一释放证据捕获流程，捕获失败在总截止时间到达时通过 holdModelDeploymentRetirementBeforeDelete 中止。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementToDeleting(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	now := r.modelDeploymentNow()
+	// 只读取一次，保证窗口门控与下方 Deleting 原因对同一目标保持一致判断。
+	encode := modelDeploymentRetirementReplicaIsEncode(plan.Target.Members)
+	if encode {
+		// 对 encoder 而言窗口本身即是门控，预算耗尽时放行删除而非中止。
+		if !modelDeploymentRetirementBudgetSpent(plan.Reservation, modelDeploymentRetirementDrainBudget, now) {
+			plan.Reservation.Reason = modelDeploymentRetirementEncodeWithdrawn
+
+			return
+		}
+	} else {
+		if modelDeploymentRetirementBudgetSpent(plan.Reservation, modelDeploymentRetirementDrainBudget, now) {
+			r.abortModelDeploymentRetirement(plan, now,
+				"the drain budget was exhausted before the target's queues reached zero")
+
+			return
+		}
+
+		if reason, drained := r.observeModelDeploymentRetirementDrained(ctx, md, plan); !drained {
+			plan.Reservation.Reason = reason
+
+			return
+		}
+	}
+
+	// 必须在授权删除前捕获并持久化释放证据。这是成员、分配记录与 Workload 全部尚存的最后时刻：
+	// 一旦删除就无法从剩余 Pod 重建原占有信息。任一步失败都阻止删除，保留现场证据。
+	record, err := r.captureModelDeploymentRetirementRelease(ctx, md, plan)
+	if err != nil {
+		r.holdModelDeploymentRetirementBeforeDelete(plan, now, encode, fmt.Sprintf(
+			"the target's release cannot be recorded, so nothing is deleted: %v", err,
+		))
+
+		return
+	}
+	if err := r.persistModelDeploymentRetirementRelease(ctx, md, record); err != nil {
+		r.holdModelDeploymentRetirementBeforeDelete(plan, now, encode, fmt.Sprintf(
+			"the target's release could not be written, so nothing is deleted: %v", err,
+		))
+
+		return
+	}
+	// 写入后立即回读校验身份绑定，避免提交删除后才发现记录未落盘或不属于当前操作。
+	if _, err := r.loadModelDeploymentRetirementRelease(md, plan); err != nil {
+		r.holdModelDeploymentRetirementBeforeDelete(plan, now, encode, fmt.Sprintf(
+			"the target's release was not recorded for this operation, so nothing is deleted: %v", err,
+		))
+
+		return
+	}
+
+	reason := "the target's queues are empty; deleting every member together"
+	if encode {
+		reason = "the target runs the Encode role and its withdrawal window is spent; " +
+			"deleting every member together"
+	}
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateDeleting
+	plan.Reservation.PhaseStartedAt = meta.NewTime(now)
+	plan.Reservation.Reason = reason
+	plan.DeletesAllowed = true
+	plan.Deletes = modelDeploymentRetirementDeleteSet(plan.Target)
+}
+
+// holdModelDeploymentRetirementBeforeDelete 在释放证据捕获失败时阻止删除并保留现场；
+// 对于已完成等待窗口的 encoder 副本，超过总截止时间后转为中止，避免永久停留在 Draining。
+func (r *ModelDeploymentReconciler) holdModelDeploymentRetirementBeforeDelete(
+	plan *modelDeploymentRetirementPlan, now time.Time, encode bool, reason string,
+) {
+	if encode && !now.Before(plan.Reservation.Deadline.Time) {
+		r.abortModelDeploymentRetirement(plan, now, reason)
+
+		return
+	}
+
+	plan.Reservation.Reason = reason
+	plan.DeletesAllowed = false
+	plan.Deletes = nil
+}
+
+// advanceModelDeploymentRetirementToSettling 观测删除是否已在 API server 上真正生效。
+//
+// 服务组成员在对应 Workload 删除前会被 Kueue finalizer 留驻在服务端，仅靠发起 Delete 不代表容量释放。
+// 当捕获的所有成员 UID 均从服务端消失后，状态进入 Settling。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementToSettling(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	now := r.modelDeploymentNow()
+	plan.DeletesAllowed = true
+
+	// held 集合会跳过已标记删除的对象，不能用来判定目标消失；需直接基于捕获 UID 重新查询服务端，
+	// 仅在成员全部消失后再进入 Settling 观测账本与配额释放。
+	reason, absent := r.observeModelDeploymentRetirementTargetsGone(ctx, md, plan)
+	if !absent {
+		plan.Reservation.Reason = reason
+		plan.Deletes = modelDeploymentRetirementDeleteSet(plan.Target)
+
+		return
+	}
+
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateSettling
+	plan.Reservation.PhaseStartedAt = meta.NewTime(now)
+	plan.Reservation.Reason = "the target has left; observing the accelerator and quota release"
+}
+
+// advanceModelDeploymentRetirementToCompleted 在观测到加速器与配额释放后结束退场操作。
+//
+// Deleting 及之后阶段绝不中止：目标已提交删除，无法保留成员、Workload 或容量，超时只更新原因并继续观测。
+func (r *ModelDeploymentReconciler) advanceModelDeploymentRetirementToCompleted(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) {
+	now := r.modelDeploymentNow()
+
+	// 先观测是否已释放，再检查超时预算：即便释放完成得较晚，只要实际已释放就应正常完成。
+	reason, released := r.observeModelDeploymentRetirementReleased(ctx, md, plan)
+	if !released {
+		if modelDeploymentRetirementBudgetSpent(plan.Reservation, modelDeploymentRetirementSettleBudget, now) {
+			plan.Reservation.Reason = fmt.Sprintf(
+				"the settle budget was exhausted and the release has not been observed: %s", reason,
+			)
+		} else {
+			plan.Reservation.Reason = reason
+		}
+
+		return
+	}
+
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateCompleted
+	plan.Reservation.Reason = "the target is deleted and its accelerator and quota release were observed"
+	plan.Clear = true
+	plan.InFlight = false
+	plan.Hold = false
+}
+
+// abortModelDeploymentRetirement 结束删除前阶段因预算耗尽而触发的中止。
+//
+// 仅从删除前步骤进入，此时目标成员、Workload 与容量均完好保留；保留原 phaseStartedAt 便于排障与重试审计。
+func (r *ModelDeploymentReconciler) abortModelDeploymentRetirement(
+	plan *modelDeploymentRetirementPlan, now time.Time, reason string,
+) {
+	plan.Reservation.State = workercore.ModelDeploymentRetirementStateAborted
+	plan.Reservation.Reason = reason + "; members, workload and capacity are retained"
+	plan.Reservation.Deadline = meta.NewTime(now)
+	plan.InFlight = false
+}
+
+// modelDeploymentRetirementBudgetSpent 报告当前阶段是否已耗尽时间预算。
+//
+// 阶段终点取阶段预算终点与整体 Deadline 中的较早者；相等即视为耗尽。
+func modelDeploymentRetirementBudgetSpent(
+	reservation *workercore.ModelDeploymentRetirementStatus, budget time.Duration, now time.Time,
+) bool {
+	phaseEnd := reservation.PhaseStartedAt.Add(budget)
+	overallEnd := reservation.Deadline.Time
+	if overallEnd.Before(phaseEnd) {
+		phaseEnd = overallEnd
+	}
+
+	return !now.Before(phaseEnd)
+}
+
+// modelDeploymentRetirementTargetTerminal 报告预留当前持有的全部成员是否均已进入终态。
+func modelDeploymentRetirementTargetTerminal(plan *modelDeploymentRetirementPlan) bool {
+	if plan.held.Len() == 0 {
+		return true
+	}
+
+	for _, member := range plan.Target.Members {
+		if member.Status.Phase != core.PodFailed && member.Status.Phase != core.PodSucceeded {
+			return false
+		}
+	}
+
+	return true
+}
+
+// modelDeploymentRetirementDeleteSet 返回协议作为整体一次性删除的 Pod 集合（同一副本的所有成员同生共死）。
+func modelDeploymentRetirementDeleteSet(view modelDeploymentReplicaView) []core.Pod {
+	deletes := make([]core.Pod, 0, len(view.Members))
+	for _, member := range view.Members {
+		deletes = append(deletes, *member)
+	}
+
+	return deletes
+}
+
 // modelDeploymentNow 读取时钟；时钟作为字段而非直接调用 time.Now，使测试可以将时间预算
 // （例如预留的各个阶段或弹性重试的退避时间）设定在任意时刻，而不必实际等待时间流逝。
 func (r *ModelDeploymentReconciler) modelDeploymentNow() time.Time {
@@ -299,12 +735,358 @@ func (r *ModelDeploymentReconciler) modelDeploymentNow() time.Time {
 	return r.clock()
 }
 
+// observeModelDeploymentRetirementResidual 检查是否仍有路由器宣称正在服务目标的任一成员，
+// 以及该问题当前是否可被可靠观测。
+//
+// 未配置路由器的部署无法观测直连 Service 上已有长连接是否静默，因此保守保持阻塞。
+// 配置路由器时复用统一观测收集与聚合规则，并逐成员核对 Bound 与 RecentDispatch，防止漏检刚分发的请求。
+func (r *ModelDeploymentReconciler) observeModelDeploymentRetirementResidual(
+	ctx context.Context, md *workercore.ModelDeployment, held sets.Set[types.UID],
+) (string, bool) {
+	if md.Spec.Router == nil {
+		return "this deployment declares no router, so the established direct-Service connections " +
+			"this target's service may still hold cannot be observed; the operation holds", true
+	}
+	ctx, cancel := r.modelDeploymentRouterObservationContext(ctx, md)
+	defer cancel()
+
+	pods, err := r.listModelDeploymentPods(ctx, md)
+	if err != nil {
+		return "the deployment's pods could not be listed: " + err.Error(), true
+	}
+	live := make([]*core.Pod, 0, len(pods))
+	for i := range pods {
+		live = append(live, &pods[i])
+	}
+
+	observations, failure := r.collectModelDeploymentRouterObservations(ctx, md, live)
+	if failure != "" {
+		return failure, true
+	}
+
+	answer := aggregateModelDeploymentServing(true, observations, modelDeploymentServingFreshness)
+	switch answer.State {
+	case workercore.ModelDeploymentServingStateUnknown:
+		return answer.Reason, true
+	case workercore.ModelDeploymentServingStateNotConverged:
+		return answer.Reason, true
+	}
+
+	serving := sets.New[types.UID]()
+	// 分发日志（RecentDispatch）仅用于检查目标是否刚刚收到过分发，不计入服务副本数；
+	// 只要命中被持有目标，就继续等待，不影响无关存活副本。
+	dispatched := sets.New[types.UID]()
+	for _, observation := range observations {
+		for _, endpoint := range observation.Bound {
+			if endpoint.Serving {
+				serving.Insert(endpoint.PodUID)
+			}
+		}
+		for _, endpoint := range observation.RecentDispatch {
+			dispatched.Insert(endpoint.PodUID)
+		}
+	}
+
+	residual := sets.New[types.UID]()
+	for uid := range serving {
+		if held.Has(uid) {
+			residual.Insert(uid)
+		}
+	}
+	for uid := range dispatched {
+		if held.Has(uid) {
+			residual.Insert(uid)
+		}
+	}
+	if residual.Len() == 0 {
+		return "", false
+	}
+
+	names := make([]string, 0, residual.Len())
+	for uid := range residual {
+		names = append(names, string(uid))
+	}
+	slices.Sort(names)
+
+	return strconvx.Itoa(len(names)) + " target members are still served: " +
+		strings.Join(names, ", "), true
+}
+
+// observeModelDeploymentRetirementDrained 检查目标所有需要作答的成员是否连续两次被观测为空闲。
+//
+// 不要求原 role 仍存在于 spec 中（删除角色本身就是常见退场场景），形态直接由目标成员自身命令行判定。
+// 分离形态先等待交接宽限期（modelDeploymentRetirementDisaggregatedGraceWindow），再连续读取两次
+// 排空状态并对每个预期指标逐项验零，避免单次瞬时读零导致误删在途流量。
+func (r *ModelDeploymentReconciler) observeModelDeploymentRetirementDrained(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) (string, bool) {
+	role := modelDeploymentRetirementRole(md, plan)
+	externalDP, renderReason := modelDeploymentRetirementRenderedExternalDP(md, plan.Target.Members)
+	if renderReason != "" {
+		return renderReason, false
+	}
+	if len(plan.Target.Members) == 0 {
+		return "the replica has no members to read", false
+	}
+	if !externalDP.known {
+		return "a member carries no engine container to read, so the replica's own command line could " +
+			"not be established", false
+	}
+	if disaggregated, reason := modelDeploymentRetirementDisaggregated(md, plan.Target.Members); reason != "" {
+		return reason, false
+	} else if disaggregated && (plan.Reservation.PhaseStartedAt.IsZero() ||
+		r.modelDeploymentNow().Sub(plan.Reservation.PhaseStartedAt.Time) < modelDeploymentRetirementDisaggregatedGraceWindow) {
+		return fmt.Sprintf(
+			"the %s disaggregated handoff grace window is in progress because a disaggregated replica has no verifiable decoder-side release",
+			modelDeploymentRetirementDisaggregatedGraceWindow,
+		), false
+	}
+
+	answering, reason := r.modelDeploymentRetirementDrainMembers(md, plan)
+	if reason != "" {
+		return reason, false
+	}
+
+	reader := r.modelDeploymentDrainReaderOf()
+	for _, member := range answering {
+		target := modelDeploymentRetirementDrainTarget(md, role, plan, member)
+		// 同一轮连续读取两次，两次均需完整且所有预期队列指标为零，避免两次请求间隙的偶然零值误放行。
+		for read := 1; read <= 2; read++ {
+			answer, err := reader.Drain(ctx, target)
+			if err != nil {
+				return fmt.Sprintf("member %s could not be read: %v", member.Name, err), false
+			}
+			if reason, idle := modelDeploymentDrainMemberIdle(member, target, answer); !idle {
+				return reason, false
+			}
+		}
+	}
+
+	return "", true
+}
+
+// modelDeploymentRetirementRenderedExternalDP 从各成员实际渲染的命令行读取副本是否采用外部 DP 负载均衡，
+// 以确定排空时应读取全部成员还是仅读取 leader。
+func modelDeploymentRetirementRenderedExternalDP(
+	md *workercore.ModelDeployment, members []*core.Pod,
+) (modelDeploymentRetirementCommand, string) {
+	var answer modelDeploymentRetirementCommand
+	var missing bool
+	for _, member := range members {
+		externalDP, known := modelDeploymentRetirementMemberExternalDP(md, member)
+		if !known {
+			missing = true
+
+			continue
+		}
+		if answer.known && answer.answer != externalDP {
+			return modelDeploymentRetirementCommand{}, "the replica's members disagree on whether it " +
+				"is disaggregated, so its shape could not be established"
+		}
+		answer = modelDeploymentRetirementCommand{answer: externalDP, known: true}
+	}
+	// 只要有任一成员无法读取，整个副本就视为不可读，防止依据部分成员误判。
+	answer.known = answer.known && !missing
+
+	return answer, ""
+}
+
+// modelDeploymentRetirementCommand 记录成员命令行给出的布尔判断以及是否全部成员均成功读取。
+type modelDeploymentRetirementCommand struct {
+	answer bool
+	known  bool
+}
+
+// modelDeploymentRetirementAnsweringShape 根据实际成员 Pod 判定副本的响应形态。
+func modelDeploymentRetirementAnsweringShape(
+	md *workercore.ModelDeployment, members []*core.Pod,
+) (modelDeploymentAnsweringShape, string) {
+	externalDP, size, reason := modelDeploymentRetirementReplicaFacts(md, members)
+	if reason != "" {
+		return modelDeploymentAnsweringUnknown, reason
+	}
+
+	return modelDeploymentAnsweringShapeOf(externalDP, size), ""
+}
+
+// modelDeploymentRetirementReplicaFacts 从存活成员中提取推导响应形态所需的两个事实（外部 DP 与规模）。
+func modelDeploymentRetirementReplicaFacts(
+	md *workercore.ModelDeployment, members []*core.Pod,
+) (externalDP bool, size int, reason string) {
+	size = len(members)
+	if size == 0 {
+		return false, 0, "the replica has no members to read"
+	}
+
+	command, cmdReason := modelDeploymentRetirementRenderedExternalDP(md, members)
+	if cmdReason != "" {
+		return false, 0, cmdReason
+	}
+	if !command.known {
+		return false, 0, "a member carries no engine container to read, so the replica's own command " +
+			"line could not be established"
+	}
+
+	shape := modelDeploymentDeployedReplicaShape(modelDeploymentReplicaView{Members: members})
+	if !shape.modelDeploymentReplicaIsWhole() {
+		return false, 0, shape.Reason
+	}
+
+	return command.answer, size, ""
+}
+
+// modelDeploymentRetirementMemberExternalDP 读取单个成员的负载均衡形态；缺少主容器时 known 返回 false。
+func modelDeploymentRetirementMemberExternalDP(
+	md *workercore.ModelDeployment, member *core.Pod,
+) (externalDP, known bool) {
+	container, found := modelDeploymentDrainContainerOf(member, modelDeploymentMainContainerName)
+	if !found {
+		return false, false
+	}
+
+	reading, err := scanModelDeploymentParallelism(modelDeploymentRetirementEngine(md),
+		container.Command, modelDeploymentContainerEnv(container))
+	if err != nil {
+		return false, true
+	}
+	shape, _ := modelDeploymentLoadBalance(modelDeploymentRetirementEngine(md),
+		modelDeploymentRoleKindFromUpstream(member.Labels[modelDeploymentLabelKeyRoleKind]),
+		modelDeploymentContainerEnv(container), reading.declared)
+	return shape == workercore.ModelDeploymentLoadBalanceExternal ||
+		shape == workercore.ModelDeploymentLoadBalanceHybrid ||
+		shape == workercore.ModelDeploymentLoadBalanceMultiPort, true
+}
+
+func modelDeploymentRetirementDisaggregated(md *workercore.ModelDeployment, members []*core.Pod) (bool, string) {
+	engine := modelDeploymentRetirementEngine(md)
+	var answer modelDeploymentRetirementCommand
+	for _, member := range members {
+		kind := strings.ToLower(member.Labels[modelDeploymentLabelKeyRoleKind])
+		if kind == "" && md != nil {
+			roleName := modelDeploymentPodRole(member)
+			for i := range md.Spec.Roles {
+				if md.Spec.Roles[i].Name == roleName {
+					if k, ok := ModelDeploymentRoleUpstreamKind(
+						ModelDeploymentEffectiveRoleKind(&md.Spec.Roles[i]),
+					); ok {
+						kind = k
+					}
+					break
+				}
+			}
+		}
+		container, found := modelDeploymentDrainContainerOf(member, modelDeploymentMainContainerName)
+		if !found {
+			return false, "a member has no engine container to classify"
+		}
+		reading, err := scanModelDeploymentParallelism(engine,
+			container.Command, modelDeploymentContainerEnv(container))
+		if err != nil {
+			return false, "the member's parallelism could not be read: " + err.Error()
+		}
+		shape, reason := modelDeploymentLoadBalance(engine,
+			modelDeploymentRoleKindFromUpstream(kind),
+			modelDeploymentContainerEnv(container), reading.declared)
+		if shape == workercore.ModelDeploymentLoadBalanceUnknown {
+			return false, reason
+		}
+		disaggregated := kind == "prefill" || kind == "decode" ||
+			modelDeploymentDrainSGLangDisaggregationMode(container.Command) != "" ||
+			shape == workercore.ModelDeploymentLoadBalanceExternal ||
+			shape == workercore.ModelDeploymentLoadBalanceHybrid ||
+			shape == workercore.ModelDeploymentLoadBalanceMultiPort
+		if answer.known && answer.answer != disaggregated {
+			return false, "the replica's members disagree on whether it is disaggregated, so its shape could not be established"
+		}
+		answer = modelDeploymentRetirementCommand{answer: disaggregated, known: true}
+	}
+	return answer.answer, ""
+}
+
 func modelDeploymentContainerEnv(container *core.Container) []workercore.ModelDeploymentEnvVar {
 	env := make([]workercore.ModelDeploymentEnvVar, 0, len(container.Env))
 	for _, entry := range container.Env {
 		env = append(env, workercore.ModelDeploymentEnvVar{Name: entry.Name, Value: entry.Value})
 	}
 	return env
+}
+
+// modelDeploymentRetirementDrainMembers 返回排空阶段需要采样观测的成员列表（不缩小预留绑定的删除 UID 集合）。
+func (r *ModelDeploymentReconciler) modelDeploymentRetirementDrainMembers(
+	md *workercore.ModelDeployment,
+	plan *modelDeploymentRetirementPlan,
+) ([]*core.Pod, string) {
+	shape, reason := modelDeploymentRetirementAnsweringShape(md, plan.Target.Members)
+	if reason != "" {
+		return nil, reason
+	}
+
+	return modelDeploymentAnsweringMembers(shape, plan.Target.Members)
+}
+
+// modelDeploymentRetirementReplicaIsEncode 根据成员 Pod 自身携带的角色类型标签判断副本是否为 encoder。
+// 全部成员均标记为 encode 才返回 true，成员不一致时走常规队列路径以保证故障安全。
+func modelDeploymentRetirementReplicaIsEncode(members []*core.Pod) bool {
+	if len(members) == 0 {
+		return false
+	}
+
+	upstream, ok := ModelDeploymentRoleUpstreamKind(workercore.ModelDeploymentRoleKindEncode)
+	if !ok {
+		return false
+	}
+	for _, member := range members {
+		if member.Labels[modelDeploymentLabelKeyRoleKind] != upstream {
+			return false
+		}
+	}
+
+	return true
+}
+
+// modelDeploymentRetirementDrainTarget 构造针对单个成员的排空观测目标，显式固定容器名、引擎与部署 UID。
+func modelDeploymentRetirementDrainTarget(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
+	plan *modelDeploymentRetirementPlan, member *core.Pod,
+) modelDeploymentDrainTarget {
+	return modelDeploymentDrainTarget{
+		PodUID:        member.UID,
+		Container:     modelDeploymentMainContainerName,
+		Role:          modelDeploymentRetirementRoleName(role, plan),
+		Engine:        modelDeploymentRetirementEngine(md),
+		DeploymentUID: md.UID,
+	}
+}
+
+// modelDeploymentDrainMemberIdle 依据排空读取结果逐项校验单成员是否真正空闲，不满足时返回可读原因。
+func modelDeploymentDrainMemberIdle(
+	member *core.Pod, target modelDeploymentDrainTarget, answer modelDeploymentDrainAnswer,
+) (string, bool) {
+	switch answer.State {
+	case modelDeploymentDrainUnsupported:
+		return "member " + member.Name + " reports no in-flight measurement: " + answer.Reason, false
+	case modelDeploymentDrainUnknown:
+		return "member " + member.Name + " is unobserved: " + answer.Reason, false
+	case modelDeploymentDrainBusy:
+		return "member " + member.Name + " still holds " +
+			modelDeploymentDrainSeriesTotal(answer.Series), false
+	}
+
+	if !answer.Complete {
+		return "member " + member.Name + " returned an incomplete envelope", false
+	}
+	if missing := modelDeploymentDrainMissingSeries(target.Engine, answer.Series); len(missing) > 0 {
+		return "member " + member.Name + " is missing " + strings.Join(missing, ", "), false
+	}
+	if invalid := modelDeploymentDrainUnusableSeries(target.Engine, answer.Series); len(invalid) > 0 {
+		return "member " + member.Name + " reported unusable activity in " +
+			strings.Join(invalid, ", "), false
+	}
+	if busy := modelDeploymentDrainActiveSeries(target.Engine, answer.Series); len(busy) > 0 {
+		return "member " + member.Name + " still holds activity in " + strings.Join(busy, ", "), false
+	}
+
+	return "", true
 }
 
 // modelDeploymentDrainActivityValue 报告一个 gauge 数值是否可被解读为有效活动量。
@@ -315,6 +1097,324 @@ func modelDeploymentContainerEnv(container *core.Container) []workercore.ModelDe
 // 被拒绝的值在判定处也以完全相同的方式被拒绝。
 func modelDeploymentDrainActivityValue(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
+}
+
+// modelDeploymentDrainUnusableSeries 列出预期指标中数值非有效活动量（NaN/Inf/负数）的指标名。
+func modelDeploymentDrainUnusableSeries(engine string, series map[string]float64) []string {
+	expected, known := modelDeploymentInFlightMetrics[engine]
+	if !known {
+		return []string{"a measurement for engine " + engine}
+	}
+
+	unusable := make([]string, 0, len(expected))
+	for _, metric := range expected {
+		if value, present := series[metric]; present && !modelDeploymentDrainActivityValue(value) {
+			unusable = append(unusable, metric)
+		}
+	}
+	sort.Strings(unusable)
+
+	return unusable
+}
+
+// modelDeploymentDrainActiveSeries 列出预期指标中数值不为零的指标名。
+func modelDeploymentDrainActiveSeries(engine string, series map[string]float64) []string {
+	expected, known := modelDeploymentInFlightMetrics[engine]
+	if !known {
+		return []string{"a measurement for engine " + engine}
+	}
+
+	active := make([]string, 0, len(expected))
+	for _, metric := range expected {
+		if value := series[metric]; value != 0 {
+			active = append(active, metric)
+		}
+	}
+	sort.Strings(active)
+
+	return active
+}
+
+// modelDeploymentDrainMissingSeries 列出本次采样缺失的预期在途指标名，预期清单直接复用全局映射表。
+func modelDeploymentDrainMissingSeries(engine string, series map[string]float64) []string {
+	expected, known := modelDeploymentInFlightMetrics[engine]
+	if !known {
+		return []string{"a measurement for engine " + engine}
+	}
+
+	missing := make([]string, 0, len(expected))
+	for _, metric := range expected {
+		if _, present := series[metric]; !present {
+			missing = append(missing, metric)
+		}
+	}
+
+	return missing
+}
+
+// modelDeploymentDrainSeriesTotal 汇总采样到的在途请求总数，供阻塞原因文案展示。
+func modelDeploymentDrainSeriesTotal(series map[string]float64) string {
+	total := 0.0
+	for _, value := range series {
+		total += value
+	}
+
+	return fmt.Sprintf("%.0f", total) + " in flight"
+}
+
+// modelDeploymentRetirementEngine 返回目标副本对应的引擎名；缺省时回退为 vLLM。
+func modelDeploymentRetirementEngine(md *workercore.ModelDeployment) string {
+	if md.Spec.Engine.Name == "" {
+		return workercore.ModelDeploymentEngineVLLM
+	}
+
+	return md.Spec.Engine.Name
+}
+
+// modelDeploymentRetirementRoleName 返回目标所属角色名；即使 spec 已删除该角色，预留中仍保留其名称。
+func modelDeploymentRetirementRoleName(
+	role *workercore.ModelDeploymentRole, plan *modelDeploymentRetirementPlan,
+) string {
+	if role != nil {
+		return role.Name
+	}
+
+	return plan.Reservation.RoleName
+}
+
+// modelDeploymentRetirementRole 在当前 spec 中查找预留指向的角色；已被删除则返回 nil。
+func modelDeploymentRetirementRole(
+	md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) *workercore.ModelDeploymentRole {
+	for i := range md.Spec.Roles {
+		if md.Spec.Roles[i].Name == plan.Reservation.RoleName {
+			return &md.Spec.Roles[i]
+		}
+	}
+
+	return nil
+}
+
+// adoptsModelDeploymentRetirement 判断在 spec 重新声明相同且健康未变的副本时，能否取消删除前预留并收编该副本。
+//
+// 必须同时满足三个条件：spec 重新包含该 ordinal、存活成员与预留 UID 集合完全一致、且除预留本身外其余
+// 健康资格维度全部通过。恢复端点资格标签时若中途出错则回滚已写标签并要求重试。
+func (r *ModelDeploymentReconciler) adoptsModelDeploymentRetirement(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+	pods []core.Pod,
+) (bool, bool) {
+	if (plan.Reservation.State != workercore.ModelDeploymentRetirementStateAdmitted &&
+		plan.Reservation.State != workercore.ModelDeploymentRetirementStateDisqualified &&
+		plan.Reservation.State != workercore.ModelDeploymentRetirementStateWithdrawing &&
+		plan.Reservation.State != workercore.ModelDeploymentRetirementStateDraining &&
+		plan.Reservation.State != workercore.ModelDeploymentRetirementStateAborted) ||
+		plan.held.Len() == 0 {
+		return false, false
+	}
+	if plan.Reservation.State != workercore.ModelDeploymentRetirementStateAborted &&
+		md.Generation < plan.Reservation.ObservedGeneration {
+		return false, false
+	}
+
+	role := modelDeploymentRetirementRole(md, plan)
+	if role == nil || int(role.Replicas) <= int(plan.Reservation.ReplicaOrdinal) {
+		return false, false
+	}
+	if plan.held.Len() != len(plan.Reservation.TargetMemberUIDs) ||
+		len(plan.Target.Members) != len(plan.Reservation.TargetMemberUIDs) {
+		return false, false
+	}
+	if len(modelDeploymentRetirementReplicaMembers(
+		pods, plan.Reservation.RoleName, int(plan.Reservation.ReplicaOrdinal),
+	)) != len(plan.Reservation.TargetMemberUIDs) {
+		return false, false
+	}
+
+	members := make([]core.Pod, 0, len(plan.Target.Members))
+	for _, member := range plan.Target.Members {
+		members = append(members, *member)
+	}
+	fetch := r.groupForwardFetch
+	if fetch == nil {
+		fetch = defaultGroupForwardFetch
+	}
+	qualifications := qualifyModelDeploymentInstances(
+		ctx, md, members, modelDeploymentPendingReplacement{}, fetch,
+	)
+	for _, qualification := range qualifications {
+		if qualification.View.Role == plan.Reservation.RoleName &&
+			qualification.View.Ordinal == int(plan.Reservation.ReplicaOrdinal) {
+			if !modelDeploymentRetirementAdoptable(qualification) {
+				return false, false
+			}
+			var patched []*core.Pod
+			for _, member := range plan.Target.Members {
+				if member.Labels[modelDeploymentLabelKeyEndpointEligible] != modelDeploymentEndpointEligibleValue {
+					base := member.DeepCopy()
+					candidate := member.DeepCopy()
+					if candidate.Labels == nil {
+						candidate.Labels = map[string]string{}
+					}
+					candidate.Labels[modelDeploymentLabelKeyEndpointEligible] = modelDeploymentEndpointEligibleValue
+					if r.Client != nil {
+						if err := r.Client.Patch(ctx, candidate, ctrlcli.MergeFrom(base)); err != nil {
+							ctrllog.FromContext(ctx).Error(
+								err, "failed to restore endpoint eligibility on adopted retirement member",
+								"pod", member.Name,
+							)
+							for _, restored := range patched {
+								withdrawn := restored.DeepCopy()
+								delete(withdrawn.Labels, modelDeploymentLabelKeyEndpointEligible)
+								if err := r.Client.Patch(ctx, withdrawn, ctrlcli.MergeFrom(restored.DeepCopy())); err != nil {
+									ctrllog.FromContext(ctx).Error(
+										err, "failed to roll back endpoint eligibility", "pod", restored.Name,
+									)
+								}
+								delete(restored.Labels, modelDeploymentLabelKeyEndpointEligible)
+							}
+							return false, true
+						}
+					}
+					if member.Labels == nil {
+						member.Labels = map[string]string{}
+					}
+					member.Labels[modelDeploymentLabelKeyEndpointEligible] = modelDeploymentEndpointEligibleValue
+					patched = append(patched, member)
+				}
+			}
+			if r.Recorder != nil {
+				r.Recorder.Event(md, core.EventTypeNormal, "RetirementAdopted",
+					"the declared replica was healthy and its retirement reservation was cancelled")
+			}
+			return true, false
+		}
+	}
+
+	return false, false
+}
+
+// modelDeploymentRetirementAdoptable 判断被保留副本在忽略 NoPlannedRetirement 这一预留项本身外，
+// 其余全部健康资格维度是否均已验证通过。
+func modelDeploymentRetirementAdoptable(qualification modelDeploymentInstanceQualification) bool {
+	for _, leg := range qualification.Legs {
+		if leg.Name == modelDeploymentLegNoPlannedRetirement {
+			continue
+		}
+		if leg.Verdict != modelDeploymentLegVerified {
+			return false
+		}
+	}
+
+	return true
+}
+
+// consumeModelDeploymentRetry 处理重试注解，并严格保证执行顺序：
+//  1. 若 token 与已消费 token 相同则视为重放，直接清理注解且不改状态；
+//  2. 否则先将新 token 与回退至 Admitted 的状态一同持久化到服务端；
+//  3. 仅在状态落盘成功后再清理重试注解。
+//
+// 这样即使在第 2 步与第 3 步之间崩溃，下一轮会命中分支 1 仅清理注解，绝不会丢失指令或重复触发重试。
+func (r *ModelDeploymentReconciler) consumeModelDeploymentRetry(
+	ctx context.Context, md *workercore.ModelDeployment, plan *modelDeploymentRetirementPlan,
+) bool {
+	logger := ctrllog.FromContext(ctx)
+
+	directive, present := md.Annotations[modelDeploymentRetirementRetryAnnotation]
+	if !present {
+		return false
+	}
+	roleName, ordinal, token, ok := parseModelDeploymentRetirementRetry(directive)
+	if !ok {
+		logger.Info("refusing a malformed retirement retry directive", "directive", directive)
+
+		return false
+	}
+	if roleName != plan.Reservation.RoleName || ordinal != int(plan.Reservation.ReplicaOrdinal) {
+		logger.Info("refusing a retirement retry directive that names another replica",
+			"directive", directive)
+
+		return false
+	}
+
+	// 重放去重必须在状态判断之前执行，确保崩溃恢复后即使状态已切回 Admitted 也能把残留注解清掉。
+	if plan.Reservation.LastConsumedRetryToken == token {
+		if err := r.clearModelDeploymentRetirementRetry(ctx, md); err != nil {
+			logger.Error(err, "clear a consumed retirement retry directive")
+		}
+
+		return false
+	}
+
+	// 仅在操作处于 Aborted 状态时接受未消费的重试指令。
+	if plan.Reservation.State != workercore.ModelDeploymentRetirementStateAborted {
+		return false
+	}
+
+	now := r.modelDeploymentNow()
+	reservation := plan.Reservation.DeepCopy()
+	reservation.LastConsumedRetryToken = token
+	reservation.State = workercore.ModelDeploymentRetirementStateAdmitted
+	reservation.Reason = "retry directive accepted"
+	reservation.StartedAt = meta.NewTime(now)
+	reservation.Deadline = meta.NewTime(now.Add(modelDeploymentRetirementOverallBudget))
+	reservation.PhaseStartedAt = meta.NewTime(now)
+
+	// 关键持久化点：写入成功后 token 即已生效，后续清理注解只是收尾动作。
+	if err := r.writeModelDeploymentRetirement(ctx, md, md.Status.Retirement, reservation); err != nil {
+		logger.Error(err, "persist a consumed retirement retry token")
+
+		return false
+	}
+
+	if err := r.clearModelDeploymentRetirementRetry(ctx, md); err != nil {
+		logger.Error(err, "clear a consumed retirement retry directive")
+	}
+
+	plan.Reservation = reservation
+	plan.Hold = true
+	plan.InFlight = true
+	plan.Deletes = nil
+	plan.DeletesAllowed = false
+
+	return true
+}
+
+// clearModelDeploymentRetirementRetry 使用带乐观锁的 merge patch 清除重试注解，防止误删并发写入的新指令。
+func (r *ModelDeploymentReconciler) clearModelDeploymentRetirementRetry(
+	ctx context.Context, md *workercore.ModelDeployment,
+) error {
+	if _, present := md.Annotations[modelDeploymentRetirementRetryAnnotation]; !present {
+		return nil
+	}
+
+	patched := md.DeepCopy()
+	delete(patched.Annotations, modelDeploymentRetirementRetryAnnotation)
+	if err := r.Client.Patch(ctx, patched, ctrlcli.MergeFromWithOptions(
+		md, ctrlcli.MergeFromWithOptimisticLock{},
+	)); err != nil {
+		return fmt.Errorf("clear the retirement retry directive: %w", err)
+	}
+	md.Annotations = patched.Annotations
+
+	return nil
+}
+
+// parseModelDeploymentRetirementRetry 严格解析三段式重试指令（roleName:ordinal:token），格式非法直接拒绝。
+func parseModelDeploymentRetirementRetry(directive string) (string, int, string, bool) {
+	parts := strings.Split(directive, ":")
+	if len(parts) != 3 {
+		return "", 0, "", false
+	}
+
+	ordinal, err := strconvx.Atoi[int](parts[1])
+	if err != nil || ordinal < 0 {
+		return "", 0, "", false
+	}
+	if parts[0] == "" || parts[2] == "" {
+		return "", 0, "", false
+	}
+
+	return parts[0], ordinal, parts[2], true
 }
 
 // errModelDeploymentReservationUnnameable 表示目标无法被标识，因此没有任何预留可以指定它。

@@ -1172,6 +1172,24 @@ type modelDeploymentGuardError struct {
 
 func (f modelDeploymentGuardError) Error() string { return f.reason }
 
+// IMPORTANT: 统一路由观测入口
+//
+// collectModelDeploymentRouterObservations 是唯一的 Router 视图收集入口，调谐期的服务观测与
+// 退场残留检查两个调用方共用此入口。过去两者各自维护了一套发现、抓取、解析与绑定逻辑，导致行为
+// 漂移，并使残留检查在服务观测不知情的超时预算下运行。
+//
+// 发现、每次读取和绑定全部在同一个 context 内执行。调用方传入截止时间时会予以保留；未设上限的
+// 调用方会获得观测预算；且单个慢 Router 无法刷新总预算，后续读取继承前次剩余时间。超时、失败
+// 或返回不可用数据的读取会在对应观测项上记为错误，使聚合结果回答 Unknown 并由残留检查保持阻塞，
+// 而不会静默变成空注册表。
+func (r *ModelDeploymentReconciler) collectModelDeploymentRouterObservations(
+	ctx context.Context, md *workercore.ModelDeployment, _ []*corev1.Pod,
+) ([]RouterServingObservation, string) {
+	observations, _, failure := r.collectModelDeploymentRouterObservationsWithMembers(ctx, md)
+
+	return observations, failure.reason
+}
+
 // collectModelDeploymentRouterObservationsWithMembers 执行收集并返回其读取的最新成员列表。
 //
 // 必须一并返回成员列表，因为分组事实是基于它计算的。每个分组的事实都会读取响应集合

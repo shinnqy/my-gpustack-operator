@@ -9,14 +9,23 @@ import (
 
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	kueuectrlconst "sigs.k8s.io/kueue/pkg/controller/constants"
 
 	worker "gpustack.ai/gpustack/api/worker/v1"
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/kubemeta"
+	"gpustack.ai/gpustack/pkg/nodefeature"
+	"gpustack.ai/gpustack/pkg/systemmeta"
 	"gpustack.ai/gpustack/pkg/systemname"
 	"gpustack.ai/gpustack/pkg/utils/json"
+	"gpustack.ai/gpustack/pkg/utils/quantityx"
 	"gpustack.ai/gpustack/pkg/utils/slicex"
 	"gpustack.ai/gpustack/pkg/utils/stringx"
+	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
+	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
 const (
@@ -307,6 +316,23 @@ func modelDeploymentSelectorLabels(
 	}
 }
 
+// IMPORTANT: 单 pod 封装函数
+// renderModelDeploymentPod 渲染完整副本 Pod：先构建角色级模板，再写入该副本成员的组元数据与指纹。
+func renderModelDeploymentPod(ctx context.Context, in ModelDeploymentRenderInput) (*core.Pod, error) {
+	// 先早模板
+	pod, err := renderModelDeploymentPodTemplate(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+
+	// 再盖钢印（写 Kueue 组名、算 spec 哈希、写多机 DNS）
+	stampModelDeploymentPod(pod, in.Deployment, in.Role, in.Ordinal, in.Member)
+
+	return pod, nil
+}
+
+// IMPORTANT: 逐行装配出“角色模板”
+//
 // renderModelDeploymentPodTemplate 渲染副本 Pod 中由其角色 spec 声明的全部内容：
 // labels、annotations、PodSpec 以及其中的所有容器。
 //
@@ -316,10 +342,327 @@ func modelDeploymentSelectorLabels(
 // 任何地方报错。connector 的 PodAnnotations 写入此处而非打标阶段，是因为它们携带的是整个角色
 // 所有副本共享的池端点与域信息。
 func renderModelDeploymentPodTemplate(ctx context.Context, in ModelDeploymentRenderInput) (*core.Pod, error) {
-	// 在第 19 章实现此函数。
-	var result0 *core.Pod
-	var result1 error
-	return result0, result1
+	md, role := in.Deployment, in.Role
+
+	// 显式声明的角色镜像始终优先：角色级镜像用于覆盖部署级默认引擎镜像（例如私有构建），
+	// 未声明角色镜像时则使用部署级引擎镜像。
+	image := role.Image
+	if image == "" {
+		image = md.Spec.Engine.Image
+	}
+	if image == "" {
+		// 经准入校验后不可达（schema 要求 spec.engine.image 非空）；显式报错以防 schema 约束变更时渲染出空镜像 Pod。
+		return nil, fmt.Errorf("role %q names no image and the deployment engine names none either", role.Name)
+	}
+
+	// IMPORTANT: 工序 1：确定镜像与计算硬件资源（GPU/CPU/内存/磁盘）
+	ress, err := deriveModelDeploymentResources(role, in.InstanceType)
+	if err != nil {
+		return nil, err
+	}
+
+	// IMPORTANT: 工序 2：拿 Kueue 队列入口
+	// 入口队列直接从 InstanceType.Status.Entrance 读取而非重新计算，保证与创建 LocalQueue 的调谐器
+	// 消费同一份事实来源，避免命名规则变化后 Pod 被路由到不存在的 LocalQueue。
+	entrance := in.InstanceType.Status.Entrance
+	if entrance == "" {
+		// InstanceType 状态尚未计算完成时拒绝渲染而非回退：缺少 queue-name 标签的 Pod 会绕过 Kueue 直接进入 kubelet。
+		return nil, fmt.Errorf(
+			"instance type %q publishes no queue entrance yet", in.InstanceType.Name,
+		)
+	}
+
+	// 替换命令行的角色拥有整条 argv，因此 operator 既不注入引擎参数，也不注入仅服务于受管参数的客户端环境变量。
+	takeOver := len(role.Command) > 0
+
+	command := role.Command
+	// 依据连接器自身的 RoutingSidecar 标志（而非传输链路存在性）判断是否前置路由代理，
+	// 并复核角色类型为 Decode，因为只有对应路由器的 decoder 才需要由代理接管对外端口。
+	directDecode := !takeOver && in.Connector.RoutingSidecar &&
+		ModelDeploymentEffectiveRoleKind(role) == workercore.ModelDeploymentRoleKindDecode
+
+	// Service 目标端口、探针端口与容器端口均来自同一个推导函数，避免 Service 转发地址与探针探测地址漂移。
+	servingPort := modelDeploymentTargetPort(md.Spec.Engine.Name, role, directDecode)
+	// declaredPorts 在此处一次性计算，供下方去重连接器合成端口，并保证 direct-decode 场景下引擎内部端口
+	// 避开角色声明的全部端口，而非仅避开 Service 入口端口。未声明端口时默认只开放 servingPort。
+	declaredPorts := modelDeploymentContainerPorts(role)
+	if len(role.Ports) == 0 {
+		declaredPorts[0] = servingPort
+	}
+	// 接管模式下命令行非本 operator 构造，不假设其暴露标准健康检查，因此 gradable 为 false。
+	var (
+		scheme     core.URIScheme
+		gradable   bool
+		enginePort = servingPort.ContainerPort
+	)
+	if directDecode {
+		enginePort = modelDeploymentInternalPort
+		for modelDeploymentPortTaken(declaredPorts, enginePort) {
+			enginePort++
+		}
+	}
+	// IMPORTANT: 工序 3: 把“模型权重”翻译成挂载卷和启动参数
+	if !takeOver {
+		// 使用模型制品时，引擎从交付位置加载权重，并以 spec.model.name 对外提供服务；
+		// 当模型参数变为挂载路径或仓库名时，通过默认 --served-model-name 保持服务名不变。
+		model, defaulted := md.Spec.Model.Name, in.Connector.DefaultedArgs
+		if in.Artifact != nil {
+			// 返回引擎启动命令中指定的模型标识
+			model = in.Artifact.model()
+			defaulted = append(slices.Clone(defaulted), []string{ModelDeploymentServedModelNameArg, md.Spec.Model.Name})
+		}
+		// IMPORTANT: 工序 4：拼装推理引擎的启动命令与端口对齐
+		command, err = ModelDeploymentEngineCommand(md.Spec.Engine.Name, model)
+		if err != nil {
+			return nil, err
+		}
+		if in.Artifact != nil {
+			command = append(command, in.Artifact.args()...)
+		}
+		command = append(command, in.Connector.Args...)
+		command = append(command, modelDeploymentDefaultedArgs(defaulted, role.ExtraArgs)...)
+		command = append(command, role.ExtraArgs...)
+
+		// IMPORTANT: 工序 5：协议探测与 K8s 三大健康探针
+		//
+		// 在填充监听参数之前先分析传输协议，且扫描与填充逻辑完全相同的参数列表。
+		// 端口是否仍由 operator 控制取决于填充前命令行中已有的参数；若此处扫描的范围更窄，
+		// 连接器带入的监听标志会被填充跳过却对门控不可见，导致两者判断不一致。
+		scheme, gradable = modelDeploymentEngineTransport(md.Spec.Engine.Name, command)
+		command = appendModelDeploymentBindArgs(md.Spec.Engine.Name, command, enginePort)
+		listenPort, listenErr := modelDeploymentCommandPort(md.Spec.Engine.Name, command)
+		if !directDecode && (listenErr != nil || listenPort != servingPort.ContainerPort) {
+			// 引擎未监听在 Service 指向的端口上（只可能出现在角色声明端口与自身 --port 不一致且
+			// 对象早于准入规则存储的场景）。此时门控无论指向哪一方都无法代表真实流量入口，直接撤回探针。
+			gradable = false
+		}
+		if directDecode {
+			enginePort, err = listenPort, listenErr
+			if err != nil {
+				return nil, fmt.Errorf("role %q cannot place its routing proxy: %w", role.Name, err)
+			}
+			for _, declared := range declaredPorts {
+				if enginePort == declared.ContainerPort {
+					return nil, fmt.Errorf(
+						"role %q places its model server on port %d, which the role already "+
+							"declares as %q", role.Name, enginePort, declared.Name,
+					)
+				}
+			}
+			gradable = true
+		}
+	}
+
+	// 连接器的卷与挂载项由上游成对生成，且与下方写入的 Pod 注解作为一个整体生效：卷通过 downwardAPI
+	// 投影其中一条注解，若只挂卷不写注解会得到空文件。对于通过环境变量配置的引擎，两者均为空，
+	// 因此此处无需再按引擎分叉。
+	//
+	// 接管模式的角色既不获得连接器卷和注解，也不获得合成参数和客户端环境变量：
+	// operator 没有构造其命令行，不能假定容器会消费这些缓存配置。
+	vols, mounts := convertModelDeploymentAdditionalVolumes(role.AdditionalVolumes)
+	if in.Artifact != nil {
+		artifactVols, artifactMounts := in.Artifact.volumes(takeOver)
+		vols = append(vols, artifactVols...)
+		mounts = append(mounts, artifactMounts...)
+	}
+	if !takeOver {
+		vols = append(vols, in.Connector.Volumes...)
+		mounts = append(mounts, in.Connector.VolumeMounts...)
+		// 除非角色自带卷已覆盖该路径，否则所有受管角色都在固定容器路径挂载编译缓存，并映射到宿主机上
+		// 属于该角色的独立子目录。这样引擎只需一个固定的缓存根目录环境变量，无需感知具体权重、并行形状
+		// 或标志组合，同时宿主机侧按角色哈希隔离，防止不同角色互相覆盖生成的核函数。若用户卷已经挂载在
+		// 该路径（或其内/外层），operator 像 /dev/shm 一样让出默认宿主机卷。使用默认宿主机卷时，如果无法
+		// 计算缓存子路径必须直接报错而不是静默省略缓存：让毫无关系的两个角色共享同一根目录正是隔离机制
+		// 要防止的冲突。
+		if !modelDeploymentCompileCacheMountOverridden(mounts) {
+			compileCacheSubPath, err := BuildModelDeploymentCompileCacheSubPath(
+				ModelDeploymentCompileCacheInput{
+					Deployment:   md,
+					Role:         role,
+					InstanceType: in.InstanceType,
+					Artifact:     in.Artifact,
+				},
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"role %q cannot place its compilation cache: %w", role.Name, err,
+				)
+			}
+			cacheVolume, cacheMount := modelDeploymentCompileCacheVolumes(compileCacheSubPath)
+			vols = append(vols, cacheVolume)
+			mounts = append(mounts, cacheMount)
+		}
+	}
+	vols, mounts = modelDeploymentSharedMemoryVolumes(role, vols, mounts)
+
+	probePath := modelDeploymentProbePath
+	probeScheme := scheme
+	if directDecode {
+		probeScheme = core.URISchemeHTTP
+		probePath = modelDeploymentDirectDecodeProbePath
+	}
+	// IMPORTANT: 工序 5：协议探测与 K8s 三大健康探针
+	startupProbe, readinessProbe, livenessProbe := modelDeploymentProbes(
+		servingPort, probeScheme, probePath, gradable,
+		modelDeploymentProbesEncoderStage(md, role, takeOver), role.StartupTimeoutSeconds,
+	)
+	ports, err := appendModelDeploymentConnectorPorts(declaredPorts, in.Connector, takeOver)
+	if err != nil {
+		return nil, err
+	}
+	if directDecode {
+		ports[0].Name = "model-server"
+		ports[0].ContainerPort = enginePort
+	}
+
+	// IMPORTANT: 工序 6：环境变量分层、安全能力与内核参数
+	mainC := core.Container{
+		Name:            modelDeploymentMainContainerName,
+		Image:           image,
+		ImagePullPolicy: role.ImagePullPolicy,
+		Command:         command,
+		Resources: getResourceRequirements(
+			ress, in.InstanceType, true, in.GeneralResourcesOvercommit, true, false,
+		),
+		Ports:          ports,
+		Env:            mergeModelDeploymentEnv(md.Spec.Engine.Name, role, in.Connector, in.Artifact, takeOver),
+		VolumeMounts:   mounts,
+		StartupProbe:   startupProbe,
+		ReadinessProbe: readinessProbe,
+		LivenessProbe:  livenessProbe,
+	}
+	if in.Artifact != nil {
+		// 将引擎下载缓存的上限叠加到主容器的 ephemeral-storage limit 上，同时保持 request 不变。
+		in.Artifact.raiseEphemeralStorageLimit(&mainC, takeOver)
+	}
+	if role.Resources != nil && role.Resources.Interface != nil && role.Resources.Interface.Sign() > 0 {
+		if in.InterfaceResource == "" {
+			return nil, fmt.Errorf("role %q requests interfaces without a fabric resource", role.Name)
+		}
+		mainC.Resources.Limits[in.InterfaceResource] = role.Resources.Interface.DeepCopy()
+	}
+	if role.Privileged {
+		mainC.SecurityContext = &core.SecurityContext{Privileged: ptr.To(true)}
+	} else if modelDeploymentRoleNeedsEngramCapabilities(md.Spec.Engine.Name, role, command) {
+		mainC.SecurityContext = &core.SecurityContext{
+			Capabilities: &core.Capabilities{
+				// IPC_LOCK 用于锁定 Engram 表注册给 UVA 访问的宿主机内存，SYS_RESOURCE 允许运行时按需提高锁内存上限。
+				Add: []core.Capability{"IPC_LOCK", "SYS_RESOURCE"},
+			},
+		}
+	}
+	// 接管模式角色不注入排空 hook，原因与不注入探针相同：operator 未构造其命令行，无法保证容器提供 hook 所需的指标接口。
+	if !takeOver {
+		mainC.Lifecycle = &core.Lifecycle{
+			// IMPORTANT: 工序 8：容器退出前的最后防线: preStop 排空钩子
+			PreStop: modelDeploymentDrainHook(md.Spec.Engine.Name, enginePort, scheme,
+				modelDeploymentTerminationGracePeriodSeconds(role)),
+		}
+	}
+
+	pod := &core.Pod{
+		ObjectMeta: meta.ObjectMeta{
+			// 名称留空并仅渲染前缀：spec 声明的是可互换的副本数量，不为单个副本预设身份，
+			// 区分各实例的随机后缀由 API server 在创建时分配。替换副本是一个新实例并获得新后缀，
+			// 绝不沿用被替换副本的名称。
+			GenerateName: md.Name + "-" + role.Name + "-",
+			Namespace:    md.Namespace,
+			Labels:       modelDeploymentPodLabels(md, role, entrance),
+		},
+		Spec: core.PodSpec{
+			// 推理副本不是交互式 Shell 环境，无需访问 Kubernetes API，也不启用服务环境变量注入。
+			AutomountServiceAccountToken: ptr.To(false),
+			EnableServiceLinks:           ptr.To(false),
+			// 滚动策略为重建替换，退出的副本由新创建的 Pod 替代而非原地以陈旧 spec 重启。
+			RestartPolicy:    core.RestartPolicyAlways,
+			ImagePullSecrets: role.ImagePullSecrets,
+			Volumes:          vols,
+			Containers:       []core.Container{mainC},
+		},
+	}
+	// IMPORTANT: EPD 软亲和性。多模态部署有 Encode（视觉编码）、Prefill、Decode 三种角色。
+	//
+	// 同节点软亲和偏好属于模板的一部分，确保同角色所有副本携带一致的调度项并被 spec 哈希覆盖。
+	// 它与创建时注入的节点级条件互补：后者写入 NodeAffinity，与 PodAffinity 互不重叠。
+	if podAffinity := modelDeploymentEPDPodAffinity(md, role); podAffinity != nil {
+		if pod.Spec.Affinity == nil {
+			pod.Spec.Affinity = &core.Affinity{}
+		}
+		pod.Spec.Affinity.PodAffinity = podAffinity
+	}
+	// 排空 hook 所依据的宽限期与 hook 配套写入；接管模式副本仅在角色显式指定时写入，
+	// 未指定时保持引入该特性前原有的 Pod 渲染结果。
+	if !takeOver {
+		pod.Spec.TerminationGracePeriodSeconds = ptr.To(modelDeploymentTerminationGracePeriodSeconds(role))
+	} else if role.TerminationGracePeriodSeconds != nil {
+		pod.Spec.TerminationGracePeriodSeconds = ptr.To(*role.TerminationGracePeriodSeconds)
+	}
+	if directDecode {
+		manufacturer := in.InstanceType.Status.Detail.Manufacturer
+		// IMPORTANT: Direct-Decode 路由代理
+		sidecar := renderModelDeploymentRoutingSidecar(
+			ctx, role, enginePort, scheme, md.Spec.Engine.Name, in.NativeSidecar,
+			manufacturer, in.ECConnector,
+		)
+		if in.NativeSidecar {
+			pod.Spec.InitContainers = []core.Container{sidecar}
+		} else {
+			// 传统形态将代理作为第一个普通容器放置：kubelet 按列表顺序启动普通容器，但这仅是事实顺序，
+			// 不具备原生 sidecar 的 API 保证。两种形态下真正控制流量的门控都是引擎容器探针指向代理端口，
+			// 因此在代理监听前 Pod 不会就绪。
+			//
+			// 传统形态失去的是关闭顺序保证：原生 sidecar 仅在所有普通容器退出后才被停止，而传统容器会与
+			// 引擎同时收到终止信号，删除 Pod 时代理可能先于引擎排空结束而退出，导致在途交接重置并触发调用方
+			// 重试到其他副本。引擎自身的排空 hook 无法保护传统形态的代理，且代理镜像没有 Shell 来运行独立 hook。
+			// 失去启动顺序保证则没有实质影响：引擎不会主动连接代理，引擎就绪前到达代理的请求收到 503，
+			// 引擎启动后即可自行恢复。
+			pod.Spec.Containers = append([]core.Container{sidecar}, pod.Spec.Containers...)
+		}
+	}
+	if in.RuntimeClassName != "" {
+		pod.Spec.RuntimeClassName = ptr.To(in.RuntimeClassName)
+	}
+	// Pod 级 SecurityContext 仅在此处写入：角色没有 Pod 级安全字段，特权模式落在上方主容器上，无需合并。
+	if in.TCPTWReuse && modelDeploymentTakesTCPTWReuse(md, role, in.Connector) {
+		pod.Spec.SecurityContext = &core.PodSecurityContext{
+			Sysctls: []core.Sysctl{{Name: modelDeploymentTCPTWReuseSysctl, Value: "1"}},
+		}
+	}
+
+	// 此处不针对加速器型号渲染 nodeSelector。角色接受所属资源池分配的任意 flavor：
+	// Kueue 按 PodSet 评估候选 flavor，不附加额外选择器时不会在单一资源池内人为缩小候选集。
+	systemmeta.NoteResource(pod, ModelDeploymentResourceType, map[string]string{
+		ModelDeploymentResourceNoteRole: role.Name,
+	})
+	kubemeta.ControlOnWithoutBlock(pod, md, workercore.SchemeGroupVersionKind("ModelDeployment"))
+
+	// 连接器注解属于模板输出，必须落在打标计算指纹之前。客户端配置存放在注解中而非 ConfigMap，
+	// 模板指纹覆盖了这些注解，因此池端点或域变化时会改变哈希并触发副本重建以获取新配置；
+	// 若放到打标之后写入，指纹会感知不到配置变化，导致旧副本静默持有过期配置且无报错。
+	//
+	// 使用与投影卷相同的接管判断：替换命令行的角色不接收任何连接器配置，只给一半比完全不给更糟。
+	if !takeOver && len(in.Connector.PodAnnotations) > 0 {
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string, len(in.Connector.PodAnnotations)+2)
+		}
+		for k, v := range in.Connector.PodAnnotations {
+			pod.Annotations[k] = v
+		}
+	}
+	if !takeOver {
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string, 5)
+		}
+		for key, value := range modelDeploymentMetricsAnnotations(enginePort, scheme) {
+			pod.Annotations[key] = value
+		}
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string, 1)
+	}
+	pod.Annotations[modelDeploymentTemplateBindingHashAnnotation] = modelDeploymentBindingHash(in, *ress)
+
+	return pod, nil
 }
 
 // modelDeploymentStampRouterCandidate 标记作为路由候选者的已渲染 Pod。
@@ -384,6 +727,39 @@ func modelDeploymentSharedMemoryVolumes(
 	}
 
 	return vols, mounts
+}
+
+// modelDeploymentTCPTWReuseSysctl 允许内核为新的出站连接复用处于 TIME-WAIT 状态的端口。
+// 该 sysctl 按网络命名空间隔离，仅影响 Pod 自身网络命名空间而不影响宿主机。
+const modelDeploymentTCPTWReuseSysctl = "net.ipv4.tcp_tw_reuse"
+
+// modelDeploymentTakesTCPTWReuse 报告在开关启用时角色 Pod 是否携带 modelDeploymentTCPTWReuseSysctl：
+// 仅适用于由本 operator 渲染了传输链路的 SGLang prefill 角色。
+//
+// 发起连接的是 prefill 端。SGLang 的 Mooncake 传输引擎每次传输都会向 decode 端和各个存储成员
+// 新建 TCP 连接并先关闭它，因此 TIME-WAIT 套接字累积在 prefill 端的网络命名空间中。该 sysctl
+// 仅影响内核为出站连接挑选端口，被连接的一侧不会从中受益，而 decode 端不运行分层缓存也不会向存储写入。
+//
+// 此处不检查协议字段：operator 不给 SGLang 直连链路授予 RDMA 设备，所有实测形态均走 TCP；在不开
+// 内核 TCP 连接的链路上该 sysctl 也无副作用。vLLM 复用长连接不会积累 TIME-WAIT，因此不加该 sysctl
+// （避免对节点 kubelet 白名单增加额外要求）。接管命令行的角色同样不加，遵循与连接器一致的规则。
+func modelDeploymentTakesTCPTWReuse(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
+	connector ModelDeploymentConnectorRender,
+) bool {
+	return md.Spec.Engine.Name == workercore.ModelDeploymentEngineSGLang &&
+		len(role.Command) == 0 &&
+		connector.KVTransfer &&
+		ModelDeploymentEffectiveRoleKind(role) == workercore.ModelDeploymentRoleKindPrefill
+}
+
+func modelDeploymentMetricsAnnotations(port int32, scheme core.URIScheme) map[string]string {
+	return map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/path":   "/metrics",
+		"prometheus.io/port":   strconv.Itoa(int(port)),
+		"prometheus.io/scheme": strings.ToLower(string(scheme)),
+	}
 }
 
 // stampModelDeploymentPod 为已渲染的副本写入 Kueue 组元数据，随后写入显式的 spec 哈希指纹
@@ -543,6 +919,134 @@ const (
 	modelDeploymentECConnectorExample = "ec-example"
 )
 
+// renderModelDeploymentRoutingSidecar 渲染 direct-decode 形态下的路由代理容器。
+func renderModelDeploymentRoutingSidecar(
+	ctx context.Context,
+	role *workercore.ModelDeploymentRole, enginePort int32, engineScheme core.URIScheme,
+	engine string, native bool, manufacturer, ecConnector string,
+) core.Container {
+	externalPort := modelDeploymentServicePort(role)
+	args := []string{
+		fmt.Sprintf("--port=%d", externalPort.ContainerPort),
+		fmt.Sprintf("--model-server-port=%d", enginePort),
+	}
+	env := []core.EnvVar{{
+		Name: "POD_IP",
+		ValueFrom: &core.EnvVarSource{FieldRef: &core.ObjectFieldSelector{
+			FieldPath: "status.podIP",
+		}},
+	}}
+	switch {
+	case engine == workercore.ModelDeploymentEngineSGLang:
+		// IMPORTANT: SGLang 引擎分支，SGLang 内置了自己的一套 PD 分离握手协议（底层实际搬砖的传输库也可以配成 Mooncake 或 NIXL，但前面怎么对暗号用的是 SGLang 自己的 Bootstrap 协议）。
+		args = append(args, "--kv-connector=sglang")
+		env = append(env, core.EnvVar{
+			Name:  "SGLANG_BOOTSTRAP_PORT",
+			Value: strconv.Itoa(int(inject.SGLangBootstrapPort)),
+		})
+	case manufacturer == nodefeature.ManufacturerAscend:
+		// IMPORTANT: nixlv2（华为昇腾 Ascend NPU 分支）
+		args = append(args, "--kv-connector=nixlv2")
+	default:
+		// IMPORTANT: Mooncake 方案（默认分支）：vLLM + NVIDIA 等常规 GPU
+		args = append(args,
+			"--kv-connector=mooncake",
+			// 告诉 Decode 里的 routing-proxy，去连接 Prefiller 的哪个端口交换显存地址和房间号
+			fmt.Sprintf("--mooncake-bootstrap-port=%d", inject.VLLMMooncakeBootstrapPort))
+	}
+	args = append(args, "--secure-proxy=false")
+	// encoder 链路与 KV 链路是独立的握手，由调用方按平台解析后传入，避免在此处再维护一套重复的平台分发分支。
+	if ecConnector != "" {
+		args = append(args, "--ec-connector="+ecConnector)
+	}
+	if engineScheme == core.URISchemeHTTPS {
+		args = append(args, "--enable-tls=decoder", "--tls-insecure-skip-verify=decoder")
+	}
+
+	return core.Container{
+		Name:            "routing-proxy",
+		Image:           redirectedImage(ctx, settings.ModelDeploymentRoutingSidecarImage.ShouldValue(ctx)),
+		ImagePullPolicy: core.PullIfNotPresent,
+		Args:            args,
+		// 容器级 RestartPolicy 是将 initContainer 声明为原生 sidecar 的关键，仅在 native 形态设置；
+		// 传统普通容器不得设置该字段，由 Pod 级 RestartPolicy 负责重启。
+		RestartPolicy: func() *core.ContainerRestartPolicy {
+			if !native {
+				return nil
+			}
+			return ptr.To(core.ContainerRestartPolicyAlways)
+		}(),
+		Ports: []core.ContainerPort{{
+			Name: externalPort.Name, Protocol: core.ProtocolTCP,
+			ContainerPort: externalPort.ContainerPort,
+		}},
+		Env: env,
+		SecurityContext: &core.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			RunAsNonRoot:             ptr.To(true),
+		},
+	}
+}
+
+// appendModelDeploymentConnectorPorts 将连接器合成的端口合并进容器声明端口列表。
+// 若端口号与名称均已存在则去重跳过；若同端口号但名称不同，说明两个端点争用同一端口，直接报错拒绝渲染。
+func appendModelDeploymentConnectorPorts(
+	ports []core.ContainerPort, connector ModelDeploymentConnectorRender, takeOver bool,
+) ([]core.ContainerPort, error) {
+	if takeOver {
+		return ports, nil
+	}
+
+	for _, synthesized := range connector.Ports {
+		declared := false
+		for _, p := range ports {
+			if p.ContainerPort != synthesized.ContainerPort {
+				continue
+			}
+			if p.Name != synthesized.Name {
+				return nil, fmt.Errorf(
+					"the connector publishes port %d as %q but the template declares it as %q",
+					synthesized.ContainerPort, synthesized.Name, p.Name,
+				)
+			}
+			declared = true
+		}
+		if !declared {
+			ports = append(ports, synthesized)
+		}
+	}
+
+	return ports, nil
+}
+
+// modelDeploymentPortTaken 报告指定端口号是否已出现在容器声明的端口列表中。
+func modelDeploymentPortTaken(ports []core.ContainerPort, port int32) bool {
+	for _, p := range ports {
+		if p.ContainerPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+// modelDeploymentPodLabels 组装副本 Pod 携带的全部标签：Service 选择器身份标签、引导至角色资源池的
+// Kueue 队列入口标签、供上游路由区分的角色类型标签，以及所有受管对象统一的 part-of 标签。
+//
+// 队列入口标签刻意不进入 Service 选择器：它跟随角色所选的 InstanceType 变化，若放入选择器会孤立已有副本。
+// 入口值由调用方从 InstanceType.Status.Entrance 读取后传入，确保与 LocalQueue 调谐器使用同一名称。
+// 角色类型经由 ModelDeploymentEffectiveRoleKind 解析，保证该标签与 status.roles[].kind 始终一致。
+func modelDeploymentPodLabels(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, entrance string,
+) map[string]string {
+	labels := modelDeploymentSelectorLabels(md, role)
+	labels[kueuectrlconst.QueueLabel] = entrance
+	kind, _ := ModelDeploymentRoleUpstreamKind(ModelDeploymentEffectiveRoleKind(role))
+	labels[modelDeploymentLabelKeyRoleKind] = kind
+	labels["app.kubernetes.io/part-of"] = "gpustack-operator-worker"
+
+	return labels
+}
+
 // modelDeploymentContainerPorts 渲染副本暴露的端口。
 //
 // 未指定任何端口的 role 仍会获得一个默认端口，因为无法访问的副本无法提供任何服务，且前端的
@@ -618,6 +1122,38 @@ func convertModelDeploymentAdditionalVolumes(
 	return vols, mounts
 }
 
+// appendModelDeploymentBindArgs 在角色未指定监听地址或端口时补充默认绑定参数。
+//
+// 各引擎默认监听地址不一致（vLLM 监听全网卡 8000，SGLang 仅监听回环 30000 导致 Service 和 kubelet
+// 探针都无法访问），显式填充使 Service 目标地址与引擎监听地址成为同一决策。
+//
+// 若命令行中已通过引擎可识别的任意拼写传入了对应标志，则原样保留，不重复追加。
+func appendModelDeploymentBindArgs(engine string, command []string, port int32) []string {
+	for _, kv := range [][2]string{
+		{modelDeploymentEngineHostArg, modelDeploymentEngineBindHost},
+		{modelDeploymentEnginePortArg, strconv.Itoa(int(port))},
+	} {
+		if modelDeploymentArgsName(engine, command, kv[0]) {
+			continue
+		}
+
+		command = append(command, kv[0], kv[1])
+	}
+
+	return command
+}
+
+// modelDeploymentArgsName 报告命令行中是否已携带指定监听标志（兼容引擎解析器认可的各类拼写）。
+func modelDeploymentArgsName(engine string, command []string, name string) bool {
+	for _, arg := range command {
+		if ModelDeploymentListenArg(engine, arg) == name {
+			return true
+		}
+	}
+
+	return false
+}
+
 // modelDeploymentEngineTransport 返回引擎监听器使用的协议方案，以及 operator 是否可以对该监听器设置探针门控。
 //
 // 只有两个参数会将监听器开启为 TLS，其余 --ssl-* 系列参数均不会。两种受支持的引擎都会将所有 ssl 参数原样传给 uvicorn 而自身不做判断，而 uvicorn 仅在配置了 `ssl_keyfile` 或 `ssl_certfile` 时才会启用 TLS。单独传入 CA 证书包、密码套件列表、密钥口令或客户端证书模式时，服务仍为普通 HTTP——因此若按整个参数族前缀判断，就会为明文监听器发布 https:// 地址，并撤回本可正常工作的门控。各引擎还会按各自不同的表达式打印 "SSL enabled" 日志；这些日志不具决定性，此处也不遵循它们。
@@ -685,8 +1221,80 @@ func modelDeploymentDemandsClientCert(command []string, i int) bool {
 //
 // 接管命令行的 role 只贡献其完整的 argv，而不附加其他内容：extra arguments 不会追加到用户已替换的命令之后，因此在这里读取它们只会描述一条并未实际运行的命令行。
 func ModelDeploymentRoleArgs(role *workercore.ModelDeploymentRole) []string {
-	// 在第 19 章中实现此函数。
-	return nil
+	if len(role.Command) > 0 {
+		return role.Command
+	}
+
+	return role.ExtraArgs
+}
+
+// modelDeploymentProbes 为副本主容器构建 startup、readiness、liveness 三个 HTTP 探针。
+//
+// 不可判定（如接管模式或要求客户端证书的 mTLS）或非 TCP 端口返回三个 nil。
+// startup 失败阈值由角色声明的启动超时向上取整推导，避免覆盖大模型的长加载预算。
+func modelDeploymentProbes(
+	servingPort core.ContainerPort, scheme core.URIScheme, path string, gradable, probesEncoder bool,
+	startupTimeoutSeconds *int32,
+) (startup, readiness, liveness *core.Probe) {
+	if !gradable {
+		return nil, nil, nil
+	}
+
+	if servingPort.Protocol != core.ProtocolTCP {
+		return nil, nil, nil
+	}
+
+	port := intstr.FromInt32(servingPort.ContainerPort)
+	timeout := modelDeploymentProbeTimeoutSeconds
+	readinessThreshold := modelDeploymentReadinessFailureThreshold
+	livenessThreshold := modelDeploymentLivenessFailureThreshold
+	if probesEncoder {
+		timeout = modelDeploymentEncoderProbeTimeoutSeconds
+		readinessThreshold = modelDeploymentEncoderReadinessFailureThreshold
+		livenessThreshold = modelDeploymentEncoderLivenessFailureThreshold
+	}
+	gate := func(failureThreshold int32) *core.Probe {
+		return &core.Probe{
+			ProbeHandler: core.ProbeHandler{
+				HTTPGet: &core.HTTPGetAction{
+					Path:   path,
+					Port:   port,
+					Scheme: scheme,
+				},
+			},
+			PeriodSeconds:    modelDeploymentProbePeriodSeconds,
+			TimeoutSeconds:   timeout,
+			FailureThreshold: failureThreshold,
+		}
+	}
+
+	return gate(modelDeploymentStartupProbeFailureThreshold(startupTimeoutSeconds)),
+		gate(readinessThreshold),
+		gate(livenessThreshold)
+}
+
+// modelDeploymentStartupProbeFailureThreshold 根据角色声明的启动预算计算 startup 探针允许的失败周期数。
+//
+// 预算为空或非正数时回退到默认阈值，保证该字段引入前的存量对象继续获得原有门控，不会立刻重启。
+func modelDeploymentStartupProbeFailureThreshold(startupTimeoutSeconds *int32) int32 {
+	if startupTimeoutSeconds == nil || *startupTimeoutSeconds <= 0 {
+		return modelDeploymentStartupFailureThreshold
+	}
+
+	periods := (*startupTimeoutSeconds + modelDeploymentProbePeriodSeconds - 1) / modelDeploymentProbePeriodSeconds
+
+	return max(periods, 1)
+}
+
+// modelDeploymentProbesEncoderStage 报告该角色的探针是否评估一个依赖按地址访问编码器阶段的 prefiller。
+// 其他角色以及不含编码器的部署维持默认探针参数，不改变其渲染结果。
+func modelDeploymentProbesEncoderStage(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, takeOver bool,
+) bool {
+	return !takeOver &&
+		modelDeploymentDeclaresEncoder(md) &&
+		modelDeploymentEPDSplitsEncoderByAddress(md.Spec.Engine.Name) &&
+		ModelDeploymentEffectiveRoleKind(role) == workercore.ModelDeploymentRoleKindPrefill
 }
 
 // mergeModelDeploymentEnv 将 operator 的环境变量与 role 的环境变量合并为一个列表。
@@ -768,9 +1376,354 @@ func modelDeploymentUserSetsEnv(userEnv []workercore.ModelDeploymentEnvVar, name
 	return false
 }
 
+// modelDeploymentDefaultedArgs 将连接器的默认参数组展开为扁平列表，并跳过角色自身参数中已声明的标志。
+func modelDeploymentDefaultedArgs(groups [][]string, userArgs []string) []string {
+	var out []string
+	for _, group := range groups {
+		if slices.ContainsFunc(userArgs, func(arg string) bool {
+			return ModelDeploymentArgName(arg) == group[0]
+		}) {
+			continue
+		}
+		out = append(out, group...)
+	}
+
+	return out
+}
+
+// modelDeploymentRoleNeedsEngramCapabilities 报告角色是否配置了需要 IPC_LOCK 与 SYS_RESOURCE 锁定
+// 宿主机 DRAM 的 Engram 查找表。
+func modelDeploymentRoleNeedsEngramCapabilities(
+	engine string, role *workercore.ModelDeploymentRole, command []string,
+) bool {
+	if role == nil {
+		return false
+	}
+
+	switch engine {
+	case workercore.ModelDeploymentEngineVLLM:
+		return modelDeploymentVLLMNeedsEngramCapabilities(command)
+	case workercore.ModelDeploymentEngineSGLang:
+		return modelDeploymentSGLangNeedsEngramCapabilities(role.Env)
+	default:
+		return false
+	}
+}
+
+// modelDeploymentVLLMNeedsEngramCapabilities 扫描 vLLM 参数流中的 --engram-config 及其点号字段覆盖，
+// 报告宿主机 CPU offload 是否处于开启状态。
+func modelDeploymentVLLMNeedsEngramCapabilities(args []string) bool {
+	seen := false
+	cpuOffload := true
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			break
+		}
+		if !strings.HasPrefix(args[i], "--") {
+			continue
+		}
+
+		rawKey, val, hasVal := strings.Cut(args[i], "=")
+		normKey := modelDeploymentVLLMFlagKey(rawKey)
+		head, tail, dotted := strings.Cut(normKey, ".")
+		if head != modelDeploymentVLLMEngramConfigArg {
+			continue
+		}
+
+		if !hasVal && i+1 < len(args) && modelDeploymentConsumableValue(args[i+1]) {
+			val = args[i+1]
+			hasVal = true
+			i++
+		}
+
+		seen = true
+		if !dotted {
+			cpuOffload = modelDeploymentVLLMEngramJSONCPUOffload(val)
+			continue
+		}
+
+		if strings.ReplaceAll(tail, "-", "_") == "cpu_offload" {
+			if !hasVal {
+				cpuOffload = true
+			} else {
+				cpuOffload = !modelDeploymentFalsyString(val)
+			}
+		}
+	}
+
+	return seen && cpuOffload
+}
+
+// modelDeploymentVLLMEngramJSONCPUOffload 从 --engram-config 的 JSON 载荷中读取 cpu_offload。
+// 字段缺失或载荷无法解析为 JSON 对象时默认返回 true，与 vLLM 的 EngramConfig.cpu_offload 默认值一致。
+func modelDeploymentVLLMEngramJSONCPUOffload(raw string) bool {
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &cfg); err != nil || cfg == nil {
+		return true
+	}
+
+	val, exists := cfg["cpu_offload"]
+	if !exists {
+		val, exists = cfg["cpu-offload"]
+	}
+	if !exists {
+		return true
+	}
+
+	switch v := val.(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		return !modelDeploymentFalsyString(v)
+	default:
+		return true
+	}
+}
+
+// modelDeploymentSGLangNeedsEngramCapabilities 报告 SGLang 的 Engram 宿主机表 offload 环境变量是否开启。
+func modelDeploymentSGLangNeedsEngramCapabilities(env []workercore.ModelDeploymentEnvVar) bool {
+	val, ok := modelDeploymentEnvValue(env, modelDeploymentSGLangEngramHostTableEnv)
+	if !ok {
+		return false
+	}
+
+	s := strings.ToLower(strings.TrimSpace(val))
+	if b, err := strconv.ParseBool(s); err == nil {
+		return b
+	}
+
+	switch s {
+	case "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func modelDeploymentFalsyString(raw string) bool {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if b, err := strconv.ParseBool(s); err == nil {
+		return !b
+	}
+
+	switch s {
+	case "no", "n", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+// deriveModelDeploymentResources 根据角色声明的加速器需求与 InstanceType 单位规格，推导完整的
+// InstanceResources，以便复用第 7–11 章的统一容器资源生成函数 getResourceRequirements。
+func deriveModelDeploymentResources(
+	role *workercore.ModelDeploymentRole,
+	instType *worker.InstanceType,
+) (*workercore.InstanceResources, error) {
+	ress := new(workercore.InstanceResources)
+	if rr := role.Resources; rr != nil {
+		ress.Accelerator = rr.Accelerator
+		ress.AcceleratorSlicedMemoryPercentage = rr.AcceleratorSlicedMemoryPercentage
+		ress.AcceleratorSlicedCoresPercentage = rr.AcceleratorSlicedCoresPercentage
+		ress.AcceleratorPartitionedProfile = rr.AcceleratorPartitionedProfile
+	}
+
+	if err := sizeModelDeploymentHostResources(ress, instType); err != nil {
+		return nil, err
+	}
+
+	// 与 Instance webhook 一致设置默认本地存储：15Gi，且绝不超过 InstanceType 所提供的上限。
+	def := resource.NewQuantity(15<<30, resource.BinarySI) // 15Gi
+	if instType.Spec.LocalStorage != "" {
+		if maxStg, err := resource.ParseQuantity(instType.Spec.LocalStorage); err == nil && def.Cmp(maxStg) > 0 {
+			def = &maxStg
+		}
+	}
+	ress.LocalStorage = *def
+
+	return ress, nil
+}
+
+// sizeModelDeploymentHostResources 按实例类型的单位规格与角色所占卡数或显存比例 计算 宿主机 CPU 与内存。
+func sizeModelDeploymentHostResources(
+	ress *workercore.InstanceResources, instType *worker.InstanceType,
+) error {
+	if !instType.Spec.Acceleratable {
+		// 纯 CPU 实例类型按 1 份单位资源配比，与 Instance 路径处理未显式声明 CPU 的请求一致。
+		cpu, ram, err := modelDeploymentUnitResources(instType, 1)
+		if err != nil {
+			return err
+		}
+		ress.CPU, ress.RAM = cpu, ram
+
+		return nil
+	}
+
+	slicing := ress.AcceleratorSlicedMemoryPercentage != 0 || ress.AcceleratorSlicedCoresPercentage != 0
+	partitioning := ress.AcceleratorPartitionedProfile != ""
+	if (slicing || partitioning) && !instType.Status.Detail.AcceleratorReady() {
+		// 所需卡份额尚无法读取；等待加速详情计算完成后可重试，绝不静默回退成整卡。
+		return fmt.Errorf("instance type %s is not ready yet (accelerator detail not computed); retry", instType.Name)
+	}
+
+	partitionPct, sizeable := PartitionProfileMemoryPercent((*workercore.InstanceType)(instType),
+		ress.AcceleratorPartitionedProfile)
+	if !sizeable {
+		return fmt.Errorf("instance type %s is not ready yet (partition profile %q cannot be sized "+
+			"from the observed accelerator detail); retry", instType.Name, ress.AcceleratorPartitionedProfile)
+	}
+
+	switch {
+	case partitionPct > 0:
+		// 硬件分区占单卡的一定显存比例，宿主机资源按同一显存比例缩放，与同等大小的逻辑切分保持一致。
+		return modelDeploymentSizeByPercent(ress, instType, partitionPct)
+	case instType.Status.Detail.IsLogicallySliceable() && slicing:
+		// 只填显存比例或算力比例其中一项时，另一项自动对齐，使单填显存比例也能获得同等算力份额，反之亦然。
+		switch {
+		case ress.AcceleratorSlicedMemoryPercentage > 0 && ress.AcceleratorSlicedCoresPercentage == 0:
+			ress.AcceleratorSlicedCoresPercentage = ress.AcceleratorSlicedMemoryPercentage
+		case ress.AcceleratorSlicedCoresPercentage > 0 && ress.AcceleratorSlicedMemoryPercentage == 0:
+			ress.AcceleratorSlicedMemoryPercentage = ress.AcceleratorSlicedCoresPercentage
+		}
+		// 显存比例决定实际预留的卡份额；算力比例仅限制核心利用率而不缩放宿主机资源。
+		return modelDeploymentSizeByPercent(ress, instType, int64(ress.AcceleratorSlicedMemoryPercentage))
+	}
+
+	// 整卡请求按卡数线性放大单位资源；在加速池上申请 0 卡的小模型仍需宿主机运行，按 1 份单位资源配比。
+	cards := int64(1)
+	if ress.Accelerator != nil && ress.Accelerator.Value() > 0 {
+		cards = ress.Accelerator.Value()
+	}
+	cpu, ram, err := modelDeploymentUnitResources(instType, cards)
+	if err != nil {
+		return err
+	}
+	ress.CPU, ress.RAM = cpu, ram
+
+	return nil
+}
+
+// modelDeploymentSizeByPercent 按单卡单位资源的百分比计算宿主机资源。
+func modelDeploymentSizeByPercent(
+	ress *workercore.InstanceResources, instType *worker.InstanceType, pct int64,
+) error {
+	cpu, err := quantityx.StringPercentMultiply(instType.Spec.UnitResources.CPU, pct)
+	if err != nil {
+		return fmt.Errorf("invalid CPU unit of instance type %s: %w", instType.Name, err)
+	}
+	ram, err := quantityx.StringPercentMultiply(instType.Spec.UnitResources.RAM, pct)
+	if err != nil {
+		return fmt.Errorf("invalid RAM unit of instance type %s: %w", instType.Name, err)
+	}
+	ress.CPU, ress.RAM = cpu, ram
+
+	return nil
+}
+
+// modelDeploymentUnitResources 将单卡对应的宿主机单位资源按整卡倍数放大。
+func modelDeploymentUnitResources(
+	instType *worker.InstanceType, multiplier int64,
+) (cpu, ram resource.Quantity, err error) {
+	cpu, err = quantityx.StringMultiply(instType.Spec.UnitResources.CPU, multiplier)
+	if err != nil {
+		return cpu, ram, fmt.Errorf("invalid CPU unit of instance type %s: %w", instType.Name, err)
+	}
+	ram, err = quantityx.StringMultiply(instType.Spec.UnitResources.RAM, multiplier)
+	if err != nil {
+		return cpu, ram, fmt.Errorf("invalid RAM unit of instance type %s: %w", instType.Name, err)
+	}
+
+	return cpu, ram, nil
+}
+
+type modelDeploymentInstanceTypeHashInput struct {
+	Name          string                               `json:"name,omitempty"`
+	Entrance      string                               `json:"entrance,omitempty"`
+	Manufacturer  string                               `json:"manufacturer,omitempty"`
+	Acceleratable bool                                 `json:"acceleratable,omitempty"`
+	UnitResources workercore.InstanceTypeUnitResources `json:"unitResources"`
+	Resources     workercore.InstanceResources         `json:"resources"`
+}
+
 type modelDeploymentRoleSiblingHashInput struct {
 	Name string                             `json:"name"`
 	Kind workercore.ModelDeploymentRoleKind `json:"kind,omitempty"`
+}
+
+// modelDeploymentBindingHash 对输入角色模板渲染的已解析外部绑定求指纹，不包含隐式默认项与集群级全局设置。
+func modelDeploymentBindingHash(
+	in ModelDeploymentRenderInput, ress workercore.InstanceResources,
+) string {
+	takeOver := len(in.Role.Command) > 0
+
+	var instType modelDeploymentInstanceTypeHashInput
+	if in.InstanceType != nil {
+		instType = modelDeploymentInstanceTypeHashInput{
+			Name:          in.InstanceType.Name,
+			Entrance:      in.InstanceType.Status.Entrance,
+			Manufacturer:  in.InstanceType.Status.Detail.Manufacturer,
+			Acceleratable: in.InstanceType.Spec.Acceleratable,
+			UnitResources: in.InstanceType.Spec.UnitResources,
+			Resources:     ress,
+		}
+	}
+
+	var artifact *ModelDeploymentArtifactRender
+	if in.Artifact != nil && (!takeOver || in.Artifact.Delivery != workercore.ModelDeploymentModelDeliveryEngine) {
+		a := *in.Artifact
+		a.Endpoint = ""
+		a.HTTPSProxy = ""
+		a.NoProxy = ""
+		artifact = &a
+	}
+
+	var connector *modelDeploymentConnectorBinding
+	var rawConnector *ModelDeploymentConnectorRender
+	var ecConnector string
+	if !takeOver {
+		if in.Connector.binding != nil {
+			connector = in.Connector.binding
+		} else if len(in.Connector.Args) > 0 || len(in.Connector.Env) > 0 ||
+			len(in.Connector.PodAnnotations) > 0 || len(in.Connector.Ports) > 0 ||
+			len(in.Connector.Volumes) > 0 || len(in.Connector.VolumeMounts) > 0 ||
+			in.Connector.KVTransfer || in.Connector.RoutingSidecar {
+			c := in.Connector
+			c.DefaultedEnv = nil
+			c.DefaultedArgs = nil
+			rawConnector = &c
+		}
+		if in.Connector.RoutingSidecar {
+			ecConnector = in.ECConnector
+		}
+	}
+
+	subject := struct {
+		InstanceType      modelDeploymentInstanceTypeHashInput `json:"instanceType"`
+		RuntimeClassName  string                               `json:"runtimeClassName,omitempty"`
+		InterfaceResource core.ResourceName                    `json:"interfaceResource,omitempty"`
+		Artifact          *ModelDeploymentArtifactRender       `json:"artifact,omitempty"`
+		Connector         *modelDeploymentConnectorBinding     `json:"connector,omitempty"`
+		RawConnector      *ModelDeploymentConnectorRender      `json:"rawConnector,omitempty"`
+		ECConnector       string                               `json:"ecConnector,omitempty"`
+	}{
+		InstanceType:      instType,
+		RuntimeClassName:  in.RuntimeClassName,
+		InterfaceResource: in.InterfaceResource,
+		Artifact:          artifact,
+		Connector:         connector,
+		RawConnector:      rawConnector,
+		ECConnector:       ecConnector,
+	}
+
+	encoded, err := json.Marshal(subject)
+	if err != nil {
+		return "unhashable-binding-" + err.Error()
+	}
+
+	return stringx.SumBytesBySHA256(encoded)
 }
 
 // modelDeploymentExplicitSpecHash 对用户显式配置的 ModelDeployment 和 role spec，以及解析后的外部绑定摘要和副本席位坐标生成指纹。

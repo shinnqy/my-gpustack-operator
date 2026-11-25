@@ -1,6 +1,12 @@
 package worker
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	core "k8s.io/api/core/v1"
+
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
@@ -39,6 +45,17 @@ func modelDeploymentTerminationGracePeriodSeconds(role *workercore.ModelDeployme
 	return modelDeploymentDefaultTerminationGracePeriodSeconds
 }
 
+// modelDeploymentDrainDeadlineSeconds 是 preStop hook 从自身启动起算的最晚返回时刻。
+//
+// 该值由终止宽限期直接推导而非独立配置，避免两者配置失配导致 kubelet 在等待中途强杀引擎。
+// 最后一次读取最多可能超出该时刻两秒（一次读超时加一次轮询间隔），由退出预留窗口吸收。
+//
+// 到达此时刻仍在运行的请求将被切断，这是可接受的上限：vLLM 在收到 SIGTERM 时立即中止请求，
+// SGLang 则自行排空直到被强杀。
+func modelDeploymentDrainDeadlineSeconds(graceSeconds int64) int64 {
+	return graceSeconds - modelDeploymentDrainExitSeconds
+}
+
 // modelDeploymentInFlightMetrics 按引擎列出所有用于统计副本当前在途工作量的 gauge 指标名（求和后即总在途量）。
 // 这些指标读取自引擎自身的 /metrics 接口，两个引擎均在其 API 端口提供该接口：vLLM 默认开启，
 // SGLang 则因渲染的启动命令包含 --enable-metrics 而开启。
@@ -60,4 +77,87 @@ var modelDeploymentInFlightMetrics = map[string][]string{
 		"sglang:num_decode_prealloc_queue_reqs",
 		"sglang:num_decode_transfer_queue_reqs",
 	},
+}
+
+// modelDeploymentDrainHook 生成副本引擎容器的 preStop hook：在静置窗口期间保持引擎正常服务，
+// 随后等待引擎的在途指标归零，最晚在宽限期允许的截止时间前返回，随后 kubelet 发送 SIGTERM。
+//
+// 等待必须发生在 SIGTERM 之前，因为两个引擎在收到信号后都无法妥善排空。vLLM 的 --shutdown-timeout
+// 默认为 0，会立即中止所有运行中请求；调大后虽会排空，但会拒绝期间到达的请求，包括删除前瞬间
+// 路由过来的请求。SGLang 虽会在收到信号后排空，但每五秒才检查一次信号且没有自身上限。在此处等待
+// 时引擎保持原状：迟到的请求仍可被服务，直到无请求可被中止时才送达信号。
+//
+// hook 读取与抓取注解相同的端口和协议，即引擎自身的监听器：在 direct-decode 形态下，那是位于
+// 路由代理之后的端口，从而统计引擎而非代理的工作量。未声明端口的角色通过 --port 移动端口时，hook
+// 会随之跟随；若声明端口与角色自身 --port 不一致（仅可能出现在准入拦截生效前存储的对象中），声明
+// 端口上没有监听，hook 会在静置期结束后返回。
+//
+// hook 通过镜像内置的 python3 执行，与 KV 缓存成员的 hook 一致：两个引擎都是 Python 程序，镜像内
+// 必然存在解释器。不能使用 httpGet hook，因为两个引擎都没有仅在空闲时才响应的路由。
+func modelDeploymentDrainHook(
+	engine string, port int32, scheme core.URIScheme, graceSeconds int64,
+) *core.LifecycleHandler {
+	url := fmt.Sprintf("%s://127.0.0.1:%d/metrics", strings.ToLower(string(scheme)), port)
+	script := modelDeploymentDrainScript(url, modelDeploymentInFlightMetrics[engine],
+		modelDeploymentDrainSettleSeconds, modelDeploymentDrainDeadlineSeconds(graceSeconds))
+
+	return &core.LifecycleHandler{
+		Exec: &core.ExecAction{Command: []string{"python3", "-c", script}},
+	}
+}
+
+// modelDeploymentDrainScript 渲染 preStop hook 的执行脚本。时间参数通过入参传入以便测试在秒级
+// 尺度运行，生产 hook 传入静置窗口与截止时间。
+//
+// 引擎的响应决定下一步行为，不同情形区分处理：
+//   - 连接被拒、HTTP 错误或 TLS 失败说明此处无法度量（引擎已退出、仍在加载或监听他处），直接返回；
+//   - 读取超时说明引擎过忙无法响应，按繁忙处理并继续等待；同时匹配 socket.timeout 与 TimeoutError，
+//     因为在 Python 3.10 之前前者不属于后者，较旧镜像可能携带该版本解释器；
+//   - 无法解析的采样按繁忙处理，因为无法证明副本已空闲。
+//
+// 脚本在连续第二次读到空闲（间隔一次轮询）时返回。prefiller 的指标在 prefill 计算完成瞬间下降，
+// 而 decoder 拉取对应 KV 紧随其后开始，第二次读取正是为该拉取提供留白。
+//
+// 脚本始终以状态码 0 退出，这仅关乎退出码本身：非零退出只会产生 Failed 生命周期事件且不会阻止
+// kubelet 在 hook 返回后发送 SIGTERM。hook 的返回并非退场副本的最终裁决——删除由退场协议拦截，
+// 协议会在 Draining 阶段一直等待直到排空读取器连续两次确认成员空闲——因此此处提前返回最多缩小
+// hook 自身的观测范围，不会扩大副本允许丢失的请求范围。
+func modelDeploymentDrainScript(url string, metrics []string, settleSeconds, deadlineSeconds int64) string {
+	names := make([]string, 0, len(metrics))
+	for _, m := range metrics {
+		names = append(names, strconv.Quote(m))
+	}
+
+	// 数值均为整数和由 strconv 转义的常量；对于其包含的 ASCII 内容，Go 引号字符串同样是合法的 Python 字符串字面量。
+	return fmt.Sprintf(`import socket, ssl, sys, time, urllib.request
+start = time.monotonic()
+time.sleep(%[1]d)
+names = [%[3]s]
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
+idle = 0
+while time.monotonic() - start < %[2]d:
+    try:
+        body = urllib.request.urlopen(%[4]s, timeout=1, context=context).read().decode()
+    except Exception as err:
+        if not isinstance(getattr(err, "reason", err), (TimeoutError, socket.timeout)):
+            sys.exit(0)
+        body = None
+    busy = 1.0 if body is None else 0.0
+    for line in (body or "").splitlines():
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name not in names:
+            continue
+        sample = line.rsplit("}", 1)[1] if "{" in line else line[len(name):]
+        try:
+            busy += float(sample.split()[0])
+        except (IndexError, ValueError):
+            busy += 1.0
+    idle = idle + 1 if busy == 0 else 0
+    if idle == 2:
+        sys.exit(0)
+    time.sleep(1)
+sys.exit(0)
+`, settleSeconds, deadlineSeconds, strings.Join(names, ", "), strconv.Quote(url))
 }

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -719,6 +720,25 @@ func ModelDeploymentEngineUpstreamName(engine string) (string, bool) {
 	}
 }
 
+// ModelDeploymentRoleUpstreamKind 返回路由器和 Pod 选择器消费的角色类型拼写。
+//
+// "encode" 是角色标签过滤器与按角色 Service 选择器用于匹配 encoder 链路的拼写。
+// 若此处遗漏该分支，encoder Pod 将缺失该标签，所有按此名称匹配的选择器都将看不到它。
+func ModelDeploymentRoleUpstreamKind(kind workercore.ModelDeploymentRoleKind) (string, bool) {
+	switch kind {
+	case workercore.ModelDeploymentRoleKindServer:
+		return "server", true
+	case workercore.ModelDeploymentRoleKindPrefill:
+		return "prefill", true
+	case workercore.ModelDeploymentRoleKindDecode:
+		return "decode", true
+	case workercore.ModelDeploymentRoleKindEncode:
+		return "encode", true
+	default:
+		return "", false
+	}
+}
+
 // modelDeploymentRoleKindFromUpstream 读取 Pod 的 role-kind 标签所指定的类型。该标签承载的是
 // 上游拼写，因此本函数负责将其转换回 API 类型。
 //
@@ -844,6 +864,35 @@ func ModelDeploymentSupportsRoleKind(engine string, kind workercore.ModelDeploym
 // 保留在此处的是属于本 API 而非渲染器的那一半职责：下方的独占键表依然会拒绝用户尝试设置
 // 该配置路径或 extra-config 参数的行为，因为这两者都会把引擎引导至将 local_hostname 解析为
 // 字面量的加载器。
+
+// ModelDeploymentEngineCommand 渲染在指定模型上启动单个引擎的 argv。
+//
+// operator 拥有整条 argv，这是由模板类型本身而非风格偏好决定的：模板只携带 Command 且刻意不设
+// Args，因此在镜像自带 entrypoint 之外无处追加参数。要么由 operator 构造整条命令行（基础命令、
+// 合成的 connector 参数、角色的 ExtraArgs），要么由用户通过接管层级完整替换它；不存在 operator
+// 向并非由自己构造的命令行追加参数的中间形态。
+//
+// 基础命令采用各引擎文档规定的入口：vLLM 安装了 "vllm" 命令行脚本，其 serve 子命令将模型作为
+// 位置参数接收；SGLang 作为模块启动，通过 --model-path 指定模型。
+//
+// 该命令不随加速后端变化，因此不接收 manufacturer 参数：vllm_ascend 是 vLLM 插件并共用同一入口。
+// 这是两个 vLLM 家族变体真正重合的地方，不同于独占键表（后者重合只是因为那些键本来就不属于后端属性）。
+func ModelDeploymentEngineCommand(engine, model string) ([]string, error) {
+	if model == "" {
+		return nil, errors.New("model name is empty")
+	}
+
+	switch engine {
+	case workercore.ModelDeploymentEngineVLLM:
+		return []string{"vllm", "serve", model}, nil
+	case workercore.ModelDeploymentEngineSGLang:
+		return []string{
+			"python3", "-m", "sglang.launch_server", "--model-path", model, "--enable-metrics",
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported engine %q", engine)
+	}
+}
 
 // --kv-transfer-config 文档同样交由 `inject` 生成。它通过结构体而非 map 渲染相同的两个键，
 // 从而将无法识别的键转化为编译期错误；并且它根据角色推导 kv_role，而不是硬编码 kv_both——

@@ -33,6 +33,7 @@ const ModelDeploymentElasticRayNodeIdentityLabel = "gpustack-pod-uid"
 // ModelDeploymentElasticHeadCommand 启用原生 vLLM 所需的状态服务。
 const ModelDeploymentElasticHeadCommand = "ray start --head --include-dashboard=true"
 
+// 判断是不是弹性部署
 // ModelDeploymentElasticRole 返回请求托管弹性配置的角色。
 func ModelDeploymentElasticRole(md *workercore.ModelDeployment) *workercore.ModelDeploymentRole {
 	for i := range md.Spec.Roles {

@@ -9,6 +9,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	kueuepodconst "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
@@ -402,6 +403,8 @@ func modelDeploymentAnsweringMembers(
 	}
 }
 
+// IMPORTANT: 为指定 (role, ordinal, member) 生成全套 Kueue 组标签与注解（pod-group-name、ordinal、member-index、total-count、role-hash=role.Name、pod-group-serving=true 及可选拓扑层级）。
+//
 // ModelDeploymentPodGroup 返回某个 role 单个副本中单个成员的分组元数据：即位于指定
 // ordinal 的副本中指定索引位置的成员。
 //
@@ -426,8 +429,52 @@ func modelDeploymentAnsweringMembers(
 func ModelDeploymentPodGroup(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, ordinal, member int,
 ) ModelDeploymentPodGroupMeta {
-	// 在第 19 章实现此函数。
-	return ModelDeploymentPodGroupMeta{}
+	labels := map[string]string{
+		kueuepodconst.GroupNameLabel:       modelDeploymentReplicaGroupName(md, role.Name, ordinal),
+		modelDeploymentReplicaOrdinalLabel: strconvx.Itoa(ordinal),
+	}
+	// 无论副本规模大小，每个成员都会写入 member index 标签。负责对外响应 API 的是索引为 0 的 Pod
+	// （每个副本一个成员，规模为 1 时即该副本唯一的 Pod），而标签选择器只能做合取匹配，因此只能通过
+	// 所有成员共同携带的标签来选出该集合。若在单成员副本上省略索引，该集合就只能表达为“没有索引或
+	// 索引为 0”，这是标签选择器无法表达的析取条件。把选择器限定到多成员角色也行不通：服务发现按
+	// kind 而非 role 过滤，不同规模的两个 server 角色共用同一选择器，索引为 0 的条件会让其中的单成员
+	// 角色全部落空。
+	//
+	// 写入该标签的代价是集群内所有部署触发一次滚动重建，这是经过权衡后主动接受的代价：写入标签会改变
+	// 单成员副本的指纹，包含此改动的版本会将其逐一重建一次，固定的渲染摘要也会按自身基线流程同步更新。
+	// 该标签记录的不再是只有一个可能取值的索引，而是使可响应集合能够被选择的唯一事实，这正是权衡改变的原因。
+	labels[modelDeploymentMemberIndexLabel] = strconvx.Itoa(member)
+
+	annotations := map[string]string{
+		// 总数即单个副本的规模，调整副本数绝不会改变它：每个分组仅归属于当前副本，因此增减副本只会
+		// 增减整组，而不会改动任何运行中成员携带的总数。这使扩缩容可以按单副本逐个增删，在规模大于 1
+		// 时同样成立——按旧规模创建的成员在副本重建前保留旧总数，两个总数可以共存，不会改写运行中的副本。
+		kueuepodconst.GroupTotalCountAnnotation: strconvx.Itoa(modelDeploymentRoleSize(role)),
+		// role-hash 是承载核心语义的注解而非装饰。Kueue 存在该注解时按原样读取，否则会对 Pod spec 的
+		// 形态（容器、nodeSelector、affinity、tolerations）计算不透明摘要，导致 PodSet 名称与运维
+		// 人员声明的角色无关。按角色划分的 flavor 分配和状态汇总都依靠该名称将 Workload 的 PodSet
+		// 关联到角色，使用摘要会在不报错的情况下破坏关联。直接写入角色自身名称就能在构造上保证 PodSet
+		// 身份与角色一致，这也是准入阶段校验角色名符合 Kueue PodSetReference 规则且唯一的原因。
+		//
+		// 该值始终保持为角色名，绝不拼入 ordinal。Kueue 依据它对 PodSet 分组，状态逻辑也靠它归属 Pod，
+		// 混入 ordinal 会让每个副本变成独立的 PodSet 身份，破坏该注解存在的关联作用。
+		kueuepodconst.RoleHashAnnotation: role.Name,
+		// 推理部署不会自然结束。缺少该注解时 Kueue 会套用批处理（BATCH）语义：Pod 进入 Succeeded 后
+		// 会被视作可回收并提前归还配额，而此时部署本应持续提供服务。
+		//
+		// 退场路径需要为此付出代价。Kueue 将 serving 分组视为永不结束，因此不会主动释放挂在组内 Pod
+		// 上的 finalizer，只有删除对应 Workload 才会释放。deleteModelDeploymentGroupWorkload 负责支付
+		// 这笔代价，若保留该注解却移除该调用就会造成 Workload 泄漏。
+		kueuepodconst.GroupServingAnnotationKey: kueuepodconst.GroupServingAnnotationValue,
+	}
+	if role.Topology != nil && role.Topology.RequiredLevel != "" {
+		annotations[kueue.PodSetRequiredTopologyAnnotation] = role.Topology.RequiredLevel
+	}
+
+	return ModelDeploymentPodGroupMeta{
+		Labels:      labels,
+		Annotations: annotations,
+	}
 }
 
 // modelDeploymentPodOrdinal 读取渲染副本时所赋予的 ordinal。

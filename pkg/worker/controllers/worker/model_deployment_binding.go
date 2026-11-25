@@ -54,6 +54,7 @@ type modelDeploymentDomain struct {
 	Usage  *resource.Quantity
 }
 
+// IMPORTANT: 检查有没有配共享 KV Cache 池
 // resolveModelDeploymentDomain 读取当前部署所引用的 KVCachePoolBinding，并投影其不可变的
 // 域配置块。
 //
@@ -309,6 +310,7 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentInterfaceProtocols(
 	return mooncake.MemberProtocols(backend), nil
 }
 
+// IMPORTANT: 检查有没有配共享 KV Cache 池
 // resolveModelDeploymentConnection 读取 pool 及其 backend 发布的信息：即同一 deployment
 // 下所有角色共享的那一半合成输入。
 //

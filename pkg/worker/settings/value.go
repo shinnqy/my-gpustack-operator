@@ -350,6 +350,15 @@ var (
 		setting.AllowBool(),
 	)
 
+	// ModelDeploymentRoutingSidecarImage 是 decoder 用来接收远程 prefill 交接的路由 sidecar 镜像。
+	// 由于本 operator 负责渲染其命令行参数，该设置主要用于镜像仓库重定向与版本固定，而非替换为其他实现。
+	ModelDeploymentRoutingSidecarImage = settings.NewEditable(
+		"model-deployment-routing-sidecar-image",
+		"Indicates the routing sidecar image a decoder runs to accept a remote prefill handoff.",
+		setting.InitializeFromEnv("gpustack/mirrored-llm-d-router-disagg-sidecar:v0.11.0"),
+		setting.AllowContainerImageReference(),
+	)
+
 	// ModelDeploymentTCPTWReuse 会在每个 SGLang prefill/decode 对中的 Prefill 部分，将
 	// net.ipv4.tcp_tw_reuse=1 渲染到 Pod 安全上下文中。
 	//

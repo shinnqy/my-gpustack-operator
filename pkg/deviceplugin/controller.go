@@ -832,6 +832,19 @@ func foldPodAllocations(
 	return desiredStatus, livePodUIDs, nil
 }
 
+// IMPORTANT: 严格模式账本折叠入口
+//
+// mergePodAllocationsStrict 执行失败即止（fail-closed）的严格重建：共享折叠过程报告的任意错误
+// 都会立即中止重建并返回，从而在输入不完整时阻塞操作，避免误判放行。
+func mergePodAllocationsStrict(
+	devs *workercore.Devices, podList *core.PodList,
+) (workercore.DevicesStatus, []string, error) {
+	return foldPodAllocations(devs, podList, initDesiredStatus(devs), stopAtFoldFailure)
+}
+
+// stopAtFoldFailure 中止共享折叠并将折叠构造的错误返回给调用方，用于阻止严格重建返回因失败而残缺的账本。
+func stopAtFoldFailure(_ foldStep, _ *core.Pod, _ error) bool { return false }
+
 // mergePodAllocations 执行尽可能完整的普通重建。它的错误处理始终要求继续，
 // 所以可忽略公共合并函数用于中途退出的附加结果。
 func mergePodAllocations(

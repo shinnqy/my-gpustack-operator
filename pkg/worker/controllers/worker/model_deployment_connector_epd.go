@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"strings"
 
+	core "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/utils/strconvx"
@@ -369,6 +372,62 @@ func modelDeploymentEPDReachesEncoderStage(
 
 	return modelDeploymentEPDConnector(md, manufacturer) != "" ||
 		modelDeploymentEPDSplitsEncoderByAddress(md.Spec.Engine.Name)
+}
+
+// modelDeploymentEPDPodAffinity 为声明了 encoder 的部署渲染副本的软同节点亲和偏好；
+// 对于未声明 encoder 的部署返回 nil，保持其渲染结果与引入该偏好之前完全一致。
+//
+// 权重按传输链路决定。prefill 与 decode 在每个 token 上都会交换 KV 缓存，同节点放置收益最大，
+// 因此权重更高；encoder 的输出每个请求仅传给 prefiller 一次，因此该对权重较低。所有项均是软偏好
+// 而非硬要求：资源紧张无法同节点放置时集群仍会调度，只是分散在不同节点上。
+//
+// 选择条件与 Service 一致（同一部署实例、同一角色类型），并在节点主机名层级计分，这正是传输链路
+// 实际衡量的拓扑层级。
+func modelDeploymentEPDPodAffinity(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
+) *core.PodAffinity {
+	if !modelDeploymentDeclaresEncoder(md) {
+		return nil
+	}
+
+	peerTerm := func(target workercore.ModelDeploymentRoleKind, weight int32) core.WeightedPodAffinityTerm {
+		kind, _ := ModelDeploymentRoleUpstreamKind(target)
+		return core.WeightedPodAffinityTerm{
+			Weight: weight,
+			PodAffinityTerm: core.PodAffinityTerm{
+				LabelSelector: &meta.LabelSelector{MatchLabels: map[string]string{
+					modelDeploymentLabelKeyName:     modelDeploymentLabelValueName,
+					modelDeploymentLabelKeyInstance: md.Name,
+					modelDeploymentLabelKeyRoleKind: kind,
+				}},
+				TopologyKey: core.LabelHostname,
+			},
+		}
+	}
+
+	switch ModelDeploymentEffectiveRoleKind(role) {
+	case workercore.ModelDeploymentRoleKindPrefill:
+		return &core.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []core.WeightedPodAffinityTerm{
+				peerTerm(workercore.ModelDeploymentRoleKindDecode, 100),
+				peerTerm(workercore.ModelDeploymentRoleKindEncode, 50),
+			},
+		}
+	case workercore.ModelDeploymentRoleKindDecode:
+		return &core.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []core.WeightedPodAffinityTerm{
+				peerTerm(workercore.ModelDeploymentRoleKindPrefill, 100),
+			},
+		}
+	case workercore.ModelDeploymentRoleKindEncode:
+		return &core.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []core.WeightedPodAffinityTerm{
+				peerTerm(workercore.ModelDeploymentRoleKindPrefill, 50),
+			},
+		}
+	default:
+		return nil
+	}
 }
 
 // modelDeploymentEPDEncoderURLs 返回 encoder 阶段的地址列表，格式符合基于地址（而非
