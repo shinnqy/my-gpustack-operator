@@ -13,6 +13,7 @@ import (
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/nodefeature"
 	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
+	"gpustack.ai/gpustack/pkg/worker/kvcache/mooncake"
 	"gpustack.ai/gpustack/pkg/worker/settings"
 )
 
@@ -260,6 +261,8 @@ func ModelDeploymentDeclaresBothHalves(md *workercore.ModelDeployment) bool {
 	return prefill && decode
 }
 
+// IMPORTANT: 判断当前角色需不需要开启 PD 点对点直传（有没有 Router、是否成对声明 P/D、Ascend+vLLM 是否配了 llm-d-router）
+//
 // modelDeploymentUsesKVTransfer 报告该角色是否运行被路由 prefill/decode 配对的
 // 引擎侧。
 //
@@ -275,8 +278,28 @@ func ModelDeploymentDeclaresBothHalves(md *workercore.ModelDeployment) bool {
 func modelDeploymentUsesKVTransfer(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, manufacturer string,
 ) bool {
-	// 在第 20 章中实现此函数。
-	return false
+	// IMPORTANT: 不是看到一个叫 Prefill 的角色就能无脑开启 KV 交接。如果没有路由器、或者只写了半边角色、或者硬件和路由器对不上号，强行开启会让引擎启动后死等一个永远不会来的搭档！
+
+	if md.Spec.Router == nil {
+		// IMPORTANT: 没有托管 Router，谁来帮请求在 Prefill 和 Decode 之间牵线搭桥？所以不能开 kv transfer
+		return false
+	}
+	if manufacturer == nodefeature.ManufacturerAscend &&
+		md.Spec.Engine.Name == workercore.ModelDeploymentEngineVLLM &&
+		md.Spec.Router.Name != workercore.ModelDeploymentRouterLLMD {
+		// IMPORTANT: Ascend（华为昇腾 NPU）+ vLLM 的特殊判断：
+		// 	- 原版 vLLM（NVIDIA）和昇腾版 vLLM-Ascend 的底层连接器握手协议不一样！vLLM-Ascend 的连接器（MooncakeConnectorV1）要求每次请求时把 Prefill 的主机、端口、块 ID、引擎 ID 塞进请求里中继给 Decode。
+		return false
+	}
+	if !ModelDeploymentDeclaresBothHalves(md) {
+		// IMPORTANT: 必须同时声明了 Prefill 和 Decode 两半才开直传
+		return false
+	}
+
+	kind := ModelDeploymentEffectiveRoleKind(role)
+	// IMPORTANT: 只有 Prefill 和 Decode 需要传 KV
+	return kind == workercore.ModelDeploymentRoleKindPrefill ||
+		kind == workercore.ModelDeploymentRoleKindDecode
 }
 
 // modelDeploymentFrontsDecodeWithSidecar 报告 decode 副本是否配备路由代理。
@@ -673,14 +696,119 @@ func ModelDeploymentArgName(arg string) string {
 	return name
 }
 
+// IMPORTANT: 把 K8s API 的字段翻译成底层 inject.Input，调 inject.Render() 拿到引擎参数，并追加监控开关 MC_TE_METRIC=1 与指纹绑定记录。
+//
 // SynthesizeModelDeploymentConnector 渲染用于将单个角色的副本接入缓存的引擎参数、环境变量和
 // 客户端 JSON。
 //
 // 它是纯函数：相同输入产生相同输出，不依赖客户端也不依赖时钟。它所需的关于池和域的一切
 // 信息均作为值传入。
 func SynthesizeModelDeploymentConnector(in ModelDeploymentConnectorInput) (ModelDeploymentConnectorRender, error) {
-	// 在第 20 章中实现此函数。
-	return ModelDeploymentConnectorRender{}, nil
+	// IMPORTANT: 翻译：引擎+厂商 → 内部引擎枚举
+	engine, err := ModelDeploymentInjectEngine(in.Engine, in.Manufacturer)
+	if err != nil {
+		return ModelDeploymentConnectorRender{}, err
+	}
+
+	// 角色由 kind 映射到渲染器的词汇表。未设置的 kind 映射为 RoleNone，渲染结果与单角色部署
+	// 一贯的产出完全一致，因此该映射在此无需特殊分支处理。
+	//
+	// 无法映射的 kind 会被直接拒绝，而非回退成 RoleNone。准入控制本应拦截此类 kind，能走到
+	// 这里说明两者出现分歧，回退只会导致静默故障：decoder 被配置成普通单角色服务器，看似健康
+	// 却在独立处理完整请求。
+	// IMPORTANT: 翻译：API RoleKind → inject.Role
+	role, ok := modelDeploymentInjectRole(in.Kind)
+	if !ok {
+		return ModelDeploymentConnectorRender{}, fmt.Errorf("unsupported role kind %q", in.Kind)
+	}
+
+	// 资源池提供的多个传输协议中究竟把哪一个交给引擎，是在此处而非连接解析阶段决定的：
+	// 该决策依赖具体引擎，连接按 deployment 解析，而引擎随各个 role 变化。受限引擎选取首个
+	// 接受的协议；不受限引擎则取首个以兼容在混用检查前已准入的旧绑定。
+	// IMPORTANT: 从共享池支持的协议里挑一个当前引擎认的
+	protocol, err := inject.MatchTransport(engine, in.Protocols)
+	if err != nil {
+		return ModelDeploymentConnectorRender{}, err
+	}
+
+	kvTransferProtocol := ""
+	if in.KVTransferProtocol != "" {
+		// IMPORTANT: 翻译：API 的 "TCP" → Mooncake 拼写的 "tcp"
+		kvTransferProtocol = mooncake.TransportProtocol(in.KVTransferProtocol)
+		if kvTransferProtocol == "" {
+			return ModelDeploymentConnectorRender{}, fmt.Errorf("unsupported KV transfer protocol %q", in.KVTransferProtocol)
+		}
+	}
+
+	res, err := inject.Render(inject.Input{
+		Engine: engine,
+		Role:   role,
+		// 配对标志随 role 一并传入，而非在此处推导：引擎的拆分模式取决于 deployment 完整的角色
+		// 集合，单个 role 本身无法得知另一半是否已声明。
+		Disaggregated: in.Disaggregated,
+		Domain:        in.Domain,
+		CachePrefix:   in.CachePrefix,
+		Dtype:         in.Dtype,
+		// 编码器分支由外部完整传入而不在此组装：由哪个连接器承载该分支由准入规则决定，取自当前
+		// 组合命中的匹配行。零值表示不启用编码器分支，输出与该分支存在前完全一致。
+		EncoderCache: in.EncoderCache,
+		EncoderURLs:  in.EncoderURLs,
+		Connection: inject.Connection{
+			MasterAddress: in.MasterServerAddress,
+			Protocol:      protocol,
+		},
+		PublishKVEvents: in.PublishKVEvents,
+		KVEventsHost:    in.KVEventsHost,
+		KVTransfer:      in.KVTransfer,
+		// 未设置时的默认值归渲染器所有；此处仅负责将显式声明的 API 协议值做映射。
+		KVTransferProtocol: kvTransferProtocol,
+		// 成对并行参数同样从外部透传而不在此处解析：解析需要读取整个 deployment 的所有角色，
+		// 而合成函数只看到单个角色的输入。
+		Parallelism: in.Parallelism,
+	})
+	if err != nil {
+		return ModelDeploymentConnectorRender{}, err
+	}
+
+	var parallelism inject.ParallelismPair
+	if engine == inject.EngineVLLMAscend && res.KVTransfer {
+		parallelism = in.Parallelism
+	}
+
+	return ModelDeploymentConnectorRender{
+		Args: res.Args,
+		Env:  res.Env,
+		// MC_TE_METRIC 在共享渲染器中没有也不应有对应项：共享渲染器输出引擎连接资源池所需的
+		// 参数，而该环境变量用于满足本控制面自身的观测需求。它以默认值而非托管键输出，因此用户
+		// 自行声明的值可无报错地覆盖它；渲染器自身的默认环境变量紧随其后遵循同一规则。
+		DefaultedEnv:   append([]core.EnvVar{{Name: "MC_TE_METRIC", Value: "1"}}, res.DefaultedEnv...),
+		DefaultedArgs:  res.DefaultedArgs,
+		Volumes:        res.Volumes,
+		VolumeMounts:   res.VolumeMounts,
+		PodAnnotations: res.PodAnnotations,
+		Ports:          res.Ports,
+		KVEvents:       res.KVEvents,
+		KVTransfer:     res.KVTransfer,
+		// 直接透传而非在此推导：渲染器无法知晓前方挂接了哪款路由器，按直传链路反推 sidecar 正是
+		// 本次拆分所要终止的耦合。
+		RoutingSidecar: in.RoutingSidecar,
+		binding: &modelDeploymentConnectorBinding{
+			Domain:              in.Domain,
+			Dtype:               in.Dtype,
+			CachePrefix:         in.CachePrefix,
+			MasterServerAddress: in.MasterServerAddress,
+			Protocol:            protocol,
+			KVTransfer:          res.KVTransfer,
+			KVTransferProtocol:  kvTransferProtocol,
+			PublishKVEvents:     in.PublishKVEvents,
+			KVEventsHost:        in.KVEventsHost,
+			RoutingSidecar:      in.RoutingSidecar,
+			Disaggregated:       in.Disaggregated && (role == inject.RolePrefill || role == inject.RoleDecode),
+			Parallelism:         parallelism,
+			EncoderCache:        in.EncoderCache,
+			EncoderURLs:         in.EncoderURLs,
+		},
+	}, nil
 }
 
 // ModelDeploymentInjectEngine 将本 API 的引擎值与角色制造商映射到共享渲染器的引擎枚举。

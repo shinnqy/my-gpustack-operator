@@ -12,6 +12,8 @@ package inject
 import (
 	"fmt"
 	"slices"
+
+	core "k8s.io/api/core/v1"
 )
 
 // Engine 表示正在为其渲染配置的推理引擎名称。
@@ -177,6 +179,18 @@ type Parallelism struct {
 	DataParallel int
 }
 
+// orOne 将未声明的并行度映射为引擎自身的默认值 1，避免配置文档中出现零宽度的角色。
+func (p Parallelism) orOne() Parallelism {
+	if p.TensorParallel == 0 {
+		p.TensorParallel = 1
+	}
+	if p.DataParallel == 0 {
+		p.DataParallel = 1
+	}
+
+	return p
+}
+
 // ParallelismPair 表示 prefill/decode 配对中双方角色共同声明的并行形态。
 // 两者作为一个整体传递，是因为传输配置文档会同时校验双方：如果渲染器只使用调用方提供的其中一侧
 // 而对另一侧取默认值，就会生成错误的块布局而非直接拒绝。
@@ -278,6 +292,16 @@ type Input struct {
 	EncoderCache EncoderCache
 }
 
+const defaultKVTransferProtocol = "tcp"
+
+// directLegProtocol 返回声明的 Mooncake 传输协议；未声明时默认返回 tcp。
+func directLegProtocol(in Input) string {
+	if in.KVTransferProtocol != "" {
+		return in.KVTransferProtocol
+	}
+	return defaultKVTransferProtocol
+}
+
 // MooncakeForceTCPEnv 是使 Mooncake 传输引擎仅使用 TCP 的环境变量名。
 // 它由传输引擎本身读取，而非由任何引擎的配置类读取，且仅检查是否存在（不关心值）。
 const MooncakeForceTCPEnv = "MC_FORCE_TCP"
@@ -302,10 +326,38 @@ const (
 	defaultMooncakeTCPAdmissionTimeoutMs          = "60000"
 )
 
+// mooncakeTCPDefaultedEnv 返回带默认值的 C++ Mooncake Transfer Engine TCP 调优环境变量。
+func mooncakeTCPDefaultedEnv() []core.EnvVar {
+	return []core.EnvVar{
+		{Name: MooncakeTCPMaxQueuedTransfersPerPeerEnv, Value: defaultMooncakeTCPMaxQueuedTransfersPerPeer},
+		{Name: MooncakeTCPMaxPendingAdmissionsPerPeerEnv, Value: defaultMooncakeTCPMaxPendingAdmissionsPerPeer},
+		{Name: MooncakeTCPLanesPerPeerEnv, Value: defaultMooncakeTCPLanesPerPeer},
+		{Name: MooncakeTCPAdmissionTimeoutMsEnv, Value: defaultMooncakeTCPAdmissionTimeoutMs},
+	}
+}
+
 // KVCacheDtypeArg 是两类引擎用于读取 KV 缓存元素类型的命令行参数：vLLM v0.29.0
 // `vllm/config/cache.py` 的 CacheDType 与 SGLang v0.5.18 `server_args.py` 的 kv_cache_dtype。
 // 两者都会在启动时按各自的可选值校验，因此引擎不识别的拼写会直接终止容器，而不会被静默忽略。
 const KVCacheDtypeArg = "--kv-cache-dtype"
+
+// directLegForcesTCP 报告解析为 tcp 的直传链路是否还应强制锁定为 tcp，而不仅仅在配置中声明。
+//
+// 仅在配置中告知并不够：Mooncake 传输引擎会根据宿主机硬件自动选择传输方式，并不读取 connector
+// 的 protocol 键。因此，在没有 RDMA 设备的宿主机上，若镜像编译启用了多机 NVLink，即使两台主机
+// 之间并不存在 NVLink 通路，它仍会加载 NVLink 传输，导致链路无法传送任何数据。传输引擎唯一会
+// 读取的开关是 MooncakeForceTCPEnv，只要该环境变量存在，引擎就会只加载 TCP 传输。
+//
+// 该开关作用于整个进程：它会让传输引擎初始化提前返回，而同一进程中的 store 客户端也通过同一个
+// 函数初始化。因此只有在进程内所有传输引擎都期望使用 tcp 时才锁定该开关——否则若 store 使用非
+// tcp 传输，就会失去原本分配给它的高速网络。存在这类 store 时，直传链路保留引擎自身的默认选择。
+func directLegForcesTCP(in Input) bool {
+	if directLegProtocol(in) != "tcp" {
+		return false
+	}
+
+	return in.Connection.MasterAddress == "" || in.Connection.Protocol == "tcp"
+}
 
 // Reason 对拒绝原因进行分类。调用方依据它做分支判断；随附的消息面向人工阅读，
 // 调整措辞不会破坏调用方逻辑。

@@ -6,6 +6,17 @@
 // 或（作为 prefiller 时）同时渲染两者，而 encoder 仅渲染此分支。
 package inject
 
+import (
+	"fmt"
+	"strconv"
+
+	core "k8s.io/api/core/v1"
+
+	"gpustack.ai/gpustack/pkg/utils/json"
+)
+
+// IMPORTANT: 本文件是 vLLM 的多模态 EncoderCache（编码器缓存）渲染分支
+
 const (
 	// vllmECTransferConfigArg 用于选择编码器缓存连接器和角色。与对应的 KV 参数一样，它是从命令行
 	// 解析的 EngineArgs 字段（`ec_transfer_config`，见 vLLM v0.30.0 `vllm/engine/arg_utils.py:1717`），
@@ -91,6 +102,164 @@ type EncoderCache struct {
 	// 且两端必须指定同一路径：缺少该键时连接器会回退到 "/tmp"（见 v0.30.0 `example_connector.py:53-56`），
 	// 而在 Pod 中该目录并非两端共享，未设置时虽看似已配置，实则无法传输任何数据。
 	SharedStoragePath string
+}
+
+// vllmECTransferConfig 是 --ec-transfer-config 的 JSON 文档。使用结构体而非 map，以便无法
+// 识别的键能在编译期报错，与本包已有的另外两类配置文档保持一致。JSON 规范不保证键顺序，
+// 因此对其做比对时应反序列化后比较，而不是做纯字符串匹配。
+type vllmECTransferConfig struct {
+	ECConnector string `json:"ec_connector"`
+	ECRole      string `json:"ec_role"`
+	// EngineID 用于命名 NIXL agent。此处留空，因为上游默认会为每个实例生成新的 UUID4
+	// （v0.30.0 `docs/features/ec_cpu_connector.md:90`），天然满足每 Pod 唯一；若在这里指定，
+	// 同样必须保证每个 Pod 唯一，而本渲染器无法校验这一点。
+	EngineID               string                      `json:"engine_id,omitempty"`
+	ECConnectorExtraConfig *vllmECConnectorExtraConfig `json:"ec_connector_extra_config,omitempty"`
+}
+
+type vllmECConnectorExtraConfig struct {
+	// ECEnableNIXL 是 JSON 布尔值而非字符串 "true"：extra config 不会做类型强转，传入非 bool
+	// 值时会被字符串化后与 "true"、"1"、"yes" 比对（见 vLLM v0.30.0
+	// `vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:88-92`）。因此字符串
+	// "true" 或数字 1 虽能碰巧生效，而 0 与 2 则会被当作关闭。这只是解析过程的偶然行为而非契约，
+	// 该键在文档中定义为布尔开关，因此此处直接按布尔值渲染。
+	ECEnableNIXL bool `json:"ec_enable_nixl,omitempty"`
+
+	// ECCPUBytes 指定 CPU 内存区域大小。ECCPUConnector 必需该键，ECExampleConnector 不读取。
+	ECCPUBytes int64 `json:"ec_cpu_bytes,omitempty"`
+
+	// SharedStoragePath 是 ECExampleConnector 的工作目录。该连接器必需此键，ECCPUConnector 不读取。
+	SharedStoragePath string `json:"shared_storage_path,omitempty"`
+}
+
+// vllmECRole 将声明的角色映射为编码器缓存连接器自身的词汇。
+//
+// 仅支持这两种角色，这种不对称正是设计本身：encoder 负责生产，只有 prefiller 负责消费，因为
+// decoder 代理会把多模态部分发送给 encoder，再由 prefill 端读回其编码结果
+// （v0.30.0 `examples/disaggregated/disaggregated_encoder/disagg_1e1p1d_example.sh:52-57`）。
+// decode 端只消费注意力块而不消费编码结果，因此在此直接拒绝，而不是为它渲染一个永远不会被
+// 调用的 "ec_consumer"。
+func vllmECRole(role Role) (string, error) {
+	switch role {
+	case RoleEncode:
+		return vllmECProducerRole, nil
+	case RolePrefill:
+		return vllmECConsumerRole, nil
+	case RoleDecode:
+		return "", newRefusal(ReasonRoleUnsupported,
+			"the decode role consumes attention blocks, not encodings: only the encoder produces "+
+				"them and only the prefill role reads them")
+	default:
+		return "", newRefusal(ReasonRoleUnsupported,
+			"the encoder-cache leg has no end for role %q: a deployment runs it as a separate "+
+				"encoder stage or as the prefill half that consumes it", role)
+	}
+}
+
+// renderVLLMEncoderCache 单独生成编码器缓存分支的配置，由调用方叠加到角色的常规渲染结果上，
+// 而非由本函数决定其外围结构。
+//
+// 返回的 Result 仅包含该分支自身的内容，既方便调用方按合适顺序追加，也便于测试单独持有该分支
+// 并与本包声明托管的键集合做比对。
+//
+// 当未请求连接器时，所有角色（包括 encoder）在此均渲染为空结果。是否允许 encoder 在未声明
+// 编码器缓存连接器的情况下进入渲染，不属于本函数的职责：本函数只负责回答已命名分支的渲染结果，
+// 而 encoder 阶段的约束规则位于组合入口处，与其他角色规则放在一起。
+func renderVLLMEncoderCache(in Input, ec EncoderCache) (*Result, error) {
+	// 未指定连接器时直接返回空结果，不视为拒绝。早于该分支存在的所有输入都不会命名连接器，
+	// 不涉及此分支的角色也不应因未发起请求而被拒绝。判空放在这里而非调用处，避免第二个组合点
+	// 遗漏判断。
+	if ec.Connector == "" {
+		return &Result{}, nil
+	}
+
+	role, err := vllmECRole(in.Role)
+	if err != nil {
+		return nil, err
+	}
+
+	doc := &vllmECTransferConfig{ECRole: role}
+	switch ec.Connector {
+	case vllmECCPUConnector:
+		// 在缺乏 NPU 拷贝通路的引擎上直接拒绝，而不是照常渲染让容器启动失败：整个传输过程是
+		// 设备间拷贝，而 Ascend 构建不包含所需的 NIXL 后端。
+		if in.Engine == EngineVLLMAscend {
+			return nil, newRefusal(ReasonTransportUnsupported,
+				"the NIXL encoder-cache connector has no NPU copy path on engine %q, so every "+
+					"value the leg declares is legal and the pair still has no container that can "+
+					"run it; name %s instead", in.Engine, vllmECExampleConnector)
+		}
+		if ec.CPUBytes <= 0 {
+			return nil, newRefusal(ReasonConnectionIncomplete,
+				"the NIXL encoder-cache connector needs the size of the CPU region to offload "+
+					"encodings into, and it raises ValueError without the key; declare one on the "+
+					"encoder-cache leg")
+		}
+		doc.ECConnector = vllmECCPUConnector
+		doc.ECConnectorExtraConfig = &vllmECConnectorExtraConfig{
+			ECEnableNIXL: true,
+			ECCPUBytes:   ec.CPUBytes,
+		}
+	case vllmECExampleConnector:
+		if ec.SharedStoragePath == "" {
+			return nil, newRefusal(ReasonConnectionIncomplete,
+				"the shared-directory encoder-cache connector needs the mount path both ends "+
+					"share, and falls back to /tmp without it, which in a Pod is a directory "+
+					"neither end can see; declare one on the encoder-cache leg")
+		}
+		doc.ECConnector = vllmECExampleConnector
+		doc.ECConnectorExtraConfig = &vllmECConnectorExtraConfig{SharedStoragePath: ec.SharedStoragePath}
+	default:
+		return nil, newRefusal(ReasonEngineUnknown,
+			"encoder-cache connector %q is not one the operator's decode proxy speaks: its sidecar "+
+				"carries the shared-directory and NIXL encodings, so this leg would move nothing "+
+				"whatever the engine's own registry resolves", ec.Connector)
+	}
+
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal the vLLM encoder-cache configuration: %w", err)
+	}
+	result := &Result{Args: []string{vllmECTransferConfigArg, string(encoded)}}
+
+	// 该模型运行器环境变量对所有角色都是连接器的前置条件，而不仅限于生产端。
+	// ECCPUConnector.__init__ 在检查传入角色之前就会校验 use_v2_model_runner，为 false 时直接抛出
+	// ValueError（见 vLLM v0.30.0 `vllm/distributed/ec_transfer/ec_connector/cpu/connector.py:40-44`），
+	// 且工厂函数为消费端与生产端构造的是同一个类（`ec_connector/factory.py:36-56`，区分的是 worker
+	// 或 scheduler，而非生产端或消费端）。因此缺少该变量会导致该分支上的 prefiller 在构造阶段反复崩溃。
+	// 共享目录分支不设置该变量，因为 ECExampleConnector.__init__ 不读取它（`example_connector.py:54-67`）。
+	if doc.ECConnector == vllmECCPUConnector {
+		result.Env = []core.EnvVar{{Name: vllmModelRunnerEnv, Value: "1"}}
+	}
+
+	if role == vllmECConsumerRole {
+		return result, nil
+	}
+
+	// 以下仅适用于生产端。侧信道变量仅由启用 NIXL 传输的生产端读取，消费端渲染它们只会宣告一个
+	// 自身并不会监听的地址。
+	if doc.ECConnector == vllmECCPUConnector {
+		result.Env = append(result.Env,
+			core.EnvVar{
+				Name: vllmECSideChannelHostEnv,
+				ValueFrom: &core.EnvVarSource{
+					FieldRef: &core.ObjectFieldSelector{FieldPath: vllmECPodIPFieldPath},
+				},
+			},
+			core.EnvVar{Name: vllmECSideChannelPortEnv, Value: strconv.Itoa(int(VLLMECSideChannelPort))},
+		)
+		result.Ports = []core.ContainerPort{{
+			Name: "ec-side-channel", Protocol: core.ProtocolTCP, ContainerPort: VLLMECSideChannelPort,
+		}}
+	}
+
+	result.DefaultedArgs = [][]string{
+		{vllmEnforceEagerArg},
+		{vllmNoPrefixCachingArg},
+		{vllmECMaxNumBatchedTokensArg, vllmECMaxNumBatchedTokens},
+		{vllmMMEncoderOnlyArg},
+	}
+	return result, nil
 }
 
 // EncoderCacheOwnedKeys 返回编码器缓存分支针对给定请求写入并自行决定的命令行参数和环境变量。

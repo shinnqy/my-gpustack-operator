@@ -697,6 +697,17 @@ func modelDeploymentEndpoint(md *workercore.ModelDeployment) string {
 		md.Name + "." + md.Namespace + ".svc:" + strconvx.Itoa(int(port.ContainerPort))
 }
 
+// 拼出 http://<md>-<role>.<ns>.svc:<port>
+func modelDeploymentRoleEndpoint(
+	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
+) string {
+	port := modelDeploymentServicePort(role)
+	scheme, _ := modelDeploymentEngineTransport(md.Spec.Engine.Name, ModelDeploymentRoleArgs(role))
+
+	return strings.ToLower(string(scheme)) + "://" + md.Name + "-" + role.Name + "." +
+		md.Namespace + ".svc:" + strconvx.Itoa(int(port.ContainerPort))
+}
+
 // alignModelDeploymentService 将渲染后的 Service 合并到观测到的 Service 上，并报告是否发生了变更。
 //
 // 这里采用对齐合并而非整体替换，因为 Service 承载了并非由 operator 写入且绝不能丢弃的状态——尤其是已分配的 ClusterIP，所有解析过它的客户端仍在使用该地址。

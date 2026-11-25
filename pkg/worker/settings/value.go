@@ -350,6 +350,34 @@ var (
 		setting.AllowBool(),
 	)
 
+	// ModelDeploymentRouterImage 是当 ModelDeployment 未指定镜像时托管路由器运行的默认镜像。
+	//
+	// 单个镜像内置全部三款路由器，实际运行哪个二进制由渲染出的命令决定，而非由本配置项决定。
+	// `spec.router.name` 选择二进制，本配置只指定镜像来源，从而离线集群只需同步一个镜像标签。
+	//
+	// 默认值固定为本项目构建的发布版本，而非上游浮动标签：三款路由器分别编译自三个上游仓库（其中
+	// 部分携带本仓库补丁），不存在包含全部三者的上游镜像，固定标签可防止不同时期安装的集群跑出
+	// 行为不一致的路由器。
+	ModelDeploymentRouterImage = settings.NewEditable(
+		"model-deployment-router-image",
+		"Indicates the image a managed router runs, when the ModelDeployment does not name one. "+
+			"It carries every router this operator supports; the rendered command chooses which "+
+			"binary runs.",
+		setting.InitializeFromEnv("gpustack/llm-router:v0.4.0"),
+		setting.AllowContainerImageReference(),
+	)
+
+	// ModelDeploymentRouterProxyImage 是位于托管路由器 endpoint picker 前方的代理镜像。
+	//
+	// API 不提供覆盖该镜像的字段，因为本 operator 按特定代理的配置 schema 渲染其配置文件，随意
+	// 更换代理二进制还必须同步更换配置。本配置项用于镜像仓库重定向与版本固定，而非替换代理实现。
+	ModelDeploymentRouterProxyImage = settings.NewEditable(
+		"model-deployment-router-proxy-image",
+		"Indicates the proxy image fronting a managed router's endpoint picker.",
+		setting.InitializeFromEnv("gpustack/mirrored-envoy:distroless-v1.33.2"),
+		setting.AllowContainerImageReference(),
+	)
+
 	// ModelDeploymentRoutingSidecarImage 是 decoder 用来接收远程 prefill 交接的路由 sidecar 镜像。
 	// 由于本 operator 负责渲染其命令行参数，该设置主要用于镜像仓库重定向与版本固定，而非替换为其他实现。
 	ModelDeploymentRoutingSidecarImage = settings.NewEditable(

@@ -19,7 +19,15 @@
 // 输出该变量。若用户自行设置该变量，则会平滑且正确地接管配置：显式配置应当优先于默认配置。
 package inject
 
-import ()
+import (
+	"strconv"
+
+	core "k8s.io/api/core/v1"
+
+	"gpustack.ai/gpustack/pkg/utils/json"
+)
+
+// IMPORTANT: 本文件是 SGLang 的“引擎侧 KV 交接配置”核心参数渲染器
 
 const (
 	// SGLang 在 `load_from_env`（v0.5.18 `mooncake_store.py:170-210`）中通过 `.get()` 读取的
@@ -211,8 +219,174 @@ func SGLangEncoderOwnedArgs() []string {
 // 以上每处引用均附带了版本号与符号名，因为本注释此前引用的纯行号已全部漂移——
 // 该上游文件现已超过 1300 行——而过时的行号在代码评审中极易因看似经过核对而被放过。
 func renderSGLang(in Input) (*Result, error) {
-	// 在第 20 章中实现此函数。
-	var result0 *Result
-	var result1 error
-	return result0, result1
+	// 依据角色支持表做门控而非在此渲染器里重复判断，从而确保准入与渲染遵守同一份角色契约。
+	if !SupportsRole(in.Engine, in.Role) {
+		return nil, newRefusal(ReasonRoleUnsupported,
+			"engine %q has no known prefill/decode equivalent for role %q; accepting the role and "+
+				"ignoring it would leave the container looking configured and behaving otherwise",
+			in.Engine, in.Role)
+	}
+
+	// 由同一个布尔变量同时决定是否输出以及如何上报，避免重复计算同一条件导致漂移：若某次改动
+	// 停止追加环境变量却仍上报已注入，注解标记就会声称存在一个容器并未携带的租户。上报标志必须
+	// 是实际输出的结果，而非另起一套判断。
+	//
+	// 域为空时彻底省略租户环境变量，而不是输出空字符串，因为该引擎会把空值归一化回 store 默认值——
+	// 输出空变量与不设置效果毫无区别，在 Pod 上却看起来像是已经做了配置。
+	hasStore := in.Connection.MasterAddress != ""
+	// decodeHalf 表示引擎是否以 decode 分离模式启动，对应下方分离分支自身的条件：孤立的 decode
+	// 单侧不拆分，按普通单角色服务运行。
+	decodeHalf := in.Disaggregated && in.Role == RoleDecode
+
+	// 拒绝为 encoder 渲染缓存，而非输出一套它无法使用的配置。下方 store 客户端会把分层缓存挂到
+	// 写入它的引擎上，而 encoder 不构建语言模型也没有可缓存的 KV，强行渲染会让容器正常启动、
+	// 携带完整的 Mooncake 配置却不搬运任何块。在进入 store 分支前直接拒绝，避免结论依赖渲染推进
+	// 到了哪一步。
+	//
+	// 条件中未包含 PublishKVEvents，因为它不可能到达这里：Render 在调用本渲染器前就会拒绝原版
+	// vLLM 之外的所有引擎发布 KV 事件。
+	if in.Role == RoleEncode && (hasStore || in.KVTransfer) {
+		return nil, newRefusal(ReasonRoleUnsupported,
+			"role %q holds no KV cache, so a shared store or a point-to-point transfer asked of it "+
+				"would leave the encoder carrying a cache configuration that moves nothing",
+			in.Role)
+	}
+	env := []core.EnvVar{}
+	tenantInjected := hasStore && in.Domain != ""
+	tenantEnvName := ""
+	if tenantInjected {
+		env = append(env, core.EnvVar{Name: sglangTenantEnv, Value: in.Domain})
+		tenantEnvName = sglangTenantEnv
+	}
+
+	result := &Result{}
+	if hasStore {
+		env = append(env, []core.EnvVar{
+			{Name: sglangMasterEnv, Value: in.Connection.MasterAddress},
+			{Name: sglangMetadataServerEnv, Value: MetadataServer},
+			{Name: sglangProtocolEnv, Value: in.Connection.Protocol},
+			{Name: sglangDeviceEnv, Value: DeviceName},
+			{Name: sglangGlobalSegmentEnv, Value: strconv.Itoa(GlobalSegmentSize)},
+			{
+				Name: sglangLocalHostnameEnv,
+				ValueFrom: &core.EnvVarSource{
+					FieldRef: &core.ObjectFieldSelector{FieldPath: sglangPodIPFieldPath},
+				},
+			},
+		}...)
+		result.Env = env
+		result.TenantInjected = tenantInjected
+		// 仅在实际输出了租户变量时填写其名称。调用方据此把工作负载中同名环境变量的所有声明都覆盖
+		// 为 Binding 解析得到的租户值。
+		result.TenantEnvName = tenantEnvName
+		result.Args = []string{sglangBackendArg, sglangBackendValue}
+		if in.CachePrefix != "" {
+			extra, err := json.Marshal(map[string]string{"extra_backend_tag": in.CachePrefix})
+			if err != nil {
+				return nil, err
+			}
+			result.Args = append(result.Args, sglangBackendExtraConfigArg, string(extra))
+		}
+		if in.Dtype != "" {
+			result.Args = append(result.Args, KVCacheDtypeArg, in.Dtype)
+		}
+		// decode 侧绝不启用分层缓存：SGLang 会在 decode 侧强制关闭 radix cache（v0.5.18
+		// `arg_groups/pd_disaggregation_hook.py`），并拒绝这两个标志同时出现。其余形态均承担
+		// prefill 并读取后端供给的树形缓存。
+		//
+		// 分层缓存会按 hicache_ratio（默认 2.0）倍于设备 KV 池的大小构建锁页主机内存池，同样受
+		// sglangRetractionBackupArg 注释所述的 10 GiB 节点全局内存预留约束；该节点前提是启用共享
+		// store 的固有代价，并非本渲染器可以缩减的项。
+		if !decodeHalf {
+			result.DefaultedArgs = append(result.DefaultedArgs, []string{sglangHierarchicalCacheArg})
+		}
+	}
+
+	// 没有配对角色却请求直传链路时无从配对，因此直接拒绝而非近似处理——未拆分角色仅渲染共享 store。
+	if in.KVTransfer && in.Role != RolePrefill && in.Role != RoleDecode {
+		return nil, newRefusal(ReasonRoleUnsupported,
+			"point-to-point transfer pairs a prefill half with a decode half, and role %q is "+
+				"neither; a role with no split renders the shared store alone", in.Role)
+	}
+
+	// 分离分支由角色与配对共同决定，而不是看 KVTransfer 标志，其中两项条件都起决定作用。上方
+	// store 客户端不区分角色，因此这些参数是两种角色在此引擎上的唯一渲染体现：声明拆分本身就是
+	// 该引擎下成为 prefill 或 decode 角色的含义。
+	//
+	// 若同时要求 KVTransfer 为真，会导致准入与渲染脱节：接受角色的处理逻辑查的是按引擎与角色
+	// 索引的支持表，并不知晓直传标志，已通过准入的角色到达此处若被拒绝，错误就会落在对象已落库
+	// 之后的 reconciler 里，用户无法在提交时修正。支持表存在的意义正是在用户仍可修正时拦截引擎
+	// 无法渲染的角色。
+	//
+	// 配对条件则是另一条有着独立原因的规则：路由器已经根据“两侧是否均已声明”决定是否拆分，孤立
+	// 单侧会被按未拆分形态路由，而不会对只能提供一侧服务的集合开启分离。如果引擎在这样的路由下
+	// 仍以半边模式启动，就会无限等待永远不会分配的对端，因此让引擎层与路由层在此达成一致。这一
+	// 代价是有意承担的：刻意只声明单侧以喂给共享 store 的部署，现在会以未拆分形态运行此引擎，
+	// 而此前它会以半边模式启动。
+	if in.Disaggregated && (in.Role == RolePrefill || in.Role == RoleDecode) {
+		result.KVTransfer = true
+		// 传输后端是配对属性，因此两侧依据同一份输入做选择：凡是 directLegForcesTCP 允许的场景均
+		// 固定到 tcp 后端，其余场景保持传输引擎自行选择的传输方式。
+		backend := sglangDisaggregationBackendMooncake
+		if directLegForcesTCP(in) {
+			backend = sglangDisaggregationBackendMooncakeTCP
+		}
+		result.Args = append(result.Args,
+			sglangDisaggregationModeArg, string(in.Role),
+			sglangDisaggregationBackendArg, backend)
+		if decodeHalf {
+			result.DefaultedArgs = append(result.DefaultedArgs,
+				[]string{sglangRetractionBackupArg, sglangRetractionBackupCPUValue})
+		}
+
+		// 只有 prefill 侧运行引导注册服务，因此只有它指定端口、在容器上暴露端口并发布服务发现注解。
+		// decode 侧按请求从路由层获知引导地址，因此三项均不渲染。
+		if in.Role == RolePrefill {
+			result.Args = append(result.Args,
+				sglangDisaggregationBootstrapPortArg, strconv.Itoa(int(SGLangBootstrapPort)))
+			result.Ports = append(result.Ports, core.ContainerPort{
+				Name: "bootstrap", Protocol: core.ProtocolTCP, ContainerPort: SGLangBootstrapPort,
+			})
+			if result.PodAnnotations == nil {
+				result.PodAnnotations = map[string]string{}
+			}
+			result.PodAnnotations[sglangBootstrapPortAnnotation] = strconv.Itoa(int(SGLangBootstrapPort))
+		}
+	}
+	if (hasStore && in.Connection.Protocol == "tcp") ||
+		(in.Disaggregated && (in.Role == RolePrefill || in.Role == RoleDecode) && directLegForcesTCP(in)) {
+		result.DefaultedEnv = append(result.DefaultedEnv, mooncakeTCPDefaultedEnv()...)
+		result.DefaultedArgs = append(result.DefaultedArgs, []string{sglangPageSizeArg, defaultSGLangTCPPageSize})
+	}
+
+	// 编码器分支是第三阶段，且必须放在最后写入，因为地址标志（sglangEncoderURLsArg）接收列表。
+	// 这里的顺序不是代码风格问题：引擎参数解析器会把该标志之后的每个条目都当作地址，直到遇到
+	// 下一个以短横线开头的标志为止，因此跟在它后面的参数值会被当成 Service 地址去拨号。
+	//
+	// 两端的不对称源于引擎本身而非本仓库的设计。encoder 只接收一个开关且不构建语言模型（v0.5.18
+	// `server_args.py:3171-3173`）；仅语言侧接收第二个开关以及所有 encoder 副本的地址列表
+	// （`:3174-3176`、`:3193-3195`）。decode 侧两者都不接收：它直接从 prefiller 已构建好的 KV
+	// 缓存中读取嵌入结果，这也是上游三阶段示例未给 decode 传任何 encoder 标志的原因（v0.5.18
+	// `docs/docs/advanced_features/epd_disaggregation.mdx`）。
+	switch in.Role {
+	case RoleEncode:
+		result.Args = append(result.Args, sglangEncoderOnlyArg)
+	case RolePrefill:
+		// 只有仅语言侧需要地址列表，因此只有它渲染此分支。未声明 encoder 的部署中，prefill 侧在此
+		// 不写入任何参数，从而保证不含 encode 角色的部署输出与此前逐字节一致。
+		if len(in.EncoderURLs) == 0 {
+			break
+		}
+		result.Args = append(result.Args,
+			sglangLanguageOnlyArg,
+			sglangEncoderBootstrapPortArg, strconv.Itoa(int(SGLangEncoderBootstrapPort)))
+		result.Ports = append(result.Ports, core.ContainerPort{
+			Name: sglangEncoderBootstrapPortName, Protocol: core.ProtocolTCP,
+			ContainerPort: SGLangEncoderBootstrapPort,
+		})
+		result.Args = append(result.Args, sglangEncoderURLsArg)
+		result.Args = append(result.Args, in.EncoderURLs...)
+	}
+
+	return result, nil
 }

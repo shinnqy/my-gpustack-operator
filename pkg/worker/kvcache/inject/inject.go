@@ -2,6 +2,7 @@
 package inject
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 
@@ -74,6 +75,17 @@ type KVEvents struct {
 	Endpoint       string
 	ReplayEndpoint string
 	Topic          string
+}
+
+// IMPORTANT: 根据可拨号主机名拼出 vLLM ZMQ KV 事件的 tcp://host:5557 和重放端口 5558 契约，供控制器写入 Router 状态和 vLLM 渲染器返回
+//
+// VLLMKVEvents 返回与 vLLM 固定监听配置相匹配的可拨号事件契约。
+func VLLMKVEvents(host string) *KVEvents {
+	return &KVEvents{
+		Endpoint:       fmt.Sprintf("tcp://%s:%d", host, VLLMKVEventsPort),
+		ReplayEndpoint: fmt.Sprintf("tcp://%s:%d", host, VLLMKVEventsReplayPort),
+		Topic:          VLLMKVEventsTopic,
+	}
 }
 
 // KVEventsPorts 返回 vLLM ZMQ 发布端及其重放端点使用的端口。
