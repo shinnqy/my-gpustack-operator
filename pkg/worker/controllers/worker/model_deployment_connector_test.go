@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/nodefeature"
+	"gpustack.ai/gpustack/pkg/worker/kvcache/inject"
 )
 
 // connectorInputForKind 构造带指定角色类型的连接器合成输入夹具，用于按引擎与角色验证 KV 交接输出。
@@ -241,6 +243,7 @@ func TestModelDeploymentConnector_RoutedPairWithoutKVCacheUsesKVTransferOnly(t *
 		at := slices.Index(container.Command, "--kv-transfer-config")
 		require.GreaterOrEqual(t, at, 0, "%s carries no direct transfer configuration", pod.Name)
 		byRole[modelDeploymentPodRole(&pod)] = container.Command[at+1]
+		assert.NotContains(t, container.Command, "--ec-transfer-config", "纯 PD 部署没有编码器阶段")
 		for _, env := range container.Env {
 			assert.NotEqual(t, "MOONCAKE_CONFIG_PATH", env.Name,
 				"a deployment without kvCache must not receive shared-store configuration")
@@ -256,4 +259,129 @@ func TestModelDeploymentConnector_RoutedPairWithoutKVCacheUsesKVTransferOnly(t *
 		"kv_connector":"MooncakeConnector","kv_role":"kv_consumer",
 		"kv_connector_extra_config":{"mooncake_protocol":"tcp"}
 	}`, byRole["decode"])
+}
+
+func TestModelDeploymentEPDMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		router, engine string
+		platforms      []string
+		connector      string
+		floor          string
+		shared         bool
+	}{
+		{"llm-d-router", "vLLM", []string{"ascend"}, "ECExampleConnector", "0.30.0rc1", true},
+		{"llm-d-router", "vLLM", []string{"nvidia", "amd"}, "ECCPUConnector", "0.30.0", false},
+		{"vllm-router", "vLLM", []string{"nvidia", "amd"}, "ECCPUConnector", "0.30.0", false},
+		{"llm-d-router", "SGLang", []string{"nvidia", "amd", "ascend"}, "encoder-urls", "0.5.10", false},
+		{"sglang-gateway", "SGLang", []string{"nvidia", "amd", "ascend"}, "encoder-urls", "0.5.10", false},
+	} {
+		for _, platform := range tc.platforms {
+			t.Run(tc.router+"/"+tc.engine+"/"+platform, func(t *testing.T) {
+				row, ok := ModelDeploymentEPDRowFor(tc.router, tc.engine, platform)
+				require.True(t, ok)
+				assert.Equal(t, tc.connector, row.Connector)
+				assert.Equal(t, tc.floor, row.EngineFloor)
+				assert.Equal(t, tc.shared, row.SharedVolume)
+			})
+		}
+	}
+	require.Len(t, modelDeploymentEPDMatrix, 11)
+	_, ok := ModelDeploymentEPDRowFor("vllm-router", "vLLM", "ascend")
+	assert.False(t, ok)
+}
+
+func TestModelDeploymentEPDEncoderLeg_AnAddressLegConfiguresNoCache(t *testing.T) {
+	// 同一组三角色经控制器渲染为实际的 PodSpec，分别核对 SGLang 地址、vLLM 网络和共享目录三种交接方式。
+	for _, tc := range []struct {
+		platform, router, engine, image string
+		wantLeg                         inject.EncoderCache
+	}{
+		{"nvidia", "sglang-gateway", "SGLang", "lmsysorg/sglang:v0.5.18", inject.EncoderCache{}},
+		{"nvidia", "llm-d-router", "vLLM", "vllm/vllm-openai:v0.30.0",
+			inject.EncoderCache{Connector: "ECCPUConnector", CPUBytes: 1 << 30}},
+		{"ascend", "llm-d-router", "vLLM", "quay.io/ascend/vllm-ascend:v0.30.0rc1",
+			inject.EncoderCache{Connector: "ECExampleConnector", SharedStoragePath: "/encoder-cache"}},
+	} {
+		t.Run(tc.engine+"/"+tc.platform, func(t *testing.T) {
+			md := routedModelDeployment()
+			md.Spec.KVCache = nil
+			md.Spec.Model.Name = "Qwen/Qwen2.5-VL-7B-Instruct"
+			md.Spec.Engine = workercore.ModelDeploymentEngine{Name: tc.engine, Image: tc.image}
+			md.Spec.Router.Name = tc.router
+			encoder := md.Spec.Roles[0]
+			encoder.Name, encoder.Kind = "encode", workercore.ModelDeploymentRoleKindEncode
+			md.Spec.Roles = append(md.Spec.Roles, encoder)
+			for i := range md.Spec.Roles {
+				role := &md.Spec.Roles[i]
+				role.Replicas, role.Image = 1, ""
+				if tc.wantLeg.SharedStoragePath != "" && role.Kind != workercore.ModelDeploymentRoleKindDecode {
+					role.AdditionalVolumes = []workercore.ModelDeploymentAdditionalVolume{{
+						MountPath:             "/encoder-cache",
+						PersistentVolumeClaim: &core.PersistentVolumeClaimVolumeSource{ClaimName: "encodings-rwx"},
+					}}
+				}
+			}
+
+			it := newRenderInstanceType()
+			it.Status.Detail.Manufacturer = tc.platform
+			cli := newModelDeploymentClient(md, it)
+			_, err := reconcileModelDeployment(t, cli)
+			require.NoError(t, err)
+			pods := replicaPods(t, cli)
+			require.Len(t, pods, 3)
+			commands := make(map[string][]string)
+			for i := range pods {
+				main := pods[i].Spec.Containers[len(pods[i].Spec.Containers)-1]
+				require.Equal(t, modelDeploymentMainContainerName, main.Name)
+				commands[modelDeploymentPodRole(&pods[i])] = slices.Concat(main.Command, main.Args)
+			}
+
+			for i := range md.Spec.Roles {
+				role := &md.Spec.Roles[i]
+				leg := modelDeploymentEPDEncoderLeg(md, role, tc.platform)
+				argv := commands[role.Name]
+				require.NotEmpty(t, argv)
+				if role.Kind == workercore.ModelDeploymentRoleKindDecode {
+					assert.Zero(t, leg)
+					assert.NotContains(t, argv, "--ec-transfer-config")
+					assert.NotContains(t, argv, "--encoder-urls")
+					continue
+				}
+				assert.Equal(t, tc.wantLeg, leg)
+				if tc.engine == workercore.ModelDeploymentEngineSGLang {
+					assert.NotContains(t, argv, "--ec-transfer-config")
+					if role.Kind == workercore.ModelDeploymentRoleKindEncode {
+						assert.Contains(t, argv, "--encoder-only")
+					} else {
+						assert.Contains(t, argv, "--language-only")
+						at := slices.Index(argv, "--encoder-urls")
+						require.GreaterOrEqual(t, at, 0)
+						require.Greater(t, len(argv), at+1)
+						assert.Equal(t, "http://qwen-encode:8000", argv[at+1])
+					}
+					continue
+				}
+				at := slices.Index(argv, "--ec-transfer-config")
+				require.GreaterOrEqual(t, at, 0)
+				require.Greater(t, len(argv), at+1)
+				var doc struct {
+					Connector string          `json:"ec_connector"`
+					Role      string          `json:"ec_role"`
+					Extra     json.RawMessage `json:"ec_connector_extra_config"`
+				}
+				require.NoError(t, json.Unmarshal([]byte(argv[at+1]), &doc))
+				assert.Equal(t, tc.wantLeg.Connector, doc.Connector)
+				if role.Kind == workercore.ModelDeploymentRoleKindEncode {
+					assert.Equal(t, "ec_producer", doc.Role)
+				} else {
+					assert.Equal(t, "ec_consumer", doc.Role)
+				}
+				if tc.wantLeg.SharedStoragePath != "" {
+					assert.JSONEq(t, `{"shared_storage_path":"/encoder-cache"}`, string(doc.Extra))
+				} else {
+					assert.JSONEq(t, `{"ec_enable_nixl":true,"ec_cpu_bytes":1073741824}`, string(doc.Extra))
+				}
+			}
+		})
+	}
 }

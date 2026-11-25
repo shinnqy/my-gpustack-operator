@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,6 +16,7 @@ import (
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	kueuepodconst "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
+	kueueworkload "sigs.k8s.io/kueue/pkg/workload"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/kubeclients/kubernetes/scheme"
@@ -128,6 +130,134 @@ func newJointClient(objs ...ctrlcli.Object) ctrlcli.Client {
 		WithObjects(objs...).
 		WithStatusSubresource(&kueue.Workload{}, &kueue.AdmissionCheck{}).
 		Build()
+}
+
+// jointReplica 按渲染器使用的角色和序号构造一个副本，并让 Workload 引用其 Pod 的 UID。
+func jointReplica(md *workercore.ModelDeployment, role string, ordinal int, reserved bool) (*core.Pod, *kueue.Workload) {
+	name := role + "-" + strconv.Itoa(ordinal)
+	pod := jointGroupPod(name, modelDeploymentReplicaGroupName(md, role, ordinal), md.Name)
+	pod.Labels[modelDeploymentMemberIndexLabel] = "0"
+	pod.Annotations = map[string]string{kueuepodconst.GroupTotalCountAnnotation: "1"}
+	return pod, jointWorkload("wl-"+name, reserved, pod)
+}
+
+// epdJointDeployment 让三个角色使用同一规格，仍各自持有独立的配额预留。
+func epdJointDeployment() *workercore.ModelDeployment {
+	md := jointDeployment("qwen", "gpu", "gpu")
+	md.Spec.Roles[0].Kind = workercore.ModelDeploymentRoleKindPrefill
+	md.Spec.Roles[1].Kind = workercore.ModelDeploymentRoleKindDecode
+	md.Spec.Roles = append(md.Spec.Roles, workercore.ModelDeploymentRole{
+		Name: "encode", Kind: workercore.ModelDeploymentRoleKindEncode, InstanceType: "gpu", Replicas: 1,
+	})
+	return md
+}
+
+func TestModelDeploymentJointAdmission_TheWholeSetOrNone(t *testing.T) {
+	ctx := t.Context()
+	md := jointDeployment("qwen", "gpu", "gpu")
+	prefill, pWorkload := jointReplica(md, "prefill", 0, true)
+	decode, dWorkload := jointReplica(md, "decode", 0, true)
+	cli := newJointClient(jointCheckObject(), md, prefill, pWorkload)
+
+	got := reconcileJoint(t, cli, pWorkload.Name)
+	require.Equal(t, kueue.CheckStatePending, jointCheckState(got))
+	assert.Contains(t, jointCheckEntry(got).Message, "still assembling")
+	assert.True(t, kueueworkload.HasQuotaReservation(got))
+
+	// Decode 已组齐，尚无配额。此时消息要指出阻塞的角色，并保留 Prefill 的预留。
+	require.NoError(t, cli.Create(ctx, decode))
+	got = reconcileJoint(t, cli, pWorkload.Name)
+	require.Equal(t, kueue.CheckStatePending, jointCheckState(got))
+	assert.Contains(t, jointCheckEntry(got).Message, "1 of 2 replicas have reserved quota")
+	assert.Contains(t, jointCheckEntry(got).Message, "roles decode")
+	assert.True(t, kueueworkload.HasQuotaReservation(got))
+
+	require.NoError(t, cli.Create(ctx, dWorkload))
+	for _, wl := range []*kueue.Workload{pWorkload, dWorkload} {
+		assert.Equal(t, kueue.CheckStateReady, jointCheckState(reconcileJoint(t, cli, wl.Name)))
+	}
+}
+
+func TestModelDeploymentJointAdmission_EveryGroupOfAnEncoderDeployment(t *testing.T) {
+	for _, waiting := range []string{"", "encode", "prefill", "decode"} {
+		t.Run("waiting="+waiting, func(t *testing.T) {
+			md := epdJointDeployment()
+			objects := []ctrlcli.Object{jointCheckObject(), md}
+			for _, role := range md.Spec.Roles {
+				pod, wl := jointReplica(md, role.Name, 0, role.Name != waiting)
+				objects = append(objects, pod, wl)
+			}
+			cli := newJointClient(objects...)
+			for _, role := range md.Spec.Roles {
+				got := reconcileJoint(t, cli, "wl-"+role.Name+"-0")
+				entry := jointCheckEntry(got)
+				require.NotNil(t, entry)
+				switch {
+				case waiting == "":
+					assert.Equal(t, kueue.CheckStateReady, entry.State)
+				case waiting == role.Name:
+					assert.Empty(t, entry.Message)
+					assert.Equal(t, kueue.CheckStatePending, entry.State)
+				default:
+					assert.Equal(t, kueue.CheckStatePending, entry.State)
+					assert.Contains(t, entry.Message, "roles "+waiting)
+					assert.True(t, kueueworkload.HasQuotaReservation(got))
+				}
+			}
+		})
+	}
+}
+
+func TestModelDeploymentJointAdmission_AScaleUpDoesNotReopenTheAdmittedGroups(t *testing.T) {
+	md := epdJointDeployment()
+	md.Spec.Roles[0].Replicas = 2
+	objects := []ctrlcli.Object{jointCheckObject(), md}
+	for _, role := range md.Spec.Roles {
+		pod, wl := jointReplica(md, role.Name, 0, true)
+		jointCheckEntry(wl).State = kueue.CheckStateReady
+		jointCheckEntry(wl).Message = "already serving"
+		wl.Status.Conditions = append(wl.Status.Conditions, meta.Condition{
+			Type: kueue.WorkloadAdmitted, Status: meta.ConditionTrue,
+		})
+		objects = append(objects, pod, wl)
+	}
+	joining, newWorkload := jointReplica(md, "prefill", 1, false)
+	cli := newJointClient(append(objects, joining, newWorkload)...)
+
+	got := reconcileJoint(t, cli, newWorkload.Name)
+	assert.Equal(t, kueue.CheckStatePending, jointCheckState(got))
+	for _, role := range md.Spec.Roles {
+		got = reconcileJoint(t, cli, "wl-"+role.Name+"-0")
+		assert.True(t, kueueworkload.IsAdmitted(got))
+		require.Equal(t, kueue.CheckStateReady, jointCheckState(got))
+		assert.Equal(t, "already serving", jointCheckEntry(got).Message)
+	}
+}
+
+func TestModelDeploymentJointAdmission_AnAbsentReplicaIsReadByItsDeparture(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		keepWorkload bool
+		want         kueue.CheckState
+	}{
+		{name: "operator_replacement", want: kueue.CheckStateReady},
+		{name: "kueue_preemption", keepWorkload: true, want: kueue.CheckStatePending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md := jointDeployment("qwen", "gpu", "gpu")
+			prefill, pWorkload := jointReplica(md, "prefill", 0, true)
+			decode, dWorkload := jointReplica(md, "decode", 0, false)
+			now := meta.Now()
+			decode.DeletionTimestamp = &now
+			decode.Finalizers = []string{"test.gpustack.ai/hold"}
+			objects := []ctrlcli.Object{jointCheckObject(), md, prefill, pWorkload, decode}
+			if tc.keepWorkload {
+				objects = append(objects, dWorkload)
+			}
+			got := reconcileJoint(t, newJointClient(objects...), pWorkload.Name)
+			assert.Equal(t, tc.want, jointCheckState(got))
+		})
+	}
 }
 
 // TestModelDeploymentJointAdmission_ReadyAtOnceForEverythingElse 验证普通工作负载和单角色部署都能立即获得 Ready。

@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"slices"
 	"strconv"
 	"testing"
@@ -9,6 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	ctrlrecord "k8s.io/client-go/tools/record"
+	ctrlcli "sigs.k8s.io/controller-runtime/pkg/client"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
@@ -149,4 +154,80 @@ func TestRenderModelDeploymentService_TargetFollowsTheEnginesPort(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestRenderModelDeploymentRoleService_ExternalDPPublishesEveryRankOfAQualifiedGroup(t *testing.T) {
+	ctx := t.Context()
+	md := newRenderDeployment()
+	md.Spec.KVCache = nil
+	role := &md.Spec.Roles[0]
+	role.ReplicaSize = 2
+	role.ExtraArgs = []string{"--data-parallel-size", "2", "--data-parallel-rank", "$(GPUSTACK_MEMBER_INDEX)"}
+	cli := newModelDeploymentClient(md, newRenderInstanceType())
+	r := &ModelDeploymentReconciler{
+		Client: cli, APIReader: cli, Recorder: ctrlrecord.NewFakeRecorder(64),
+		// 返回与本次转发探测绑定的请求号，让控制器沿正常路径判定这组成员可服务。
+		groupForwardFetch: func(_ context.Context, _ string, body []byte) ([]byte, error) {
+			var request struct {
+				ID string `json:"request_id"`
+			}
+			if err := json.Unmarshal(body, &request); err != nil {
+				return nil, err
+			}
+			return fmt.Appendf(nil, `{"id":"cmpl-%s","choices":[{"finish_reason":"length"}]}`, request.ID), nil
+		},
+	}
+	_, err := reconcileModelDeploymentWith(t, r)
+	require.NoError(t, err)
+	pods := replicaPods(t, cli)
+	require.Len(t, pods, 4)
+	for i := range pods {
+		pods[i].Status.PodIP = "10.0.0." + strconv.Itoa(i+1)
+		pods[i].Status.Conditions = []core.PodCondition{{Type: core.PodReady, Status: core.ConditionTrue}}
+		require.NoError(t, cli.Status().Update(ctx, &pods[i]))
+	}
+	_, err = reconcileModelDeploymentWith(t, r)
+	require.NoError(t, err)
+
+	svc := new(core.Service)
+	require.NoError(t, cli.Get(ctx, ctrlcli.ObjectKey{Namespace: md.Namespace, Name: md.Name + "-" + role.Name}, svc))
+	require.Equal(t, modelDeploymentEndpointEligibleValue, svc.Spec.Selector[modelDeploymentLabelKeyEndpointEligible])
+	require.NotContains(t, svc.Spec.Selector, modelDeploymentMemberIndexLabel)
+	selector := labels.SelectorFromSet(svc.Spec.Selector)
+	pods = replicaPods(t, cli)
+	require.Len(t, pods, 4)
+	for _, pod := range pods {
+		require.True(t, selector.Matches(labels.Set(pod.Labels)), pod.Name)
+	}
+
+	// 同组一名成员失去就绪状态后，整组退出角色 Service，另一份副本的两个 rank 仍可接收请求。
+	member := new(core.Pod)
+	require.NoError(t, cli.Get(ctx, ctrlcli.ObjectKeyFromObject(&pods[0]), member))
+	member.Status.Conditions[0].Status = core.ConditionFalse
+	require.NoError(t, cli.Status().Update(ctx, member))
+	_, err = reconcileModelDeploymentWith(t, r)
+	require.NoError(t, err)
+	require.NoError(t, cli.Get(ctx, ctrlcli.ObjectKeyFromObject(svc), svc))
+	selector = labels.SelectorFromSet(svc.Spec.Selector)
+	pods = replicaPods(t, cli)
+	require.Len(t, pods, 4)
+	for _, pod := range pods {
+		otherGroup := pod.Labels[modelDeploymentReplicaOrdinalLabel] != member.Labels[modelDeploymentReplicaOrdinalLabel]
+		assert.Equal(t, otherGroup, selector.Matches(labels.Set(pod.Labels)), pod.Name)
+	}
+}
+
+func TestRenderModelDeploymentRoleService_EligibilityInLeaderAndMixedModes(t *testing.T) {
+	md := newRenderDeployment()
+	role := &md.Spec.Roles[0]
+	role.ReplicaSize = 2
+	leader := renderModelDeploymentRoleService(md, role, nil, nil, false)
+	assert.Equal(t, "0", leader.Spec.Selector[modelDeploymentMemberIndexLabel])
+	assert.Equal(t, modelDeploymentEndpointEligibleValue, leader.Spec.Selector[modelDeploymentLabelKeyEndpointEligible])
+
+	mixed := renderModelDeploymentRoleService(md, role, nil, nil, true)
+	assert.Equal(t, modelDeploymentAPIAnsweringValue, mixed.Spec.Selector[modelDeploymentLabelKeyAPIAnswering])
+	assert.Equal(t, modelDeploymentEndpointEligibleValue, mixed.Annotations[modelDeploymentEligibilityActiveAnnotation])
+	assert.NotContains(t, mixed.Spec.Selector, modelDeploymentLabelKeyEndpointEligible)
+	assert.NotContains(t, mixed.Spec.Selector, modelDeploymentMemberIndexLabel)
 }

@@ -524,13 +524,27 @@ func modelDeploymentEligibilitySelectorActive(
 // modelDeploymentEligibilityActiveAnnotation 在混合 Service 使用成员关系期间保留门控的激活状态。
 const modelDeploymentEligibilityActiveAnnotation = "modeldeployment.gpustack.ai/eligibility-active"
 
+// IMPORTANT: 只让通过 Operator 整组验收的 Pod 接流量，同时放开 External DP (外部数据并行) 的所有 rank，并兼容升级过渡期。
+//
 // modelDeploymentSelectEligibleEndpoints 选择具备资格的 HTTP 端点。
 // External 角色对所有 rank 提供服务；Internal 角色保留其 leader 限制。
 // Headless 对等 Service 从不使用端点资格筛选。
 func modelDeploymentSelectEligibleEndpoints(
 	svc *core.Service, md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole,
 ) {
-	// 在第 21 章实现此函数。
+	if svc.Spec.Selector[modelDeploymentLabelKeyAPIAnswering] == modelDeploymentAPIAnsweringValue {
+		// 混合模式已通过应答标签选出各组中有资格接收 HTTP 请求的成员。用注解记录资格筛选已启用。
+		if svc.Annotations == nil {
+			svc.Annotations = map[string]string{}
+		}
+		svc.Annotations[modelDeploymentEligibilityActiveAnnotation] = modelDeploymentEndpointEligibleValue
+		return
+	}
+	svc.Spec.Selector[modelDeploymentLabelKeyEndpointEligible] = modelDeploymentEndpointEligibleValue
+	// External DP 中合格组的每个 rank 都能应答。移除只选择 leader 的条件，保留组的资格要求。
+	if modelDeploymentRoleExternalDP(md, role) {
+		delete(svc.Spec.Selector, modelDeploymentMemberIndexLabel)
+	}
 }
 
 // renderModelDeploymentRoleService 渲染前置代理单个角色的 Service。

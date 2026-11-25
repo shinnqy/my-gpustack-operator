@@ -96,7 +96,7 @@ type ModelDeploymentEPDRow struct {
 	SharedVolume bool
 }
 
-// modelDeploymentEPDMatrix 保存所有获准入的 (router, engine, platform) 组合。
+// modelDeploymentEPDMatrix IMPORTANT: 保存所有获准入的 (router, engine, platform) 组合。
 //
 // Ascend 和 ROCm 的 vLLM 行作为设计基线：基于上游代码实现，尚未在硬件上验证。NVIDIA vLLM
 // 行（位于 llm-d-router 和 vllm-router 之后）以及 NVIDIA SGLang 行（位于 llm-d-router 和
@@ -250,6 +250,10 @@ func ModelDeploymentEPDConnector(router, engine, platform string) string {
 	return row.Connector
 }
 
+// modelDeploymentEPDCPUBytes 是 ECCPUConnector 每个副本使用的缓冲区大小。该连接器要求显式配置容量，
+// 当前 API 未提供覆盖字段，沿用 vLLM 示例中的 1 GiB。
+const modelDeploymentEPDCPUBytes = 1 << 30
+
 // modelDeploymentEPDEncoderLeg 解析声明了 Encode 角色的部署中，单个角色需要获取哪些关于
 // encoder 阶段的信息，以及该角色是否参与执行其中任何部分。
 //
@@ -272,8 +276,47 @@ func ModelDeploymentEPDConnector(router, engine, platform string) string {
 func modelDeploymentEPDEncoderLeg(
 	md *workercore.ModelDeployment, role *workercore.ModelDeploymentRole, manufacturer string,
 ) inject.EncoderCache {
-	// 在第 21 章中实现此函数。
-	return inject.EncoderCache{}
+	kind := ModelDeploymentEffectiveRoleKind(role)
+	if kind != workercore.ModelDeploymentRoleKindEncode &&
+		kind != workercore.ModelDeploymentRoleKindPrefill {
+		// IMPORTANT: 守卫 1：只给 Encode（生产者）和 Prefill（消费者）配这条链路
+		return inject.EncoderCache{}
+	}
+
+	if !modelDeploymentDeclaresEncoder(md) {
+		// IMPORTANT: 守卫 2：整个部署必须真的声明了 Encode 角色！
+		return inject.EncoderCache{}
+	}
+
+	// IMPORTANT: 守卫 3：查 11 行准入矩阵表 (modelDeploymentEPDMatrix)，确认 (router, engine, manufacturer) 是否合法
+	router := ""
+	if md.Spec.Router != nil {
+		router = md.Spec.Router.Name
+	}
+	row, admitted := ModelDeploymentEPDRowFor(router, md.Spec.Engine.Name, manufacturer)
+	if !admitted {
+		return inject.EncoderCache{}
+	}
+
+	// IMPORTANT: 核心分发：按矩阵表决定的 Connector 类型组装配置
+	switch row.Connector {
+	case ModelDeploymentECConnectorCPU:
+		// IMPORTANT: 流派 A：vLLM + NVIDIA/AMD → 网络 NIXL + 1 GiB CPU 缓冲
+		return inject.EncoderCache{Connector: row.Connector, CPUBytes: modelDeploymentEPDCPUBytes}
+	case ModelDeploymentECConnectorExample:
+		// IMPORTANT: // 流派 B：vLLM + Ascend → 共享目录，读 Encode 角色的 PVC 挂载路径
+		//
+		// 准入已校验两个角色的共享卷和挂载路径一致。将 Encode 的路径同时交给写入和读取编码结果的两端。
+		return inject.EncoderCache{
+			Connector:         row.Connector,
+			SharedStoragePath: modelDeploymentEPDSharedPath(md),
+		}
+	default:
+		// IMPORTANT: 流派 C：SGLang（encoder-urls）→ 不配编码缓存连接器，走另一条 EncoderURLs 链路
+		//
+		// SGLang 的 Prefill 通过 EncoderURLs 访问编码服务，无需配置编码缓存连接器。
+		return inject.EncoderCache{}
+	}
 }
 
 // modelDeploymentDeclaresEncoder 报告该部署是否运行 encoder 阶段。
@@ -428,6 +471,27 @@ func modelDeploymentEPDPodAffinity(
 	default:
 		return nil
 	}
+}
+
+// modelDeploymentEPDSharedPath 读取 Encode 角色第一个 PVC 的挂载目录。准入已核对 Prefill 使用相同目录。
+func modelDeploymentEPDSharedPath(md *workercore.ModelDeployment) string {
+	if !modelDeploymentDeclaresEncoder(md) {
+		return ""
+	}
+
+	for i := range md.Spec.Roles {
+		if ModelDeploymentEffectiveRoleKind(&md.Spec.Roles[i]) !=
+			workercore.ModelDeploymentRoleKindEncode {
+			continue
+		}
+		for _, volume := range md.Spec.Roles[i].AdditionalVolumes {
+			if volume.PersistentVolumeClaim != nil {
+				return volume.MountPath
+			}
+		}
+	}
+
+	return ""
 }
 
 // modelDeploymentEPDEncoderURLs 返回 encoder 阶段的地址列表，格式符合基于地址（而非

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	core "k8s.io/api/core/v1"
@@ -300,11 +301,119 @@ type jointHeld struct {
 	Settled bool
 }
 
+// IMPORTANT: 这是 PD 分离场景下的 联合准入函数
+//
+// jointVerdict 逐个检查各角色声明的副本。Kueue 先为 Workload 预留配额，等联合检查通过后才准入。
+// 因此这里检查配额预留。若等待其他 Workload 先获准，各组就会相互等待。
 func (r *ModelDeploymentJointAdmissionReconciler) jointVerdict(
 	ctx context.Context, md *workercore.ModelDeployment,
 ) (jointHeld, error) {
-	// 第 21 章补上跨角色的配额判断。当前让多角色部署保持 Pending，普通实例已在上面的分支放行。
-	return jointHeld{State: kueue.CheckStatePending, Message: "joint admission is pending"}, nil
+	// 1. 拉取“现状快照”
+	byGroup, liveByGroup, shapes, err := modelDeploymentReplicaGroups(ctx, r.Client, md)
+	if err != nil {
+		return jointHeld{}, err
+	}
+
+	wlList := new(kueue.WorkloadList)
+	if err = r.Client.List(ctx, wlList, ctrlcli.InNamespace(md.Namespace), ctrlclix.WithoutQuorum); err != nil {
+		return jointHeld{}, fmt.Errorf("list workloads: %w", err)
+	}
+
+	// 2. 按“图纸（Spec）”而不是按“现场（Pod）”逐个点名
+	//
+	// 一个角色可以有多个独立预留配额的副本。按声明的角色和序号推导组名，才能发现尚未创建的组。
+	// 两个角色可以使用同一规格，因此等待消息记录角色名，便于定位缺少配额的副本。
+	var waiting, assembling []string
+	reserved, replicas := 0, 0
+	for i := range md.Spec.Roles {
+		role := &md.Spec.Roles[i]
+
+		var roleWaiting, roleAssembling bool
+		for ordinal := range int(role.Replicas) {
+			replicas++
+			group := modelDeploymentReplicaGroupName(md, role.Name, ordinal)
+			members := byGroup[group]
+			// 3. 判断该副本是不是“还在盖房子（集结中）”
+			//
+			// 组的大小取自已部署的成员。修改规格时，新规格可能与眼前这组 Pod 的大小不同。
+			// 正在终止的成员仍可能持有配额，但只有留下的成员才算组齐。组尚未齐备时不能因超时暂停。
+			if shape := shapes[group]; !shape.modelDeploymentReplicaIsWhole() ||
+				liveByGroup[group].Len() < shape.Total {
+				roleAssembling = true
+			}
+			// 4. 判断“配额到位了，还是正在受控替换中”
+			if anyWorkloadHoldsQuotaFor(wlList.Items, members) ||
+				jointReplicaDepartingRollout(md, wlList.Items, members, liveByGroup[group]) {
+				reserved++
+				continue
+			}
+			roleWaiting = true
+		}
+
+		if roleWaiting {
+			waiting = append(waiting, role.Name)
+		}
+		if roleAssembling {
+			assembling = append(assembling, role.Name)
+		}
+	}
+	// 正常滚动替换时旧成员正在退出，这组也会暂时缺人。先判断所有组是否都已预留或正在替换。
+	if len(waiting) == 0 {
+		return jointHeld{
+			State: kueue.CheckStateReady,
+			Message: "every replica of this deployment has reserved quota or is being replaced by " +
+				"this operator's own rollout",
+		}, nil
+	}
+	if len(assembling) > 0 {
+		return jointHeld{
+			State: kueue.CheckStatePending,
+			Message: fmt.Sprintf(
+				"holding this replica while the deployment is still assembling: the roles "+
+					"%s do not yet have every replica they declare, so Kueue has composed no "+
+					"workload for them yet. Nothing is wrong with the cluster; this resolves itself as "+
+					"the replicas appear",
+				strings.Join(assembling, ", "),
+			),
+		}, nil
+	}
+
+	return jointHeld{
+		State: kueue.CheckStatePending,
+		Message: fmt.Sprintf(
+			"holding this replica until the whole deployment can run: %d of %d replicas have reserved quota, "+
+				"and the ones still waiting belong to the roles %s. Every replica keeps the quota it has "+
+				"reserved while it waits",
+			reserved, replicas, strings.Join(waiting, ", "),
+		),
+		Settled: true,
+	}, nil
+}
+
+// jointReplicaDepartingRollout 利用替换时留下的状态识别正在交接的副本。释放副本位置时，
+// Operator 删除 Workload 并让旧 Pod 退出。如果是 Kueue 抢占，失去配额的 Workload 仍会引用旧 Pod。
+// 手工同时删除两者也会留下相同状态，协调循环会重建该副本。部署自身已开始删除时则无需等待重建。
+func jointReplicaDepartingRollout(
+	md *workercore.ModelDeployment,
+	wls []kueue.Workload,
+	members, live sets.Set[types.UID],
+) bool {
+	if md.DeletionTimestamp != nil || members.Len() == 0 || members.Len() == live.Len() {
+		return false
+	}
+
+	return !anyWorkloadOwnsAny(wls, members)
+}
+
+// anyWorkloadOwnsAny 检查是否还有 Workload 引用组内任一 Pod，包括已经失去配额的 Workload。
+func anyWorkloadOwnsAny(wls []kueue.Workload, members sets.Set[types.UID]) bool {
+	for i := range wls {
+		if modelDeploymentWorkloadOwnsAny(&wls[i], members) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // modelDeploymentReplicaGroups 只列带当前部署标签的 Pod，再根据所有者引用核实归属，避免在每个事件上扫描整个命名空间。
@@ -352,6 +461,18 @@ func modelDeploymentReplicaGroups(
 	}
 
 	return all, live, shapes, nil
+}
+
+// anyWorkloadHoldsQuotaFor 检查是否有已预留配额的 Workload 引用组内任一 Pod 的 UID。
+func anyWorkloadHoldsQuotaFor(wls []kueue.Workload, members sets.Set[types.UID]) bool {
+	for i := range wls {
+		wl := &wls[i]
+		if modelDeploymentWorkloadOwnsAny(wl, members) && kueueworkload.HasQuotaReservation(wl) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // workloadModelDeployment 沿 Workload 的 Pod 所有者引用，再沿 Pod 的控制器引用查找 ModelDeployment。
