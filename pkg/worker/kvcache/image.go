@@ -5,9 +5,24 @@ package kvcache
 import (
 	dockerref "github.com/distribution/reference"
 	core "k8s.io/api/core/v1"
+
+	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 )
 
 // 本文件负责：按 K8s 同款规则提前算出 ImagePullPolicy
+
+// EffectivePullPolicy 定义了渲染后的容器所遵循的策略。
+//
+// 该策略在此被解决，而非留空让 API 服务器采用默认值，这正是该函数的设计目的。渲染为空的策略无法被收敛：服务
+// 器在写入时会填充该值，因此当比较器将空预期值与存储的默认值进行对比时，每次迭代都会产生差异，导致工作负载
+// 永远无法恢复——而通过跳过对比来避免这种情况的比较器则永远无法修正过时的数值。有两种状态因此陷入困境：一种
+// 是在设置后又被移除的策略，它保留了设置时的数值；另一种是后端服务，其镜像在 pinned 标签和 :latest 之间切换，
+// 它保留了从旧镜像衍生出的默认值。
+//
+// 每次迭代都会显示具体数值，没有默认选项可忽略，也没有可以跳过的内容。
+func EffectivePullPolicy(kvcb *workercore.KVCacheBackend, image string) core.PullPolicy {
+	return ResolvePullPolicy(kvcb.Spec.ImagePullPolicy, image)
+}
 
 // ResolvePullPolicy 解析渲染后的容器应携带的具体拉取策略。
 //

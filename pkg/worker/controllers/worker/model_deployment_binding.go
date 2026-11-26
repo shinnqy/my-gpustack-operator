@@ -310,7 +310,8 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentInterfaceProtocols(
 	return mooncake.MemberProtocols(backend), nil
 }
 
-// IMPORTANT: 检查有没有配共享 KV Cache 池
+// IMPORTANT: 找“真正能连的地址”。推理引擎启动需要 Master 的 IP:Port 和 传输协议（TCP/RDMA）。这些信息藏在后面的 Pool 和 Backend 里。
+//
 // resolveModelDeploymentConnection 读取 pool 及其 backend 发布的信息：即同一 deployment
 // 下所有角色共享的那一半合成输入。
 //
@@ -327,6 +328,59 @@ func (r *ModelDeploymentReconciler) resolveModelDeploymentInterfaceProtocols(
 func (r *ModelDeploymentReconciler) resolveModelDeploymentConnection(
 	ctx context.Context, domain *modelDeploymentDomain,
 ) (*ModelDeploymentConnectorInput, error) {
-	// 在第 22 章实现此函数。
-	return nil, nil
+	if domain == nil || !domain.Ready || domain.KVCache == nil {
+		return nil, nil
+	}
+
+	pool := &workercore.KVCachePool{}
+	if err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: domain.KVCache.Pool}, pool); err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("getting kv cache pool %q: %w", domain.KVCache.Pool, err)
+	}
+
+	// ClientEndpoint 由后端发布到 Pool，供推理引擎连接。空值表示后端尚未公布端点，等待后续调谐。
+	if pool.Status.ClientEndpoint == "" {
+		return nil, nil
+	}
+
+	// Pool 的 webhook 要求恰有一个后端，以便解释配额落在哪个 master 的账本上；schema 本身未强制此约束。
+	// 历史对象或 webhook 不可用期间写入的对象可能没有后端，先检查长度避免索引越界。
+	if len(pool.Spec.Backends) == 0 {
+		return nil, nil
+	}
+
+	kvcb := &workercore.KVCacheBackend{}
+	if err := r.Client.Get(ctx, ctrlcli.ObjectKey{Name: pool.Spec.Backends[0]}, kvcb); err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("getting kv cache backend %q: %w", pool.Spec.Backends[0], err)
+	}
+
+	tenant := domain.KVCache.Domain.Name
+	if !KVCacheMasterSeparatesTenants(kvcb, pool) {
+		// 没有租户账本的 master 会把所有名称映射到默认租户。因此生成连接时省略域名，在部署 status
+		// 中保留用户声明的原名，Pool 的条件说明原因。
+		tenant = ""
+	}
+
+	// 同一 Binding 上的每个引擎都需要用相同 dtype 写入 KV。存储键不包含 dtype，所以只要部署控制器负责管
+	// 理它，就要传给引擎，无论 master 是否支持租户账本。
+	var dtype string
+	if ModelDeploymentOwnsKVCacheDtype(ctx) {
+		dtype = domain.KVCache.Domain.Dtype
+	}
+
+	return &ModelDeploymentConnectorInput{
+		Domain:              tenant,
+		Dtype:               dtype,
+		MasterServerAddress: pool.Status.ClientEndpoint,
+		// MemberProtocols 统一处理 Auto、空值和各成员组的覆盖设置，返回每组实际提供的协议。等合成具
+		// 体引擎的配置时，再从中选择它能使用的协议。
+		Protocols: mooncake.MemberProtocols(kvcb),
+	}, nil
 }

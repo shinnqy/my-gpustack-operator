@@ -1,13 +1,27 @@
 package mooncake
 
 import (
+	"encoding/json"
 	"fmt"
+	"slices"
+	"strconv"
+	"strings"
 
+	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
+	"gpustack.ai/gpustack/pkg/kubemeta"
 	"gpustack.ai/gpustack/pkg/nodefeature"
+	"gpustack.ai/gpustack/pkg/systemmeta"
 	"gpustack.ai/gpustack/pkg/systemname"
+	"gpustack.ai/gpustack/pkg/utils/stringx"
+	"gpustack.ai/gpustack/pkg/worker/kuberess"
+	"gpustack.ai/gpustack/pkg/worker/kvcache"
 )
 
 const (
@@ -250,6 +264,18 @@ const (
 	MemberBucketKeysLimit int64 = 64
 )
 
+// memberEvictionPolicies 将此 API 对驱逐策略的命名与客户的命名进行对应。这是两个术语交汇的地方，就像另一侧
+// 的 leaderAllocationStrategies 一样。
+//
+// memberEvictionPolicyNone 不在映射中，因为它不是 API 值：它是“驱逐功能关闭”所生成的名称，也是客户端用于表
+// 示该状态的自定义名称。
+var memberEvictionPolicies = map[string]string{
+	"FIFO": "fifo",
+	"LRU":  "lru",
+}
+
+const memberEvictionPolicyNone = "none"
+
 // memberProtocols 将本 API 中的传输协议拼写映射为构建产物的拼写。
 //
 // Auto 会映射为构建产物的 tcp，而非根据 Node 向上解析，原因正如 API 类型自身的注释所述：
@@ -319,6 +345,24 @@ func MemberObjectName(kvcb *workercore.KVCacheBackend, group int) string {
 	return fmt.Sprintf("%s-member-%d", kvcb.Name, group)
 }
 
+// MemberSelectorLabels 既用于 DaemonSet 选择其 Pod，也用于控制器列出该后端的成员 Pod。
+//
+// DaemonSet 的 spec.selector 是不可变的，与 Deployment 的 spec.selector 一样。它仅携带身份信息——即是哪个后
+// 端、哪个角色、哪个组——而从不包含组的 nodeSelector，因为扩大组的范围是预期中的，否则会使该对象无法使用。
+func MemberSelectorLabels(kvcb *workercore.KVCacheBackend, group int) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":      "kv-cache-backend",
+		"app.kubernetes.io/instance":  kvcb.Name,
+		"app.kubernetes.io/component": fmt.Sprintf("member-%d", group),
+	}
+}
+
+func memberPodLabels(kvcb *workercore.KVCacheBackend, group int) map[string]string {
+	labels := MemberSelectorLabels(kvcb, group)
+	labels["app.kubernetes.io/part-of"] = "gpustack-operator-worker"
+	return labels
+}
+
 // MemberProtocol 返回某个组解析后的传输协议，采用构建产物自身的拼写。未识别的值
 // 不会渲染任何内容而非猜测：schema 已枚举了该字段，因此返回空结果意味着该对象
 // 从未经过准入校验。
@@ -353,6 +397,457 @@ func MemberProtocols(kvcb *workercore.KVCacheBackend) []string {
 	return offers
 }
 
+// RenderMemberDaemonSet 为指定成员组生成一个 DaemonSet。
+//
+// 成员贡献所在节点的内存、磁盘或设备，因此按节点部署。每个成员组独立使用 DaemonSet，同一节点可同时运行 DRAM
+// 组和 VRAM 组的各一个成员。Deployment 加反亲和只能近似这种放置约束。
+//
+// 与 leader 一样，调用方传入后端镜像，成员组可显式覆盖它。不同组可能选择不同型号的加速卡，需要匹配硬件的客
+// 户端构建。介质和传输协议也按组读取。
+func RenderMemberDaemonSet(
+	kvcb *workercore.KVCacheBackend, group int, image string,
+) *apps.DaemonSet {
+	member := kvcb.Spec.Connection.Managed.Members[group]
+	if member.Image != "" {
+		image = member.Image
+	}
+
+	ds := &apps.DaemonSet{
+		ObjectMeta: meta.ObjectMeta{
+			Name:      MemberObjectName(kvcb, group),
+			Namespace: kuberess.SystemNamespaceName,
+			Labels:    memberPodLabels(kvcb, group),
+		},
+		Spec: apps.DaemonSetSpec{
+			Selector: &meta.LabelSelector{MatchLabels: MemberSelectorLabels(kvcb, group)},
+			// 使用 OnDelete，让控制器选择哪些 Pod 需要重启。节点选择器属于 Pod 模板，如果使用
+			// RollingUpdate，仅增加一个匹配节点就会改变模板哈希，使其余节点也重启并重新挂载内存
+			// 段。Deployment 和 StatefulSet 的模板也有这个特性。
+			//
+			// OnDelete 不会自动应用镜像更新。因此控制器给影响成员进程的配置计算指纹，只删除指纹已变化的 Pod。
+			UpdateStrategy: apps.DaemonSetUpdateStrategy{
+				Type: apps.OnDeleteDaemonSetStrategyType,
+			},
+			Template: core.PodTemplateSpec{
+				ObjectMeta: meta.ObjectMeta{Labels: memberPodLabels(kvcb, group)},
+				Spec: core.PodSpec{
+					// DaemonSet 在每个匹配成员组选择器的节点上运行一个成员。扩大选择范
+					// 围时，可以增加新成员并保留原有节点上的 Pod。
+					NodeSelector:                  member.NodeSelector,
+					TerminationGracePeriodSeconds: ptr.To(memberTerminationGracePeriodSeconds(kvcb, member)),
+					// 显式写出默认 DNS 策略以便双向收敛。从使用主机网络的互联切回 TCP
+					// 时，需要把 ClusterFirstWithHostNet 还原。
+					DNSPolicy: core.DNSClusterFirst,
+					// 关闭 HA 时，成员只访问 leader。显式关闭默认的令牌挂载，避免给第三
+					// 方镜像提供多余的 Kubernetes 凭据，尤其是使用主机互联的 Pod 已持有
+					// 两项 Linux capabilities。
+					//
+					// 启用 HA 后，默认通过 Service 寻址时用不到令牌，但显式使用 Lease
+					// 地址时要用，因此仍为成员挂载对应账号的凭据。
+					AutomountServiceAccountToken: ptr.To(leaderNeedsAPIAccess(
+						kvcb.Spec.Connection.Managed.Leader,
+					)),
+					ServiceAccountName: memberServiceAccountName(kvcb),
+					ImagePullSecrets:   kvcb.Spec.ImagePullSecrets,
+					Containers: []core.Container{
+						memberContainerSpec(kvcb, member, group, image),
+					},
+				},
+			},
+		},
+	}
+
+	// 成员组未指定 FabricInterfaceCount 时按一个互联接口处理。schema 没有存储默认值，省略与显式写 1 应
+	// 产生相同的 Pod 模板。
+	applyMemberFabric(ds, MemberProtocolForGroup(kvcb, member), ptr.Deref(member.FabricInterfaceCount, 1))
+	applyMemberLocalDisk(ds, kvcb, member, group)
+	applyMemberHostPaths(ds, member)
+	// 最后应用这项配置，以便在互联配置已经设置的安全上下文上合并所需权限。
+	applyMemberSecurityContext(ds, member)
+
+	if member.RuntimeClassName != "" {
+		ds.Spec.Template.Spec.RuntimeClassName = ptr.To(member.RuntimeClassName)
+	}
+
+	// 在完整模板上计算指纹，确保覆盖刚设置的互联字段。计算时从副本移除节点选择器和指纹注解本身，避免指纹依赖自身。
+	ds.Spec.Template.Annotations = map[string]string{
+		MemberPodSpecHashAnnotation: MemberPodSpecHash(ds.Spec.Template),
+	}
+
+	systemmeta.NoteResource(ds, kvcache.ResourceType, map[string]string{
+		kvcache.ResourceNoteBackend: kvcb.Name,
+		"role":                      memberResourceNoteRole,
+		"group":                     strconv.Itoa(group),
+	})
+	kubemeta.ControlOnWithoutBlock(ds, kvcb,
+		workercore.SchemeGroupVersion.WithKind("KVCacheBackend"))
+
+	return ds
+}
+
+// memberContainerSpec 构造单个成员的容器配置。
+func memberContainerSpec(
+	kvcb *workercore.KVCacheBackend,
+	member workercore.KVCacheBackendMember,
+	group int,
+	image string,
+) core.Container {
+	return core.Container{
+		Name:            "member",
+		Image:           image,
+		ImagePullPolicy: kvcache.EffectivePullPolicy(kvcb, image),
+		// 缺少运输组件厂商运行时环境的图像——由于需要调用 CANN——会在动态链接器中的错误输出中崩溃，而
+		// 默认策略无法处理此情况。
+		TerminationMessagePolicy: core.TerminationMessageFallbackToLogsOnError,
+		Command:                  []string{memberEntrypoint},
+		Args:                     renderMemberArgs(member, group),
+		Env:                      renderMemberEnv(kvcb, member),
+		// 任何路径上都不存在数据平面 containerPort。传输引擎会随机绑定其端口——有一次测试中出现了
+		// 15002 和 15995，另一次客户端出现了 16566 和 16655，而这些都是未配置的端口——因此此处使用固
+		// 定列表会是对该过程的错误描述。可达性要求属于端口范围，文档也将其列为一种要求。
+		//
+		// 入口点会在服务此端口之前挂载其内存段，因此连接能够证明是挂载行为，而非仅仅是进程。若没有
+		// 这一点，kubelet 会在容器启动后立即报告成员已准备就绪，而主节点尚未将其列入——这会被控制器
+		// 视为一种不足。TCP 是因为 API 仅支持 /api/* 数据操作动词：没有密钥或副作用的话，就无法进行 GET 请求。
+		ReadinessProbe: &core.Probe{
+			ProbeHandler: core.ProbeHandler{
+				TCPSocket: &core.TCPSocketAction{Port: intstr.FromInt32(memberRESTPort(group))},
+			},
+			PeriodSeconds:    5,
+			FailureThreshold: 3,
+		},
+		Resources: memberResources(member),
+	}
+}
+
+// MemberMasterEntry 默认会为成员分配主节点 Service 地址。若选择显式的 Lease 选项，则在 HA 运行时将为客户端
+// 提供 Lease 坐标。该 Service 仅发布已准备好的端点，因此备用节点不会作为推理服务主节点进行响应。
+func MemberMasterEntry(kvcb *workercore.KVCacheBackend) string {
+	leader := kvcb.Spec.Connection.Managed.Leader
+	if leaderNeedsAPIAccess(leader) && leader.MemberAddressing == MemberAddressingLease {
+		return fmt.Sprintf("k8s://%s/%s", kuberess.SystemNamespaceName, LeaderObjectName(kvcb))
+	}
+
+	return fmt.Sprintf("%s:%d", LeaderServiceHost(kvcb), LeaderRPCPort)
+}
+
+// renderMemberEnv 构建成员的完整配置，最后是组的 extraEnv。
+//
+// 未设置的项是有意为之。MOONCAKE_DEVICE 保持未设置状态，因此客户端的设备筛选器为空，这被解读为“所有设备”——
+// 请参考 keys.go 了解为何文档中所述的 "auto-discovery" 字符串是一个陷阱。MOONCAKE_TENANT_ID 则保持其默认值，
+// 因为配额规范中规定了租户关系，此处的数值会优先于该规范。
+func renderMemberEnv(
+	kvcb *workercore.KVCacheBackend, member workercore.KVCacheBackendMember,
+) []core.EnvVar {
+	env := []core.EnvVar{
+		{Name: memberEnvMetadataServer, Value: memberMetadataServerValue},
+		{
+			Name:  memberEnvMaster,
+			Value: MemberMasterEntry(kvcb),
+		},
+		{Name: memberEnvProtocol, Value: MemberProtocolForGroup(kvcb, member)},
+		{
+			// 这是主节点传递给客户端的地址，不仅仅是一个标签：它成为内存段 te_endpoint 的宿主部
+			// 分。传输引擎将其数据端口绑定在 Pod 的网络命名空间中，因此这里的节点名称所代表的端
+			// 口，实际上没有任何节点监听——在双节点集群中，一个客户端 Pod 因节点名称和节点 IP 均
+			// 被拒绝连接，最终通过 Pod IP 进行了连接。
+			//
+			// 它成为内存段名称的半部分，而非全部。此评论的早期版本声称名称就是该字符串的纯文本
+			// 形式，且每次启动时新的端口仅属于 te_endpoint。与 mooncake 0.3.13 相比，这两点都是
+			// 错误的：主节点将 segment_name 发布为“<此值>:<端口>”，而重启过程中不仅移动了该端口，
+			// 还把 te_endpoint 的端口移动到同一次重启中的不同值。存在两个新的端口，而非一个，其
+			// 中一个位于名称中。
+			//
+			// 这对任何在上面进行匹配的操作者来说都是一种负担：将 segment_name 与这个值进行比较
+			// 时什么也没有找到，而找不到任何东西则意味着无响应。需要按名称选择的调用者必须比较
+			// 主机部分，而主节点自身的列表已经将这部分区分出来了。
+			//
+			// 有限制：这个名称的唯一性取决于此值。在主机-织物路径上，Pod 会持有主机的网络命名空
+			// 间，因此一个节点上的每个成员组都会报告相同的主机状态——这是基于实际情况报告的，而非猜测。
+			Name: memberEnvLocalHostname,
+			ValueFrom: &core.EnvVarSource{
+				FieldRef: &core.ObjectFieldSelector{FieldPath: "status.podIP"},
+			},
+		},
+		{Name: memberEnvTransferMetrics, Value: memberTransferMetricsValue},
+	}
+
+	if member.Medium != "VRAM" {
+		// 主机-内存组被远离加速器，这就是使所声明的介质能够与任何事物结合的原因。
+		//
+		// 内存段实际位于主机内存还是设备显存，取决于镜像的编译方式。若容器运行时默认暴露加速器，支
+		// 持显存段的构建会使用它，即便成员声明的是 DRAM。此时 Pod 没有申请加速器，调度和配额均未登
+		// 记该用量，真正申请这张卡的工作负载可能因显存不足无法启动。
+		//
+		// 隐藏这些设备能确保两种结果都真实有效。能够使用主机内存的图像可以正常运作。无法启动的图像
+		// 会明显地违背那些要求其执行但未实际实施的任务的群体——这种错误就出现在该位置，因为图像是否
+		// 使用了某种媒介是关于该图像的一个事实。
+		env = append(env,
+			core.EnvVar{Name: memberEnvVisibleDevicesAMD, Value: memberVisibleDevicesNone},
+			core.EnvVar{Name: memberEnvVisibleDevicesCambricon, Value: memberVisibleDevicesNone},
+			core.EnvVar{Name: memberEnvVisibleDevicesIluvatar, Value: memberVisibleDevicesNone},
+			core.EnvVar{Name: memberEnvVisibleDevicesMThreads, Value: memberVisibleDevicesNone},
+			core.EnvVar{Name: memberEnvVisibleDevicesNVIDIA, Value: memberVisibleDevicesNone},
+		)
+	}
+	if size := member.CapacityPerMember.Value(); size > 0 {
+		// 两种介质的拼写均相同：在 VRAM 版本中，相同大小的内存段用于设备分配，因为编译时的切换改变
+		// 了内存段的分配位置，而非其总大小如何被分配器处理。
+		env = append(env, core.EnvVar{
+			Name:  memberEnvGlobalSegmentSize,
+			Value: strconv.FormatInt(size, 10),
+		})
+	}
+	if size := member.LocalBufferSize.Value(); size > 0 {
+		env = append(env, core.EnvVar{
+			Name:  memberEnvLocalBufferSize,
+			Value: strconv.FormatInt(size, 10),
+		})
+	}
+
+	// 今天有一个条目构成完整列表，此渲染器会读取第一个条目：准入限制将一组元素归为同一层级，因此第二个
+	// 条目则是一个无法被集群承载的形状，而非此处未解决的渲染问题。
+	if len(member.LocalDisks) > 0 {
+		disk := member.LocalDisks[0]
+		// 要么两个键，要么没有。当卸载功能被启用且存在存放字节的位置时，客户端才会注册一个本地磁盘
+		// 内存段；因此，没有开关的路径，或者没有路径的开关，都是不会包含任何层的成员，尽管对象声称包含一层。
+		//
+		// 那个桶对会无条件地随它们一起行动：正是它使得这一层级能够获得一个字节，因此它和路径一样，
+		// 也是定义该层级的一部分。
+		env = append(env,
+			core.EnvVar{Name: memberEnvOffloadEnabled, Value: "true"},
+			core.EnvVar{Name: memberEnvOffloadPath, Value: disk.Path},
+			core.EnvVar{
+				Name:  memberEnvOffloadBucketSizeLimit,
+				Value: strconv.FormatInt(MemberBucketSizeLimit, 10),
+			},
+			core.EnvVar{
+				Name:  memberEnvOffloadBucketKeysLimit,
+				Value: strconv.FormatInt(MemberBucketKeysLimit, 10),
+			})
+
+		if size := disk.Capacity.Value(); size > 0 {
+			// 一个数值，两个设置。第一个设置决定了层级的内容；第二个设置则是配额值，而水印值是
+			// 该配额的一部分，默认值为驱逐路径所识别的“已关闭”数值。
+			env = append(env,
+				core.EnvVar{
+					Name:  memberEnvOffloadSizeLimit,
+					Value: strconv.FormatInt(size, 10),
+				},
+				core.EnvVar{
+					Name:  memberEnvOffloadBucketMaxTotalSize,
+					Value: strconv.FormatInt(size, 10),
+				})
+		}
+		if disk.KeyLimit > 0 {
+			env = append(env, core.EnvVar{
+				Name:  memberEnvOffloadKeysLimit,
+				Value: strconv.FormatInt(disk.KeyLimit, 10),
+			})
+		}
+
+		env = append(env, renderMemberEviction(disk.Eviction)...)
+	}
+
+	// 这种退出机制最后被采用，按照书写顺序，同一个规范的两种实现版本在字节层面是完全相同的。它无法覆盖
+	// 其上方的任何内容：准入机制拒绝了这个实现方式所生成的名称，这也是确保此处所有变量为单一来源的原因—
+	// —Kubernetes 会接受携带一个名称的容器两次，由运行时来决定最终结果。
+	for _, e := range member.ExtraEnv {
+		env = append(env, core.EnvVar{Name: e.Name, Value: e.Value})
+	}
+
+	return env
+}
+
+// renderMemberEviction 将该层的驱逐块转换为客户端设置。
+//
+// 一个空的块会显示“无内容”，因此一个从未处理驱逐问题的后端会运行在字段存在之前的环境，同时也会应用客户端自己的行为。
+//
+// 关闭驱逐时需要同时设置磁盘格式中的策略和上层水位开关，保证两层都禁用驱逐。启用时客户端已有相应默认值，无需重复渲染。
+func renderMemberEviction(eviction *workercore.KVCacheBackendMemberLocalDiskEviction) []core.EnvVar {
+	if eviction == nil {
+		return nil
+	}
+
+	// 模式默认设置为启用，因此这里的 `nil` 表示一个从未经过接纳的对象。将其视为 "on"，可以使得该对象的
+	// 渲染结果与模式生成的结果几乎一致，而非完全相同。
+	if eviction.Enabled != nil && !*eviction.Enabled {
+		return []core.EnvVar{
+			{Name: memberEnvOffloadEvictionPolicy, Value: memberEvictionPolicyNone},
+			{Name: memberEnvOffloadWatermarkEnabled, Value: "false"},
+		}
+	}
+
+	var env []core.EnvVar
+
+	// 无法识别的策略会导致无果而终。该字段由架构定义，因此结果为空意味着既没有请求任何策略——在这种情况
+	// 下适用客户端自身的默认设置——也意味着该对象从未经过审核。将字符串传递过去则属于更糟糕的失败情况：
+	// 客户端会将其未知内容都视为不会发生驱逐，而并未明确说明。
+	if mapped, ok := memberEvictionPolicies[eviction.Policy]; ok {
+		env = append(env, core.EnvVar{Name: memberEnvOffloadEvictionPolicy, Value: mapped})
+	}
+
+	if watermark := eviction.Watermark; watermark != nil {
+		env = append(env,
+			core.EnvVar{
+				Name:  memberEnvOffloadWatermarkHigh,
+				Value: memberWatermarkRatio(watermark.High),
+			},
+			core.EnvVar{
+				Name:  memberEnvOffloadWatermarkLow,
+				Value: memberWatermarkRatio(watermark.Low),
+			})
+	}
+
+	return env
+}
+
+// memberWatermarkRatio 将百分比转换为客户端可解析的分数形式。
+//
+// 始终使用两位小数，采用固定格式而非最短格式：客户端通过流提取机制读取值，该机制必须完整消耗整个字符串，对
+// 于无法处理的情形则静默回退到自己的默认值——因此仅符合 Go 语法的表示方式是不够的。它还拒绝处理超出范围的值
+// （即 (0, 1] 之外），而该字段自带的 1 到 100 的边界限制已经将其包含在内。
+func memberWatermarkRatio(percent int32) string {
+	return strconv.FormatFloat(float64(percent)/100, 'f', 2, 64)
+}
+
+// renderMemberArgs 构建成员的 argv：即该成员在需要移动时使用的 REST 端口；随后 extraArgs 作为入口点自身的按键覆盖参数。
+//
+// 这里的覆盖配置为“-D key=value”，而在主节点上则为“-key=value”，因为这两个二进制文件接受不同的配置。入口点
+// 会在环境设置之后应用这些配置，从而决定最终的结果，这也使得该配置对渲染器来说非常有用，因为渲染器是根据节
+// 点特定的事实来生成这些配置的。
+//
+// 客户端配置对象中未包含的关键项会被静默忽略——入口点使用 hasattr 来保护该赋值操作，只有当缺少“=”符号时才会
+// 发出警告。因此，此处出现拼写错误会导致配置无效，且不会产生任何警告。
+//
+// --port 是此入口点解析器的真实标志，而非配置键，因此无法通过 extraArgs 访问它——使用`-D port=...`会设置名为
+// 该名称的配置键，服务器仍会保持原样进行监听。
+func renderMemberArgs(member workercore.KVCacheBackendMember, group int) []string {
+	var args []string
+
+	// 仅在需要移动端口的情况下才会渲染，而第一组并不在那个位置：基础配置是入口点的默认设置，因此将其传
+	// 递至该位置会为当前运行的每个成员增加一个参数，移动指纹，并删除和重新创建所有内容，以让每个成员继
+	// 续做它原本在做的事情。
+	if port := memberRESTPort(group); port != memberRESTPortBase {
+		args = append(args, "--port", strconv.Itoa(int(port)))
+	}
+
+	// 按照书写顺序，因此同一个规范的两种实现版本在字节层面是完全相同的，且 DaemonSet 不会发生变化。每个
+	// 条目都带有其特定的分号标记；这些分号是此 API 用于表示“一个标志令牌”的装饰符，而入口点自身的覆盖项
+	// 则被精简成了这些分号。
+	for _, entry := range member.ExtraArgs {
+		args = append(args, "-D", strings.TrimLeft(entry, "-"))
+	}
+	return args
+}
+
+// memberRESTPort 是某个组入口点用于提供其 HTTP API 的端口，也是唯一决定该端口的地方：argv、就绪状态探针以及
+// preStop 钩子都会调用此端口，因此无法为同一个容器定义多个不同的端口。
+//
+// 该端口是根据该组的位置确定的，因为在主机-架构路径上，该成员拥有主机的网络命名空间，而 API 会绑定 0.0.0.0。
+// 两个节点选择器重叠的组因此会在同一个节点上放置两个主机-网络 Pods，而一个固定的端口则只能让第一个组绑定：
+// 第二个组会运行，但永远不会通过其就绪探针，也不会报告任何原因。准入机制无法拒绝这一配对，因为两个选择器是
+// 否会相遇取决于该组没有的节点标签——这种冲突仅在部署时存在，因此解决方案就是不存在这种冲突。
+//
+// 与分配不同，基于位置进行分配才使其稳定：该位置在其他地方已经标识了一个组（其 DaemonSet 名称和选择器标签），
+// 因此一个组的端口与其身份一样持久，无需保留任何状态来记录哪个端口被分配到了哪里。
+//
+// 为什么这次冲突如此安静，值得被保留下来，因为这正是让这项工作值得去做而非仅仅记录的原因：这里没有任何关于
+// containerPort 或 hostPort 的声明。如果存在 hostPort，调度器会将其视为节点级资源，导致第二个 Pod 处于待处
+// 理状态并带有冲突标记。hostNetwork 加上清单中从未提及的端口，在那种检查中是看不见的——Pod 被放置了，进程无
+// 法绑定，唯一的证据就是容器日志。因此，根本不能允许该端口产生冲突。
+func memberRESTPort(group int) int32 {
+	return memberRESTPortBase + int32(group)
+}
+
+// memberResources 声明了成员的权益，以便容量规划能够识别它。不符合要求的成员会处于待处理状态，后端会显示“降
+// 级”，这是真实的结果——另一种情况则是成员过度占用其所在的节点。
+//
+// 该声明所依据的内容遵循了相关介质。DRAM 成员的内存段属于主机内存，因此 capacityPerMember 和
+// localBufferSize 都归属于内存。VRAM 成员的内存段属于设备内存，此处没有任何分配行为：主机内存仅承载
+// localBufferSize，而设备内存则通过分配获得，没有其他方式。
+//
+// 没有任何操作会占用它，因为该说法并不成立。在 v0.3.13.post1 上游进行测量：该成员使用一次 cudaMalloc 分配其
+// 整个内存段，每次拆分操作都会执行一次（mooncake-store/src/client_buffer_allocation.cpp）；这些拆分操作是为
+// 了保持在传输层的注册限制范围内，而非为了跨越不同设备（GetTransportRegistrationLimit, real_client.cpp）；
+// 该路径上没有任何操作调用 cudaSetDevice。因此，一个成员的内存段位于某一设备上——无论容器首先看到哪台设备——
+// 而节点的其他加速器则不受其影响。如果向调度器请求一个扩展资源，则必须让整个加速器从推理任务中退出，以覆盖
+// 该设备内存的极小部分，而该成员无法使用其剩余资源。
+//
+// 共享设备不单独记入调度配额时，引擎仍会看到设备上的全部显存。管理员需要结合引擎配置的显存使用比例设置
+// capacityPerMember，两者的显存不会在此路径上自动隔离。
+//
+// 磁盘层无论以何种方式都会增加一个主机目录，这完全不在 kubelet 的临时存储计费范围之内——它涵盖容器文件系统、
+// emptyDir 卷和日志，而绝不会包含 hostPath。针对该层进行请求会预留一个不受任何约束的额度，随后会使节点成员
+// 无法使用该磁盘所在的节点。该文件系统的管理权属于操作员，文档也明确说明了这一点。
+func memberResources(member workercore.KVCacheBackendMember) core.ResourceRequirements {
+	buffer := member.LocalBufferSize.DeepCopy()
+
+	if member.Medium != "VRAM" {
+		buffer.Add(member.CapacityPerMember)
+	}
+
+	return core.ResourceRequirements{
+		Requests: core.ResourceList{core.ResourceMemory: buffer},
+	}
+}
+
+// applyMemberFabric 提供互联网络所需的资源，且仅适用于需要这些资源的路径。
+//
+// RDMA 和 EFA 共享主机-织物基础：hostNetwork，两个能力以及一项扩展资源请求——且永远不享有特权，否则就会为了
+// 两项操作而让成员拥有整个节点。
+//
+//   - 该请求源自协议，并未被明确声明。这两个互联网络中，每个网络都恰好有一个名称，该名称出现在运行此操作系
+//     统的每个集群中：EFA 的插件属于 AWS 自身，而 RDMA 的插件则由该操作系统的设备管理器发布。无法获取该名称
+//     的节点会处于待处理状态，这就是所期望的失败情况——无法为互联网络提供服务的集群，其后端应显示 TCP，这种
+//     描述是在对象中给出的，而非在存储日志中后续发现的。
+//   - 没有挂载设备树：插件注入了它分配的节点，而 RDMADevicePath 说明了为何其旁边的树会导致部分分配失效。
+//   - libfabric 的 EFA 组件在镜像中运行，因此没有需要挂载的主机安装前缀，也无需设置环境进行渲染。
+//   - 其他所有路径，包括解析为 tcp 的 Auto 路径，都保持原样：没有安全上下文，而不是空上下文，因为空结构体实
+//     际上是一个可以添加功能的机会。
+func applyMemberFabric(ds *apps.DaemonSet, protocol string, interfaceCount int32) {
+	if !memberProtocolIsHostFabric(protocol) {
+		return
+	}
+
+	podSpec := &ds.Spec.Template.Spec
+
+	podSpec.HostNetwork = true
+	// 一个保留 ClusterFirst 设置的 hostNetwork Pod，会依赖主机的解析器，但无法找到主节点的 Service 名称。
+	podSpec.DNSPolicy = core.DNSClusterFirstWithHostNet
+
+	container := &podSpec.Containers[0]
+	container.SecurityContext = &core.SecurityContext{
+		Capabilities: &core.Capabilities{
+			// IPC_LOCK 用于锁定互联网络注册的内存，SYS_RESOURCE 用于提高锁定内存的限制值，从而
+			// 支持锁定操作。两种操作，两种功能。
+			Add: []core.Capability{"IPC_LOCK", "SYS_RESOURCE"},
+		},
+	}
+
+	// 仅涉及设备分配，其他无关内容不讨论。libfabric 的 EFA 组件在镜像中运行，因此没有挂载主机安装前缀，
+	// 也不存在 LD_LIBRARY_PATH：主机树会从主机的`/usr`目录中解析自己的`libefa`和`libibverbs`库，而此处
+	// 并未挂载该目录，因此指向它的加载器在符号版本上会失败，而不是进行加载——此外，不同发行版中该前缀可
+	// 能是`lib`或`lib64`，因此没有一种路径能同时适用于两者。
+	//
+	// 仅通过 `Set on Limits` 来实现扩展资源的需求：一个实例的请求与限制可能不同，而默认配置会从限制中填
+	// 充请求内容。该默认配置在 Pod 上运行，且特意不使用 Pod 模板，因此此 DaemonSet 会保留此处呈现的内容
+	// ——这也能避免控制器在每次迭代时重写模板。该配置通过保护机制处理，而非直接索引：
+	// FabricDeviceResource 定义了其协议，因此如果某个 `fabric` 被添加到 memberProtocolIsHostFabric 中，
+	// 而未被添加到其中，则此处会返回空资源。若进行渲染，列表中会出现空键，这代表一个节点无法满足的请求，
+	// 且没有相关说明；跳过该配置则意味着成员请求了不存在的设备，而这正是此渲染内容的其余部分所视为的可见故障。
+	device := FabricDeviceResource(protocol, interfaceCount)
+	if device == "" {
+		return
+	}
+
+	if container.Resources.Limits == nil {
+		container.Resources.Limits = core.ResourceList{}
+	}
+
+	container.Resources.Limits[device] = *resource.NewQuantity(int64(interfaceCount), resource.DecimalSI)
+}
+
 // FabricDeviceResource 是主机 fabric 协议所请求的扩展资源，它会显式列举协议名称，
 // 而不会 fallthrough 到其中某一种协议。
 //
@@ -379,4 +874,306 @@ func FabricDeviceResource(protocol string, interfaceCount int32) core.ResourceNa
 	default:
 		return ""
 	}
+}
+
+// applyMemberHostPaths 会从其节点上获取该组声明的所需内容。
+//
+// 按条目在列表中的位置生成卷名，避免与保留卷或同组其他条目冲突。挂载路径则由管理员指定，准入时拒绝重复路径。
+//
+// 声明为“无”的组会保持原样显示，因此此功能不会移动未使用此功能的后端中的 Pod 模板——进而也不会移动其指纹以及运行成员。
+func applyMemberHostPaths(ds *apps.DaemonSet, member workercore.KVCacheBackendMember) {
+	if len(member.HostPaths) == 0 {
+		return
+	}
+
+	podSpec := &ds.Spec.Template.Spec
+	container := &podSpec.Containers[0]
+
+	for i, hp := range member.HostPaths {
+		name := fmt.Sprintf("%s-%d", memberHostPathVolumeNamePrefix, i)
+
+		podSpec.Volumes = append(podSpec.Volumes, core.Volume{
+			Name: name,
+			VolumeSource: core.VolumeSource{
+				HostPath: &core.HostPathVolumeSource{
+					Path: hp.Path,
+					Type: hp.Type,
+				},
+			},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, core.VolumeMount{
+			Name:      name,
+			MountPath: hp.MountPath,
+			ReadOnly:  hp.ReadOnly,
+		})
+	}
+}
+
+// applyMemberSecurityContext 会将该组的声明安全上下文 ONTO 与 fabric 路径逐字段合并后的安全上下文，以及联合
+// 的能力集合进行合并。
+//
+// 合并而非替换，因为双方了解不同的内容。互联网络路径知道：没有 IPC_LOCK 时，主机-互联网络成员无法注册内存，
+// 也没有 SYS_RESOURCE 时无法提升绑定限制；声明则知道节点的厂商栈需要什么。如果进行整体结构替换，第一对内容
+// 将被无声地丢弃——容器仅会在传输引擎注册其缓冲区时开始、运行并失败，因此这种合并使得两个声明相互独立。
+//
+// 仅“Add”被合并了。“Drop”被当作已声明存在：一种操作器永远不会添加的能力，此渲染器对此没有看法；而与“Add”重
+// 叠的“Drop”则是 kubelet 需要解决的矛盾点，而非此函数的功能。
+func applyMemberSecurityContext(ds *apps.DaemonSet, member workercore.KVCacheBackendMember) {
+	if member.SecurityContext == nil {
+		return
+	}
+
+	container := &ds.Spec.Template.Spec.Containers[0]
+	derived := container.SecurityContext
+
+	// 被深度复制了，因此由调用者提交并跨渲染环境共享的对象——比如列表器的缓存副本——永远不会被写入。
+	merged := member.SecurityContext.DeepCopy()
+
+	if derived != nil {
+		if merged.Privileged == nil {
+			merged.Privileged = derived.Privileged
+		}
+		if merged.RunAsUser == nil {
+			merged.RunAsUser = derived.RunAsUser
+		}
+		if merged.RunAsGroup == nil {
+			merged.RunAsGroup = derived.RunAsGroup
+		}
+		if merged.RunAsNonRoot == nil {
+			merged.RunAsNonRoot = derived.RunAsNonRoot
+		}
+		if merged.ReadOnlyRootFilesystem == nil {
+			merged.ReadOnlyRootFilesystem = derived.ReadOnlyRootFilesystem
+		}
+		if merged.AllowPrivilegeEscalation == nil {
+			merged.AllowPrivilegeEscalation = derived.AllowPrivilegeEscalation
+		}
+		if merged.ProcMount == nil {
+			merged.ProcMount = derived.ProcMount
+		}
+		if merged.SELinuxOptions == nil {
+			merged.SELinuxOptions = derived.SELinuxOptions
+		}
+		if merged.WindowsOptions == nil {
+			merged.WindowsOptions = derived.WindowsOptions
+		}
+		if merged.SeccompProfile == nil {
+			merged.SeccompProfile = derived.SeccompProfile
+		}
+		if merged.AppArmorProfile == nil {
+			merged.AppArmorProfile = derived.AppArmorProfile
+		}
+
+		if derived.Capabilities != nil && len(derived.Capabilities.Add) > 0 {
+			if merged.Capabilities == nil {
+				merged.Capabilities = &core.Capabilities{}
+			}
+			for _, capability := range derived.Capabilities.Add {
+				if !slices.Contains(merged.Capabilities.Add, capability) {
+					merged.Capabilities.Add = append(merged.Capabilities.Add, capability)
+				}
+			}
+			// 按顺序排列后，同一规格的两种渲染结果在字节层面是完全相同的，无论双方贡献的顺序如
+			// 何，DaemonSet 也不会发生变动。
+			slices.Sort(merged.Capabilities.Add)
+		}
+	}
+
+	container.SecurityContext = merged
+}
+
+// memberTerminationGracePeriodSeconds 表示 kubelet 在收到 SIGTERM 信号后，等待多久才会终止该节点。
+//
+// 它源自“等待期间”的设定，而非被置于其旁边；这就是“窗口始终保留等待状态”背后的全部机制：可以设置两个独立的
+// 字段，使得 kubelet 在按照等待规范要求进行等待时终止容器进程，而无论进行多少验证都无法破坏这种关系——它只是
+// 让该关系可被检查而已。作为衍生结果，它无法被违反。
+//
+// 没有磁盘层的分组没有等待对象，因此会保留入口点自身的关闭预算，其 Pod 模板也不会移动。
+func memberTerminationGracePeriodSeconds(
+	kvcb *workercore.KVCacheBackend, member workercore.KVCacheBackendMember,
+) int64 {
+	if len(member.LocalDisks) == 0 {
+		return memberShutdownSeconds
+	}
+	return int64(memberScaleInGraceSeconds(kvcb)) + memberShutdownSeconds
+}
+
+// memberScaleInGraceSeconds 表示离开的成员进程在注销其磁盘层后还能存活的时间。此等待过程会持续，该层会立即停止响应。
+func memberScaleInGraceSeconds(kvcb *workercore.KVCacheBackend) int32 {
+	managed := kvcb.Spec.Connection.Managed
+	if managed == nil || managed.ScaleIn == nil {
+		return 0
+	}
+	return managed.ScaleIn.GracePeriodSeconds
+}
+
+// applyMemberLocalDisk 会授予该组的磁盘级别权限：其所在的主机目录，以及在成员离开前将其注销的钩子。
+//
+// 没有成员的组将保持原样显示，这确保了现有后端中的 Pod 模板——以及其识别特征和运行成员——不受此功能的影响。
+func applyMemberLocalDisk(
+	ds *apps.DaemonSet,
+	kvcb *workercore.KVCacheBackend,
+	member workercore.KVCacheBackendMember,
+	group int,
+) {
+	if len(member.LocalDisks) == 0 {
+		return
+	}
+
+	podSpec := &ds.Spec.Template.Spec
+
+	// 目录模式为 `Directory`，而非 DirectoryOrCreate。后者更方便，但无法使用。测量结果显示：Kubelet 创
+	// 建的目录由 root 用户拥有，权限为 0755；而存储镜像以 uid 65532 运行——因此成员节点会尝试访问该目录，
+	// 发现无法写入，就会重新尝试存储设置，直到放弃为止。此渲染器无法添加任何从 Pod 内部进行的修复方案：
+	// fsGroup 不适用于 hostPath（也进行了测量，该目录仍由 root 用户拥有）；其他替代方案则意味着需要在节
+	// 点上授予容器根目录的权限，以便对主机目录进行 chown 操作。
+	//
+	// 因此，目录是节点需要提供的，也是其所属的位置——在主机上拥有路径并非操作员应代表管理员进行修改的内
+	// 容。目录会将缺失的情况标记为 FailedMount，此时 Pod 会停止工作，而不是出现无法被写入的静默挂载。文
+	// 档中提供了如何创建该目录的说明，以及所选镜像以哪个 UID 运行。
+	//
+	// 两个条件均满足：要么是 hostPath，而不是 emptyDir。emptyDir 会随 Pod 重启而消失，因此每次重启都会
+	// 丢弃那些仅存于残骸中的缓存层；此外，kubelet 会处理 emptyDir，在缓存层填满时将其从节点中移除，这与
+	// 缓存层在达到自身上限时应有的行为完全相反。
+	podSpec.Volumes = append(podSpec.Volumes, core.Volume{
+		Name: memberLocalDiskVolumeName,
+		VolumeSource: core.VolumeSource{
+			HostPath: &core.HostPathVolumeSource{
+				Path: member.LocalDisks[0].Path,
+				Type: ptr.To(core.HostPathDirectory),
+			},
+		},
+	})
+
+	container := &podSpec.Containers[0]
+	// 安装在客户端被要求写入的路径上，因此其中一个字段同时说明了字节位于主机上的位置以及它们在容器中的地址。
+	container.VolumeMounts = append(container.VolumeMounts, core.VolumeMount{
+		Name:      memberLocalDiskVolumeName,
+		MountPath: member.LocalDisks[0].Path,
+	})
+	container.Lifecycle = &core.Lifecycle{
+		PreStop: memberUnmountLocalDiskHook(memberScaleInGraceSeconds(kvcb), memberRESTPort(group)),
+	}
+
+	podSpec.InitContainers = append(podSpec.InitContainers,
+		memberLocalDiskSurveyContainer(container.Image, member.LocalDisks[0].Path))
+}
+
+// memberLocalDiskSurveyContainer 在成员启动时检查磁盘层目录中是否已有内容，以便管理员及时发现目录复用，避免
+// 读到属于旧后端的缓存条目。
+//
+// 它只进行报告。它不会移除任何内容，也不会在管理员目录中写入任何标记，且其脚本在包括自身失败在内的所有路径上都以零退出。
+//
+// 若脚本能启动，它会正常退出。但镜像缺少 sh 或挂载不可读，初始化容器可能根本无法启动。此时 kubelet 会重试，
+// 后续成员容器也会被阻塞。
+//
+// 因此，这增加了 members[].image 的一个要求：它必须提供一个外壳。该存储操作所依赖的组件确实如此，而成员自己
+// 的入口点是一个 Python 控制台脚本，因此这个外壳是预先确定的。这一点在 API 字段和文档中有说明，而不是在升级
+// 过程中由用户自行发现并解决潜在问题。
+//
+// 计数信息存储在终止消息中，而非日志中，因为当消息位于 Pod 上时，需要从已消失的容器中获取日志，而这一情况已
+// 经被相同的协调过程处理过了。
+//
+// IT 计数第二次，它不可能为零。这项调查的每种失败模式都会导致空计数：没有壳文件、无法读取的挂载点，或命令不
+// 在映像中。当询问“目录是否为空”时，用户所寻求的就是这种结果，因此单独的零值无法被处理。根目录永远不会为空，
+// 因此控制参数为 0 的读数表明调查失败，会被拒绝而非相信。
+//
+// 该控制机制检查的是工具本身，而非测量结果，这两种情况都是不同的故障。它计数在根目录中，因此证明存在 shell
+// 和 `ls` 命令——但与层级无关。如果容器的用户无法读取该层级，则 `ls` 会返回非零退出码和空标准输出，而
+// `wc -l` 会显示出空目录产生的同样为 0 的结果，尽管控制机制完全正常。那么这一结果就会被相信，并且会长期被相信下去。
+//
+// 因此，该层自己的退出状态被单独处理并作为“-1”的条目进行报告，而读者对此表示拒绝。计数无法体现这种失败状态，
+// 因为任何可能出现的计数，都是空目录也能产生的计数。
+//
+// 这种修改会更改 POD 模板，因此升级会重新启动声明了层的后端组件。该层本身是一个主机目录，在重启后依然保留；
+// 没有任何内容被丢弃。没有层的组则不会受到任何影响，这也是其他后端组件组件能够保持原状的原因。
+func memberLocalDiskSurveyContainer(image, path string) core.Container {
+	// 该层级被特意列出两次。计数必须通过管道进行，而管道的状态由最后一个命令决定，因此 `ls | wc -l` 可
+	// 以显示 `wc` 是否运行了，但无法显示 `ls` 是否读取了任何内容。第二次调用是唯一能获取状态的地方。
+	//
+	// 路径被用反引号包裹，而非单引号包裹。之前的版本使用 %q 进行插值处理，从而产生双引号——而 `sh` 会展
+	// 开内部的 $、反引号和 $(...) 等符号，因此看起来就像真正的引用一样，但实际上并非如此。以 `sh` 的表
+	// 示方式来看：路径 /tmp/qp/$(id -u) 以那种形式执行命令时，输出结果为 RAN；而单引号包裹的形式则保持
+	// 原样。准入机制接受任何绝对路径，且不受 ".." 的限制，也不限制字符集，因此这种引用方式就是该对象中
+	// 的字段与成员初始化容器中的命令执行之间唯一的连接点。
+	script := fmt.Sprintf(
+		`t=$(ls -A %[1]s 2>/dev/null | wc -l); c=$(ls -A / 2>/dev/null | wc -l); `+
+			`ls -A %[1]s >/dev/null 2>&1 || t=-1; `+
+			`printf 'entries=%%s control=%%s' "${t:-}" "${c:-}" > /dev/termination-log 2>/dev/null; `+
+			`exit 0`,
+		shellQuote(path),
+	)
+	return core.Container{
+		Name:                     MemberLocalDiskSurveyContainerName,
+		Image:                    image,
+		Command:                  []string{"sh", "-c", script},
+		TerminationMessagePolicy: core.TerminationMessageReadFile,
+		VolumeMounts: []core.VolumeMount{
+			{Name: memberLocalDiskVolumeName, MountPath: path},
+		},
+	}
+}
+
+// shellQuote 将字符串编码为 POSIX sh 可原样读取的单个参数。
+//
+// 单引号是唯一的引用符号，在内部不会进行展开操作，因此该值不能成为变量、命令替换或多个参数。值中的单引号根
+// 本无法在单引号内被转义——这种序列会结束当前运行，产生一个被转义的引号，并开启下一个引号，这就是替换结果呈
+// 现如此样子的原因。
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// memberUnmountLocalDiskHook 构建了关闭钩子，用于取消该成员磁盘层的注册。
+//
+// 这是一项执行操作，而非 httpGet 调用，这其实是一种限制而非偏好：生命周期中的 httpGet 不会发送请求体，也无
+// 法选择方法，而此路由则是一个 POST 请求，其处理程序会先解码请求体，如果请求体为空则返回 400 错误。因此，
+// httpGet 钩子在每次关闭时都会失败——而失败的 preStop 会被记录为事件，否则会被忽略，所以该钩子看起来是配置好
+// 的，但实际上并未执行任何操作。
+//
+// 解释器是图像自带的：这个容器的命令是一个 Python 控制台脚本，因此无法运行 python3 的图像也无法运行该成员。
+// 仅使用标准库，原因相同——如果图像未携带 curl 工具，也会以同样沉默的方式失败。
+func memberUnmountLocalDiskHook(graceSeconds, restPort int32) *core.LifecycleHandler {
+	// 超时时间等于宽容时间加一个很小的余量，这个“小”就是关键所在。
+	//
+	// 钩子超时必须长于处理程序等待的宽限时间，又要给入口进程留出关闭时间。kubelet 在执行 preStop 前就开
+	// 始终止倒计时，直到钩子返回才发 SIGTERM。若钩子耗尽总预算，入口进程会在关闭途中收到 SIGKILL。
+	script := fmt.Sprintf(
+		`import json,urllib.request;`+
+			`urllib.request.urlopen(urllib.request.Request(`+
+			`"http://127.0.0.1:%d%s",`+
+			`data=json.dumps({"grace_period_seconds":%d}).encode(),`+
+			`headers={"Content-Type":"application/json"},method="POST"),timeout=%d)`,
+		restPort, memberUnmountLocalDiskPath, graceSeconds,
+		int64(graceSeconds)+memberHookTimeoutMarginSeconds,
+	)
+
+	return &core.LifecycleHandler{
+		Exec: &core.ExecAction{Command: []string{"python3", "-c", script}},
+	}
+}
+
+// MemberPodSpecHash 会识别成员 pod 模板中的所有内容，但节点选择器除外。
+//
+// 这种排除正是其目的所在。扩展操作只会改变节点选择器，不会有其他影响；同时，扩展操作不得重新启动已运行的成
+// 员；对模板的其他任何修改都必须进行。因此，在哈希处理之前会移除节点选择器，而 DaemonSet 会保持 OnDelete 状
+// 态，这样只有这个指纹才能决定是否重启。
+//
+// 存储的哈希值注释也被清除掉了，因此指纹永远不会自我覆盖——如果保留该值，每次生成和滚动组时都会发生变化。
+func MemberPodSpecHash(template core.PodTemplateSpec) string {
+	subject := *template.DeepCopy()
+	subject.Spec.NodeSelector = nil
+	delete(subject.Annotations, MemberPodSpecHashAnnotation)
+	if len(subject.Annotations) == 0 {
+		subject.Annotations = nil
+	}
+
+	// JSON 而非 fmt：它会对映射键进行排序，因此同一个规范哈希的两种呈现形式可能相同。对于
+	// PodTemplateSpec 而言，无法发生序列化失败，将其视为空摘要会静默禁用所有重启操作，因此最终呈现为一
+	// 个无法匹配的值。
+	encoded, err := json.Marshal(subject)
+	if err != nil {
+		return "unhashable-" + err.Error()
+	}
+
+	return stringx.SumBytesBySHA256(encoded)
 }

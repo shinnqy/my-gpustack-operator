@@ -15,6 +15,23 @@ func GetLabel(obj MetaObject, key string) (string, bool) {
 	return v, ok
 }
 
+// SetLabel 按给定的键设置标签值。
+//
+// 如果标签已存在，直接更新它的值。
+func SetLabel(obj MetaObject, key, value string) {
+	if obj == nil {
+		panic("object is nil")
+	}
+
+	ls := obj.GetLabels()
+	if ls == nil {
+		ls = map[string]string{}
+	}
+
+	ls[key] = value
+	obj.SetLabels(ls)
+}
+
 // IsLabeled 返回 true，表示具有给定键和值的标签存在。
 func IsLabeled(obj MetaObject, key, value string) bool {
 	v, ok := GetLabel(obj, key)

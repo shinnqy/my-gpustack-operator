@@ -697,6 +697,7 @@ func ModelDeploymentArgName(arg string) string {
 }
 
 // IMPORTANT: 把 K8s API 的字段翻译成底层 inject.Input，调 inject.Render() 拿到引擎参数，并追加监控开关 MC_TE_METRIC=1 与指纹绑定记录。
+//   - 点对点直传 kv transfer，和 共享缓存池 shared kv store，公共使用这个方法逻辑
 //
 // SynthesizeModelDeploymentConnector 渲染用于将单个角色的副本接入缓存的引擎参数、环境变量和
 // 客户端 JSON。
@@ -740,6 +741,7 @@ func SynthesizeModelDeploymentConnector(in ModelDeploymentConnectorInput) (Model
 		}
 	}
 
+	// IMPORTANT: 【共享缓存池 kv cache】把连接信息翻译成推理引擎的参数
 	res, err := inject.Render(inject.Input{
 		Engine: engine,
 		Role:   role,
