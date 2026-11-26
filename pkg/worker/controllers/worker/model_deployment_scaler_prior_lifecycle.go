@@ -56,6 +56,14 @@ func (r *ModelDeploymentScalerReconciler) invalidateCapacityPriorState(
 	r.setCondition(scaler, workercore.ModelDeploymentScalerConditionTypeCapacityPriorsReady, meta.ConditionUnknown, reason, message, now)
 }
 
+func modelDeploymentScalerPriorAPIError(err error) error {
+	var refusal *priors.RefusalError
+	if errors.As(err, &refusal) {
+		return nil
+	}
+	return err
+}
+
 func (r *ModelDeploymentScalerReconciler) applyCapacityPriorResolution(
 	scaler *workercore.ModelDeploymentScaler, resolved *ModelDeploymentScalerCapacityPriors, resolutionErr error, now time.Time,
 ) {
@@ -100,6 +108,34 @@ func (r *ModelDeploymentScalerReconciler) stopForCapacityPrior(
 		return ctrlreconcile.Result{}, err
 	}
 	return ctrlreconcile.Result{RequeueAfter: r.interval(scaler)}, nil
+}
+
+func (r *ModelDeploymentScalerReconciler) recheckCapacityPriors(
+	ctx context.Context, scaler *workercore.ModelDeploymentScaler, target *workercore.ModelDeployment, planned *ModelDeploymentScalerCapacityPriors,
+) error {
+	if !modelDeploymentScalerPriorRequested(scaler) {
+		return nil
+	}
+	latestScaler := new(workercore.ModelDeploymentScaler)
+	if err := r.priorReader().Get(ctx, ctrlcli.ObjectKeyFromObject(scaler), latestScaler); err != nil {
+		return err
+	}
+	if latestScaler.UID != scaler.UID || latestScaler.Generation != scaler.Generation ||
+		latestScaler.Spec.Suspend || latestScaler.Spec.Mode != workercore.ModelDeploymentScalerModeActive {
+		return modelDeploymentScalerPriorRefusal("", "scaler configuration changed while planning; retry resolution")
+	}
+	latestTarget := new(workercore.ModelDeployment)
+	if err := r.priorReader().Get(ctx, ctrlcli.ObjectKeyFromObject(target), latestTarget); err != nil {
+		return err
+	}
+	resolved, err := ResolveModelDeploymentScalerCapacityPriors(ctx, r.priorReader(), latestScaler, latestTarget)
+	if err != nil {
+		return err
+	}
+	if !maps.Equal(modelDeploymentScalerPriorFingerprints(planned.Status), modelDeploymentScalerPriorFingerprints(resolved.Status)) {
+		return modelDeploymentScalerPriorRefusal("", "capacity compatibility changed while planning; retry resolution")
+	}
+	return nil
 }
 
 func (r *ModelDeploymentScalerReconciler) mapCapacityPriorCatalog(ctx context.Context, obj ctrlcli.Object) []ctrlreconcile.Request {

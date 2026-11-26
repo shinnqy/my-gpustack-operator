@@ -2,13 +2,17 @@ package worker
 
 import (
 	"context"
+	"math"
+	"sort"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	gpustack "gpustack.ai/gpustack/api/v1"
 	workercore "gpustack.ai/gpustack/api/worker/v1alpha1"
 	"gpustack.ai/gpustack/pkg/kubemeta"
+	"gpustack.ai/gpustack/pkg/worker/scaling/algorithm"
 	"gpustack.ai/gpustack/pkg/worker/scaling/priors"
 )
 
@@ -210,4 +214,148 @@ func (r *ModelDeploymentScalerReconciler) updateStatus(
 		return nil
 	}
 	return r.Client.Status().Update(ctx, scaler)
+}
+
+func modelDeploymentScalerQuantityValue(quantity *resource.Quantity) float64 {
+	if quantity == nil {
+		return 0
+	}
+	return quantity.AsApproximateFloat64()
+}
+
+func quantityPointerFloat(value float64) *resource.Quantity {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	quantity := *resource.NewMilliQuantity(int64(math.Round(value*1000)), resource.DecimalSI)
+	return &quantity
+}
+
+// modelDeploymentScalerLatencyQuantity 将已测出的角色延迟转为 Quantity。缺少实测值时返回 nil。
+//
+// 状态只写入实际测得的延迟。填入零会让读者以为引擎瞬间响应。
+func modelDeploymentScalerLatencyQuantity(milliseconds float64, unmeasured bool) *resource.Quantity {
+	if unmeasured {
+		return nil
+	}
+	return quantityPointerFloat(milliseconds)
+}
+
+func scalerObservationState(observation algorithm.RoleObservation) string {
+	states := []algorithm.SignalState{observation.GaugeState, observation.ThroughputState, observation.LatencyState}
+	missing := false
+	fresh := false
+	for _, state := range states {
+		switch state {
+		case algorithm.SignalMissing:
+			missing = true
+		case algorithm.SignalFresh:
+			fresh = true
+		case algorithm.SignalStale:
+			return string(algorithm.SignalStale)
+		}
+	}
+	if missing || !observation.CompleteCoverage {
+		return string(algorithm.SignalMissing)
+	}
+	if fresh {
+		return string(algorithm.SignalFresh)
+	}
+	return string(algorithm.SignalIdle)
+}
+
+func scalerPredictor(
+	statuses []workercore.ModelDeploymentScalerPredictorStatus,
+	role string,
+) *algorithm.PredictorState {
+	for i := range statuses {
+		status := &statuses[i]
+		if status.Name != role {
+			continue
+		}
+		state := &algorithm.PredictorState{SampleCount: status.SampleCount, History: algorithm.NewDemandHistory()}
+		if status.Level != nil {
+			state.Level = status.Level.AsApproximateFloat64()
+		}
+		if status.Trend != nil {
+			state.Trend = status.Trend.AsApproximateFloat64()
+		}
+		if status.Covariance != nil {
+			state.Covariance = [4]float64{
+				modelDeploymentScalerQuantityValue(status.Covariance.P00), modelDeploymentScalerQuantityValue(status.Covariance.P01),
+				modelDeploymentScalerQuantityValue(status.Covariance.P10), modelDeploymentScalerQuantityValue(status.Covariance.P11),
+			}
+		}
+		for _, sample := range status.History {
+			state.History.Push(algorithm.DemandSample{
+				Timestamp: sample.Timestamp.Time, TokensPerSecond: sample.TokensPerSecond.AsApproximateFloat64(),
+			})
+		}
+		return state
+	}
+	return nil
+}
+
+func scalerPredictorStatuses(states map[string]*algorithm.PredictorState) []workercore.ModelDeploymentScalerPredictorStatus {
+	roles := make([]string, 0, len(states))
+	for role := range states {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	result := make([]workercore.ModelDeploymentScalerPredictorStatus, 0, len(roles))
+	for _, role := range roles {
+		state := states[role]
+		if state == nil {
+			continue
+		}
+		status := workercore.ModelDeploymentScalerPredictorStatus{
+			Name: role, Level: quantityPointerFloat(state.Level), Trend: quantityPointerFloat(state.Trend), SampleCount: state.SampleCount,
+			Covariance: &workercore.ModelDeploymentScalerKalmanCovariance{
+				P00: quantityPointerFloat(state.Covariance[0]), P01: quantityPointerFloat(state.Covariance[1]),
+				P10: quantityPointerFloat(state.Covariance[2]), P11: quantityPointerFloat(state.Covariance[3]),
+			},
+		}
+		if state.History != nil {
+			for _, sample := range state.History.Data() {
+				tps := quantityPointerFloat(sample.TokensPerSecond)
+				if tps == nil {
+					continue
+				}
+				status.History = append(status.History, workercore.ModelDeploymentScalerDemandSample{
+					Timestamp: meta.NewTime(sample.Timestamp), TokensPerSecond: *tps,
+				})
+			}
+		}
+		result = append(result, status)
+	}
+	return result
+}
+
+func scalerStabilizationHistory(
+	roles []workercore.ModelDeploymentScalerRoleStatus,
+	name string,
+) []workercore.ModelDeploymentScalerStabilizationSample {
+	for i := range roles {
+		if roles[i].Name == name {
+			return append([]workercore.ModelDeploymentScalerStabilizationSample(nil), roles[i].StabilizationHistory...)
+		}
+	}
+	return nil
+}
+
+func scalerRoleLastScaleUp(roles []workercore.ModelDeploymentScalerRoleStatus, name string) *meta.Time {
+	for i := range roles {
+		if roles[i].Name == name && roles[i].LastScaleUpTime != nil {
+			cloned := *roles[i].LastScaleUpTime
+			return &cloned
+		}
+	}
+	return nil
+}
+
+func scalerRoleLastScaleUpTime(roles []workercore.ModelDeploymentScalerRoleStatus, name string) time.Time {
+	if value := scalerRoleLastScaleUp(roles, name); value != nil {
+		return value.Time
+	}
+	return time.Time{}
 }

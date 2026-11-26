@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -102,4 +103,43 @@ func (r *ModelDeploymentScalerReconciler) recoverDecision(
 	if scaler.Status.Binding == nil || scaler.Status.Binding.TargetUID == "" {
 		scaler.Status.Binding = &workercore.ModelDeploymentScalerBindingStatus{TargetUID: string(md.UID), TargetName: md.Name, Term: decision.Term}
 	}
+}
+
+func (r *ModelDeploymentScalerReconciler) writeVector(
+	ctx context.Context,
+	scaler *workercore.ModelDeploymentScaler,
+	md *workercore.ModelDeployment,
+	vector map[string]int32,
+	baseline map[string]int32,
+	now time.Time,
+) (string, error) {
+	term := scalerTerm(scaler)
+	decisionID := fmt.Sprintf("%s-%d-%d", scaler.UID, term, now.UnixNano())
+	for i := range md.Spec.Roles {
+		if replicas, ok := vector[md.Spec.Roles[i].Name]; ok {
+			md.Spec.Roles[i].Replicas = replicas
+		}
+	}
+	decision, err := json.Marshal(modelDeploymentScalerDecisionAnnotation{
+		ScalerUID: string(scaler.UID), DecisionID: decisionID, Term: term, Vector: cloneReplicaVector(vector),
+		BaselineVector: cloneReplicaVector(baseline), Timestamp: timePointer(now), TargetGeneration: md.Generation + 1,
+	})
+	if err != nil {
+		return "", err
+	}
+	if md.Annotations == nil {
+		md.Annotations = make(map[string]string)
+	}
+	md.Annotations[workercore.ModelDeploymentScalerDecisionAnnotationKey] = string(decision)
+	if err := r.Client.Update(ctx, md); err != nil {
+		return "", err
+	}
+	return decisionID, nil
+}
+
+func scalerTerm(scaler *workercore.ModelDeploymentScaler) int64 {
+	if scaler.Status.Binding == nil {
+		return 0
+	}
+	return scaler.Status.Binding.Term
 }

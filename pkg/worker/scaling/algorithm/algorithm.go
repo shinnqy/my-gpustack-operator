@@ -30,6 +30,29 @@ const (
 // SignalState 描述单个采样信号的质量状态。
 type SignalState string
 
+const (
+	SignalFresh   SignalState = "Fresh"
+	SignalIdle    SignalState = "Idle"
+	SignalMissing SignalState = "Missing"
+	SignalStale   SignalState = "Stale"
+)
+
+// 算法给出副本数建议时一并返回的原因。
+const (
+	ReasonWaitingForMetrics           = "WaitingForMetrics"
+	ReasonRatioCoupled                = "RatioCoupled"
+	ReasonPredictorWarmingUp          = "PredictorWarmingUp"
+	ReasonPredictiveConsolidationHold = "PredictiveConsolidationHold"
+	ReasonLatencyGuardScaleUp         = "LatencyGuardScaleUp"
+	ReasonLatencyGuardHold            = "LatencyGuardHold"
+	ReasonTokenThroughput             = "TokenThroughput"
+	ReasonNoReadyReplicas             = "NoReadyReplicas"
+	ReasonWithinTolerance             = "WithinTolerance"
+	ReasonScaleUp                     = "ScaleUp"
+	ReasonScaleDown                   = "ScaleDown"
+	ReasonPanic                       = "Panic"
+)
+
 // RoleObservation 包含某个角色在某一时刻的采样值。
 type RoleObservation struct {
 	Role                      string
@@ -59,6 +82,14 @@ type RoleObservation struct {
 	ObservedAt       time.Time
 }
 
+// RoleRecommendation 是一个角色在应用约束前的副本建议。
+type RoleRecommendation struct {
+	DesiredReplicas int32
+	Reason          string
+	HoldScaleDown   bool
+	InPanic         bool
+}
+
 // DemandSample 是带时间戳的角色需求采样点。
 type DemandSample struct {
 	Timestamp       time.Time
@@ -77,4 +108,78 @@ type PredictorState struct {
 	// 若使用切片，则在每个周期都需要重新分配内存来维持同一窗口。
 	History     *datax.RingBuffer[DemandSample]
 	PanicExitAt time.Time
+}
+
+// NewDemandHistory 创建空的需求历史记录。
+//
+// 预测器用它保存需求样本，容量覆盖算法可能请求的最长窗口。
+func NewDemandHistory() *datax.RingBuffer[DemandSample] {
+	return datax.NewRingBuffer[DemandSample](maxDemandHistoryCap)
+}
+
+// Algorithm 根据一个角色的观测数据建议其副本数。
+type Algorithm interface {
+	Name() string
+	Recommend(obs RoleObservation, prior *PredictorState) (RoleRecommendation, *PredictorState)
+}
+
+// copyDemandHistory 将需求样本复制到新的环形缓冲区。
+func copyDemandHistory(source *datax.RingBuffer[DemandSample]) *datax.RingBuffer[DemandSample] {
+	if source == nil {
+		return NewDemandHistory()
+	}
+	return source.Clone()
+}
+
+// copyState 返回算法计算本轮建议时使用的起始状态。
+//
+// 算法会把本轮样本追加到历史记录中，因此先复制上一轮历史。如果调谐在保存前失败，
+// 采样器保留的旧状态仍然有效。
+func copyState(prior *PredictorState) PredictorState {
+	if prior == nil {
+		return PredictorState{
+			History: NewDemandHistory(),
+		}
+	}
+	state := *prior
+	state.History = copyDemandHistory(prior.History)
+	return state
+}
+
+// signalUsable 仅在信号新鲜或已确认空闲时返回 true。缺失、过期、空状态及未知状态均视为不可用。
+func signalUsable(state SignalState) bool {
+	return state == SignalFresh || state == SignalIdle
+}
+
+func roleKind(obs RoleObservation) RoleKind {
+	if obs.Kind != "" {
+		return obs.Kind
+	}
+	switch obs.Role {
+	case "server", "Server":
+		return RoleKindServer
+	case "prefill", "Prefill":
+		return RoleKindPrefill
+	case "decode", "Decode":
+		return RoleKindDecode
+	case "encode", "Encode":
+		return RoleKindEncode
+	default:
+		return RoleKindUnknown
+	}
+}
+
+func clampPartialCoverage(rec *RoleRecommendation, obs RoleObservation) {
+	if obs.CompleteCoverage || rec.DesiredReplicas >= obs.CurrentReplicas {
+		return
+	}
+	rec.DesiredReplicas = obs.CurrentReplicas
+	rec.HoldScaleDown = true
+}
+
+func maxInt32(a, b int32) int32 {
+	if a > b {
+		return a
+	}
+	return b
 }
