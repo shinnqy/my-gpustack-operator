@@ -99,6 +99,26 @@ func TestRenderModelDeploymentPod_Command(t *testing.T) {
 			},
 		},
 		{
+			name:      "vLLM 将带空格的 speculative JSON 作为一个参数传入",
+			engine:    workercore.ModelDeploymentEngineVLLM,
+			extraArgs: []string{"--speculative-config", testSpeculativeNgramConfig},
+			wantCommand: []string{
+				"vllm", "serve", "Qwen/Qwen2.5-72B-Instruct",
+				"--speculative-config", testSpeculativeNgramConfig,
+				"--host", "0.0.0.0", "--port", "8000",
+			},
+		},
+		{
+			name:      "SGLang 接收原生 speculative 参数",
+			engine:    workercore.ModelDeploymentEngineSGLang,
+			extraArgs: []string{"--speculative-algorithm", "EAGLE", "--speculative-num-steps=4"},
+			wantCommand: []string{
+				"python3", "-m", "sglang.launch_server", "--model-path", "Qwen/Qwen2.5-72B-Instruct",
+				"--enable-metrics", "--speculative-algorithm", "EAGLE", "--speculative-num-steps=4",
+				"--host", "0.0.0.0", "--port", "8000",
+			},
+		},
+		{
 			name:      "connector arguments land before the user's, and the address after both",
 			engine:    workercore.ModelDeploymentEngineVLLM,
 			connector: ModelDeploymentConnectorRender{Args: []string{`--kv-transfer-config={}`}},

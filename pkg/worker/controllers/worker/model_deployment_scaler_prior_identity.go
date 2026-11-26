@@ -846,6 +846,80 @@ const modelDeploymentScalerRedactedValue = "[redacted]"
 // modelDeploymentScalerPriorFlags 按引擎的参数拼写规则读取身份敏感的标志。
 // 完整的有序 argv（包括未识别的性能参数）仍保留在目录匹配中。
 func modelDeploymentScalerPriorFlags(engine string, args []string) (map[string]string, error) {
-	// 在第 23 章实现此函数。
-	return nil, nil
+	if engine != workercore.ModelDeploymentEngineVLLM && engine != workercore.ModelDeploymentEngineSGLang {
+		return nil, fmt.Errorf("unsupported engine %q", engine)
+	}
+	// 划定“身份敏感参数”白名单
+	values := map[string]string{}
+	// --dtype / --quantization：模型权重计算精度（如 fp16 / bf16 / fp8 / fp4），直接决定算力速度和显存占用，对吞吐影响翻倍。
+	// --kv-cache-dtype：KV Cache 的存储精度（比如 fp8 KV Cache 可以塞下更大 batch，显著改变吞吐）。
+	// --revision / --tokenizer / --tokenizer-revision：权重和分词器的版本——换了分词器，同样的句子切出的 token 数都不一样，tokens/s 指标就不可比了。
+	// --cpu-offload-gb / --swap-space：把模型权重或 KV Cache 卸载/交换到宿主机内存（CPU RAM），一旦走 PCIe 内存交换，延迟会暴增，跟纯显存压测完全是两个世界。
+	// --enable-prefix-caching / --no-enable-prefix-caching（vLLM）与 --disable-radix-cache（SGLang）：前缀缓存（Prefix Caching / RadixAttention）开关——复用相同系统提示词的 KV Cache 会大幅拉低 TTFT，所以必须记录用户有没有改过它！
+	valueFlags := []string{
+		"--dtype", "--kv-cache-dtype", "--revision", "--tokenizer", "--tokenizer-revision",
+		"--quantization", "--cpu-offload-gb", "--swap-space",
+	}
+	boolFlags := []string{"--enable-prefix-caching", "--no-enable-prefix-caching", "--disable-radix-cache"}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return nil, fmt.Errorf("catalog cannot interpret arguments after --")
+		}
+		key, value, inline := strings.Cut(arg, "=")
+		if engine == workercore.ModelDeploymentEngineVLLM {
+			key = strings.ReplaceAll(key, "_", "-")
+			if strings.HasPrefix(key, "-q") && len(key) > 2 && !inline {
+				value, key, inline = key[2:], "--quantization", true
+			}
+		}
+		if key == "-q" && engine == workercore.ModelDeploymentEngineVLLM {
+			key = "--quantization"
+		}
+		if key == "--tokenizer-path" && engine == workercore.ModelDeploymentEngineSGLang {
+			key = "--tokenizer"
+		}
+		if key == "--model" || key == "--model-path" || strings.Contains(key, "speculative") ||
+			strings.Contains(key, "hierarchical-cache") || strings.Contains(key, "kv-transfer") ||
+			strings.Contains(key, "config") || strings.Contains(key, "lora") {
+			return nil, fmt.Errorf("catalog cannot establish settings from %s", key)
+		}
+		if slices.Contains(boolFlags, key) {
+			if inline {
+				return nil, fmt.Errorf("%s requires its bare boolean spelling", key)
+			}
+			if engine == workercore.ModelDeploymentEngineSGLang && key != "--disable-radix-cache" ||
+				engine == workercore.ModelDeploymentEngineVLLM && key == "--disable-radix-cache" {
+				return nil, fmt.Errorf("%s is not an engine-native cache flag", key)
+			}
+			values[key] = "true"
+			switch key {
+			case "--enable-prefix-caching":
+				delete(values, "--no-enable-prefix-caching")
+			case "--no-enable-prefix-caching":
+				delete(values, "--enable-prefix-caching")
+			}
+			continue
+		}
+		if !slices.Contains(valueFlags, key) {
+			for _, known := range append(slices.Clone(valueFlags), boolFlags...) {
+				if strings.HasPrefix(key, "--") && strings.HasPrefix(known, key) {
+					return nil, fmt.Errorf("catalog requires the full identity flag %s", known)
+				}
+			}
+			continue
+		}
+		if !inline {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return nil, fmt.Errorf("%s requires a value", key)
+			}
+			i++
+			value = args[i]
+		}
+		if value == "" {
+			return nil, fmt.Errorf("%s requires a nonempty value", key)
+		}
+		values[key] = value
+	}
+	return values, nil
 }
