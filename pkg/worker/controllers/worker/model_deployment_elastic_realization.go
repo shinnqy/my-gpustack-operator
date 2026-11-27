@@ -353,6 +353,7 @@ func (r *ModelDeploymentReconciler) convergeModelDeploymentElastic(ctx context.C
 			}
 		}
 	}
+	// [IMPORTANT: elastic EP] 总编排入口
 	if err := r.reconcileModelDeploymentElasticResize(ctx, md); err != nil {
 		return true, modelDeploymentPassObservation{}, err
 	}

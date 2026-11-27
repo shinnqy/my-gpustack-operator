@@ -3,7 +3,7 @@
 // 它只与固定版本 vLLM 的原生路由通信：下方两个缩扩容路由，以及 ObserveNativeWorld
 // 用来探测前端实际执行范围的单个补全路由。源自 v0.29.0 serve/elastic_ep 路由器的原生契约为：
 //
-//	POST /scale_elastic_ep      {"new_data_parallel_size": positive int, "drain_timeout": positive int}
+//	POST /scale_elastic_ep      {"new_data_parallel_size": 正整数, "drain_timeout": 正整数}
 //	                            200 {"message": ...} | 400 | 408 | 500
 //	POST /is_scaling_elastic_ep  200 {"is_scaling_elastic_ep": bool}
 //
@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"gpustack.ai/gpustack/pkg/utils/json"
@@ -129,6 +131,47 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	timeout time.Duration
+}
+
+// New 创建只访问指定引擎的弹性端点客户端。
+//
+// 调用超时必须为正值，由 Operator 决定。引擎排空一个 worker 所需的时间与控制器能为一次请求等待多久是两个独立预算，
+// 分别传入。
+//
+// 客户端自行配置传输并在构建后固定其行为。拒绝重定向可防止同一个变更请求在新地址被再次执行。
+func New(baseURL string, timeout time.Duration) (*Client, error) {
+	if timeout <= 0 {
+		return nil, invalid("", "the call timeout must be positive, got %s", timeout)
+	}
+
+	trimmed := strings.TrimSpace(baseURL)
+	if trimmed == "" {
+		return nil, invalid("", "the engine base URL is empty")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		// URL 解析错误可能原样包含带凭据的传入地址，因此只返回不含地址的错误说明。
+		return nil, invalid("", "the engine base URL is not a URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, invalid("", "the engine base URL must be http or https, got %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, invalid("", "the engine base URL has no host")
+	}
+
+	client := &Client{
+		baseURL: strings.TrimRight(trimmed, "/"),
+		timeout: timeout,
+	}
+	// 两个原生接口都使用 POST。禁用自动跟随重定向，以免变更请求被再次发送。
+	client.http = &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	return client, nil
 }
 
 // callContext 使用 operator 的超时时间限制单次调用。
@@ -333,4 +376,45 @@ func decodeObject(op string, raw []byte) (map[string]json.RawMessage, *Error) {
 	}
 
 	return answer, nil
+}
+
+// IsScaling 查询引擎当前是否正在调整宽度。
+//
+// 应答必须显式包含布尔字段 is_scaling_elastic_ep。字段缺失、为 null 或类型不符都表示读数未知，
+// 不能将其解释为引擎空闲。
+//
+// 返回 false 只说明引擎当前没有变更宽度。移除成员还要取得其无 actor 等证据。
+func (c *Client) IsScaling(ctx context.Context) (bool, error) {
+	const op = isScalingPath
+
+	raw, failure := c.post(ctx, op, isScalingPath, struct{}{})
+	if failure != nil {
+		return false, failure
+	}
+
+	answer, failure := decodeObject(op, raw)
+	if failure != nil {
+		return false, failure
+	}
+
+	field, present := answer[isScalingField]
+	if !present {
+		return false, &Error{
+			Kind: KindMalformed, Op: op, Detail: "the answer does not carry " + isScalingField,
+		}
+	}
+	if string(field) == "null" {
+		return false, &Error{
+			Kind: KindMalformed, Op: op, Detail: isScalingField + " is null rather than a boolean",
+		}
+	}
+	var scaling bool
+	if err := json.Unmarshal(field, &scaling); err != nil {
+		return false, &Error{
+			Kind: KindMalformed, Op: op,
+			Detail: isScalingField + " is not a boolean", Err: err,
+		}
+	}
+
+	return scaling, nil
 }

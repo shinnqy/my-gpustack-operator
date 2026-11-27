@@ -1,24 +1,18 @@
-"""Bounded read-only Ray GCS table collector for the elastic EP identity observer.
+"""在 Ray head 容器中只读采集三张 GCS 表，供 Elastic EP 控制器核对 rank 与 Pod 的身份。
 
-Runs inside the Ray head container via the operator's existing exec transport. It reads
-three GCS tables through the pinned-wheel raw accessors and prints ONE JSON document:
+Operator 通过已有的 Pod exec 在 head 内执行脚本。它使用固定版本 Ray 的原生访问接口，
+将以下三张表的结果一起写到一份 JSON 文档中。
 
-  nodes            accessor.get_node_table() rows, projected to explicit fields
-  actors           accessor.get_actor_table(None, None) rows, ActorTableData.FromString
-  placement_groups accessor.get_placement_group_table() rows, PlacementGroupTableData.FromString
+  nodes             对 get_node_table() 返回的每条节点记录提取需要的字段。
+  actors            用 ActorTableData.FromString 解码 get_actor_table(None, None) 的记录。
+  placement_groups  用 PlacementGroupTableData.FromString 解码 get_placement_group_table() 的记录。
 
-Fail-closed rules:
-  - A table that cannot be read is recorded in "errors" and the script exits 2; it never
-    prints a partial table that could be mistaken for an empty one.
-  - The whole document is written through a bounded writer; exceeding the cap exits 4
-    after discarding, so a truncated document is never mistaken for a complete one.
-  - --deadline-seconds bounds total wall time; expiry exits 3.
-  - IDs are emitted as hex, enums as the raw integer plus the enum's name; nothing is
-    stringified through repr.
-  - No actor is ever called: this script only reads GCS tables. It never starts Ray
-    processes and never calls ray.init().
+设备和成员身份保留原始表示。ID 编码成十六进制，枚举同时给出整数值和名称，避免用 repr 推断类型。
+采集只读 GCS，无需启动 Ray 进程、执行 ray.init() 或调用任何 actor。
 
-Exit codes: 0 complete, 2 transport/schema refusal, 3 deadline, 4 output bound.
+返回 0 表示文档完整。表读取或解析失败时把原因写入 errors，以 2 退出，区分缺表和空表。
+--deadline-seconds 限制整轮采集可用的时间，检测到超时以 3 退出。
+所有输出都经有大小限制的缓冲区写出，超限以 4 退出，避免下游误读截断的 JSON。
 """
 import argparse
 import json
@@ -27,6 +21,15 @@ import time
 
 from ray._raylet import GcsClientOptions, GlobalStateAccessor
 from ray.core.generated import gcs_pb2
+
+"""
+[IMPORTANT: elastic EP]
+
+本文件如何工作？
+    - Operator 通过 K8s Pod exec 在 CPU Head 容器里跑这个 Python 脚本
+为什么不用 ray.init() ？
+    - ray.init() 会启动 Ray worker/client 进程，开销大且会修改集群状态
+"""
 
 SCHEMA_VERSION = 1
 
@@ -87,8 +90,7 @@ def connect(gcs_address):
 
 
 def project_node(row):
-    # get_node_table() returns the wheel's node dicts. Every projected field must be
-    # present; a missing key is a schema failure recorded by the caller, not a default.
+    # 固定版本的 get_node_table() 返回节点字典。保留关键信息缺失的状态，以供解析端拒绝不完整的记录。
     labels = row.get("Labels") or {}
     resources = row.get("Resources") or {}
     return {
@@ -228,8 +230,7 @@ def main():
             document[table] is None
             for table in ("nodes", "actors", "placement_groups")
         ):
-            # A refused table is a refusal for the whole document: the parser must
-            # never see an absent table and read it as an empty one.
+            # 任意一张表读取失败就拒绝整份观测，防止解析端把读取失败误认为表中确实没有成员。
             writer.write(json.dumps(document, indent=1))
             writer.emit()
             die(2, "one or more GCS tables refused")
