@@ -1,0 +1,196 @@
+{{- if .Values.modelManager.enabled }}
+{{- $name := include "gpustack-operator.modelManager.fullname" . }}
+{{- $image := include "gpustack-operator.image" (dict "root" . "overrides" .Values.modelManager.image) }}
+{{- $imagePullPolicy := include "gpustack-operator.imagePullPolicy" (dict "root" . "overrides" .Values.modelManager.image) }}
+{{- $registrarImage := include "gpustack-operator.image" (dict "root" . "overrides" .Values.modelManager.registrar.image) }}
+{{- $registrarPullPolicy := include "gpustack-operator.imagePullPolicy" (dict "root" . "overrides" .Values.modelManager.registrar.image) }}
+{{- $kubeletDir := .Values.modelManager.kubeletDir | trimSuffix "/" }}
+{{- $pluginDir := printf "%s/plugins/model.csi.gpustack.ai" $kubeletDir }}
+{{- $podsDir := printf "%s/pods" $kubeletDir }}
+{{- $rootPath := .Values.modelManager.rootPath | trimSuffix "/" }}
+{{- $securePort := .Values.modelManager.securePort }}
+{{- $peerSync := and (kindIs "invalid" .Values.modelManager.port | not) (gt (.Values.modelManager.port | int) 0) }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.modelManager.labels" . | nindent 4 }}
+spec:
+  {{- /*
+    每次只滚动更新一个节点。已有 Pod 保留 bind mount，新挂载请求由 kubelet 在插件恢复后重试。
+  */}}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "gpustack-operator.modelManager.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpustack-operator.modelManager.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- end }}
+      {{- end }}
+      {{- $nodeSelector := merge (deepCopy (.Values.modelManager.nodeSelector | default dict)) (deepCopy (.Values.global.nodeSelector | default dict)) }}
+      {{- with $nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ $name }}
+      priorityClassName: system-node-critical
+      {{- with .Values.modelManager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: main
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ $imagePullPolicy }}
+          args:
+            - gpustack-operator
+            - model-manager
+            - -v=2
+            - --secure-port={{ $securePort }}
+            - --node-name=$(KUBERNETES_NODE_NAME)
+            - --kubelet-dir={{ $kubeletDir }}
+            - --cache-root={{ $rootPath }}
+            - --csi-socket={{ $pluginDir }}/csi.sock
+            {{- if $peerSync }}
+            {{- /* 其他节点的插件通过 peer 端口获取已发布的权重，并用投射的 ServiceAccount 令牌认证。 */}}
+            - --peer-sync-port={{ .Values.modelManager.port }}
+            - --peer-sync-auth=token
+            - --peer-sync-service-account={{ $name }}
+            {{- with .Values.modelManager.peerSync }}
+            - --peer-sync-max-serving-streams={{ .maxServingStreams }}
+            - --peer-sync-streams-per-source={{ .streamsPerSource }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.modelManager.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.modelManager.resources | nindent 12 }}
+          {{- /*
+            插件要在 kubelet 的 Pod 目录下执行 bind mount，因此需要特权和双向挂载传播。
+          */}}
+          securityContext:
+            allowPrivilegeEscalation: true
+            privileged: true
+            readOnlyRootFilesystem: true
+            runAsNonRoot: false
+          env:
+            - name: KUBERNETES_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: https
+              containerPort: {{ $securePort }}
+            {{- if $peerSync }}
+            - name: peer-sync
+              containerPort: {{ .Values.modelManager.port }}
+            {{- end }}
+          startupProbe:
+            failureThreshold: 10
+            periodSeconds: 5
+            httpGet:
+              port: https
+              path: /readyz
+              scheme: HTTPS
+          readinessProbe:
+            failureThreshold: 3
+            timeoutSeconds: 5
+            periodSeconds: 5
+            httpGet:
+              port: https
+              path: /readyz
+              scheme: HTTPS
+          livenessProbe:
+            failureThreshold: 10
+            timeoutSeconds: 5
+            periodSeconds: 10
+            httpGet:
+              port: https
+              path: /livez
+              scheme: HTTPS
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: {{ $pluginDir }}
+            - name: pods-dir
+              mountPath: {{ $podsDir }}
+              mountPropagation: Bidirectional
+            - name: cache-root
+              mountPath: {{ $rootPath }}
+            - name: tmp-dir
+              mountPath: /tmp
+            {{- if $peerSync }}
+            - name: peer-token
+              mountPath: /var/run/secrets/gpustack-model-peer
+              readOnly: true
+            {{- end }}
+        - name: registrar
+          image: {{ $registrarImage | quote }}
+          imagePullPolicy: {{ $registrarPullPolicy }}
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+      volumes:
+        - name: pods-dir
+          hostPath:
+            path: {{ $podsDir }}
+            type: Directory
+        - name: cache-root
+          hostPath:
+            path: {{ $rootPath }}
+            type: DirectoryOrCreate
+        - name: plugin-dir
+          hostPath:
+            path: {{ $pluginDir }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ $kubeletDir }}/plugins_registry
+            type: Directory
+        - name: tmp-dir
+          emptyDir: {}
+        {{- if $peerSync }}
+        - name: peer-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  audience: gpustack-model-peer
+                  expirationSeconds: 3600
+                  path: token
+        {{- end }}
+{{- end }}

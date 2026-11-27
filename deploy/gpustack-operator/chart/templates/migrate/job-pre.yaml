@@ -1,0 +1,55 @@
+{{- /*
+  安装或升级前清理卡在终止状态的 Kueue，升级时还更新子 chart 的 CRD 并处理不可变的工作负载选择器。
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gpustack-operator.fullname" . }}-migrate-pre
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "gpustack-operator.commonLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- /*
+        hook 可能在其他工作负载创建前或删除后运行，因此不继承依赖本 release 才会创建的节点标签。
+      */}}
+      serviceAccountName: {{ include "gpustack-operator.fullname" . }}-migrate
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "gpustack-operator.image" (dict "root" . "overrides" .Values.migrate.image) | quote }}
+          imagePullPolicy: {{ include "gpustack-operator.imagePullPolicy" (dict "root" . "overrides" .Values.migrate.image) }}
+          command: ["/usr/bin/env", "bash", "/scripts/migrate-pre.sh"]
+          env:
+            - name: GPUSTACK_NAMESPACE
+              value: {{ include "gpustack-operator.namespace" . | quote }}
+            - name: GPUSTACK_RELEASE
+              value: {{ .Release.Name | quote }}
+            - name: GPUSTACK_PHASE
+              value: {{ if .Release.IsUpgrade }}upgrade{{ else }}install{{ end }}
+            - name: GPUSTACK_CHART_VERSION
+              value: {{ .Chart.Version | quote }}
+          volumeMounts:
+            - name: migrate-scripts
+              mountPath: /scripts
+      volumes:
+        - name: migrate-scripts
+          configMap:
+            name: {{ include "gpustack-operator.fullname" . }}-migrate
+            defaultMode: 0755

@@ -1,0 +1,51 @@
+{{- if and .Values.modelManager.enabled (gt (.Values.modelManager.port | int) 0) .Values.modelManager.networkPolicy.enabled }}
+{{- $name := include "gpustack-operator.modelManager.fullname" . }}
+{{- $peerPort := .Values.modelManager.port }}
+{{- $securePort := .Values.modelManager.securePort }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-peer
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.modelManager.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gpustack-operator.modelManager.selectorLabels" . | nindent 6 }}
+  # 仅约束进入模型管理器的流量。
+  policyTypes:
+    - Ingress
+  ingress:
+    # 允许模型管理器节点插件之间通过 peer 端口拉取已发布的模型。
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gpustack-operator.modelManager.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $peerPort }}
+    # Worker 通过安全端口读取当前下载，以生成 progress 子资源。
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gpustack-operator.worker.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $securePort }}
+    {{- with .Values.modelManager.networkPolicy.scrapers }}
+    # 允许获准采集 /metrics 的客户端访问。
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $securePort }}
+    {{- end }}
+    {{- with .Values.modelManager.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,871 @@
+# yaml-language-server: $schema=values.schema.json
+# GPUStack Operator 的默认 Helm 参数。
+#
+# 连字符键对应 Helm 依赖的原名，子键遵循各组件的配置格式。其余父 chart 参数采用 camelCase。
+
+# -- 卸载时执行 post-delete Job，清理由 Worker 在运行时创建的对象。共用集群应先核实本次安装的资源归属。
+cleanupOnUninstall: false
+
+# @schema
+# minimum: 1
+# @schema
+# -- 卸载前排空自定义资源的总时间预算，以秒为单位。控制器在这段时间内继续处理终结器。
+cleanupDrainBudgetSeconds: 210
+
+# -- 控制已终止的 Pod 是否继续占用设备账本中的整卡、共享卡与逻辑切片。Worker 和设备管理器必须使用相同配置。
+ledgerReleaseTerminatedPods: true
+
+# -- 父 chart 和子 chart 共享的配置。
+global:
+  # -- 全局镜像仓库地址适用于工作负载、sidecar 和 hook。未设置时再读取 global.hub，均为空时保留组件自己的仓库。
+  imageRegistry: ""
+  # @schema
+  # type: [string, null]
+  # @schema
+  # -- imageRegistry 的别名，仅在 imageRegistry 为空时读取，便于与使用 hub 的父 chart 共用配置。
+  hub: ""
+  # -- 用指定组织名替换镜像引用的 namespace，包括子 chart 和 hook 使用的镜像。
+  imageNamespace: ""
+  # @schema
+  # enum: ["", Always, IfNotPresent, Never]
+  # @schema
+  # -- 全局镜像拉取策略，非空时优先于各组件的策略。
+  imagePullPolicy: ""
+  # -- 工作负载拉取镜像时使用的 Secret。
+  imagePullSecrets: []
+  # -- 配置长期运行的控制面和设备管理器的默认节点选择器。组件可以覆盖默认值，带硬件或操作系统要求的组件还会合并必需条件。
+  #
+  # 以下工作负载单独决定调度位置。
+  #
+  # NFD 节点采集器、拓扑更新器和 CSI 节点插件需要覆盖其服务的节点，不能被通用的控制面选择器排除。
+  #
+  # 安装和卸载 hook 的执行时间可能早于节点标签的创建，或晚于其删除，因此使用独立的调度规则。
+  nodeSelector: {}
+  # -- 统一设置 Worker 与 Kueue 的服务证书签发方式。放在 global 下，才能把同一配置传给子 chart。
+  certmanager:
+    # @schema
+    # type: [string, boolean]
+    # enum: [auto, "true", "false", true, false]
+    # @schema
+    # -- auto 在集群已有 cert-manager CRD 时创建对应资源。true 要求使用 cert-manager，false 使用组件自身的证书流程。接受布尔值及其字符串形式。
+    #
+    # 已有安装可通过升级启用 cert-manager。关闭前须处理现有 Secret 的所有权和 APIService 的 CA，否则 Helm 可能在升级途中发生冲突。
+    enabled: auto
+    issuer:
+      # -- 使用已有签发者的名称。为空时为每个组件创建自签名 Issuer。
+      name: ""
+      # -- 已有签发者的类型为 Issuer 或 ClusterIssuer，仅在指定名称时使用。
+      kind: Issuer
+  # -- 每行声明一个受管厂商，包括 PCI vendor ID、设备插件资源名及 RuntimeClass 等属性，并将对应配置注入相关组件。
+  #
+  # runtimeInjectsDriver 表示用户态驱动依赖运行时注入。该厂商的设备管理器也需要对应 RuntimeClass。
+  #
+  # runtimeInjectsDevices 表示工作负载依赖运行时把已分配设备注入 /dev。设备管理器自身是否需要 RuntimeClass 由驱动注入方式决定。
+  #
+  # 两项注入需求中有一项成立时，chart 才会为该厂商创建 RuntimeClass。runtimeName 指定所用类的名称。
+  #
+  # 此表的键决定 Worker 的 --manufacturer 列表、按厂商部署的设备管理器以及 Kueue 的 credits 映射。
+  #
+  # 将厂商表放在 global 下，使 Kueue 子 chart 与 Worker 共享。默认包含 pkg/nodefeature 支持的厂商，可在部署参数中缩小范围。
+  manufacturers:
+    amd:
+      pciVendorID: "1002"
+      resourceName: amd.com/gpu
+      runtimeName: amd
+    ascend:
+      pciVendorID: "19e5"
+      resourceName: huawei.com/npu
+      runtimeName: ascend
+      runtimeInjectsDevices: true
+    cambricon:
+      pciVendorID: "cabc"
+      resourceName: cambricon.com/mlu
+      runtimeName: cambricon
+    hygon:
+      pciVendorID: "1d94"
+      resourceName: hygon.com/dcu
+      partitionKind: mig
+    iluvatar:
+      pciVendorID: "1e3e"
+      resourceName: iluvatar.com/gpu
+      runtimeName: iluvatar
+      runtimeInjectsDevices: true
+    metax:
+      pciVendorID: "9999"
+      resourceName: metax-tech.com/gpu
+    mthreads:
+      pciVendorID: "1ed5"
+      resourceName: mthreads.com/gpu
+      runtimeName: mthreads
+      runtimeInjectsDriver: true
+    nvidia:
+      pciVendorID: "10de"
+      resourceName: nvidia.com/gpu
+      runtimeName: nvidia
+      runtimeInjectsDriver: true
+      partitionKind: mig
+    thead:
+      pciVendorID: "1ded"
+      resourceName: alibabacloud.com/ppu
+      partitionKind: mig
+
+# -- 覆盖资源名称中采用的 chart 名。
+nameOverride: ""
+# -- 覆盖用作资源名前缀的完整 release 名。
+fullnameOverride: ""
+# -- 要部署到的命名空间，默认取 release 的命名空间。
+namespaceOverride: ""
+
+# -- 为所有资源添加的标签。
+commonLabels: {}
+# -- 为所有资源添加的注解。
+commonAnnotations: {}
+
+# -- Worker 和设备管理器共用的默认 Operator 镜像，各组件可覆盖具体字段。
+image:
+  # -- 默认 Operator 镜像仓库。
+  repository: gpustack/gpustack-operator
+  # @schema
+  # type: string
+  # @schema
+  # -- 默认镜像标签。为空时使用 v 加 chart 的 appVersion。
+  tag: ""
+  # @schema
+  # enum: [Always, IfNotPresent, Never]
+  # @schema
+  # -- 默认镜像拉取策略。
+  pullPolicy: IfNotPresent
+
+# 控制面组件通过选主提供高可用，增加副本可以在主节点故障时接替。节点组件按 DaemonSet 部署。
+
+worker:
+  # -- 启用 Worker 控制平面。关闭后可以单独部署设备管理器。
+  enabled: true
+  # -- Worker 副本数。始终启用选主，额外副本处于待命状态。
+  replicas: 1
+  # @schema
+  # enum: [Recreate, RollingUpdate]
+  # @schema
+  # -- Worker Deployment 的升级策略。需让新副本完成启动准备并能处理聚合 API 后，再退出旧副本。
+  strategyType: Recreate
+  # -- 指定 Worker 启动时跳过的组件。父 chart 自己部署组件时默认传入 *，避免重复安装，可按实际部署方式列出组件名。
+  disableApplications:
+    - "*"
+  # -- Instance 隔离策略使用的 IPv4 Pod 网段，外部放行规则会排除这些地址。留空关闭隔离，保留系统和 Operator 命名空间。
+  instanceIsolationPodCIDRs: []
+  podDisruptionBudget:
+    # -- 为 Worker 创建 PodDisruptionBudget。单副本部署中启用会影响节点维护时的自愿驱逐。
+    enabled: false
+    # @schema
+    # type: [integer, string]
+    # @schema
+    # -- 必须保持可用的 Worker Pod 数或百分比。应小于副本总数。
+    minAvailable: 1
+  # -- Worker 的安全服务端口。
+  securePort: 31443
+  # -- 覆盖 Worker 的镜像仓库、标签或拉取策略。未设置字段沿用父 chart 默认值。
+  image: {}
+  # -- 挂入 /var/lib/gpustack 用于持久化 Operator 数据的主机路径。
+  dataDir: /var/lib/gpustack
+  # -- Worker 容器的资源请求和限制。
+  resources:
+    limits:
+      cpu: "4"
+      memory: 8Gi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  # -- Worker 节点选择器，留空时读取 global.nodeSelector。
+  nodeSelector: {}
+  # @schema
+  # type: array
+  # items:
+  #   type: object
+  # @schema
+  # -- Worker 的污点容忍。默认允许在控制平面节点上运行。
+  tolerations:
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/controlplane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "CriticalAddonsOnly"
+      operator: "Exists"
+      effect: "NoSchedule"
+  # @schema
+  # type: array
+  # items:
+  #   type: object
+  # @schema
+  # -- Worker 的拓扑分布约束，用于指定按节点或可用区分散副本的规则。
+  topologySpreadConstraints: []
+  # -- Worker 的 affinity，设置后替换默认的软性 Pod 反亲和规则。
+  affinity: {}
+  # -- 追加给 Worker 的命令行参数。
+  extraArgs: []
+  # -- 以键值对形式提供的 Worker 附加环境变量。
+  env: {}
+
+deviceManager:
+  # -- 按厂商创建每节点设备管理 DaemonSet。
+  enabled: true
+  # -- 设备管理器容器的安全服务端口。
+  securePort: 32443
+  # -- 容器引擎 config.toml 所在目录，按主机原路径只读挂入设备管理器。
+  #
+  # 按发行版填写实际配置目录，例如 k3s 的 containerd 配置位于其 agent 目录下。
+  #
+  # 自动选择注入方式时读取此配置，核实容器引擎是否支持 CDI 及其实际的 runtime handler。
+  containerdConfigDir: /etc/containerd
+  # -- 设备管理器的镜像覆盖项。未设置字段沿用父 chart 的 image。
+  image: {}
+  # -- 控制哪些来源可以访问设备管理器的安全端口。
+  #
+  # /metrics 可以返回该节点上各 Instance 的信息，包含租户命名空间及设备数据，应按采集方身份限定访问。
+  networkPolicy:
+    # -- 创建相应的 NetworkPolicy。
+    #
+    # 需要 CNI 实际支持 NetworkPolicy 才能执行这些限制。
+    enabled: false
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- 除 Worker 外允许访问安全端口的抓取方，采用 NetworkPolicy 的 from 配置格式。
+    scrapers: []
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- 原样追加的完整入站规则，用于声明 scrapers 无法表达的条件。
+    #
+    # kubelet 探针来自节点地址。视 CNI 的主机流量处理方式，可通过额外入站规则允许本机探测。
+    extraIngress: []
+  # -- 为明确依赖运行时注入驱动或设备的厂商创建 RuntimeClass。
+  createRuntimeClasses: true
+  # -- 每个设备管理器容器的资源请求和限制。
+  resources:
+    limits:
+      cpu: "4"
+      memory: 8Gi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  # @schema
+  # type: array
+  # items:
+  #   type: object
+  # @schema
+  # -- 各厂商设备管理器的污点容忍。默认容忍所有污点，以便在有设备的节点上调度。
+  tolerations:
+    - operator: "Exists"
+  # -- 追加给设备管理器的命令行参数。
+  extraArgs: []
+  # -- 设备管理器的附加环境变量，按名称和值填写。
+  env: {}
+
+modelManager:
+  # -- 部署模型管理器和 model.csi.gpustack.ai 节点 CSI 驱动，通过各节点缓存交付 Hugging Face ModelArtifact 的权重。
+  #
+  # 启用后 chart 声明交付模式为 Node，Worker 每次启动都会重新确认。modelManager.enabled 会同时影响驱动部署和交付配置。
+  enabled: true
+  # -- 节点模型缓存的 hostPath。建议采用独立文件系统；若与 kubelet 共盘，水位受驱逐和镜像回收阈值约束。修改此目录会切换到另一份缓存。
+  rootPath: /var/lib/gpustack/models
+  # -- kubelet 根目录。节点插件双向传播其 pods 子目录中的 bind mount，把权重挂载交给工作负载。
+  kubeletDir: /var/lib/kubelet
+  # -- 模型管理器提供指标、就绪和存活探测的安全端口。
+  securePort: 32444
+  # -- 节点间传输已发布权重的 TCP 端口，设为 0 关闭。使用 audience 为 gpustack-model-peer 的投射 ServiceAccount 令牌认证。
+  port: 32445
+  peerSync:
+    # -- 单节点同时响应的 peer 文件请求数。
+    maxServingStreams: 8
+    # -- 单节点同时向同一 peer 发起的请求数。
+    streamsPerSource: 4
+  networkPolicy:
+    # -- 用 NetworkPolicy 限制租户 Pod 访问 peer 端口，并仅允许 Worker 等指定来源访问安全端口。需要具备策略执行能力的 CNI。
+    enabled: true
+    # -- 允许获准采集 /metrics 的客户端访问。
+    scrapers: []
+    # -- 原样追加的入站规则。
+    extraIngress: []
+  # -- 模型管理器的镜像覆盖项。留空字段使用全局默认镜像配置。
+  image: {}
+  registrar:
+    # -- node-driver-registrar sidecar 镜像，与 NFS 和 S3 的固定镜像来源一致，也参与全局镜像地址替换。
+    image:
+      repository: docker.io/gpustack/mirrored-csi-node-driver-registrar
+      tag: v2.17.0
+  # -- 模型管理器的资源请求和限制。
+  resources:
+    limits:
+      cpu: "4"
+      memory: 2Gi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  # -- 模型管理器 DaemonSet 的节点选择器，与 global.nodeSelector 合并。
+  nodeSelector: {}
+  # @schema
+  # type: array
+  # items:
+  #   type: object
+  # @schema
+  # -- 模型管理器 DaemonSet 的污点容忍。默认覆盖所有可能运行业务 Pod 的节点，以便提供模型卷。
+  tolerations:
+    - operator: "Exists"
+  # -- 追加给模型管理器的命令行参数。
+  extraArgs: []
+
+# -- 迁移 hook 的配置。安装或升级前处理上次卸载遗留的 Kueue，升级时应用子 chart 的 CRD，接管完成后清理旧 release。
+migrate:
+  # -- 为迁移 Job 指定镜像；未覆盖的字段沿用父 chart 默认值。
+  image: {}
+
+# -- Kueue 子 chart 固定为 0.18.11。
+# @default -- 具体配置见下面的 kueue 各项。
+kueue:
+  # -- 部署随附的 Kueue。
+  enabled: true
+  # -- Kueue 资源以固定前缀 kueue 命名，使父 chart 与 Worker 自安装的资源名保持一致。
+  fullnameOverride: kueue
+  controllerManager:
+    # -- Kueue controller manager 的副本数。managerConfig 启用选主，其他副本待命，webhook 仍可接收请求。
+    replicas: 1
+    podDisruptionBudget:
+      # -- 为 Kueue 控制器创建 PodDisruptionBudget。应配合多副本使用。
+      enabled: false
+      # @schema
+      # type: [integer, string]
+      # @schema
+      # -- 必须保持可用的 Kueue 控制器数量或百分比，应小于副本总数。
+      minAvailable: 1
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- Kueue 控制器的拓扑分布约束，按配置原样传入，标签选择器由配置方给出。
+    topologySpreadConstraints: []
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- Kueue 控制器的污点容忍。默认允许控制平面节点，全部容忍会扩大调度范围。
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/controlplane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+    manager:
+      image:
+        # -- Kueue 控制器的镜像仓库。
+        repository: docker.io/gpustack/mirrored-kueue
+        # -- 固定 Kueue 镜像标签，使更新子 chart 时可以单独核对实际运行的镜像版本。
+        tag: v0.18.11
+        # @schema
+        # enum: [Always, IfNotPresent, Never]
+        # @schema
+        # -- Kueue 控制器的拉取策略。
+        pullPolicy: IfNotPresent
+      # -- 写入 Kueue 控制器 Pod 的项目管理注解。
+      podAnnotations:
+        gpustack.ai/managed: "true"
+      # -- Kueue 控制器的资源请求和限制。
+      resources:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+  managerConfig:
+    # -- 经 manager-config ConfigMap 交付的 Kueue 控制器配置。chart 另外计算资源转换和管理的命名空间，避免覆盖这两项。
+    # @default -- 下面是 controllerManagerConfigYaml 的实际配置内容。
+    controllerManagerConfigYaml: |-
+      apiVersion: config.kueue.x-k8s.io/v1beta2
+      kind: Configuration
+      featureGates:
+        AssignQueueLabelsForPods: false
+        TopologyAwareScheduling: true
+        TASBalancedPlacement: true
+        # 让 TAS 在可行节点中考虑 Pod 的软性节点亲和性，包括优先选择已经缓存模型权重的节点。此能力在 Kueue 0.18 为 alpha。
+        TASRespectNodeAffinityPreferred: true
+        # 启用 Kueue 0.18 的配额核查策略功能门，以便使用下面的 resources.quotaCheckStrategy。
+        QuotaCheckStrategy: true
+      health:
+        healthProbeBindAddress: :8081
+      metrics:
+        bindAddress: :8443
+      # enableClusterQueueResources: true
+      webhook:
+        port: 9443
+      leaderElection:
+        leaderElect: true
+        resourceName: c1f6bfd2.kueue.x-k8s.io
+      controller:
+        groupKindConcurrency:
+          Job.batch: 5
+          Pod: 5
+          Workload.kueue.x-k8s.io: 5
+          LocalQueue.kueue.x-k8s.io: 1
+          ClusterQueue.kueue.x-k8s.io: 1
+          ResourceFlavor.kueue.x-k8s.io: 1
+      clientConnection:
+        qps: 50
+        burst: 100
+      #pprofBindAddress: :8083
+      #waitForPodsReady:
+      #  timeout: 5m
+      #  recoveryTimeout: 3m
+      #  blockAdmission: false
+      #  requeuingStrategy:
+      #    timestamp: Eviction
+      #    backoffLimitCount: null # null 表示可无限重新入队
+      #    backoffBaseSeconds: 60
+      #    backoffMaxSeconds: 3600
+      #manageJobsWithoutQueueName: true
+      # 默认排除 kube-system 和本 release 的命名空间，以免 Kueue 管理自己的控制器。若显式声明选择器，则覆盖此默认。
+      #managedJobsNamespaceSelector:
+      #  matchExpressions:
+      #    - key: kubernetes.io/metadata.name
+      #      operator: NotIn
+      #      values: [ kube-system, gpustack-system ]
+      integrations:
+        frameworks:
+        - "batch/job"
+        - "kubeflow.org/mpijob"
+        - "ray.io/rayjob"
+        - "ray.io/raycluster"
+        - "jobset.x-k8s.io/jobset"
+        - "trainer.kubeflow.org/trainjob"
+        - "kubeflow.org/paddlejob"
+        - "kubeflow.org/pytorchjob"
+        - "kubeflow.org/tfjob"
+        - "kubeflow.org/xgboostjob"
+        - "kubeflow.org/jaxjob"
+        - "workload.codeflare.dev/appwrapper"
+        - "pod"
+        - "deployment"
+        - "statefulset"
+        - "leaderworkerset.x-k8s.io/leaderworkerset"
+      #  externalFrameworks:
+      #  - "Foo.v1.example.com"
+      #fairSharing:
+      #  preemptionStrategies: [LessThanOrEqualToFinalShare, LessThanInitialShare]
+      #admissionFairSharing:
+      #  usageHalfLifeTime: "168h" # 7 天
+      #  usageSamplingInterval: "5m"
+      #  resourceWeights: # 可选，未指定时所有资源的权重均为 1
+      #    cpu: 0    # 忽略 CPU 用量
+      #    memory: 0 # 忽略内存用量
+      #    example.com/gpu: 100 # 只计入 GPU 用量
+      resources:
+        # 设备精细记账以 Devices CR 为准。ClusterQueue 按池公布 CPU 或厂商 credits，Workload 仍携带完整请求，配额只核查队列管理的资源。
+        quotaCheckStrategy: IgnoreUndeclared
+        # resources.transformations 由 global.manufacturers 生成。各厂商的不同设备申请转换成同一种 credits，队列即可维护统一预算。
+      #objectRetentionPolicies:
+      #  workloads:
+      #    afterFinished: null # null 表示永久保留，0s 表示立即清理
+      #    afterDeactivatedByKueue: null # null 表示永久保留，0s 表示立即清理
+
+# -- Node Feature Discovery 子 chart 固定为 0.19.0。
+# @default -- 具体配置见下面的 node-feature-discovery 各项。
+node-feature-discovery:
+  # -- 部署随附的 Node Feature Discovery。
+  enabled: true
+  # -- NFD 使用固定的资源名前缀，以便父 chart 和 Worker 自安装模式引用同名资源。
+  fullnameOverride: node-feature-discovery
+  image:
+    # -- NFD master、worker 和 gc 共同使用的镜像仓库。
+    repository: docker.io/gpustack/mirrored-node-feature-discovery
+    # -- 固定 NFD 镜像标签，更新子 chart 时可单独核对实际镜像。
+    tag: v0.19.0-gpustack1
+  master:
+    # -- NFD master 的副本数。master 将设备发现结果发布成节点标签，停机时新标签更新会暂停。
+    replicaCount: 1
+    # -- NFD master 的 affinity。该子 chart 依靠亲和性规则控制跨节点放置。
+    #
+    # 保留 NFD 偏好控制平面节点的默认策略，对角色标签使用存在性匹配，兼容不同标签值。
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+    podDisruptionBudget:
+      # -- 为 NFD master 创建 PodDisruptionBudget，应配合多副本使用。
+      enable: false
+      # @schema
+      # type: [integer, string]
+      # @schema
+      # -- 必须保持可用的 NFD master 数量或百分比，应小于副本数。
+      minAvailable: 1
+    # -- NFD master Pod 的注解。
+    annotations:
+      gpustack.ai/managed: "true"
+    # -- NFD master Deployment 的注解。
+    deploymentAnnotations:
+      gpustack.ai/managed: "true"
+    serviceAccount:
+      # -- NFD master ServiceAccount 的注解。
+      annotations:
+        gpustack.ai/managed: "true"
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- NFD master 的污点容忍，默认允许控制平面节点。
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/controlplane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+    config:
+      # -- NFD master 可写入的特征标签配置。调度链依赖这些默认值，因此在父 chart 中显式声明。
+      #
+      # 保持 NodeFeature 来源的命名空间可见。若将 nodeFeatureNamespaceSelector 锁定到单一命名空间，master 会漏掉其他命名空间发布的特征。
+      restrictions:
+        disableLabels: false
+        disableTaints: false
+        disableAnnotations: false
+        disableExtendedResources: false
+        allowOverwrite: true
+        denyNodeFeatureLabels: false
+  worker:
+    # -- NFD worker Pod 的注解。
+    annotations:
+      gpustack.ai/managed: "true"
+    # -- NFD worker DaemonSet 的注解。
+    daemonsetAnnotations:
+      gpustack.ai/managed: "true"
+    serviceAccount:
+      # -- NFD worker ServiceAccount 的注解。
+      annotations:
+        gpustack.ai/managed: "true"
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- NFD worker 的污点容忍，默认发现所有带污点的节点。
+    tolerations:
+      - operator: "Exists"
+    config:
+      core:
+        # -- NFD worker 启用的特征源。custom 让 gpustack-cpu-info 规则生效，PCI 等特征源提供硬件分类数据。
+        labelSources:
+          - "cpu"
+          - "pci"
+          - "custom"
+          - "system"
+        # -- 仅发布本 chart 的消费者所需的标签以及外部 GPU Operator 使用的 system-os_release 标签。
+        labelWhiteList: '^(pci-|cpu-model\.|system-os_release\.|acceleratable)'
+      sources:
+        pci:
+          # -- 需要标记的 PCI 类别前缀，包含显示控制器、计算加速器和可能表现为协处理器的设备。
+          # https://admin.pci-ids.ucw.cz/read/PD). The `gpustack-cpu-info` NodeFeatureRule
+          # NodeFeatureRule 由 pkg/nodefeature 生成，使用相同的类别集合。两侧一起更新，避免探测和匹配范围不同。
+          deviceClassWhitelist:
+            - "02"
+            - "03"
+            - "0b"
+            - "12"
+          # -- PCI 特征使用的字段。规则通过 vendor 字段匹配 global.manufacturers 中的 PCI 厂商 ID。
+          deviceLabelFields:
+            - vendor
+  gc:
+    # -- NFD gc Pod 的注解。
+    annotations:
+      gpustack.ai/managed: "true"
+    # -- NFD gc Deployment 的注解。
+    deploymentAnnotations:
+      gpustack.ai/managed: "true"
+    serviceAccount:
+      # -- NFD gc ServiceAccount 的注解。
+      annotations:
+        gpustack.ai/managed: "true"
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- NFD gc 的污点容忍，默认允许控制平面节点。
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/controlplane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+# -- csi-driver-nfs 子 chart 固定为 4.13.4。
+# @default -- 具体配置见下面的 csi-driver-nfs 各项。
+csi-driver-nfs:
+  # -- 部署随附的 NFS CSI 驱动。
+  enabled: true
+  driver:
+    # -- 项目专用的 CSI 驱动名，可与集群已有的 NFS CSI 共存。Worker 创建存储对象时使用此名称。
+    name: nfs.csi.gpustack.ai
+  # -- NFS 镜像由 baseRepo 和各组件以斜杠开头的 repository 拼接。每个组件单独固定版本。
+  image:
+    baseRepo: docker.io
+    nfs:
+      repository: /gpustack/mirrored-csi-nfs-driver
+      tag: v4.13.4
+    csiProvisioner:
+      repository: /gpustack/mirrored-csi-provisioner
+      tag: v6.3.0
+    csiResizer:
+      repository: /gpustack/mirrored-csi-resizer
+      tag: v2.2.0
+    csiSnapshotter:
+      repository: /gpustack/mirrored-csi-snapshotter
+      tag: v8.6.0
+    livenessProbe:
+      repository: /gpustack/mirrored-csi-livenessprobe
+      tag: v2.19.0
+    nodeDriverRegistrar:
+      repository: /gpustack/mirrored-csi-node-driver-registrar
+      tag: v2.17.0
+  controller:
+    # -- NFS 控制器副本数，各 sidecar 启用选主。控制器离线会延迟新卷供应，已挂载的卷由节点插件继续服务。
+    replicas: 1
+    # @schema
+    # enum: [Recreate, RollingUpdate]
+    # @schema
+    # -- NFS 控制器的升级策略。滚动升级时可保留存活副本，减少新卷供应中断的时间。
+    strategyType: Recreate
+    # -- NFS 控制器 Deployment 及其 Pod 的名称。
+    name: csi-nfs-controller
+    # @schema
+    # enum: [Default, ClusterFirst, ClusterFirstWithHostNet]
+    # @schema
+    # -- NFS 控制器 Pod 的 DNS 策略。
+    dnsPolicy: ClusterFirstWithHostNet
+    # -- NFS 控制器的 affinity。仅在包含 nodeSelectorTerms 时生效，用于节点放置。
+    affinity: {}
+    # -- NFS 控制器 Pod 的节点选择器。
+    nodeSelector: {}
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- NFS 控制器的拓扑分布约束。子 chart 的项目补丁支持此项，多副本时需要按 hostname 设置 DoNotSchedule 分散到不同节点。
+    topologySpreadConstraints: []
+    # -- NFS 控制器的优先级类。system-cluster-critical 可使卷供应在节点资源紧张时继续运行。
+    priorityClassName: system-cluster-critical
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- NFS 控制器的污点容忍，默认允许在控制平面节点运行。
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/controlplane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+  node:
+    # -- NFS 节点 DaemonSet 及其 Pod 的名称。挂载操作由每个节点自己的插件完成。
+    name: csi-nfs-node
+    # @schema
+    # enum: [Default, ClusterFirst, ClusterFirstWithHostNet]
+    # @schema
+    # -- NFS 节点 Pod 的 DNS 策略。hostNetwork 配合 ClusterFirstWithHostNet 可解析集群 DNS 中的 NFS 服务。
+    dnsPolicy: ClusterFirstWithHostNet
+    # -- NFS 节点 Pod 的 affinity，按配置原样渲染。
+    affinity: {}
+    # -- NFS 节点 Pod 的节点选择器，chart 还会加入 Linux 条件，以限定可挂载 NFS 的节点。
+    nodeSelector: {}
+    # -- NFS 节点 Pod 的优先级类。
+    priorityClassName: system-cluster-critical
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- NFS 节点 Pod 的污点容忍，默认覆盖所有可能挂载卷的节点。
+    tolerations:
+      - operator: "Exists"
+  nodeDriverRegistrar:
+    livenessProbe:
+      # -- 由节点插件自己的健康端口负责存活探测，因此关闭 registrar 的重复探针。
+      enabled: false
+  rbac:
+    # -- NFS 驱动 ClusterRole 和 ClusterRoleBinding 的名称前缀。
+    name: csi-nfs
+
+# -- csi-driver-s3 子 chart 固定为 0.43.7。
+# @default -- 具体配置见下面的 csi-driver-s3 各项。
+csi-driver-s3:
+  # -- 部署随附的 S3 CSI 驱动。
+  enabled: true
+  driver:
+    # -- 项目专用的 S3 CSI 驱动名，可与集群自有驱动共存，并与 Worker 引用的驱动名一致。
+    name: s3.csi.gpustack.ai
+  # -- 以包含仓库、组织、镜像名和标签的完整引用固定 S3 各组件镜像。此 chart 没有独立的标签参数。
+  images:
+    s3: docker.io/gpustack/mirrored-csi-s3-driver:v0.43.7
+    csiProvisioner: docker.io/gpustack/mirrored-csi-provisioner:v6.3.0
+    livenessProbe: docker.io/gpustack/mirrored-csi-livenessprobe:v2.19.0
+    nodeDriverRegistrar: docker.io/gpustack/mirrored-csi-node-driver-registrar:v2.17.0
+  controller:
+    # -- S3 控制器副本数。provisioner sidecar 启用选主，控制器离线影响新卷供应，已挂载的卷由节点插件继续服务。
+    replicas: 1
+    # @schema
+    # enum: [Recreate, RollingUpdate]
+    # @schema
+    # -- S3 控制器的升级策略。滚动升级可缩短控制器不可用的时间。
+    strategyType: Recreate
+    # -- S3 控制器 Deployment 及其 Pod 的名称。
+    name: csi-s3-controller
+    # -- S3 控制器的 affinity，包含 nodeSelectorTerms 时才生效。该控制器模板没有独立的 DNS 策略配置。
+    affinity: {}
+    # -- S3 控制器 Pod 的节点选择器。
+    nodeSelector: {}
+    # -- S3 控制器 Pod 的优先级类。system-cluster-critical 可保护新卷供应。
+    priorityClassName: system-cluster-critical
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- S3 控制器的污点容忍，默认允许在控制平面节点运行。
+    tolerations:
+      - key: "node-role.kubernetes.io/master"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/controlplane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+  node:
+    # -- S3 节点 DaemonSet 及其 Pod 的名称。节点插件按节点部署并执行挂载。
+    name: csi-s3-node
+    # @schema
+    # enum: [Default, ClusterFirst, ClusterFirstWithHostNet]
+    # @schema
+    # -- S3 节点 Pod 的 DNS 策略。使用 geesefs 时，挂载器作为节点上的系统进程运行，有自己的域名解析环境。
+    dnsPolicy: ClusterFirstWithHostNet
+    # -- S3 节点 Pod 的 affinity，按声明渲染。
+    affinity: {}
+    # -- S3 节点 Pod 的节点选择器，chart 同时要求节点运行 Linux。
+    nodeSelector: {}
+    # -- S3 节点 Pod 的优先级类。
+    priorityClassName: system-cluster-critical
+    # @schema
+    # type: array
+    # items:
+    #   type: object
+    # @schema
+    # -- S3 节点 Pod 的污点容忍，默认覆盖所有可能挂载卷的节点。
+    tolerations:
+      - operator: "Exists"
+  nodeDriverRegistrar:
+    livenessProbe:
+      # -- 由节点插件自己的健康端口负责存活探测，因此关闭 registrar 的重复探针。
+      enabled: false
+  rbac:
+    # -- NFS 驱动 ClusterRole 和 ClusterRoleBinding 的名称前缀。
+    name: csi-s3
+
+# -- Topograph 发现物理拓扑并写入 Kubernetes Node 标签，管理员选择真实数据提供方后再启用。
+# @default -- 具体配置见下面的 topograph 各项。
+topograph:
+  # -- 启用随附的 Topograph。要求 Kubernetes 1.27 以上、生产 provider 和 Kubernetes engine。
+  enabled: false
+  provider:
+    # -- 生产环境选择实际 provider，例如 aws、dra 或 infiniband-k8s。禁用时保留上游默认的 test 值，启用时会拒绝它。
+    name: test
+    # -- 填写所选 provider 需要的凭据和发现参数。
+    params: {}
+  engine:
+    # -- 使用 Kubernetes engine 作为 Topograph 节点标签的唯一写入方。
+    name: k8s
+    # -- 当前固定版本 Topograph 支持的 Kubernetes engine 配置。
+    params: {}
+  image:
+    # -- Topograph 镜像仓库，离线环境可改用镜像站。
+    repository: docker.io/gpustack/mirrored-nvidia-topograph
+    # -- Topograph 镜像标签，留空时使用子 chart 的 appVersion。
+    tag: ""
+    # -- Topograph 工作负载的镜像拉取策略。
+    pullPolicy: IfNotPresent
+  # -- Topograph API、节点观察器和节点数据服务所使用的镜像拉取 Secret。
+  imagePullSecrets: []
+  serviceAccount:
+    # -- 是否创建 Topograph API 的 ServiceAccount。若由外部云身份管理，可关闭并指定已有名称。
+    create: true
+    # -- 关闭创建时使用的 Topograph API ServiceAccount 名称。
+    name: ""
+  config:
+    # -- 给所选 provider 提供凭据的已有 Secret。
+    credentialsSecret: ""
+  # -- Topograph API 服务容器的安全上下文。
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+  nodeDataBroker:
+    # -- 部署各节点的数据中转服务，可按 provider 要求缩小其调度范围，保留独立的 API 服务与观察器。
+    enabled: true
+    # -- 仅应用于 Topograph 节点数据服务 DaemonSet 的节点选择器。
+    nodeSelector: {}
+    # -- 节点数据服务容器的安全上下文。
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      capabilities:
+        drop:
+          - ALL

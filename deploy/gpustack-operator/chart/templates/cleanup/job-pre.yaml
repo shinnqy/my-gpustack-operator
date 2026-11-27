@@ -1,0 +1,51 @@
+{{- if .Values.cleanupOnUninstall }}
+{{- /*
+  趁控制器仍运行时排空业务资源，让终结器有机会完成清理。Job 的截止时间须留出生成报告的余量。
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gpustack-operator.fullname" . }}-drain
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: {{ add (int .Values.cleanupDrainBudgetSeconds) 60 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpustack-operator.commonLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- /*
+        此 Job 需在安装或卸载的过渡期也能调度，避免依赖由本 release 创建的节点标签。
+      */}}
+      serviceAccountName: {{ include "gpustack-operator.fullname" . }}-cleanup
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: drain
+          image: {{ include "gpustack-operator.image" (dict "root" . "overrides" dict) | quote }}
+          imagePullPolicy: {{ include "gpustack-operator.imagePullPolicy" (dict "root" . "overrides" dict) }}
+          command: ["/usr/bin/env", "bash", "/scripts/drain.sh"]
+          args:
+            - {{ include "gpustack-operator.namespace" . | quote }}
+            - {{ .Values.cleanupDrainBudgetSeconds | quote }}
+          volumeMounts:
+            - name: cleanup-script
+              mountPath: /scripts
+      volumes:
+        - name: cleanup-script
+          configMap:
+            name: {{ include "gpustack-operator.fullname" . }}-cleanup
+            defaultMode: 0755
+{{- end }}

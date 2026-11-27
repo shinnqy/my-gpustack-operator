@@ -1,0 +1,42 @@
+{{- if and .Values.deviceManager.enabled .Values.deviceManager.networkPolicy.enabled }}
+{{- $securePort := .Values.deviceManager.securePort | default 32443 }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "gpustack-operator.deviceManager.fullname" . }}
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.deviceManager.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # 所有厂商的设备管理 DaemonSet 共用这些标签，一条策略可覆盖节点上的全部设备管理器。
+  podSelector:
+    matchLabels:
+      {{- include "gpustack-operator.deviceManager.selectorLabels" . | nindent 6 }}
+  # 仅约束进入设备管理器的流量。它仍需访问 API Server 和节点设备。
+  policyTypes:
+    - Ingress
+  ingress:
+    # Worker 从设备管理器读取加速器快照，为 Instance 的 metrics 子资源提供数据。
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "gpustack-operator.worker.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $securePort }}
+    {{- with .Values.deviceManager.networkPolicy.scrapers }}
+    # 允许获准采集 /metrics 的客户端访问。
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $securePort }}
+    {{- end }}
+    {{- with .Values.deviceManager.networkPolicy.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

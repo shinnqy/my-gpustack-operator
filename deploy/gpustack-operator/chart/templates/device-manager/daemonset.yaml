@@ -1,0 +1,365 @@
+{{- if .Values.deviceManager.enabled }}
+{{- $root := . }}
+{{- $image := include "gpustack-operator.image" (dict "root" $root "overrides" $root.Values.deviceManager.image) }}
+{{- $imagePullPolicy := include "gpustack-operator.imagePullPolicy" (dict "root" $root "overrides" $root.Values.deviceManager.image) }}
+{{- $name := include "gpustack-operator.deviceManager.fullname" . }}
+{{- $securePort := .Values.deviceManager.securePort }}
+{{- range $manu := (keys .Values.global.manufacturers | sortAlpha) }}
+{{- $identity := index $root.Values.global.manufacturers $manu }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}-{{ $manu }}
+  namespace: {{ include "gpustack-operator.namespace" $root }}
+  labels:
+    {{- include "gpustack-operator.deviceManager.labels" $root | nindent 4 }}
+    gpustack.ai/manufacturer: {{ $manu }}
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "gpustack-operator.deviceManager.selectorLabels" $root | nindent 6 }}
+      gpustack.ai/manufacturer: {{ $manu }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpustack-operator.deviceManager.labels" $root | nindent 8 }}
+        gpustack.ai/manufacturer: {{ $manu }}
+    spec:
+      {{- with $root.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- end }}
+      {{- end }}
+      {{- /*
+        该厂商的用户态驱动由容器运行时注入，因此设备管理器也必须使用对应 RuntimeClass 才能访问管理库。
+      */}}
+      {{- if $identity.runtimeInjectsDriver }}
+      runtimeClassName: {{ $identity.runtimeName }}
+      {{- end }}
+      # 厂商管理库需要主机 PID 来识别占用设备的进程，驱动通信还需要主机 IPC。
+      hostPID: true
+      hostIPC: true
+      {{- /*
+        按 NFD 的 PCI 厂商标签选择节点，同时合并全局选择器。发生同名冲突时，识别设备所必需的 PCI 条件优先。
+      */}}
+      {{- $placement := dict (printf "feature.node.kubernetes.io/pci-%s.present" $identity.pciVendorID) "true" }}
+      nodeSelector:
+        {{- merge $placement (deepCopy ($root.Values.global.nodeSelector | default dict)) | toYaml | nindent 8 }}
+      serviceAccountName: {{ $name }}
+      priorityClassName: system-cluster-critical
+      {{- with $root.Values.deviceManager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # 将镜像内的逻辑切片库与 ld.so.preload 同步到节点。按内容比较，避免重复复制。
+        - name: stage-libs
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ $imagePullPolicy }}
+          command:
+            - copy-dir.sh
+            - /etc/gpustack/lib
+            - /var/lib/gpustack/operator/lib
+          volumeMounts:
+            - name: gpustack-data-dir
+              mountPath: /var/lib/gpustack
+      containers:
+        - name: main
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ $imagePullPolicy }}
+          args:
+            - gpustack-operator
+            - device-manager
+            - serve
+            - -v=2
+            - --secure-port={{ $securePort }}
+            - --manufacturer={{ $manu }}
+            {{- with $root.Values.deviceManager.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml $root.Values.deviceManager.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: true
+            capabilities: {}
+            privileged: true
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+          env:
+            {{- /*
+              声明 MIG 管理权限，使 NVIDIA 容器运行时向设备管理器公开分区管理所需的驱动设备节点。
+            */}}
+            {{- if eq $manu "nvidia" }}
+            - name: NVIDIA_MIG_CONFIG_DEVICES
+              value: "all"
+            - name: NVIDIA_MIG_MONITOR_DEVICES
+              value: "all"
+            {{- end }}
+            # 把管理员提供的环境变量放在受管的 Downward API 和 PCI 厂商变量之前，保证关键身份值取最后一项。
+            {{- range $key, $value := $root.Values.deviceManager.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: KUBERNETES_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUBERNETES_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KUBERNETES_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: KUBERNETES_SERVICE_NAME
+              value: {{ $name | quote }}
+            - name: GPUSTACK_LEDGER_RELEASE_TERMINATED_PODS
+              value: {{ $root.Values.ledgerReleaseTerminatedPods | quote }}
+            {{- with $root.Values.deviceManager.containerdConfigDir }}
+            - name: GPUSTACK_CONTAINERD_CONFIG_DIR
+              value: {{ . | quote }}
+            {{- end }}
+            {{- include "gpustack-operator.manufacturer.env"
+                  (dict "name" $manu "identity" $identity) | trim | nindent 12 }}
+          ports:
+            - name: https
+              containerPort: {{ $securePort }}
+          startupProbe:
+            failureThreshold: 10
+            periodSeconds: 5
+            httpGet:
+              port: https
+              path: /readyz
+              scheme: HTTPS
+          readinessProbe:
+            failureThreshold: 3
+            timeoutSeconds: 5
+            periodSeconds: 5
+            httpGet:
+              port: https
+              path: /readyz
+              scheme: HTTPS
+          livenessProbe:
+            failureThreshold: 10
+            timeoutSeconds: 5
+            periodSeconds: 10
+            httpGet:
+              port: https
+              path: /livez
+              scheme: HTTPS
+          volumeMounts:
+            - name: dev-dir
+              mountPath: /dev
+            - name: sys-dir
+              mountPath: /sys
+            - name: tmp-dir
+              mountPath: /tmp
+            - name: containerd-run-dir
+              mountPath: /run/containerd
+            - name: docker-run-dir
+              mountPath: /run/docker
+            - name: gpustack-data-dir
+              mountPath: /var/lib/gpustack
+            {{- /*
+              静态 CDI 目录和厂商动态生成的 CDI 目录都要只读挂入，才能判断容器引擎实际能解析哪些设备。
+            */}}
+            - name: cdi-static-dir
+              mountPath: /etc/cdi
+              readOnly: true
+            - name: cdi-dir
+              mountPath: /var/run/cdi
+              readOnly: true
+            {{- with $root.Values.deviceManager.containerdConfigDir }}
+            {{- /*
+              将容器引擎配置只读挂在其主机路径，供设备管理器判断 CDI 开关和未指定 RuntimeClass 时使用的 handler。
+            */}}
+            - name: containerd-config-dir
+              mountPath: {{ . }}
+              readOnly: true
+            {{- end }}
+            - name: kubelet-device-plugins-dir
+              mountPath: /var/lib/kubelet/device-plugins
+            {{- /*
+              挂载 kubelet 的 pod-resources 目录，用于把 Allocate 对应到容器。挂目录可跟随 socket 的重建。
+            */}}
+            - name: kubelet-pod-resources-dir
+              mountPath: /var/lib/kubelet/pod-resources
+              readOnly: true
+            {{- if eq $manu "amd" }}
+            - name: gpustack-amd-driver
+              mountPath: /opt/rocm
+              readOnly: true
+            {{- /*
+              显式挂入真实库目录，覆盖不同 ROCm 安装中符号链接的布局差异。
+            */}}
+            - name: gpustack-amd-driver-lib
+              mountPath: /opt/rocm/lib
+              readOnly: true
+            {{- end }}
+            {{- if eq $manu "ascend" }}
+            - name: gpustack-ascend-driver
+              mountPath: /usr/local/dcmi
+              readOnly: true
+            - name: gpustack-ascend-toolkit
+              mountPath: /usr/local/Ascend
+              readOnly: true
+            {{- end }}
+            {{- if eq $manu "cambricon" }}
+            - name: gpustack-cambricon-driver
+              mountPath: /usr/local/neuware
+              readOnly: true
+            {{- end }}
+            {{- if eq $manu "hygon" }}
+            - name: gpustack-hygon-driver
+              mountPath: /opt/hyhal
+              readOnly: true
+            - name: gpustack-hygon-toolkit
+              mountPath: /opt/dtk
+              readOnly: true
+            # 此注册目录须可写，厂商库在创建硬件分区时会通过当前进程写入记录。
+            - name: gpustack-hygon-mig-config
+              mountPath: /etc/dmi_mig_config
+            {{- end }}
+            {{- if eq $manu "iluvatar" }}
+            - name: gpustack-iluvatar-toolkit
+              mountPath: /usr/local/corex
+              readOnly: true
+            {{- end }}
+            {{- if eq $manu "metax" }}
+            - name: gpustack-metax-driver
+              mountPath: /opt/mxdriver
+              readOnly: true
+            - name: gpustack-metax-toolkit
+              mountPath: /opt/maca
+              readOnly: true
+            {{- end }}
+            {{- if eq $manu "thead" }}
+            - name: gpustack-thead-toolkit
+              mountPath: /usr/local/PPU_SDK
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: sys-dir
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: tmp-dir
+          hostPath:
+            path: /tmp
+        - name: containerd-run-dir
+          hostPath:
+            path: /run/containerd
+            type: DirectoryOrCreate
+        - name: docker-run-dir
+          hostPath:
+            path: /run/docker
+            type: DirectoryOrCreate
+        - name: gpustack-data-dir
+          hostPath:
+            path: /var/lib/gpustack
+            type: DirectoryOrCreate
+        - name: cdi-static-dir
+          hostPath:
+            path: /etc/cdi
+            type: DirectoryOrCreate
+        - name: cdi-dir
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: kubelet-device-plugins-dir
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: DirectoryOrCreate
+        - name: kubelet-pod-resources-dir
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+            type: DirectoryOrCreate
+        {{- with $root.Values.deviceManager.containerdConfigDir }}
+        - name: containerd-config-dir
+          hostPath:
+            path: {{ . }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "amd" }}
+        - name: gpustack-amd-driver
+          hostPath:
+            path: /opt/rocm
+            type: DirectoryOrCreate
+        # 使用按需创建的挂载目录，允许没有安装 ROCm 的节点正常启动设备管理器。
+        - name: gpustack-amd-driver-lib
+          hostPath:
+            path: /opt/rocm/lib
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "ascend" }}
+        - name: gpustack-ascend-driver
+          hostPath:
+            path: /usr/local/dcmi
+            type: DirectoryOrCreate
+        - name: gpustack-ascend-toolkit
+          hostPath:
+            path: /usr/local/Ascend
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "cambricon" }}
+        - name: gpustack-cambricon-driver
+          hostPath:
+            path: /usr/local/neuware
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "hygon" }}
+        - name: gpustack-hygon-driver
+          hostPath:
+            path: /opt/hyhal
+            type: DirectoryOrCreate
+        - name: gpustack-hygon-toolkit
+          hostPath:
+            path: /opt/dtk
+            type: DirectoryOrCreate
+        # 挂载厂商的计算实例注册表，以便根据分区 UUID 找到驱动枚举的实例，并在工作负载中使用相同映射。
+        - name: gpustack-hygon-mig-config
+          hostPath:
+            path: /etc/dmi_mig_config
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "iluvatar" }}
+        - name: gpustack-iluvatar-toolkit
+          hostPath:
+            path: /usr/local/corex
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "metax" }}
+        - name: gpustack-metax-driver
+          hostPath:
+            path: /opt/mxdriver
+            type: DirectoryOrCreate
+        - name: gpustack-metax-toolkit
+          hostPath:
+            path: /opt/maca
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq $manu "thead" }}
+        - name: gpustack-thead-toolkit
+          hostPath:
+            path: /usr/local/PPU_SDK
+            type: DirectoryOrCreate
+        {{- end }}
+{{- end }}
+{{- end }}

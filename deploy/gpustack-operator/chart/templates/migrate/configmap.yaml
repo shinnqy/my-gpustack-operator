@@ -1,0 +1,19 @@
+{{- /*
+  迁移 Job 从同一份 ConfigMap 挂载安装前与升级后的脚本，按 hook 生命周期创建和清理。
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gpustack-operator.fullname" . }}-migrate
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade,post-upgrade
+    "helm.sh/hook-weight": "-11"
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+data:
+  migrate-pre.sh: |-
+{{ .Files.Get "files/migrate-pre.sh" | indent 4 }}
+  migrate-post.sh: |-
+{{ .Files.Get "files/migrate-post.sh" | indent 4 }}

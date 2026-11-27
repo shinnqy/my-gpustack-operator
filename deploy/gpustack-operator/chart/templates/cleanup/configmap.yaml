@@ -1,0 +1,23 @@
+{{- if .Values.cleanupOnUninstall }}
+{{- /*
+  将卸载脚本装进 ConfigMap，供 pre-delete 和 post-delete Job 共用。负权重保证它和 RBAC 先于 Job 就绪。
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gpustack-operator.fullname" . }}-cleanup
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-delete,post-delete
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+data:
+  drain.sh: |-
+{{ .Files.Get "files/drain.sh" | indent 4 }}
+  cleanup.sh: |-
+{{ .Files.Get "files/cleanup.sh" | indent 4 }}
+  drain-kueue.sh: |-
+{{ .Files.Get "files/drain-kueue.sh" | indent 4 }}
+{{- end }}

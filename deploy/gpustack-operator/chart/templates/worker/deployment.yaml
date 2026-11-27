@@ -1,0 +1,190 @@
+{{- if .Values.worker.enabled }}
+{{- $certmanager := eq (include "gpustack-operator.certmanager.enabled" .) "true" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gpustack-operator.worker.fullname" . }}
+  namespace: {{ include "gpustack-operator.namespace" . }}
+  labels:
+    {{- include "gpustack-operator.worker.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  strategy:
+    type: {{ .Values.worker.strategyType }}
+  selector:
+    matchLabels:
+      {{- include "gpustack-operator.worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpustack-operator.worker.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gpustack-operator.worker.fullname" . }}
+      restartPolicy: Always
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ if kindIs "string" . }}{{ . }}{{ else }}{{ .name }}{{ end }}
+        {{- end }}
+      {{- end }}
+      {{- with (.Values.worker.nodeSelector | default .Values.global.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - {{- toYaml . | nindent 10 }}
+          {{- if not .labelSelector }}
+          labelSelector:
+            matchLabels:
+              {{- include "gpustack-operator.worker.selectorLabels" $ | nindent 14 }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      # 使用软反亲和，使 Worker 副本尽量分布到不同节点。节点不足时仍能调度。
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "gpustack-operator.worker.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      containers:
+        - name: main
+          image: {{ include "gpustack-operator.image" (dict "root" . "overrides" .Values.worker.image) | quote }}
+          imagePullPolicy: {{ include "gpustack-operator.imagePullPolicy" (dict "root" . "overrides" .Values.worker.image) }}
+          args:
+            - gpustack-operator
+            - worker
+            - -v=2
+            - --secure-port={{ .Values.worker.securePort }}
+            {{- if $certmanager }}
+            - --cert-dir=/var/run/gpustack/certs
+            {{- end }}
+            {{- if .Values.global.manufacturers }}
+            - --manufacturer={{ keys .Values.global.manufacturers | sortAlpha | join "," }}
+            {{- end }}
+            # 指定有权写入 NodeModelStore 状态的模型管理器身份，供准入 webhook 核验。
+            - --model-manager-service-account={{ include "gpustack-operator.modelManager.fullname" . }}
+            {{- with .Values.worker.disableApplications }}
+            # 将全部待禁用组件放入同一参数。该参数会累积，多次传入只会继续增加禁用项。
+            - --disable-applications={{ join "," . }}
+            {{- end }}
+            {{- with .Values.worker.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          env:
+            # 用户提供的环境变量排在受管变量之前，保证 Downward API 提供的身份优先。
+            {{- range $key, $value := .Values.worker.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: KUBERNETES_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUBERNETES_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KUBERNETES_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: KUBERNETES_SERVICE_NAME
+              value: {{ include "gpustack-operator.worker.fullname" . | quote }}
+            # 将镜像仓库、命名空间等设置传入 Worker，使它运行时安装的组件也使用同一套镜像配置。
+            - name: GPUSTACK_CONTAINER_REGISTRY
+              value: {{ coalesce .Values.global.imageRegistry .Values.global.hub | default "" | trimSuffix "/" | quote }}
+            - name: GPUSTACK_CONTAINER_NAMESPACE
+              value: {{ .Values.global.imageNamespace | quote }}
+            - name: GPUSTACK_IMAGE_PULL_SECRETS
+              value: "{{ range $i, $s := .Values.global.imagePullSecrets }}{{ if $i }},{{ end }}{{ if kindIs "string" $s }}{{ $s }}{{ else }}{{ $s.name }}{{ end }}{{ end }}"
+            - name: GPUSTACK_IMAGE_PULL_POLICY
+              value: {{ include "gpustack-operator.imagePullPolicy" (dict "root" . "overrides" .Values.worker.image) | quote }}
+            # 填写 IPv4 Pod 网段才启用 Instance 的跨命名空间隔离策略。
+            {{- with .Values.worker.instanceIsolationPodCIDRs }}
+            - name: GPUSTACK_INSTANCE_ISOLATION_POD_CIDRS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            # Worker 的节点设备检查和设备管理器须按同一规则判断已终止 Pod 是否仍占用设备。
+            - name: GPUSTACK_LEDGER_RELEASE_TERMINATED_PODS
+              value: {{ .Values.ledgerReleaseTerminatedPods | quote }}
+            {{- if .Values.modelManager.enabled }}
+            # 由 chart 声明权重交付模式。Worker 每次启动按此设置校正已保存的值。
+            - name: GPUSTACK_MODEL_ARTIFACT_DELIVERY_MODE
+              value: Node
+            {{- end }}
+            # 把厂商身份配置传给 Worker，使 NFD 的规则、资源记账和设备管理器都使用同一组厂商属性。
+            {{- range $manu := (keys .Values.global.manufacturers | sortAlpha) }}
+            {{- include "gpustack-operator.manufacturer.env"
+                  (dict "name" $manu "identity" (index $.Values.global.manufacturers $manu))
+                  | trim | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.worker.securePort }}
+          # 启动探针的时间预算要覆盖 Prepare 在开始提供服务之前完成的安装、资源准备与证书处理。
+          startupProbe:
+            failureThreshold: 180
+            periodSeconds: 5
+            httpGet:
+              scheme: HTTPS
+              port: https
+              path: /readyz
+          readinessProbe:
+            failureThreshold: 3
+            timeoutSeconds: 5
+            periodSeconds: 5
+            httpGet:
+              scheme: HTTPS
+              port: https
+              path: /readyz
+          livenessProbe:
+            failureThreshold: 10
+            timeoutSeconds: 5
+            periodSeconds: 10
+            httpGet:
+              scheme: HTTPS
+              port: https
+              path: /livez
+          volumeMounts:
+            - name: gpustack-data-dir
+              mountPath: /var/lib/gpustack
+            {{- if $certmanager }}
+            - name: gpustack-cert-dir
+              mountPath: /var/run/gpustack/certs
+            {{- end }}
+      volumes:
+        - name: gpustack-data-dir
+          hostPath:
+            path: {{ .Values.worker.dataDir }}
+            type: DirectoryOrCreate
+        {{- if $certmanager }}
+        - name: gpustack-cert-dir
+          secret:
+            secretName: {{ include "gpustack-operator.worker.fullname" . }}-cert
+        {{- end }}
+{{- end }}

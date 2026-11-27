@@ -1,0 +1,93 @@
+GPUStack Operator {{ .Chart.AppVersion }} has been deployed as release "{{ .Release.Name }}" in namespace "{{ include "gpustack-operator.namespace" . }}".
+
+Components:
+{{- if .Values.worker.enabled }}
+  - Worker (control plane): {{ include "gpustack-operator.worker.fullname" . }} ({{ .Values.worker.replicas }} replica(s))
+    On startup it applies the two custom resources no chart can carry — the gpustack-cpu-info
+    NodeFeatureRule the chain starts from, and the gpustack-node-devices AdmissionCheck it ends at
+    — retrying until each one's CRD is served, so a component disabled below leaves the worker
+    waiting for whatever provides it.
+{{- end }}
+{{- if .Values.deviceManager.enabled }}
+  - Device managers: one DaemonSet per manufacturer ({{ join ", " (keys .Values.global.manufacturers | sortAlpha) }})
+    Each only schedules on nodes that NFD labels with the matching PCI vendor.
+
+  Before a manufacturer's Pods can use its accelerators, its driver must already be on the node —
+  and, where our allocator hands the container a *_VISIBLE_DEVICES variable instead of injecting
+  `/dev` nodes itself, so must its container toolkit. A vendor GPU Operator can run alongside once
+  the components that would compete with this chart's are turned off; which those are, and the
+  vendors where it has to go instead, are per manufacturer:
+  https://github.com/gpustack/gpustack-operator/blob/main/docs/getting-started/vendor-prerequisites.md
+{{- /*
+  根据厂商的 runtimeInjectsDriver 和 runtimeInjectsDevices 生成容器工具包提示，所用依据与 RuntimeClass 的创建条件一致。需停用的外部组件随厂商和设备模式而异。
+*/}}
+{{- range $manu := (keys .Values.global.manufacturers | sortAlpha) }}
+{{- $identity := index $.Values.global.manufacturers $manu }}
+    - {{ $manu }}: requires the driver{{ if or $identity.runtimeInjectsDriver $identity.runtimeInjectsDevices }} and the container toolkit{{ end }}
+{{- end }}
+{{- end }}
+{{- if (index .Values "node-feature-discovery").enabled }}
+  - Node Feature Discovery, including its CRDs
+{{- else }}
+  - No Node Feature Discovery: it is disabled, so the cluster must run its own
+{{- end }}
+{{- if .Values.kueue.enabled }}
+  - Kueue, including its CRDs
+{{- else }}
+  - No Kueue: it is disabled, so the cluster must run its own
+{{- end }}
+{{- if (index .Values "csi-driver-nfs").enabled }}
+  - NFS CSI driver ({{ (index .Values "csi-driver-nfs").driver.name }})
+{{- else }}
+  - No NFS CSI driver: it is disabled, so the cluster must register its own as
+    {{ (index .Values "csi-driver-nfs").driver.name }} — the provisioner the worker writes into every StorageClass it manages
+{{- end }}
+{{- if (index .Values "csi-driver-s3").enabled }}
+  - S3 CSI driver ({{ (index .Values "csi-driver-s3").driver.name }})
+{{- else }}
+  - No S3 CSI driver: it is disabled, so the cluster must register its own as
+    {{ (index .Values "csi-driver-s3").driver.name }} — the provisioner the worker writes into every StorageClass it manages
+{{- end }}
+{{- if .Values.worker.enabled }}
+
+Check the worker rollout:
+
+  kubectl -n {{ include "gpustack-operator.namespace" . }} rollout status deployment/{{ include "gpustack-operator.worker.fullname" . }}
+{{- end }}
+{{- if .Values.kueue.enabled }}
+
+WARNING: this release owns Kueue and its CRDs, so `helm uninstall {{ .Release.Name }}` deletes
+every ClusterQueue, LocalQueue, ResourceFlavor, AdmissionCheck and Workload in the cluster along
+with them. Earlier versions installed Kueue as a release of its own, which outlived an operator
+uninstall; this one does not. To keep a Kueue this release does not own, install with
+`--set kueue.enabled=false` and bring your own.
+{{- end }}
+{{- if .Values.cleanupOnUninstall }}
+
+NOTE: `helm uninstall` runs a pre-delete Job that deletes this operator's custom resources while
+its controllers are still up, so the teardown each finalizer holds for gets to run — a
+KVCacheBackend empties every node's cache tier, a KVCachePoolBinding drops its tenant from the
+master's quota ledger. It stops after {{ .Values.cleanupDrainBudgetSeconds }}s, and helm gives up
+on a delete hook after `--timeout` (5m by default) and fails the uninstall. Both apply, so a large
+cache tier needs `--set cleanupDrainBudgetSeconds=<n>` AND a larger `--timeout`; raising either on
+its own changes nothing. Whatever has not drained is reported, and the post-delete Job removes it
+by force.
+{{- if .Values.kueue.enabled }}
+
+A second pre-delete Job then scales the worker to zero and deletes the Kueue objects it created
+(its ClusterQueues, ResourceFlavors, Topologies and AdmissionChecks, chosen by the worker's own
+labels) while Kueue is still up to finalize them; without it `helm uninstall --wait` waits on the
+Kueue CRDs until `--timeout`. It runs only where the Kueue in the cluster is this release's, and
+it FAILS the uninstall when Kueue has not finalized them within 120s, naming what is left; retry
+the uninstall, or pass `--no-hooks` to skip every hook.
+{{- end }}
+{{- else }}
+
+NOTE: `helm uninstall` removes only what this release owns. The controllers go first, so the
+teardown each finalizer holds for never runs: a node keeps the cache blocks its tier held, and a
+cache master keeps the quota ledger entries of tenants that are gone. The finalizers themselves,
+the CRDs and aggregated APIServices the worker registers itself, and its webhook configurations
+also stay behind. Run the chart's files/drain.sh BEFORE the uninstall and its files/cleanup.sh
+after, or install with `--set cleanupOnUninstall=true` to have two hook Jobs do both — which is
+safe only where this release exclusively owns those CRDs.
+{{- end }}

@@ -1,0 +1,21 @@
+# Helm 打包时忽略以下路径。每行一个相对路径或通配模式，感叹号表示例外。
+.DS_Store
+# 版本管理目录。
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+# 编辑器生成的备份文件。
+*.swp
+*.bak
+*.tmp
+*~
+# 开发环境配置。
+.project
+.idea/
+*.tmproj
+ci/
+*.gotmpl
